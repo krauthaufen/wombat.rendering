@@ -38,10 +38,10 @@ What's NOT yet implemented in v0.1, in rough priority order.
 
 ## Runtime layer (packages/runtime)
 
-- **PreparedRenderObject cache key** is currently just the
-  `RenderObject` reference. Should also key on
-  `(effect-id, signature)` so the same RenderObject can render
-  into different FBO shapes — pipeline color targets must match.
+- ~~**PreparedRenderObject cache key**.~~ DONE: keyed on
+  `(RenderObject, FramebufferSignature)`; pipelines additionally
+  use `Effect.id` (wombat.shader build-time stable hash) instead
+  of FNV-hashing shader source.
 - **Adaptive subscription.** `RenderTask.run(token)` walks the
   command alist on every call, reading every aval through `token`.
   Correct, but unoptimised — re-walks the tree even when nothing
@@ -78,9 +78,10 @@ What's NOT yet implemented in v0.1, in rough priority order.
   `effect.compile({ target: "wgsl" })`; integration test in
   `tests/shader-integration.test.ts` runs full source → WGSL →
   pipeline.
-- **Effect IDs as cache keys.** wombat.shader produces stable
-  build-time IDs (`Effect.id`); plumb into `compileRenderPipeline`'s
-  cache key in place of shader-source FNV hashing.
+- ~~**Effect IDs as cache keys**.~~ DONE: `compileRenderPipeline`
+  accepts `effectId`; `prepareRenderObject` threads `Effect.id`
+  through. FNV-hash fallback only for hand-built effects without
+  an upstream Effect.
 - **Source-map plumbing.** `CompiledStage.sourceMap` is now
   re-exported but not yet surfaced in the rendering layer for
   shader-compile error reporting.

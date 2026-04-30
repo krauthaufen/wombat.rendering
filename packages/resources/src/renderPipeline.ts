@@ -13,6 +13,15 @@
 
 export interface CompileRenderPipelineDescription {
   readonly label?: string;
+  /**
+   * Stable identity of the source effect (wombat.shader's
+   * build-time `Effect.id`). Used as the strong key for the
+   * pipeline cache — two `compileRenderPipeline` calls with the
+   * same `effectId` + the rest of the descriptor share a
+   * `GPURenderPipeline`. Falls back to FNV-hashing the shader
+   * source when omitted (only useful for hand-built sources).
+   */
+  readonly effectId?: string;
   readonly vertexShaderSource: string;
   readonly fragmentShaderSource: string;
   readonly vertexEntryPoint: string;
@@ -92,14 +101,19 @@ export function compileRenderPipeline(
 }
 
 function pipelineKey(d: CompileRenderPipelineDescription): string {
-  // Deterministic string fingerprint. Shader source is a strong
-  // identity component; the rest of the descriptor is small enough
-  // to JSON-stringify.
+  // Strong identity component: prefer `effectId` (wombat.shader's
+  // build-time stable hash); fall back to FNV-hashing the shader
+  // source for hand-built effects. The rest of the descriptor is
+  // small enough to JSON-stringify.
+  const ident = d.effectId !== undefined
+    ? d.effectId
+    : `${hashString(d.vertexShaderSource)}/${hashString(d.fragmentShaderSource)}`;
   const slim = {
-    vs: hashString(d.vertexShaderSource), vEntry: d.vertexEntryPoint,
-    fs: hashString(d.fragmentShaderSource), fEntry: d.fragmentEntryPoint,
+    id: ident,
+    vEntry: d.vertexEntryPoint,
+    fEntry: d.fragmentEntryPoint,
     vb: d.vertexBufferLayouts,
-    bgl: d.bindGroupLayouts.map(b => Object.getPrototypeOf(b)?.constructor?.name ?? "BGL"),
+    bgl: d.bindGroupLayouts.length,
     ct: d.colorTargets,
     ds: d.depthStencil,
     pr: d.primitive,

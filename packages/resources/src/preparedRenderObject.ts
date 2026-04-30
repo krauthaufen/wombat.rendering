@@ -211,6 +211,13 @@ export class PreparedRenderObject {
 
 export interface PrepareRenderObjectOptions {
   readonly label?: string;
+  /**
+   * Stable identity of the upstream effect — wombat.shader's
+   * `Effect.id`. Threaded into the pipeline cache key so that
+   * pipelines compiled from the same effect against the same
+   * signature dedupe correctly.
+   */
+  readonly effectId?: string;
 }
 
 export function prepareRenderObject(
@@ -320,6 +327,7 @@ export function prepareRenderObject(
 
   const pipelineDesc: CompileRenderPipelineDescription = {
     ...(opts.label !== undefined ? { label: opts.label } : {}),
+    ...(opts.effectId !== undefined ? { effectId: opts.effectId } : {}),
     vertexShaderSource: vsStage.source,
     fragmentShaderSource: fsStage.source,
     vertexEntryPoint: vsStage.entryName,

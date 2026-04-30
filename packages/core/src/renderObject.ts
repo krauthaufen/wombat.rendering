@@ -18,6 +18,13 @@ import type { PipelineState } from "./pipelineState.js";
 import type { Effect } from "./shader.js";
 
 export interface RenderObject {
+  /**
+   * A wombat.shader Effect — the user-facing object produced by
+   * `vertex(...) / fragment(...) / effect(...)` or by
+   * hand-building stages with `stage(module, ...)`. The runtime
+   * calls `effect.compile({ target: "wgsl" })` (cached by the
+   * effect's own hole-value key + target) before lowering.
+   */
   readonly effect: Effect;
   readonly pipelineState: PipelineState;
 

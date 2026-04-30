@@ -12,6 +12,8 @@ import type {
   RenderObject,
   RenderTree,
 } from "@aardworx/wombat.rendering-core";
+// `Effect.id` is the wombat.shader build-time stable hash; we use
+// it as the strong identity for the pipeline cache key.
 import {
   prepareRenderObject,
   type PreparedRenderObject,
@@ -20,31 +22,47 @@ import { render, renderMany } from "@aardworx/wombat.rendering-commands";
 import type { AdaptiveToken, aval } from "@aardworx/wombat.adaptive";
 
 export interface PreparedCache {
-  /** Get-or-compute the prepared object for `obj` against `signature`. */
-  get(obj: RenderObject, sig: FramebufferSignature, eff: CompiledEffect, device: GPUDevice): PreparedRenderObject;
-  /** Release every cached entry; called on disposal. */
+  /**
+   * Get-or-compute the prepared object for `obj` rendered into a
+   * framebuffer of shape `sig`. Keyed on
+   * `(RenderObject, FramebufferSignature)` because the pipeline's
+   * color-target formats depend on the signature.
+   *
+   * Aardvark.Rendering's ResourceManager keys equivalent caches on
+   * `(IRenderObject, IFramebufferSignature)`; same structure here.
+   */
+  get(
+    obj: RenderObject,
+    sig: FramebufferSignature,
+    eff: CompiledEffect,
+    effectId: string,
+    device: GPUDevice,
+  ): PreparedRenderObject;
   releaseAll(): void;
 }
 
 export function makeCache(): PreparedCache {
-  // TODO: cache key should include `(effect-id, signature)` so the same
-  // RenderObject in two different FBOs produces two pipelines (different
-  // color targets). Today we only key on the RenderObject identity; same
-  // limitation as the RenderTask version.
-  const map = new Map<RenderObject, PreparedRenderObject>();
+  const outer = new Map<RenderObject, Map<FramebufferSignature, PreparedRenderObject>>();
   return {
-    get(obj, sig, eff, device) {
-      let p = map.get(obj);
+    get(obj, sig, eff, effectId, device) {
+      let bySig = outer.get(obj);
+      if (bySig === undefined) {
+        bySig = new Map();
+        outer.set(obj, bySig);
+      }
+      let p = bySig.get(sig);
       if (p === undefined) {
-        p = prepareRenderObject(device, obj, eff, sig);
+        p = prepareRenderObject(device, obj, eff, sig, { effectId });
         p.acquire();
-        map.set(obj, p);
+        bySig.set(sig, p);
       }
       return p;
     },
     releaseAll() {
-      for (const p of map.values()) p.release();
-      map.clear();
+      for (const bySig of outer.values()) {
+        for (const p of bySig.values()) p.release();
+      }
+      outer.clear();
     },
   };
 }
@@ -61,7 +79,12 @@ export function collectLeaves(
   switch (tree.kind) {
     case "Empty": return out;
     case "Leaf":
-      out.push(cache.get(tree.object, sig, compileEffect(tree.object.effect), device));
+      out.push(cache.get(
+        tree.object, sig,
+        compileEffect(tree.object.effect),
+        tree.object.effect.id,
+        device,
+      ));
       return out;
     case "Ordered":
     case "Unordered":

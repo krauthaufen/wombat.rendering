@@ -1,12 +1,7 @@
-// renderTo end-to-end: a hidden RenderTask renders a scene into
-// an off-screen FBO; the returned aval<ITexture> is consumed by a
-// downstream RenderObject (whose textures HashMap binds it). When
-// the outer task runs, the inner task encodes itself into the same
-// command encoder, producing scene → texture data flow
-// automatically.
-//
-// Lifetime is verified separately: acquiring/releasing the
-// returned aval drives the underlying FBO + inner-task lifecycle.
+// renderTo end-to-end. The pass-through shader is real wombat.shader;
+// the textured outer shader uses a hand-built ProgramInterface
+// (combined sampler+texture in source needs the Vite-plugin
+// transform; not run in vitest).
 
 import { describe, expect, it } from "vitest";
 import {
@@ -17,6 +12,7 @@ import {
   type aval,
 } from "@aardworx/wombat.adaptive";
 import { V4f } from "@aardworx/wombat.base";
+import { Tf32, Vec, type Type } from "@aardworx/wombat.shader-ir";
 import {
   IBuffer,
   ISampler,
@@ -34,75 +30,77 @@ import {
   createFramebufferSignature,
 } from "@aardworx/wombat.rendering-resources";
 import { Runtime } from "@aardworx/wombat.rendering-runtime";
+import { fakeEffectFromCompiled } from "./_fakeEffect.js";
+import { makeEffect } from "./_makeEffect.js";
 import { MockGPU } from "./_mockGpu.js";
 
-function bv(format: GPUVertexFormat = "float32x3"): aval<BufferView> {
-  return cval<BufferView>({
-    buffer: IBuffer.fromHost(new ArrayBuffer(36)),
-    offset: 0, count: 3, stride: 12, format,
-  });
+const Tvec3f: Type = Vec(Tf32, 3);
+const Tvec4f: Type = Vec(Tf32, 4);
+const TtexFloat2D: Type = { kind: "Texture", target: "2D", sampled: { kind: "Float" }, arrayed: false, multisampled: false };
+const TsampFloat:  Type = { kind: "Sampler", target: "2D", sampled: { kind: "Float" }, comparison: false };
+
+function passEffect() {
+  return makeEffect(
+    `
+      function vsMain(input: { position: V3f }): { gl_Position: V4f } {
+        return { gl_Position: new V4f(input.position.x, input.position.y, input.position.z, 1.0) };
+      }
+      function fsMain(_input: {}): V4f {
+        return new V4f(1.0, 0.0, 0.0, 1.0);
+      }
+    `,
+    [
+      {
+        name: "vsMain", stage: "vertex",
+        inputs: [{ name: "position", type: Tvec3f, semantic: "Position", decorations: [{ kind: "Location", value: 0 }] }],
+        outputs: [{ name: "gl_Position", type: Tvec4f, semantic: "Position", decorations: [{ kind: "Builtin", value: "position" }] }],
+      },
+      {
+        name: "fsMain", stage: "fragment",
+        outputs: [{ name: "outColor", type: Tvec4f, semantic: "Color", decorations: [{ kind: "Location", value: 0 }] }],
+      },
+    ],
+  );
 }
 
-import type { Type } from "@aardworx/wombat.shader-ir";
-
-const f32:   Type = { kind: "Float", width: 32 };
-const vec3f: Type = { kind: "Vector", element: f32, dim: 3 };
-const vec4f: Type = { kind: "Vector", element: f32, dim: 4 };
-const tex2d: Type = { kind: "Texture", target: "2D", sampled: { kind: "Float" }, arrayed: false, multisampled: false };
-const samp:  Type = { kind: "Sampler", target: "2D", sampled: { kind: "Float" }, comparison: false };
-
-function passEffect(): CompiledEffect {
+/** Hand-built CompiledEffect for the textured outer shader — see _fakeEffect.ts. */
+function texturedEffectCompiled(): CompiledEffect {
   return {
     target: "wgsl",
     stages: [
-      { stage: "vertex",   entryName: "main", source: "@vertex fn main(){} /*pass*/",  bindings: [] as never, meta: {} as never, sourceMap: null },
-      { stage: "fragment", entryName: "main", source: "@fragment fn main(){} /*pass*/", bindings: [] as never, meta: {} as never, sourceMap: null },
+      { stage: "vertex",   entryName: "main", source: "// vs", bindings: [] as never, meta: {} as never, sourceMap: null },
+      { stage: "fragment", entryName: "main", source: "// fs", bindings: [] as never, meta: {} as never, sourceMap: null },
     ],
     interface: {
       target: "wgsl",
       stages: [],
-      attributes: [{ name: "position", location: 0, type: vec3f, format: "float32x3", components: 3, byteSize: 12 }],
-      fragmentOutputs: [{ name: "color", location: 0, type: vec4f }],
+      attributes: [{ name: "position", location: 0, type: Tvec3f, format: "float32x3", components: 3, byteSize: 12 }],
+      fragmentOutputs: [{ name: "color", location: 0, type: Tvec4f }],
       uniforms: [], uniformBlocks: [],
-      samplers: [], textures: [], storageBuffers: [],
-    },
-    avalBindings: {},
-  };
-}
-
-function texturedEffect(): CompiledEffect {
-  return {
-    target: "wgsl",
-    stages: [
-      { stage: "vertex",   entryName: "main", source: "@vertex fn main(){} /*tex*/",  bindings: [] as never, meta: {} as never, sourceMap: null },
-      { stage: "fragment", entryName: "main", source: "@fragment fn main(){} /*tex*/", bindings: [] as never, meta: {} as never, sourceMap: null },
-    ],
-    interface: {
-      target: "wgsl",
-      stages: [],
-      attributes: [{ name: "position", location: 0, type: vec3f, format: "float32x3", components: 3, byteSize: 12 }],
-      fragmentOutputs: [{ name: "color", location: 0, type: vec4f }],
-      uniforms: [], uniformBlocks: [],
-      textures: [{ name: "src",  group: 0, slot: 0, type: tex2d }],
-      samplers: [{ name: "samp", group: 0, slot: 1, type: samp }],
+      textures: [{ name: "src",  group: 0, slot: 0, type: TtexFloat2D }],
+      samplers: [{ name: "samp", group: 0, slot: 1, type: TsampFloat }],
       storageBuffers: [],
     },
     avalBindings: {},
   };
 }
 
+function bv(): aval<BufferView> {
+  return cval<BufferView>({
+    buffer: IBuffer.fromHost(new ArrayBuffer(36)),
+    offset: 0, count: 3, stride: 12, format: "float32x3",
+  });
+}
+
 describe("renderTo", () => {
   it("compose: inner scene renders into FBO, outer scene samples its texture", () => {
     const gpu = new MockGPU();
-    const runtime = new Runtime({
-      device: gpu.device,
-      compileEffect: e => e as unknown as CompiledEffect,
-    });
+    const runtime = new Runtime({ device: gpu.device });
 
-    // Inner scene: one triangle, no textures, renders into the offscreen FBO.
+    // Inner scene: a real shader, no textures, renders to the offscreen FBO.
     const innerEff = passEffect();
     const innerObj: RenderObject = {
-      effect: innerEff as unknown as RenderObject["effect"],
+      effect: innerEff,
       pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } },
       vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv()),
       uniforms: HashMap.empty(),
@@ -111,21 +109,21 @@ describe("renderTo", () => {
       drawCall: cval<DrawCall>({ kind: "non-indexed", vertexCount: 3, instanceCount: 1, firstVertex: 0, firstInstance: 0 }),
     };
     const innerScene = RenderTree.leaf(innerObj);
+    const offscreenSig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
 
-    // renderTo → aval<ITexture> for "color" attachment.
-    const offscreenSig = createFramebufferSignature({ colors: { color: "rgba8unorm" } });
     const result = runtime.renderTo(innerScene, {
       size: cval({ width: 32, height: 32 }),
       signature: offscreenSig,
-      clear: { colors: HashMap.empty<string, V4f>().add("color", new V4f(0, 0, 0, 1)) } as ClearValues,
+      clear: { colors: HashMap.empty<string, V4f>().add("outColor", new V4f(0, 0, 0, 1)) } as ClearValues,
       label: "offscreen",
     });
-    const offscreenColor = result.color("color");
+    const offscreenColor = result.color("outColor");
 
-    // Outer scene: one triangle that samples the offscreen color.
-    const outerEff = texturedEffect();
+    // Outer scene: textured (synthetic CompiledEffect — combined samplers
+    // need the Vite plugin which isn't running here).
+    const outerEff = fakeEffectFromCompiled(texturedEffectCompiled(), "outer-textured");
     const outerObj: RenderObject = {
-      effect: outerEff as unknown as RenderObject["effect"],
+      effect: outerEff,
       pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } },
       vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv()),
       uniforms: HashMap.empty(),
@@ -134,34 +132,23 @@ describe("renderTo", () => {
       drawCall: cval<DrawCall>({ kind: "non-indexed", vertexCount: 3, instanceCount: 1, firstVertex: 0, firstInstance: 0 }),
     };
 
-    // Backbuffer for the outer scene.
     const outerSig = createFramebufferSignature({ colors: { color: "rgba8unorm" } });
     const backbuffer = allocateFramebuffer(gpu.device, outerSig, cval({ width: 64, height: 64 }));
     backbuffer.acquire();
     const ifb = backbuffer.getValue(AdaptiveToken.top);
 
-    const outerCmds = AList.ofArray<Command>([
+    const cmds = AList.ofArray<Command>([
       { kind: "Render", output: ifb, tree: RenderTree.leaf(outerObj) },
     ]);
-    const task = runtime.compile(outerCmds);
+    const task = runtime.compile(cmds);
     task.run(AdaptiveToken.top);
 
-    // Two render passes were encoded: first the inner (offscreen) clear,
-    // then the inner scene render, then the outer scene render — but the
-    // outer scene's render reads the inner's texture, so the inner
-    // encoding happens *before* the outer draw.
-    //
-    // We expect at least 3 render passes:
-    //   1. inner clear (offscreen FBO)
-    //   2. inner render (offscreen FBO, 1 draw)
-    //   3. outer render (backbuffer, 1 draw)
+    // Inner clear + inner render + outer render: at least 3 passes;
+    // exactly 2 draws total.
     expect(gpu.renderPasses.length).toBeGreaterThanOrEqual(3);
     const drawCounts = gpu.renderPasses.map(p => p.drawCalls.length);
-    // The exact number of clear-only passes vs. render passes can shift
-    // as we coalesce; minimal assertion: total draws across all passes
-    // is exactly 2.
     expect(drawCounts.reduce((a, b) => a + b, 0)).toBe(2);
-    // The pipeline cache built two pipelines (inner + outer).
+    // Two pipelines: inner pass + outer textured.
     expect(gpu.pipelines).toHaveLength(2);
 
     task.dispose();
@@ -170,14 +157,10 @@ describe("renderTo", () => {
 
   it("lifecycle: acquire on derived aval brings the FBO live; release tears it down", () => {
     const gpu = new MockGPU();
-    const runtime = new Runtime({
-      device: gpu.device,
-      compileEffect: e => e as unknown as CompiledEffect,
-    });
-
+    const runtime = new Runtime({ device: gpu.device });
     const innerEff = passEffect();
     const innerObj: RenderObject = {
-      effect: innerEff as unknown as RenderObject["effect"],
+      effect: innerEff,
       pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } },
       vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv()),
       uniforms: HashMap.empty(),
@@ -187,20 +170,15 @@ describe("renderTo", () => {
     };
     const result = runtime.renderTo(RenderTree.leaf(innerObj), {
       size: cval({ width: 16, height: 16 }),
-      signature: createFramebufferSignature({ colors: { color: "rgba8unorm" } }),
+      signature: createFramebufferSignature({ colors: { outColor: "rgba8unorm" } }),
     });
-
-    const colorAval = result.color("color");
+    const colorAval = result.color("outColor");
     expect(gpu.textures).toHaveLength(0);
     colorAval.acquire();
-    // FBO not yet allocated — allocation happens on first compute.
-    expect(gpu.textures).toHaveLength(0);
-    // First read materialises the FBO texture.
+    expect(gpu.textures).toHaveLength(0);  // lazy, allocated on first compute
     colorAval.getValue(AdaptiveToken.top);
     expect(gpu.textures).toHaveLength(1);
-
     colorAval.release();
-    // Last release frees the FBO texture.
     expect(gpu.textures[0]!.destroyed).toBe(true);
   });
 });

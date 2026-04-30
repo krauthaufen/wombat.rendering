@@ -1,6 +1,6 @@
 // Runtime end-to-end: alist<Command> with Clear + Render + Copy +
-// Custom commands → encoded into a single GPUCommandEncoder via
-// the mock. Verifies RenderTree traversal, batching, command order.
+// Custom commands, all encoded into a single GPUCommandEncoder via
+// the mock. Real wombat.shader for the renderable effect.
 
 import { describe, expect, it } from "vitest";
 import {
@@ -11,13 +11,13 @@ import {
   type aval,
 } from "@aardworx/wombat.adaptive";
 import { V4f } from "@aardworx/wombat.base";
+import { Tf32, Vec, type Type } from "@aardworx/wombat.shader-ir";
 import {
   IBuffer,
   RenderTree,
   type BufferView,
   type ClearValues,
   type Command,
-  type CompiledEffect,
   type DrawCall,
   type RenderObject,
 } from "@aardworx/wombat.rendering-core";
@@ -26,89 +26,81 @@ import {
   createFramebufferSignature,
 } from "@aardworx/wombat.rendering-resources";
 import { Runtime } from "@aardworx/wombat.rendering-runtime";
+import { makeEffect } from "./_makeEffect.js";
 import { MockGPU } from "./_mockGpu.js";
 
-function bv(bytes: number, format: GPUVertexFormat, count = 3): aval<BufferView> {
+const Tvec3f: Type = Vec(Tf32, 3);
+const Tvec4f: Type = Vec(Tf32, 4);
+
+function singleAttribEffect() {
+  return makeEffect(
+    `
+      function vsMain(input: { position: V3f }): { gl_Position: V4f } {
+        return { gl_Position: new V4f(input.position.x, input.position.y, input.position.z, 1.0) };
+      }
+      function fsMain(_input: {}): V4f {
+        return new V4f(1.0, 0.0, 0.0, 1.0);
+      }
+    `,
+    [
+      {
+        name: "vsMain", stage: "vertex",
+        inputs: [
+          { name: "position", type: Tvec3f, semantic: "Position", decorations: [{ kind: "Location", value: 0 }] },
+        ],
+        outputs: [
+          { name: "gl_Position", type: Tvec4f, semantic: "Position", decorations: [{ kind: "Builtin", value: "position" }] },
+        ],
+      },
+      {
+        name: "fsMain", stage: "fragment",
+        outputs: [{ name: "outColor", type: Tvec4f, semantic: "Color", decorations: [{ kind: "Location", value: 0 }] }],
+      },
+    ],
+  );
+}
+
+function bv(): aval<BufferView> {
   return cval<BufferView>({
-    buffer: IBuffer.fromHost(new ArrayBuffer(bytes)),
-    offset: 0,
-    count,
-    stride: 12,
-    format,
+    buffer: IBuffer.fromHost(new ArrayBuffer(36)),
+    offset: 0, count: 3, stride: 12, format: "float32x3",
   });
 }
 
-import type { Type } from "@aardworx/wombat.shader-ir";
-
-const f32:   Type = { kind: "Float", width: 32 };
-const vec3f: Type = { kind: "Vector", element: f32, dim: 3 };
-const vec4f: Type = { kind: "Vector", element: f32, dim: 4 };
-
-function effect(): CompiledEffect {
+function obj() {
   return {
-    target: "wgsl",
-    stages: [
-      { stage: "vertex",   entryName: "main", source: "@vertex fn main(){}",  bindings: [] as never, meta: {} as never, sourceMap: null },
-      { stage: "fragment", entryName: "main", source: "@fragment fn main(){}", bindings: [] as never, meta: {} as never, sourceMap: null },
-    ],
-    interface: {
-      target: "wgsl",
-      stages: [],
-      attributes: [{ name: "position", location: 0, type: vec3f, format: "float32x3", components: 3, byteSize: 12 }],
-      fragmentOutputs: [{ name: "color", location: 0, type: vec4f }],
-      uniforms: [],
-      uniformBlocks: [{
-        name: "Globals", group: 0, slot: 0, size: 16,
-        fields: [{ name: "tint", type: vec4f, offset: 0, size: 16, align: 16 }],
-      }],
-      samplers: [], textures: [], storageBuffers: [],
-    },
-    avalBindings: {},
-  };
-}
-
-function obj(eff: CompiledEffect): RenderObject {
-  return {
-    effect: eff as unknown as RenderObject["effect"],
-    pipelineState: {
-      rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" },
-    },
-    vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv(36, "float32x3")),
-    uniforms:         HashMap.empty<string, aval<unknown>>().add("tint", cval(new V4f(1, 0, 0, 1))),
+    effect: singleAttribEffect(),
+    pipelineState: { rasterizer: { topology: "triangle-list" as const, cullMode: "none" as const, frontFace: "ccw" as const } },
+    vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv()),
+    uniforms: HashMap.empty(),
     textures: HashMap.empty(),
     samplers: HashMap.empty(),
     drawCall: cval<DrawCall>({ kind: "non-indexed", vertexCount: 3, instanceCount: 1, firstVertex: 0, firstInstance: 0 }),
-  };
+  } satisfies RenderObject;
 }
 
 describe("Runtime.compile(alist<Command>)", () => {
   it("Clear + Render emit two render passes in order", () => {
     const gpu = new MockGPU();
-    const runtime = new Runtime({ device: gpu.device, compileEffect: e => e as unknown as CompiledEffect });
-
-    const sig = createFramebufferSignature({ colors: { color: "rgba8unorm" } });
+    const runtime = new Runtime({ device: gpu.device });
+    const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
     const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
     fbo.acquire();
     const ifb = fbo.getValue(AdaptiveToken.top);
-
-    const eff = effect();
-    const tree = RenderTree.leaf(obj(eff));
+    const tree = RenderTree.leaf(obj());
     const clearValues: ClearValues = {
-      colors: HashMap.empty<string, V4f>().add("color", new V4f(0, 0, 0, 1)),
+      colors: HashMap.empty<string, V4f>().add("outColor", new V4f(0, 0, 0, 1)),
     };
     const commands = AList.ofArray<Command>([
       { kind: "Clear",  output: ifb, values: clearValues },
       { kind: "Render", output: ifb, tree },
     ]);
-
     const task = runtime.compile(commands);
     task.run(AdaptiveToken.top);
 
     expect(gpu.renderPasses).toHaveLength(2);
-    // First pass = clear (loadOp:"clear", no draws).
     expect((gpu.renderPasses[0]!.desc.colorAttachments as GPURenderPassColorAttachment[])[0]!.loadOp).toBe("clear");
     expect(gpu.renderPasses[0]!.drawCalls).toHaveLength(0);
-    // Second pass = render (loadOp:"load", one draw).
     expect((gpu.renderPasses[1]!.desc.colorAttachments as GPURenderPassColorAttachment[])[0]!.loadOp).toBe("load");
     expect(gpu.renderPasses[1]!.drawCalls).toHaveLength(1);
 
@@ -118,13 +110,12 @@ describe("Runtime.compile(alist<Command>)", () => {
 
   it("Ordered tree of two leaves batches into one render pass", () => {
     const gpu = new MockGPU();
-    const runtime = new Runtime({ device: gpu.device, compileEffect: e => e as unknown as CompiledEffect });
-    const sig = createFramebufferSignature({ colors: { color: "rgba8unorm" } });
+    const runtime = new Runtime({ device: gpu.device });
+    const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
     const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
     fbo.acquire();
     const ifb = fbo.getValue(AdaptiveToken.top);
-    const eff = effect();
-    const tree = RenderTree.ordered(RenderTree.leaf(obj(eff)), RenderTree.leaf(obj(eff)));
+    const tree = RenderTree.ordered(RenderTree.leaf(obj()), RenderTree.leaf(obj()));
     const cmds = AList.ofArray<Command>([{ kind: "Render", output: ifb, tree }]);
     const task = runtime.compile(cmds);
     task.run(AdaptiveToken.top);
@@ -136,11 +127,9 @@ describe("Runtime.compile(alist<Command>)", () => {
 
   it("Custom command receives the encoder", () => {
     const gpu = new MockGPU();
-    const runtime = new Runtime({ device: gpu.device, compileEffect: e => e as unknown as CompiledEffect });
+    const runtime = new Runtime({ device: gpu.device });
     const seen: GPUCommandEncoder[] = [];
-    const cmds = AList.ofArray<Command>([
-      { kind: "Custom", encode: (enc) => { seen.push(enc); } },
-    ]);
+    const cmds = AList.ofArray<Command>([{ kind: "Custom", encode: (enc) => { seen.push(enc); } }]);
     const task = runtime.compile(cmds);
     task.run(AdaptiveToken.top);
     expect(seen).toHaveLength(1);
@@ -149,7 +138,7 @@ describe("Runtime.compile(alist<Command>)", () => {
 
   it("Copy command emits buffer-to-buffer transfer", () => {
     const gpu = new MockGPU();
-    const runtime = new Runtime({ device: gpu.device, compileEffect: e => e as unknown as CompiledEffect });
+    const runtime = new Runtime({ device: gpu.device });
     const src = { size: 64 } as GPUBuffer;
     const dst = { size: 64 } as GPUBuffer;
     const cmds = AList.ofArray<Command>([
