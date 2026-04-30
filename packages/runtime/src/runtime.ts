@@ -21,19 +21,46 @@ export interface RuntimeOptions {
 
 export class Runtime {
   private readonly ctx: RuntimeContext;
+  private readonly _tasks = new Set<IRenderTask>();
+  private _disposed = false;
+  private _deviceLost = false;
+  /**
+   * Resolves to the lost-info when the device is reported lost.
+   * Stays pending while the device is alive.
+   */
+  readonly deviceLost: Promise<GPUDeviceLostInfo>;
 
   constructor(opts: RuntimeOptions) {
     this.ctx = {
       device: opts.device,
       compileEffect: opts.compileEffect ?? ((e: Effect) => e.compile({ target: "wgsl" })),
     };
+    // `device.lost` is a real-WebGPU promise; mock devices may not
+    // expose it. Treat as "never lost" in that case.
+    const lost = (opts.device as { lost?: Promise<GPUDeviceLostInfo> }).lost;
+    this.deviceLost = lost !== undefined
+      ? lost.then((info) => {
+          this._deviceLost = true;
+          // Best-effort: dispose all outstanding tasks so user code
+          // that still holds them stops trying to encode against a
+          // dead device.
+          this.disposeAll();
+          return info;
+        })
+      : new Promise(() => { /* never resolves on mock */ });
   }
 
   get device(): GPUDevice { return this.ctx.device; }
+  get isDeviceLost(): boolean { return this._deviceLost; }
 
   /** Compile an `alist<Command>` into a runnable `IRenderTask`. */
   compile(commands: alist<Command>): IRenderTask {
-    return compileRenderTask(this.ctx, commands);
+    if (this._disposed) throw new Error("Runtime: compile after disposeAll");
+    const task = compileRenderTask(this.ctx, commands);
+    this._tasks.add(task);
+    const origDispose = task.dispose.bind(task);
+    task.dispose = () => { origDispose(); this._tasks.delete(task); };
+    return task;
   }
 
   /**
@@ -44,6 +71,24 @@ export class Runtime {
    * to a downstream RenderObject), and shut down on last release.
    */
   renderTo(scene: RenderTree, opts: RenderToOptions): RenderToResult {
+    if (this._disposed) throw new Error("Runtime: renderTo after disposeAll");
     return renderTo(this.ctx, scene, opts);
+  }
+
+  /**
+   * Tear down every IRenderTask compiled through this Runtime.
+   * After calling this, `compile()` and `renderTo()` throw.
+   * Idempotent. Intended for page-unload + fatal error paths.
+   *
+   * Note: doesn't destroy the GPUDevice itself — the user still
+   * owns its lifecycle.
+   */
+  disposeAll(): void {
+    if (this._disposed) return;
+    this._disposed = true;
+    for (const t of [...this._tasks]) {
+      try { t.dispose(); } catch (e) { console.error("Runtime.disposeAll: task.dispose threw", e); }
+    }
+    this._tasks.clear();
   }
 }

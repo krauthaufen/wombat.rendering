@@ -156,11 +156,13 @@ class AdaptiveTexture extends AdaptiveResource<GPUTexture> {
 
 function uploadRaw(device: GPUDevice, tex: GPUTexture, src: RawTextureSource): void {
   const bytes = src.data instanceof ArrayBuffer ? new Uint8Array(src.data) : new Uint8Array(src.data.buffer, src.data.byteOffset, src.data.byteLength);
-  const bytesPerPixel = bytesPerPixelFor(src.format);
+  const block = blockInfoFor(src.format);
+  const blocksPerRow = Math.ceil(src.width / block.width);
+  const rowsOfBlocks = Math.ceil(src.height / block.height);
   device.queue.writeTexture(
     { texture: tex },
     bytes as unknown as GPUAllowSharedBufferSource,
-    { bytesPerRow: src.width * bytesPerPixel, rowsPerImage: src.height },
+    { bytesPerRow: blocksPerRow * block.bytesPerBlock, rowsPerImage: rowsOfBlocks },
     { width: src.width, height: src.height, depthOrArrayLayers: src.depthOrArrayLayers ?? 1 },
   );
 }
@@ -173,24 +175,84 @@ function uploadExternal(device: GPUDevice, tex: GPUTexture, src: ExternalTexture
   );
 }
 
-function bytesPerPixelFor(format: GPUTextureFormat): number {
-  // Minimal table — covers the formats we expect in practice. Extend as needed.
+interface BlockInfo {
+  readonly width: number;        // pixels per block in x
+  readonly height: number;       // pixels per block in y
+  readonly bytesPerBlock: number;
+}
+
+/**
+ * Block dimensions + size for a WebGPU texture format. Linear
+ * (uncompressed) formats report 1×1 blocks. Block-compressed
+ * formats (BC*, ETC*, ASTC*, EAC) use their native block size so
+ * `writeTexture`'s bytesPerRow / rowsPerImage land on the right
+ * block grid.
+ */
+function blockInfoFor(format: GPUTextureFormat): BlockInfo {
   switch (format) {
-    case "r8unorm": case "r8snorm": case "r8uint": case "r8sint": return 1;
+    // 8-bit
+    case "r8unorm": case "r8snorm": case "r8uint": case "r8sint":
+      return { width: 1, height: 1, bytesPerBlock: 1 };
+    // 16-bit
     case "rg8unorm": case "rg8snorm": case "rg8uint": case "rg8sint":
-    case "r16uint": case "r16sint": case "r16float": return 2;
+    case "r16uint": case "r16sint": case "r16float":
+      return { width: 1, height: 1, bytesPerBlock: 2 };
+    // 32-bit
     case "rgba8unorm": case "rgba8unorm-srgb": case "rgba8snorm":
     case "rgba8uint": case "rgba8sint":
     case "bgra8unorm": case "bgra8unorm-srgb":
     case "rgb10a2unorm": case "rgb10a2uint":
     case "rg11b10ufloat": case "rgb9e5ufloat":
     case "rg16uint": case "rg16sint": case "rg16float":
-    case "r32uint": case "r32sint": case "r32float": return 4;
+    case "r32uint": case "r32sint": case "r32float":
+      return { width: 1, height: 1, bytesPerBlock: 4 };
+    // 64-bit
     case "rgba16uint": case "rgba16sint": case "rgba16float":
-    case "rg32uint": case "rg32sint": case "rg32float": return 8;
-    case "rgba32uint": case "rgba32sint": case "rgba32float": return 16;
+    case "rg32uint": case "rg32sint": case "rg32float":
+      return { width: 1, height: 1, bytesPerBlock: 8 };
+    // 128-bit
+    case "rgba32uint": case "rgba32sint": case "rgba32float":
+      return { width: 1, height: 1, bytesPerBlock: 16 };
+
+    // ---- Block-compressed formats ----
+    // BC1/2/3/4/5 (DXT/RGTC) — 4×4 blocks
+    case "bc1-rgba-unorm": case "bc1-rgba-unorm-srgb":
+    case "bc4-r-unorm":   case "bc4-r-snorm":
+      return { width: 4, height: 4, bytesPerBlock: 8 };
+    case "bc2-rgba-unorm": case "bc2-rgba-unorm-srgb":
+    case "bc3-rgba-unorm": case "bc3-rgba-unorm-srgb":
+    case "bc5-rg-unorm":   case "bc5-rg-snorm":
+    case "bc6h-rgb-ufloat": case "bc6h-rgb-float":
+    case "bc7-rgba-unorm":  case "bc7-rgba-unorm-srgb":
+      return { width: 4, height: 4, bytesPerBlock: 16 };
+
+    // ETC2 — 4×4 blocks
+    case "etc2-rgb8unorm": case "etc2-rgb8unorm-srgb":
+    case "etc2-rgb8a1unorm": case "etc2-rgb8a1unorm-srgb":
+    case "eac-r11unorm":  case "eac-r11snorm":
+      return { width: 4, height: 4, bytesPerBlock: 8 };
+    case "etc2-rgba8unorm": case "etc2-rgba8unorm-srgb":
+    case "eac-rg11unorm":  case "eac-rg11snorm":
+      return { width: 4, height: 4, bytesPerBlock: 16 };
+
+    // ASTC — variable block size, all 16 bytes/block.
+    case "astc-4x4-unorm":   case "astc-4x4-unorm-srgb":   return { width: 4,  height: 4,  bytesPerBlock: 16 };
+    case "astc-5x4-unorm":   case "astc-5x4-unorm-srgb":   return { width: 5,  height: 4,  bytesPerBlock: 16 };
+    case "astc-5x5-unorm":   case "astc-5x5-unorm-srgb":   return { width: 5,  height: 5,  bytesPerBlock: 16 };
+    case "astc-6x5-unorm":   case "astc-6x5-unorm-srgb":   return { width: 6,  height: 5,  bytesPerBlock: 16 };
+    case "astc-6x6-unorm":   case "astc-6x6-unorm-srgb":   return { width: 6,  height: 6,  bytesPerBlock: 16 };
+    case "astc-8x5-unorm":   case "astc-8x5-unorm-srgb":   return { width: 8,  height: 5,  bytesPerBlock: 16 };
+    case "astc-8x6-unorm":   case "astc-8x6-unorm-srgb":   return { width: 8,  height: 6,  bytesPerBlock: 16 };
+    case "astc-8x8-unorm":   case "astc-8x8-unorm-srgb":   return { width: 8,  height: 8,  bytesPerBlock: 16 };
+    case "astc-10x5-unorm":  case "astc-10x5-unorm-srgb":  return { width: 10, height: 5,  bytesPerBlock: 16 };
+    case "astc-10x6-unorm":  case "astc-10x6-unorm-srgb":  return { width: 10, height: 6,  bytesPerBlock: 16 };
+    case "astc-10x8-unorm":  case "astc-10x8-unorm-srgb":  return { width: 10, height: 8,  bytesPerBlock: 16 };
+    case "astc-10x10-unorm": case "astc-10x10-unorm-srgb": return { width: 10, height: 10, bytesPerBlock: 16 };
+    case "astc-12x10-unorm": case "astc-12x10-unorm-srgb": return { width: 12, height: 10, bytesPerBlock: 16 };
+    case "astc-12x12-unorm": case "astc-12x12-unorm-srgb": return { width: 12, height: 12, bytesPerBlock: 16 };
+
     default:
-      throw new Error(`bytesPerPixelFor: unsupported format ${format}`);
+      throw new Error(`blockInfoFor: unsupported format ${format}`);
   }
 }
 

@@ -24,9 +24,11 @@ What's NOT yet implemented in v0.1, in rough priority order.
   `mipLevelCount` slots when `generateMips: true` is passed, but
   only uploads mip 0. Real mip generation needs a compute pass
   (Dawn / Three.js have reference impls).
-- **`bytesPerPixelFor` table** in `adaptiveTexture.ts` is minimal —
-  extend as new formats are needed (block-compressed formats need a
-  different code path entirely).
+- ~~**`bytesPerPixelFor` table**~~. DONE: replaced with
+  `blockInfoFor(format)` returning `{ width, height, bytesPerBlock }`.
+  Linear formats use 1×1 blocks; BC1–BC7, ETC2/EAC, and the full
+  ASTC range (4×4 through 12×12) covered. `writeTexture` builds
+  bytesPerRow / rowsPerImage off the block grid.
 - **Buffer alignment / staging.** Right now `queue.writeBuffer` is
   used unconditionally. For very large uploads or per-frame compute
   outputs, a staging-buffer + `copyBufferToBuffer` path is cheaper.
@@ -53,9 +55,12 @@ What's NOT yet implemented in v0.1, in rough priority order.
 - ~~**Pass coalescing**.~~ DONE: adjacent `Clear` + `Render` on
   the same FBO aval fuse into one render pass with `loadOp:"clear"`
   attachments.
-- **`device.lost` + recovery.** The runtime currently has no
-  lost-device handling. On lost device all `AdaptiveResource`s
-  need rebuilding.
+- ~~**`device.lost` + recovery**.~~ DONE (basic): `Runtime` now
+  subscribes to `device.lost` and fires `disposeAll()` when the
+  promise resolves. `Runtime.isDeviceLost` + `Runtime.deviceLost`
+  are observable. **Not** done: rebuilding all `AdaptiveResource`s
+  on a fresh device (which is the actual recovery story); for now
+  the user has to construct a new `Runtime` from a new device.
 - **Multiple queues / async submission.** Single queue, sync
   submit per `run()`. For async readback or upload, callers go
   through `Custom`.
@@ -100,8 +105,10 @@ What's NOT yet implemented in v0.1, in rough priority order.
   with Vulkan flags. Picks the real GPU (NVIDIA RTX 5060 /
   Blackwell on this host) instead of SwiftShader. Pixel-level
   validation via `copyTextureToBuffer` + map readback.
-- `Runtime.disposeAll()` and other lifetime niceties for the
-  page-unload path.
+- ~~`Runtime.disposeAll()`~~ — DONE. Tracks every task compiled
+  via `Runtime.compile()` / `Runtime.renderTo()` in a registry;
+  `disposeAll()` releases each task and blocks future compiles.
+  Auto-fires from the `device.lost` handler.
 
 ## Upstream wombat.shader bug
 
