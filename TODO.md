@@ -94,11 +94,28 @@ What's NOT yet implemented in v0.1, in rough priority order.
 - No examples yet (`packages/examples/hello-cube`,
   `camera-controller`, `instanced-grid`, `post-processing`,
   `compute-readback`).
-- No browser smoke test infra. All current tests use a Node-side
-  mock; verifying against real WebGPU needs either a Dawn-Node
-  binding or a Playwright headless-Chromium pipeline.
+- ~~No browser smoke test infra.~~ DONE: `tests-browser/`
+  runs under vitest browser-mode + Playwright headless Chromium
+  with real WebGPU. `npm run test:browser` validates clear +
+  hello-triangle on real GPU with pixel readback.
 - `Runtime.disposeAll()` and other lifetime niceties for the
   page-unload path.
+
+## Upstream wombat.shader bug
+
+- **`liftReturns` not effective via `parseShader → stage(...)` path.**
+  When using compileShaderSource, `liftReturns` rewrites bare
+  `return new V4f(...)` into a `WriteOutput("outColor", ...)`. But
+  going through `parseShader` + `stage(module).compile()` doesn't
+  apply the lift — the resulting WGSL has `return vec4<f32>(...)`
+  with the wrong return type vs `FsMainOutput`, causing
+  `Error while parsing WGSL: return statement type must match its
+  function return type, returned 'vec4<f32>', expected 'FsMainOutput'`.
+  Workaround: declare the fragment function with an explicit struct
+  return (`function fsMain(...): { outColor: V4f } { return { outColor: ... } }`).
+  Likely the carrier annotation that liftReturns matches on is
+  non-enumerable and gets stripped when stage() spreads the values.
+  File against wombat.shader.
 
 ## Type-level loose ends
 

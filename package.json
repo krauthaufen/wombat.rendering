@@ -2,18 +2,27 @@
   "name": "@aardworx/wombat.rendering-monorepo",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=18" },
-  "workspaces": ["packages/*", "examples/*"],
+  "engines": {
+    "node": ">=18"
+  },
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean && rm -rf packages/*/dist",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:browser": "vitest run --config vitest.browser.config.ts",
+    "test:all": "vitest run && vitest run --config vitest.browser.config.ts",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
+    "@vitest/browser": "^1.6.1",
     "@webgpu/types": "^0.1.69",
+    "playwright": "^1.59.1",
     "typescript": "^5.4.0",
     "vitest": "^1.4.0"
   },
