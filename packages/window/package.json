@@ -14,9 +14,12 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "src"],
+  "files": [
+    "dist",
+    "src"
+  ],
   "dependencies": {
-    "@aardworx/wombat.adaptive": "file:../../../wombat.adaptive",
+    "@aardworx/wombat.adaptive": "^0.2.1",
     "@aardworx/wombat.rendering-core": "*",
     "@aardworx/wombat.rendering-resources": "*",
     "@aardworx/wombat.rendering-runtime": "*"
