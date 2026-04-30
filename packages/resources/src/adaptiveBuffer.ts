@@ -22,6 +22,8 @@
 
 import {
   AdaptiveResource,
+  tryAcquire,
+  tryRelease,
   type IBuffer,
 } from "@aardworx/wombat.rendering-core";
 import {
@@ -56,7 +58,7 @@ class AdaptiveBuffer extends AdaptiveResource<GPUBuffer> {
   }
 
   protected create(): void {
-    // Lazy allocation — first compute() will materialise the buffer.
+    tryAcquire(this.source);
   }
 
   protected destroy(): void {
@@ -65,6 +67,7 @@ class AdaptiveBuffer extends AdaptiveResource<GPUBuffer> {
       this._owned = undefined;
       this._ownedCapacity = 0;
     }
+    tryRelease(this.source);
   }
 
   override compute(token: AdaptiveToken): GPUBuffer {

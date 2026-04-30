@@ -1,46 +1,45 @@
 // prepareRenderObject — turn a `RenderObject` + `CompiledEffect`
 // + `FramebufferSignature` into a runnable `PreparedRenderObject`.
 //
-// MVP slice (this revision):
-//   - Vertex attributes: each shader-required attribute is bound
-//     to its own vertex-buffer slot at the attribute's location.
-//     `prepareAdaptiveBuffer` lifts each `aval<BufferView>` into
-//     a managed `GPUBuffer`.
-//   - Uniform buffers: one bind group per `ProgramInterface.uniformBuffers`
-//     entry; `prepareUniformBuffer` packs the named bag using the
-//     shader's layout.
-//   - Index buffer: optional, follows `BufferView.format` (uint16/uint32).
-//   - Draw call: read from `obj.drawCall: aval<DrawCall>`.
-//   - Pipeline: cached via `compileRenderPipeline`.
+// Slice landed in this revision:
+//   - Vertex attributes by name.
+//   - Uniform buffers (one per `ProgramInterface.uniformBuffers`).
+//   - Textures + samplers (one bind-group entry per
+//     `ProgramInterface.textures` / `.samplers`).
+//   - Storage buffers (one bind-group entry per
+//     `ProgramInterface.storageBuffers`; user passes the source as
+//     `aval<IBuffer>`, runtime wraps via `prepareAdaptiveBuffer`).
+//   - Index buffer / draw call.
+//   - Pipeline (cached).
 //
-// Not yet handled (next slice): textures, samplers, storage
-// buffers, instance attributes, depth-stencil state, blend state,
-// multisample.
+// Not yet handled (see TODO.md):
+//   - Instance attributes / per-attribute stepMode.
+//   - Blend / stencil / multisample plumbing.
+//   - `BufferView.indexFormat` (currently hardcoded `uint32`).
 
 import {
   AdaptiveResource,
   type CompiledEffect,
   type FramebufferSignature,
-  type IBuffer,
   type ProgramInterface,
   type RenderObject,
-  type UniformBufferLayout,
 } from "@aardworx/wombat.rendering-core";
 import {
   type AdaptiveToken,
   type aval,
 } from "@aardworx/wombat.adaptive";
 import { prepareAdaptiveBuffer } from "./adaptiveBuffer.js";
+import { prepareAdaptiveTexture } from "./adaptiveTexture.js";
+import { prepareAdaptiveSampler } from "./adaptiveSampler.js";
 import { prepareUniformBuffer } from "./uniformBuffer.js";
 import { compileRenderPipeline, type CompileRenderPipelineDescription } from "./renderPipeline.js";
-import { BufferUsage } from "./webgpuFlags.js";
+import { BufferUsage, ShaderStage } from "./webgpuFlags.js";
 
 // ---------------------------------------------------------------------------
-// Helpers — derive WebGPU descriptors from ProgramInterface + signature
+// Helpers
 // ---------------------------------------------------------------------------
 
 function vertexFormatStride(fmt: GPUVertexFormat): number {
-  // Minimal table — extend as needed.
   switch (fmt) {
     case "float32": return 4;
     case "float32x2": return 8;
@@ -60,23 +59,15 @@ function vertexFormatStride(fmt: GPUVertexFormat): number {
 
 interface VertexBindingInfo {
   readonly name: string;
-  readonly slot: number;          // index into the `buffers` array (== shader location for our scheme)
+  readonly slot: number;
   readonly format: GPUVertexFormat;
 }
 
 function vertexBufferLayoutsFor(iface: ProgramInterface): VertexBindingInfo[] {
-  return iface.vertexAttributes.map(a => ({
-    name: a.name,
-    slot: a.location,
-    format: a.format,
-  }));
+  return iface.vertexAttributes.map(a => ({ name: a.name, slot: a.location, format: a.format }));
 }
 
 function colorTargetsFor(iface: ProgramInterface, sig: FramebufferSignature): GPUColorTargetState[] {
-  // One target per fragment output, looked up by name in the
-  // signature. The signature's HashMap is iterated to produce the
-  // correct slot ordering — slot index = shader-declared location.
-  // Outputs whose names are not in the signature are an error.
   const out: GPUColorTargetState[] = [];
   for (const o of iface.fragmentOutputs) {
     const fmt = sig.colors.tryFind(o.name);
@@ -88,28 +79,42 @@ function colorTargetsFor(iface: ProgramInterface, sig: FramebufferSignature): GP
   return out;
 }
 
-function bindGroupLayoutsForUniforms(device: GPUDevice, iface: ProgramInterface): {
-  layouts: GPUBindGroupLayout[];
-  byGroup: Map<number, UniformBufferLayout[]>;
-} {
-  const byGroup = new Map<number, UniformBufferLayout[]>();
-  for (const ub of iface.uniformBuffers) {
-    let arr = byGroup.get(ub.group);
-    if (arr === undefined) { arr = []; byGroup.set(ub.group, arr); }
-    arr.push(ub);
+// ---------------------------------------------------------------------------
+// Bind-group entry descriptions
+// ---------------------------------------------------------------------------
+
+type EntryDesc =
+  | { kind: "ubuf";    binding: number; resource: AdaptiveResource<GPUBuffer> }
+  | { kind: "sbuf";    binding: number; resource: AdaptiveResource<GPUBuffer>; access: "read" | "read_write" }
+  | { kind: "tex";     binding: number; resource: AdaptiveResource<GPUTexture>; sampleType: GPUTextureSampleType }
+  | { kind: "sampler"; binding: number; resource: AdaptiveResource<GPUSampler> };
+
+interface GroupDesc {
+  readonly group: number;
+  readonly layout: GPUBindGroupLayout;
+  readonly entries: readonly EntryDesc[];
+}
+
+function buildGroups(device: GPUDevice, descs: readonly EntryDesc[][]): GroupDesc[] {
+  const out: GroupDesc[] = [];
+  for (let g = 0; g < descs.length; g++) {
+    const entries = (descs[g] ?? []).slice().sort((a, b) => a.binding - b.binding);
+    const layoutEntries: GPUBindGroupLayoutEntry[] = entries.map(e => {
+      const visibility = ShaderStage.VERTEX | ShaderStage.FRAGMENT;
+      switch (e.kind) {
+        case "ubuf":   return { binding: e.binding, visibility, buffer: { type: "uniform" } };
+        case "sbuf":   return {
+          binding: e.binding, visibility,
+          buffer: { type: e.access === "read_write" ? "storage" : "read-only-storage" },
+        };
+        case "tex":    return { binding: e.binding, visibility, texture: { sampleType: e.sampleType } };
+        case "sampler": return { binding: e.binding, visibility, sampler: { type: "filtering" } };
+      }
+    });
+    const layout = device.createBindGroupLayout({ entries: layoutEntries });
+    out.push({ group: g, layout, entries });
   }
-  const layouts: GPUBindGroupLayout[] = [];
-  const maxGroup = iface.uniformBuffers.reduce((m, u) => Math.max(m, u.group), -1);
-  for (let g = 0; g <= maxGroup; g++) {
-    const ubs = byGroup.get(g) ?? [];
-    const entries: GPUBindGroupLayoutEntry[] = ubs.map(u => ({
-      binding: u.binding,
-      visibility: 0x1 | 0x2,            // ShaderStage.VERTEX | ShaderStage.FRAGMENT
-      buffer: { type: "uniform" as const },
-    }));
-    layouts.push(device.createBindGroupLayout({ entries }));
-  }
-  return { layouts, byGroup };
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +123,7 @@ function bindGroupLayoutsForUniforms(device: GPUDevice, iface: ProgramInterface)
 
 export class PreparedRenderObject {
   readonly pipeline: GPURenderPipeline;
-  readonly bindGroupLayouts: readonly GPUBindGroupLayout[];
+  readonly groups: readonly GroupDesc[];
 
   constructor(
     private readonly device: GPUDevice,
@@ -127,63 +132,58 @@ export class PreparedRenderObject {
     private readonly indexBuffer: AdaptiveResource<GPUBuffer> | undefined,
     private readonly indexFormat: GPUIndexFormat | undefined,
     private readonly indices: aval<import("@aardworx/wombat.rendering-core").BufferView> | undefined,
-    private readonly uniformBuffers: ReadonlyMap<number, ReadonlyMap<number, AdaptiveResource<GPUBuffer>>>,
+    groups: readonly GroupDesc[],
     private readonly drawCall: aval<import("@aardworx/wombat.rendering-core").DrawCall>,
     pipeline: GPURenderPipeline,
-    bindGroupLayouts: readonly GPUBindGroupLayout[],
   ) {
     this.pipeline = pipeline;
-    this.bindGroupLayouts = bindGroupLayouts;
+    this.groups = groups;
   }
 
   acquire(): void {
     for (const r of this.vertexBuffers.values()) r.acquire();
     if (this.indexBuffer !== undefined) this.indexBuffer.acquire();
-    for (const grp of this.uniformBuffers.values()) for (const u of grp.values()) u.acquire();
+    for (const g of this.groups) for (const e of g.entries) e.resource.acquire();
   }
 
   release(): void {
     for (const r of this.vertexBuffers.values()) r.release();
     if (this.indexBuffer !== undefined) this.indexBuffer.release();
-    for (const grp of this.uniformBuffers.values()) for (const u of grp.values()) u.release();
+    for (const g of this.groups) for (const e of g.entries) e.resource.release();
   }
 
-  /** Encode this object into an open render pass. Reads all current adaptive state via `token`. */
+  /** Encode this object into an open render pass. */
   record(pass: GPURenderPassEncoder, token: AdaptiveToken): void {
     pass.setPipeline(this.pipeline);
 
-    // Bind groups — rebuilt every frame for now; cheap relative to draw work.
-    for (let g = 0; g < this.bindGroupLayouts.length; g++) {
-      const grp = this.uniformBuffers.get(g);
-      const entries: GPUBindGroupEntry[] = [];
-      if (grp !== undefined) {
-        for (const [binding, res] of grp.entries()) {
-          const buf = res.getValue(token);
-          entries.push({ binding, resource: { buffer: buf } });
+    for (const g of this.groups) {
+      const entries: GPUBindGroupEntry[] = g.entries.map(e => {
+        switch (e.kind) {
+          case "ubuf":
+          case "sbuf":
+            return { binding: e.binding, resource: { buffer: e.resource.getValue(token) } };
+          case "tex":
+            return { binding: e.binding, resource: e.resource.getValue(token).createView() };
+          case "sampler":
+            return { binding: e.binding, resource: e.resource.getValue(token) };
         }
-      }
-      const bg = this.device.createBindGroup({ layout: this.bindGroupLayouts[g]!, entries });
-      pass.setBindGroup(g, bg);
+      });
+      const bg = this.device.createBindGroup({ layout: g.layout, entries });
+      pass.setBindGroup(g.group, bg);
     }
 
-    // Vertex buffers.
     for (const vb of this.vertexBindings) {
       const res = this.vertexBuffers.get(vb.name);
-      if (res === undefined) {
-        throw new Error(`PreparedRenderObject.record: missing vertex buffer for "${vb.name}"`);
-      }
-      const buf = res.getValue(token);
-      pass.setVertexBuffer(vb.slot, buf);
+      if (res === undefined) throw new Error(`PreparedRenderObject.record: missing vertex buffer for "${vb.name}"`);
+      pass.setVertexBuffer(vb.slot, res.getValue(token));
     }
 
-    // Index buffer (if any).
     if (this.indexBuffer !== undefined && this.indices !== undefined && this.indexFormat !== undefined) {
       const buf = this.indexBuffer.getValue(token);
       const view = this.indices.getValue(token);
       pass.setIndexBuffer(buf, this.indexFormat, view.offset, view.count * (this.indexFormat === "uint16" ? 2 : 4));
     }
 
-    // Draw.
     const dc = this.drawCall.getValue(token);
     if (dc.kind === "indexed") {
       pass.drawIndexed(dc.indexCount, dc.instanceCount, dc.firstIndex, dc.baseVertex, dc.firstInstance);
@@ -211,14 +211,12 @@ export function prepareRenderObject(
   const iface = effect.interface;
   const vertexBindings = vertexBufferLayoutsFor(iface);
 
-  // Vertex buffers — one per shader-required attribute.
+  // Vertex buffers.
   const vertexBuffers = new Map<string, AdaptiveResource<GPUBuffer>>();
   const vertexLayouts: GPUVertexBufferLayout[] = [];
   for (const vb of vertexBindings) {
     const av = obj.vertexAttributes.tryFind(vb.name);
-    if (av === undefined) {
-      throw new Error(`prepareRenderObject: missing vertex attribute "${vb.name}"`);
-    }
+    if (av === undefined) throw new Error(`prepareRenderObject: missing vertex attribute "${vb.name}"`);
     const stride = vertexFormatStride(vb.format);
     const bufAval = av.map(view => view.buffer);
     const res = prepareAdaptiveBuffer(device, bufAval, {
@@ -232,7 +230,7 @@ export function prepareRenderObject(
     };
   }
 
-  // Index buffer (optional).
+  // Index buffer.
   let indexBuffer: AdaptiveResource<GPUBuffer> | undefined;
   let indexFormat: GPUIndexFormat | undefined;
   if (obj.indices !== undefined) {
@@ -241,28 +239,56 @@ export function prepareRenderObject(
       usage: BufferUsage.INDEX,
       ...(opts.label !== undefined ? { label: `${opts.label}.indices` } : {}),
     });
-    // We can't read the format off `aval` synchronously here — we
-    // pessimistically pick uint32 unless someone overrides via the
-    // first-evaluated value. For Phase-1 tests we accept that the
-    // format is fixed at initial-evaluation time of the consumer.
-    // A cleaner answer is `BufferView.indexFormat: GPUIndexFormat`
-    // declared on the view; deferred.
-    indexFormat = "uint32";
+    indexFormat = "uint32"; // TODO: pull from BufferView once `indexFormat` field lands
   }
 
-  // Uniform buffers — one resource per (group, binding).
-  const ubByGroup = new Map<number, Map<number, AdaptiveResource<GPUBuffer>>>();
+  // Per-group entry collection.
+  const maxGroup = Math.max(
+    -1,
+    ...iface.uniformBuffers.map(u => u.group),
+    ...iface.samplers.map(s => s.group),
+    ...iface.textures.map(t => t.group),
+    ...iface.storageBuffers.map(s => s.group),
+  );
+  const perGroup: EntryDesc[][] = [];
+  for (let g = 0; g <= maxGroup; g++) perGroup.push([]);
+
   for (const ub of iface.uniformBuffers) {
     const res = prepareUniformBuffer(device, ub, obj.uniforms, {
       ...(opts.label !== undefined ? { label: `${opts.label}.${ub.name}` } : {}),
     });
-    let grp = ubByGroup.get(ub.group);
-    if (grp === undefined) { grp = new Map(); ubByGroup.set(ub.group, grp); }
-    grp.set(ub.binding, res);
+    perGroup[ub.group]!.push({ kind: "ubuf", binding: ub.binding, resource: res });
   }
 
-  // Bind group layouts (uniform-only for this slice).
-  const { layouts: bindGroupLayouts } = bindGroupLayoutsForUniforms(device, iface);
+  for (const t of iface.textures) {
+    const av = obj.textures.tryFind(t.name);
+    if (av === undefined) throw new Error(`prepareRenderObject: missing texture "${t.name}"`);
+    const res = prepareAdaptiveTexture(device, av, {
+      ...(opts.label !== undefined ? { label: `${opts.label}.${t.name}` } : {}),
+    });
+    perGroup[t.group]!.push({ kind: "tex", binding: t.binding, resource: res, sampleType: t.sampleType });
+  }
+
+  for (const s of iface.samplers) {
+    const av = obj.samplers.tryFind(s.name);
+    if (av === undefined) throw new Error(`prepareRenderObject: missing sampler "${s.name}"`);
+    const res = prepareAdaptiveSampler(device, av);
+    perGroup[s.group]!.push({ kind: "sampler", binding: s.binding, resource: res });
+  }
+
+  for (const sb of iface.storageBuffers) {
+    const av = obj.storageBuffers?.tryFind(sb.name);
+    if (av === undefined) throw new Error(`prepareRenderObject: missing storage buffer "${sb.name}"`);
+    const usage = BufferUsage.STORAGE
+      | (sb.access === "read_write" ? BufferUsage.COPY_DST : 0);
+    const res = prepareAdaptiveBuffer(device, av, {
+      usage,
+      ...(opts.label !== undefined ? { label: `${opts.label}.${sb.name}` } : {}),
+    });
+    perGroup[sb.group]!.push({ kind: "sbuf", binding: sb.binding, resource: res, access: sb.access });
+  }
+
+  const groups = buildGroups(device, perGroup);
 
   // Pipeline.
   const colorTargets = colorTargetsFor(iface, signature);
@@ -278,7 +304,7 @@ export function prepareRenderObject(
     vertexEntryPoint: "main",
     fragmentEntryPoint: "main",
     vertexBufferLayouts: vertexLayouts,
-    bindGroupLayouts,
+    bindGroupLayouts: groups.map(g => g.layout),
     colorTargets,
     primitive: {
       topology: obj.pipelineState.rasterizer.topology,
@@ -297,9 +323,11 @@ export function prepareRenderObject(
   const pipeline = compileRenderPipeline(device, pipelineDesc);
 
   return new PreparedRenderObject(
-    device, vertexBindings, vertexBuffers,
+    device,
+    vertexBindings, vertexBuffers,
     indexBuffer, indexFormat, obj.indices,
-    ubByGroup, obj.drawCall,
-    pipeline, bindGroupLayouts,
+    groups,
+    obj.drawCall,
+    pipeline,
   );
 }

@@ -11,3 +11,16 @@ export {
 } from "./renderTask.js";
 
 export { copy } from "./copy.js";
+
+export {
+  renderTo,
+  type RenderToOptions,
+  type RenderToResult,
+} from "./renderTo.js";
+
+export {
+  encodeTree,
+  collectLeaves,
+  makeCache,
+  type PreparedCache,
+} from "./treeWalker.js";

@@ -17,6 +17,8 @@
 
 import {
   AdaptiveResource,
+  tryAcquire,
+  tryRelease,
   type ITexture,
   type ExternalTextureSource,
   type RawTextureSource,
@@ -104,7 +106,7 @@ class AdaptiveTexture extends AdaptiveResource<GPUTexture> {
     super();
   }
 
-  protected create(): void {}
+  protected create(): void { tryAcquire(this.source); }
 
   protected destroy(): void {
     if (this._owned !== undefined) {
@@ -112,6 +114,7 @@ class AdaptiveTexture extends AdaptiveResource<GPUTexture> {
       this._owned = undefined;
       this._ownedDesc = undefined;
     }
+    tryRelease(this.source);
   }
 
   override compute(token: AdaptiveToken): GPUTexture {

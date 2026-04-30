@@ -8,6 +8,8 @@
 
 import {
   AdaptiveResource,
+  tryAcquire,
+  tryRelease,
   type ISampler,
 } from "@aardworx/wombat.rendering-core";
 import {
@@ -59,9 +61,11 @@ class AdaptiveSampler extends AdaptiveResource<GPUSampler> {
     private readonly device: GPUDevice,
     private readonly source: aval<ISampler>,
   ) { super(); }
-  protected create(): void {}
+  protected create(): void { tryAcquire(this.source); }
   protected destroy(): void {
-    // We never own the GPUSampler — the cache does.
+    // We never own the GPUSampler — the cache does. Just propagate
+    // release to the source aval (in case it's an AdaptiveResource).
+    tryRelease(this.source);
   }
   override compute(token: AdaptiveToken): GPUSampler {
     const s = this.source.getValue(token);

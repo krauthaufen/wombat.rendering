@@ -4,15 +4,10 @@ What's NOT yet implemented in v0.1, in rough priority order.
 
 ## Resource layer (packages/resources)
 
-- **Textures + samplers in bind groups.** `prepareAdaptiveTexture` /
-  `prepareAdaptiveSampler` exist as standalone resources, but
-  `prepareRenderObject` does not yet consult `iface.textures` /
-  `iface.samplers` to build their bind-group entries. Pipeline
-  layouts only carry uniform-buffer bindings today.
-- **Storage buffers.** Same shape as uniforms — needs
-  `iface.storageBuffers` lowering in `prepareRenderObject`, plus a
-  fast path that lets compute-produced `AdaptiveResource<GPUBuffer>`
-  flow directly in (no extra wrapping).
+- **Storage buffers** lowering uses `prepareAdaptiveBuffer` per source
+  `aval<IBuffer>`. A fast path that lets compute-produced
+  `AdaptiveResource<GPUBuffer>` flow directly in (no extra wrapping)
+  would avoid a redundant indirection.
 - **Instance attributes.** `RenderObject.instanceAttributes` is
   defined in core but ignored in `prepareRenderObject`. Needs per-
   attribute `stepMode: "instance"` in the vertex layout.
@@ -43,12 +38,6 @@ What's NOT yet implemented in v0.1, in rough priority order.
 
 ## Runtime layer (packages/runtime)
 
-- **`runtime.renderTo(scene, size): aval<ITexture>`** — the headline
-  feature. Pieces are in place: `allocateFramebuffer`,
-  `compileRenderTask`, `AdaptiveResource.acquire/release`. Just
-  needs a wrapper that allocates the FBO, compiles a hidden render
-  task, and exposes a color attachment as `aval<ITexture>` whose
-  acquire/release lifecycle drives the FBO + task.
 - **PreparedRenderObject cache key** is currently just the
   `RenderObject` reference. Should also key on
   `(effect-id, signature)` so the same RenderObject can render

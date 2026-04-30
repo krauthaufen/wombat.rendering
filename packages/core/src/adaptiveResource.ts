@@ -63,4 +63,26 @@ export abstract class AdaptiveResource<T> extends AbstractVal<T> {
   /** True iff at least one consumer holds an acquire. */
   get isActive(): boolean { return this._refCount > 0; }
   get refCount(): number { return this._refCount; }
+
+  /**
+   * Derive a new `AdaptiveResource<R>` whose lifetime forwards to
+   * `this`. Consumers of the derived resource transitively
+   * acquire/release `this`. Use this to expose structured outputs
+   * of a complex resource (e.g. the colour textures of a `renderTo`
+   * framebuffer) as individual `aval<ITexture>`s.
+   */
+  derive<R>(project: (t: T) => R): AdaptiveResource<R> {
+    return new DerivedAdaptiveResource<T, R>(this, project);
+  }
+}
+
+class DerivedAdaptiveResource<T, R> extends AdaptiveResource<R> {
+  constructor(private readonly parent: AdaptiveResource<T>, private readonly project: (t: T) => R) {
+    super();
+  }
+  protected override create(): void { this.parent.acquire(); }
+  protected override destroy(): void { this.parent.release(); }
+  override compute(token: AdaptiveToken): R {
+    return this.project(this.parent.getValue(token));
+  }
 }

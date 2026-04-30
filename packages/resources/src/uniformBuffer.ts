@@ -19,7 +19,12 @@
 // silently ignored — same "pull, don't push" semantics as the
 // rest of the renderer.
 
-import { AdaptiveResource, type UniformBufferLayout } from "@aardworx/wombat.rendering-core";
+import {
+  AdaptiveResource,
+  tryAcquire,
+  tryRelease,
+  type UniformBufferLayout,
+} from "@aardworx/wombat.rendering-core";
 import {
   type AdaptiveToken,
   type aval,
@@ -54,12 +59,21 @@ class UniformBufferResource extends AdaptiveResource<GPUBuffer> {
     };
   }
 
-  protected create(): void {}
+  protected create(): void {
+    for (const f of this.layout.fields) {
+      const av = this.inputs.tryFind(f.name);
+      if (av !== undefined) tryAcquire(av);
+    }
+  }
 
   protected destroy(): void {
     if (this._gpu !== undefined) {
       this._gpu.destroy();
       this._gpu = undefined;
+    }
+    for (const f of this.layout.fields) {
+      const av = this.inputs.tryFind(f.name);
+      if (av !== undefined) tryRelease(av);
     }
   }
 

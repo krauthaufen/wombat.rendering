@@ -66,13 +66,16 @@ class AdaptiveFramebuffer extends AdaptiveResource<IFramebuffer> {
       this._lastSize = size;
     }
     let colorViews = HashMap.empty<string, GPUTextureView>();
+    let colorTextures = HashMap.empty<string, GPUTexture>();
     for (const [name, tex] of this._ownedColors.entries()) {
       colorViews = colorViews.add(name, tex.createView());
+      colorTextures = colorTextures.add(name, tex);
     }
     return {
       signature: this.signature,
       colors: colorViews,
-      ...(this._ownedDepth ? { depthStencil: this._ownedDepth.createView() } : {}),
+      colorTextures,
+      ...(this._ownedDepth ? { depthStencil: this._ownedDepth.createView(), depthStencilTexture: this._ownedDepth } : {}),
       width: size.width,
       height: size.height,
     };

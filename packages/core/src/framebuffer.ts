@@ -11,6 +11,13 @@ export interface IFramebuffer {
   /** name → color attachment view, matching `signature.colors`. */
   readonly colors: HashMap<string, GPUTextureView>;
   readonly depthStencil?: GPUTextureView;
+  /**
+   * Underlying GPU textures for each color attachment. Populated
+   * by `allocateFramebuffer`; used by `renderTo` to expose
+   * results as `ITexture.fromGPU(...)` to downstream samplers.
+   */
+  readonly colorTextures?: HashMap<string, GPUTexture>;
+  readonly depthStencilTexture?: GPUTexture;
   readonly width: number;
   readonly height: number;
 }

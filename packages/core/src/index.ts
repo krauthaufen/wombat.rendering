@@ -93,5 +93,10 @@ export {
 } from "./adaptiveResource.js";
 
 export {
+  tryAcquire,
+  tryRelease,
+} from "./acquire.js";
+
+export {
   RenderContext,
 } from "./renderContext.js";
