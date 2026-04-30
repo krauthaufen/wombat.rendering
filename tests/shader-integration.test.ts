@@ -1,7 +1,9 @@
-// Real wombat.shader → wombat.rendering integration. Builds a real
-// `Effect` from TypeScript source via `parseShader` + `stage(...)`,
-// puts it on a RenderObject, and runs the whole rendering pipeline
-// against the mock device. No hand-built ProgramInterface.
+// Real wombat.shader → wombat.rendering integration invariants:
+//   - WGSL emit produces real `@vertex` / `@fragment` markers.
+//   - Pipeline cache key correctly distinguishes
+//     (effect, signature) pairs.
+// Pixel-correctness of the actual hello-triangle renders lives in
+// tests-browser/render-real.test.ts.
 
 import { describe, expect, it } from "vitest";
 import {
@@ -73,50 +75,7 @@ function bv(format: GPUVertexFormat, bytes = 24): aval<BufferView> {
   });
 }
 
-describe("shader integration: real wombat.shader → wombat.rendering", () => {
-  it("Effect.compile() returns a CompiledEffect we can lower to a pipeline", () => {
-    const gpu = new MockGPU();
-    const eff = helloTriangle();
-    const compiled = eff.compile({ target: "wgsl" });
-    expect(compiled.target).toBe("wgsl");
-    expect(compiled.interface.attributes.map(a => a.name).sort()).toEqual(["a_color", "a_position"]);
-    expect(compiled.interface.fragmentOutputs.map(o => o.name)).toEqual(["outColor"]);
-
-    const obj: RenderObject = {
-      effect: eff,
-      pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } },
-      vertexAttributes: HashMap.empty<string, aval<BufferView>>()
-        .add("a_position", bv("float32x2"))
-        .add("a_color",    bv("float32x3")),
-      uniforms: HashMap.empty(),
-      textures: HashMap.empty(),
-      samplers: HashMap.empty(),
-      drawCall: cval<DrawCall>({ kind: "non-indexed", vertexCount: 3, instanceCount: 1, firstVertex: 0, firstInstance: 0 }),
-    };
-
-    const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
-    const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
-    fbo.acquire();
-
-    const runtime = new Runtime({ device: gpu.device });
-    const cmds = AList.ofArray<Command>([
-      { kind: "Render", output: fbo, tree: RenderTree.leaf(obj) },
-    ]);
-    const task = runtime.compile(cmds);
-    task.run(AdaptiveToken.top);
-
-    expect(gpu.pipelines).toHaveLength(1);
-    const pdesc = gpu.pipelines[0]!;
-    const vbufs = pdesc.vertex.buffers as GPUVertexBufferLayout[];
-    expect(vbufs).toHaveLength(2);
-    expect((pdesc.fragment!.targets as GPUColorTargetState[])[0]!.format).toBe("rgba8unorm");
-    expect(gpu.renderPasses[0]!.drawCalls).toHaveLength(1);
-    expect(gpu.renderPasses[0]!.setVertexBufferCalls.map(c => c.slot).sort()).toEqual([0, 1]);
-
-    task.dispose();
-    fbo.release();
-  });
-
+describe("shader integration: invariants", () => {
   it("emitted WGSL has @vertex / @fragment markers", () => {
     const eff = helloTriangle();
     const compiled = eff.compile({ target: "wgsl" });

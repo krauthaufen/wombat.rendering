@@ -1,6 +1,8 @@
-// Runtime end-to-end: alist<Command> with Clear + Render + Copy +
-// Custom commands, all encoded into a single GPUCommandEncoder via
-// the mock. Real wombat.shader for the renderable effect.
+// Runtime command-walker invariants: Clear+Render coalescing and
+// Ordered tree batching. Both produce specific render-pass shapes
+// the mock can inspect; real-GPU tests verify the same scenarios
+// at the pixel level. Custom + Copy command paths live in
+// tests-browser/runtime-real.test.ts.
 
 import { describe, expect, it } from "vitest";
 import {
@@ -124,28 +126,4 @@ describe("Runtime.compile(alist<Command>)", () => {
     fbo.release();
   });
 
-  it("Custom command receives the encoder", () => {
-    const gpu = new MockGPU();
-    const runtime = new Runtime({ device: gpu.device });
-    const seen: GPUCommandEncoder[] = [];
-    const cmds = AList.ofArray<Command>([{ kind: "Custom", encode: (enc) => { seen.push(enc); } }]);
-    const task = runtime.compile(cmds);
-    task.run(AdaptiveToken.top);
-    expect(seen).toHaveLength(1);
-    task.dispose();
-  });
-
-  it("Copy command emits buffer-to-buffer transfer", () => {
-    const gpu = new MockGPU();
-    const runtime = new Runtime({ device: gpu.device });
-    const src = { size: 64 } as GPUBuffer;
-    const dst = { size: 64 } as GPUBuffer;
-    const cmds = AList.ofArray<Command>([
-      { kind: "Copy", copy: { kind: "buffer", src, dst, range: { srcOffset: 0, dstOffset: 0, size: 64 } } },
-    ]);
-    const task = runtime.compile(cmds);
-    task.run(AdaptiveToken.top);
-    expect(gpu.copyBufferCalls).toEqual([{ src, srcOffset: 0, dst, dstOffset: 0, size: 64 }]);
-    task.dispose();
-  });
 });
