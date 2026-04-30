@@ -4,6 +4,7 @@
 
 import {
   RenderContext,
+  type ClearValues,
   type Command,
   type CompiledEffect,
   type Effect,
@@ -54,8 +55,25 @@ class RenderTask implements IRenderTask {
   encode(enc: GPUCommandEncoder, token: AdaptiveToken): void {
     if (this._disposed) throw new Error("RenderTask: encode after dispose");
     RenderContext.withEncoder(enc, () => {
-      const list = this.commands.content.getValue(token);
-      for (const cmdItem of list) this.encodeCommand(enc, cmdItem, token);
+      // Materialise the alist into an array so we can peek ahead for
+      // Clear+Render coalescing.
+      const arr: Command[] = [];
+      for (const c of this.commands.content.getValue(token)) arr.push(c);
+      for (let i = 0; i < arr.length; i++) {
+        const c = arr[i]!;
+        if (c.kind === "Clear") {
+          const next = arr[i + 1];
+          // Coalesce Clear → Render when both target the same
+          // framebuffer aval; the Render's pass uses the cleared
+          // loadOps and we skip the standalone clear pass.
+          if (next !== undefined && next.kind === "Render" && next.output === c.output) {
+            this.encodeRender(enc, c.output.getValue(token), next.tree, token, c.values);
+            i++;
+            continue;
+          }
+        }
+        this.encodeCommand(enc, c, token);
+      }
     });
   }
 
@@ -74,8 +92,8 @@ class RenderTask implements IRenderTask {
     }
   }
 
-  private encodeRender(enc: GPUCommandEncoder, output: IFramebuffer, tree: RenderTree, token: AdaptiveToken): void {
-    encodeTree(enc, output, tree, token, this.cache, this.ctx.compileEffect, this.ctx.device);
+  private encodeRender(enc: GPUCommandEncoder, output: IFramebuffer, tree: RenderTree, token: AdaptiveToken, clearValues?: ClearValues): void {
+    encodeTree(enc, output, tree, token, this.cache, this.ctx.compileEffect, this.ctx.device, clearValues);
   }
 }
 

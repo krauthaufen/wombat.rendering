@@ -80,7 +80,7 @@ function obj() {
 }
 
 describe("Runtime.compile(alist<Command>)", () => {
-  it("Clear + Render emit two render passes in order", () => {
+  it("Clear + Render on same FBO coalesces into one pass with loadOp clear", () => {
     const gpu = new MockGPU();
     const runtime = new Runtime({ device: gpu.device });
     const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
@@ -97,11 +97,12 @@ describe("Runtime.compile(alist<Command>)", () => {
     const task = runtime.compile(commands);
     task.run(AdaptiveToken.top);
 
-    expect(gpu.renderPasses).toHaveLength(2);
-    expect((gpu.renderPasses[0]!.desc.colorAttachments as GPURenderPassColorAttachment[])[0]!.loadOp).toBe("clear");
-    expect(gpu.renderPasses[0]!.drawCalls).toHaveLength(0);
-    expect((gpu.renderPasses[1]!.desc.colorAttachments as GPURenderPassColorAttachment[])[0]!.loadOp).toBe("load");
-    expect(gpu.renderPasses[1]!.drawCalls).toHaveLength(1);
+    // Coalesced: one render pass that both clears and draws.
+    expect(gpu.renderPasses).toHaveLength(1);
+    const att = (gpu.renderPasses[0]!.desc.colorAttachments as GPURenderPassColorAttachment[])[0]!;
+    expect(att.loadOp).toBe("clear");
+    expect(att.clearValue).toEqual({ r: 0, g: 0, b: 0, a: 1 });
+    expect(gpu.renderPasses[0]!.drawCalls).toHaveLength(1);
 
     task.dispose();
     fbo.release();

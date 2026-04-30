@@ -12,7 +12,18 @@ describe("WebGPU probe", () => {
   });
 
   it("can request an adapter + device", async () => {
-    const device = await requestRealDevice();
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error("no adapter");
+    // Surface what the test environment actually picked — useful
+    // for confirming whether vitest-browser used the real GPU
+    // (e.g. NVIDIA / Blackwell) or fell back to SwiftShader.
+    console.log("adapter info:", JSON.stringify({
+      vendor: adapter.info?.vendor,
+      architecture: adapter.info?.architecture,
+      device: adapter.info?.device,
+      description: adapter.info?.description,
+    }));
+    const device = await adapter.requestDevice();
     expect(device).toBeDefined();
     expect(typeof device.createBuffer).toBe("function");
     expect(typeof device.createTexture).toBe("function");

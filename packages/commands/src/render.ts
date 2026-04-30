@@ -7,7 +7,7 @@
 // is the path the RenderTask walker uses for an `Ordered` /
 // `Unordered` subtree of leaves all targeting the same FBO.
 
-import type { IFramebuffer } from "@aardworx/wombat.rendering-core";
+import type { ClearValues, IFramebuffer } from "@aardworx/wombat.rendering-core";
 import type { AdaptiveToken } from "@aardworx/wombat.adaptive";
 
 // Forward type — we don't import from -resources to avoid a
@@ -17,14 +17,30 @@ export interface Recordable {
   record(pass: GPURenderPassEncoder, token: AdaptiveToken): void;
 }
 
-function beginPassDescriptor(output: IFramebuffer): GPURenderPassDescriptor {
+/**
+ * Build a render-pass descriptor for `output`. If `clear` is set,
+ * named attachments use `loadOp: "clear"` with the requested
+ * values; the rest fall back to `loadOp: "load"`. Used by
+ * `render` / `renderMany` and by the runtime walker's Clear+Render
+ * coalescing path.
+ */
+export function beginPassDescriptor(output: IFramebuffer, clear?: ClearValues): GPURenderPassDescriptor {
   const colorAttachments: GPURenderPassColorAttachment[] = [];
   for (const [name] of output.signature.colors) {
     const view = output.colors.tryFind(name);
     if (view === undefined) {
       throw new Error(`render: framebuffer is missing color attachment "${name}"`);
     }
-    colorAttachments.push({ view, loadOp: "load", storeOp: "store" });
+    const cv = clear?.colors?.tryFind(name);
+    if (cv !== undefined) {
+      const d = cv as unknown as { _data: ArrayLike<number> };
+      colorAttachments.push({
+        view, loadOp: "clear", storeOp: "store",
+        clearValue: { r: d._data[0]!, g: d._data[1]!, b: d._data[2]!, a: d._data[3]! },
+      });
+    } else {
+      colorAttachments.push({ view, loadOp: "load", storeOp: "store" });
+    }
   }
   let depthStencilAttachment: GPURenderPassDepthStencilAttachment | undefined;
   if (output.signature.depthStencil !== undefined) {
@@ -33,8 +49,20 @@ function beginPassDescriptor(output: IFramebuffer): GPURenderPassDescriptor {
     }
     const sig = output.signature.depthStencil;
     const att: GPURenderPassDepthStencilAttachment = { view: output.depthStencil };
-    if (sig.hasDepth) { att.depthLoadOp = "load"; att.depthStoreOp = "store"; }
-    if (sig.hasStencil) { att.stencilLoadOp = "load"; att.stencilStoreOp = "store"; }
+    if (sig.hasDepth) {
+      if (clear?.depth !== undefined) {
+        att.depthLoadOp = "clear"; att.depthStoreOp = "store"; att.depthClearValue = clear.depth;
+      } else {
+        att.depthLoadOp = "load"; att.depthStoreOp = "store";
+      }
+    }
+    if (sig.hasStencil) {
+      if (clear?.stencil !== undefined) {
+        att.stencilLoadOp = "clear"; att.stencilStoreOp = "store"; att.stencilClearValue = clear.stencil;
+      } else {
+        att.stencilLoadOp = "load"; att.stencilStoreOp = "store";
+      }
+    }
     depthStencilAttachment = att;
   }
   return {
@@ -48,8 +76,9 @@ export function render(
   prepared: Recordable,
   output: IFramebuffer,
   token: AdaptiveToken,
+  clear?: ClearValues,
 ): void {
-  const pass = cmd.beginRenderPass(beginPassDescriptor(output));
+  const pass = cmd.beginRenderPass(beginPassDescriptor(output, clear));
   prepared.record(pass, token);
   pass.end();
 }
@@ -59,9 +88,10 @@ export function renderMany(
   prepared: readonly Recordable[],
   output: IFramebuffer,
   token: AdaptiveToken,
+  clear?: ClearValues,
 ): void {
   if (prepared.length === 0) return;
-  const pass = cmd.beginRenderPass(beginPassDescriptor(output));
+  const pass = cmd.beginRenderPass(beginPassDescriptor(output, clear));
   for (const p of prepared) p.record(pass, token);
   pass.end();
 }

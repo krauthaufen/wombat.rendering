@@ -19,12 +19,18 @@ export default defineConfig({
       headless: true,
       providerOptions: {
         launch: {
+          // Playwright's bundled chromium_headless_shell falls back
+          // to SwiftShader for WebGPU. Use the system Chromium
+          // (full build with the compositor) so adapter selection
+          // picks the real GPU via Vulkan.
+          executablePath: "/usr/bin/chromium",
           args: [
             "--enable-unsafe-webgpu",
             "--enable-features=Vulkan,UseSkiaRenderer",
             "--use-vulkan=native",
             "--ignore-gpu-blocklist",
             "--enable-webgpu-developer-features",
+            "--use-angle=vulkan",
           ],
         },
       },

@@ -47,12 +47,12 @@ What's NOT yet implemented in v0.1, in rough priority order.
   Correct, but unoptimised — re-walks the tree even when nothing
   changed. Future: make `RenderTask` itself an `AdaptiveObject`
   that subscribes only to alist deltas, with cached prepared-leaves.
-- **Unordered reordering.** `Unordered` and `UnorderedFromSet`
-  currently emit children in iteration order. Should sort by
-  pipeline → bind-group → vertex-buffer to minimise state changes.
-- **Pass coalescing.** Adjacent `Clear` + `Render` on the same FBO
-  could fold into one render pass with the right `loadOp`s. Not
-  done; v0.1 emits one pass per command.
+- ~~**Unordered reordering**.~~ DONE: `Unordered` /
+  `UnorderedFromSet` children sort by pipeline (then by group-0
+  layout) before encoding. Reduces state-change boundaries.
+- ~~**Pass coalescing**.~~ DONE: adjacent `Clear` + `Render` on
+  the same FBO aval fuse into one render pass with `loadOp:"clear"`
+  attachments.
 - **`device.lost` + recovery.** The runtime currently has no
   lost-device handling. On lost device all `AdaptiveResource`s
   need rebuilding.
@@ -95,9 +95,11 @@ What's NOT yet implemented in v0.1, in rough priority order.
   `camera-controller`, `instanced-grid`, `post-processing`,
   `compute-readback`).
 - ~~No browser smoke test infra.~~ DONE: `tests-browser/`
-  runs under vitest browser-mode + Playwright headless Chromium
-  with real WebGPU. `npm run test:browser` validates clear +
-  hello-triangle on real GPU with pixel readback.
+  runs under vitest browser-mode + Playwright using the
+  **system Chromium** (`/usr/bin/chromium` via `executablePath`)
+  with Vulkan flags. Picks the real GPU (NVIDIA RTX 5060 /
+  Blackwell on this host) instead of SwiftShader. Pixel-level
+  validation via `copyTextureToBuffer` + map readback.
 - `Runtime.disposeAll()` and other lifetime niceties for the
   page-unload path.
 

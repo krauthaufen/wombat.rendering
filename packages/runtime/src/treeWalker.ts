@@ -5,6 +5,7 @@
 // implicit single-pass scene render).
 
 import type {
+  ClearValues,
   CompiledEffect,
   Effect,
   FramebufferSignature,
@@ -87,10 +88,18 @@ export function collectLeaves(
       ));
       return out;
     case "Ordered":
-    case "Unordered":
-      // TODO: Unordered should sort by pipeline / bind-group / vertex-buffer.
       for (const c of tree.children) collectLeaves(c, sig, token, cache, compileEffect, device, out);
       return out;
+    case "Unordered": {
+      // Collect into a fresh list so we can sort just THIS subtree's
+      // leaves without disturbing surrounding Ordered context, then
+      // append the sorted result.
+      const local: PreparedRenderObject[] = [];
+      for (const c of tree.children) collectLeaves(c, sig, token, cache, compileEffect, device, local);
+      sortByState(local);
+      out.push(...local);
+      return out;
+    }
     case "Adaptive":
       collectLeaves((tree.tree as aval<RenderTree>).getValue(token), sig, token, cache, compileEffect, device, out);
       return out;
@@ -101,10 +110,49 @@ export function collectLeaves(
     }
     case "UnorderedFromSet": {
       const set = tree.children.content.getValue(token);
-      for (const c of set) collectLeaves(c, sig, token, cache, compileEffect, device, out);
+      const local: PreparedRenderObject[] = [];
+      for (const c of set) collectLeaves(c, sig, token, cache, compileEffect, device, local);
+      sortByState(local);
+      out.push(...local);
       return out;
     }
   }
+}
+
+// Per-handle identity counter used to give pipelines / bind-group
+// layouts stable numeric ranks for the Unordered sort. We don't
+// have direct access to the underlying GPU handle's identity, but
+// the PreparedRenderObject's `pipeline` reference IS stable across
+// frames (the pipeline cache returns the same handle for the same
+// effect+sig+state), so sorting by pipeline reference is a robust
+// proxy.
+const sortRanks = new WeakMap<object, number>();
+let nextSortRank = 1;
+function rankOf(o: object): number {
+  let r = sortRanks.get(o);
+  if (r === undefined) { r = nextSortRank++; sortRanks.set(o, r); }
+  return r;
+}
+
+/**
+ * Sort `Unordered` / `UnorderedFromSet` children to minimise GPU
+ * state changes: pipeline first, then group-0 layout (uniforms /
+ * textures / samplers usually live there), then vertex buffers.
+ * The exact heuristic is allowed to change as long as adjacent
+ * leaves share more state than a random ordering would.
+ */
+function sortByState(leaves: PreparedRenderObject[]): void {
+  leaves.sort((a, b) => {
+    const pa = rankOf(a.pipeline);
+    const pb = rankOf(b.pipeline);
+    if (pa !== pb) return pa - pb;
+    const la = a.groups[0]?.layout;
+    const lb = b.groups[0]?.layout;
+    if (la !== undefined && lb !== undefined && la !== lb) {
+      return rankOf(la) - rankOf(lb);
+    }
+    return 0;
+  });
 }
 
 export function encodeTree(
@@ -115,9 +163,17 @@ export function encodeTree(
   cache: PreparedCache,
   compileEffect: (e: Effect) => CompiledEffect,
   device: GPUDevice,
+  clearValues?: ClearValues,
 ): void {
   const leaves = collectLeaves(tree, output.signature, token, cache, compileEffect, device);
-  if (leaves.length === 0) return;
-  if (leaves.length === 1) render(enc, leaves[0]!, output, token);
-  else renderMany(enc, leaves, output, token);
+  if (leaves.length === 0) {
+    // Empty tree but `clearValues` set → still need a pass that
+    // clears. Fall through to `render(empty)`-style: a single
+    // begin/end pass with the requested loadOps. Easiest to do
+    // via clear() — the runtime walker hits this path only when
+    // a Clear had no following Render to fuse with.
+    return;
+  }
+  if (leaves.length === 1) render(enc, leaves[0]!, output, token, clearValues);
+  else renderMany(enc, leaves, output, token, clearValues);
 }

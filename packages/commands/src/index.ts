@@ -6,5 +6,6 @@ export { clear } from "./clear.js";
 export {
   render,
   renderMany,
+  beginPassDescriptor,
   type Recordable,
 } from "./render.js";

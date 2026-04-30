@@ -168,6 +168,16 @@ function buildGroups(device: GPUDevice, descs: readonly EntryDesc[][]): GroupDes
   return out;
 }
 
+// Per-handle identity counter for the bind-group cache key. WebGPU
+// handles have no built-in id; we attach one via a WeakMap.
+const handleIds = new WeakMap<object, number>();
+let nextHandleId = 1;
+function handleId(h: object): number {
+  let id = handleIds.get(h);
+  if (id === undefined) { id = nextHandleId++; handleIds.set(h, id); }
+  return id;
+}
+
 // ---------------------------------------------------------------------------
 // PreparedRenderObject
 // ---------------------------------------------------------------------------
@@ -175,6 +185,12 @@ function buildGroups(device: GPUDevice, descs: readonly EntryDesc[][]): GroupDes
 export class PreparedRenderObject {
   readonly pipeline: GPURenderPipeline;
   readonly groups: readonly GroupDesc[];
+
+  // Per-group bind group cache. Keyed on the concatenated identity
+  // of the underlying GPU handles (`buffer:N`, `tex:N`, etc.); a
+  // cache hit means none of the resources reallocated since the
+  // last record(), so the GPUBindGroup is reusable.
+  private readonly _bindGroupCache: { key: string | null; group: GPUBindGroup | null }[];
 
   constructor(
     private readonly device: GPUDevice,
@@ -189,6 +205,7 @@ export class PreparedRenderObject {
   ) {
     this.pipeline = pipeline;
     this.groups = groups;
+    this._bindGroupCache = groups.map(() => ({ key: null, group: null }));
   }
 
   acquire(): void {
@@ -206,19 +223,50 @@ export class PreparedRenderObject {
   record(pass: GPURenderPassEncoder, token: AdaptiveToken): void {
     pass.setPipeline(this.pipeline);
 
-    for (const g of this.groups) {
-      const entries: GPUBindGroupEntry[] = g.entries.map(e => {
+    for (let gi = 0; gi < this.groups.length; gi++) {
+      const g = this.groups[gi]!;
+      // Build a cache key from the resolved GPU handle identities;
+      // resources may be re-allocated by their AdaptiveResource on
+      // capacity growth or shape change, so we need to key on the
+      // CURRENT handles, not on the AdaptiveResource references.
+      let cacheKey = "";
+      const resolved: { binding: number; resource: GPUBindingResource }[] = [];
+      for (const e of g.entries) {
         switch (e.kind) {
           case "ubuf":
-          case "sbuf":
-            return { binding: e.binding, resource: { buffer: e.resource.getValue(token) } };
-          case "tex":
-            return { binding: e.binding, resource: e.resource.getValue(token).createView() };
-          case "sampler":
-            return { binding: e.binding, resource: e.resource.getValue(token) };
+          case "sbuf": {
+            const buf = e.resource.getValue(token);
+            cacheKey += `${e.binding}:b${handleId(buf)};`;
+            resolved.push({ binding: e.binding, resource: { buffer: buf } });
+            break;
+          }
+          case "tex": {
+            const tex = e.resource.getValue(token);
+            cacheKey += `${e.binding}:t${handleId(tex)};`;
+            // We create a new view per record because views are cheap
+            // and texture identity already keys the cache. (A
+            // real-perf-tuned implementation would also cache the
+            // view per texture.)
+            resolved.push({ binding: e.binding, resource: tex.createView() });
+            break;
+          }
+          case "sampler": {
+            const samp = e.resource.getValue(token);
+            cacheKey += `${e.binding}:s${handleId(samp)};`;
+            resolved.push({ binding: e.binding, resource: samp });
+            break;
+          }
         }
-      });
-      const bg = this.device.createBindGroup({ layout: g.layout, entries });
+      }
+      const slot = this._bindGroupCache[gi]!;
+      let bg: GPUBindGroup;
+      if (slot.key === cacheKey && slot.group !== null) {
+        bg = slot.group;
+      } else {
+        bg = this.device.createBindGroup({ layout: g.layout, entries: resolved });
+        slot.key = cacheKey;
+        slot.group = bg;
+      }
       pass.setBindGroup(g.group, bg);
     }
 
