@@ -59,4 +59,6 @@ export interface PipelineState {
    * "no blending, write all channels".
    */
   readonly blends?: HashMap<string, BlendState>;
+  /** Multi-sample alpha-to-coverage. Default `false`. */
+  readonly alphaToCoverage?: boolean;
 }

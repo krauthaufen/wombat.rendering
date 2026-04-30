@@ -66,14 +66,52 @@ function vertexBindingsFor(iface: ProgramInterface): VertexBindingInfo[] {
   }));
 }
 
-function colorTargetsFor(iface: ProgramInterface, sig: FramebufferSignature): GPUColorTargetState[] {
+function colorTargetsFor(
+  iface: ProgramInterface,
+  sig: FramebufferSignature,
+  blends: import("@aardworx/wombat.adaptive").HashMap<string, import("@aardworx/wombat.rendering-core").BlendState> | undefined,
+): GPUColorTargetState[] {
   const out: GPUColorTargetState[] = [];
   for (const o of iface.fragmentOutputs) {
     const fmt = sig.colors.tryFind(o.name);
     if (fmt === undefined) {
       throw new Error(`prepareRenderObject: fragment output "${o.name}" has no matching signature attachment`);
     }
-    out[o.location] = { format: fmt };
+    const target: GPUColorTargetState = { format: fmt };
+    const blend = blends?.tryFind(o.name);
+    if (blend !== undefined) {
+      target.blend = {
+        color: { operation: blend.color.operation, srcFactor: blend.color.srcFactor, dstFactor: blend.color.dstFactor },
+        alpha: { operation: blend.alpha.operation, srcFactor: blend.alpha.srcFactor, dstFactor: blend.alpha.dstFactor },
+      };
+      target.writeMask = blend.writeMask;
+    }
+    out[o.location] = target;
+  }
+  return out;
+}
+
+function depthStencilStateFor(
+  sig: FramebufferSignature,
+  ps: import("@aardworx/wombat.rendering-core").PipelineState,
+): GPUDepthStencilState | undefined {
+  if (sig.depthStencil === undefined) return undefined;
+  if (ps.depth === undefined && ps.stencil === undefined) return undefined;
+  const out: GPUDepthStencilState = {
+    format: sig.depthStencil.format,
+    depthWriteEnabled: ps.depth?.write ?? false,
+    depthCompare: ps.depth?.compare ?? "always",
+  };
+  if (ps.stencil !== undefined) {
+    out.stencilFront = ps.stencil.front;
+    out.stencilBack = ps.stencil.back;
+    out.stencilReadMask = ps.stencil.readMask;
+    out.stencilWriteMask = ps.stencil.writeMask;
+  }
+  if (ps.rasterizer.depthBias !== undefined) {
+    out.depthBias = ps.rasterizer.depthBias.constant;
+    out.depthBiasSlopeScale = ps.rasterizer.depthBias.slopeScale;
+    out.depthBiasClamp = ps.rasterizer.depthBias.clamp;
   }
   return out;
 }
@@ -230,12 +268,17 @@ export function prepareRenderObject(
   const iface = effect.interface;
   const vertexBindings = vertexBindingsFor(iface);
 
-  // Vertex buffers (one per shader-required attribute).
+  // Vertex + instance buffers — same shape; only stepMode differs.
+  // Each shader-required attribute is looked up in obj.vertexAttributes
+  // first (per-vertex) then obj.instanceAttributes (per-instance).
   const vertexBuffers = new Map<string, AdaptiveResource<GPUBuffer>>();
   const vertexLayouts: GPUVertexBufferLayout[] = [];
   for (const vb of vertexBindings) {
-    const av = obj.vertexAttributes.tryFind(vb.name);
+    const perVertex = obj.vertexAttributes.tryFind(vb.name);
+    const perInstance = obj.instanceAttributes?.tryFind(vb.name);
+    const av = perVertex ?? perInstance;
     if (av === undefined) throw new Error(`prepareRenderObject: missing vertex attribute "${vb.name}"`);
+    const stepMode: GPUVertexStepMode = perInstance !== undefined ? "instance" : "vertex";
     const stride = vb.byteSize !== undefined && vb.byteSize > 0
       ? vb.byteSize
       : vertexFormatStride(vb.format);
@@ -247,11 +290,12 @@ export function prepareRenderObject(
     vertexBuffers.set(vb.name, res);
     vertexLayouts[vb.slot] = {
       arrayStride: stride,
+      stepMode,
       attributes: [{ shaderLocation: vb.slot, offset: 0, format: vb.format }],
     };
   }
 
-  // Index buffer.
+  // Index buffer — `indexFormat` from BufferView wins; defaults to uint32.
   let indexBuffer: AdaptiveResource<GPUBuffer> | undefined;
   let indexFormat: GPUIndexFormat | undefined;
   if (obj.indices !== undefined) {
@@ -260,7 +304,9 @@ export function prepareRenderObject(
       usage: BufferUsage.INDEX,
       ...(opts.label !== undefined ? { label: `${opts.label}.indices` } : {}),
     });
-    indexFormat = "uint32"; // TODO: pull from BufferView once `indexFormat` field lands
+    const initial = obj.indices.force();
+    indexFormat = initial.indexFormat
+      ?? (initial.format === "uint16" ? "uint16" : "uint32");
   }
 
   // Per-group entry collection. Use `slot` (real shape) instead of `binding`.
@@ -319,12 +365,20 @@ export function prepareRenderObject(
   const groups = buildGroups(device, perGroup);
 
   // Pipeline.
-  const colorTargets = colorTargetsFor(iface, signature);
+  const colorTargets = colorTargetsFor(iface, signature, obj.pipelineState.blends);
   const vsStage = effect.stages.find(s => s.stage === "vertex");
   const fsStage = effect.stages.find(s => s.stage === "fragment");
   if (vsStage === undefined) throw new Error("prepareRenderObject: CompiledEffect has no vertex stage");
   if (fsStage === undefined) throw new Error("prepareRenderObject: CompiledEffect has no fragment stage");
 
+  const ds = depthStencilStateFor(signature, obj.pipelineState);
+  const multisample: GPUMultisampleState | undefined =
+    signature.sampleCount > 1 || obj.pipelineState.alphaToCoverage === true
+      ? {
+          count: signature.sampleCount,
+          ...(obj.pipelineState.alphaToCoverage === true ? { alphaToCoverageEnabled: true } : {}),
+        }
+      : undefined;
   const pipelineDesc: CompileRenderPipelineDescription = {
     ...(opts.label !== undefined ? { label: opts.label } : {}),
     ...(opts.effectId !== undefined ? { effectId: opts.effectId } : {}),
@@ -340,14 +394,8 @@ export function prepareRenderObject(
       ...(obj.pipelineState.rasterizer.cullMode !== "none" ? { cullMode: obj.pipelineState.rasterizer.cullMode } : {}),
       frontFace: obj.pipelineState.rasterizer.frontFace,
     },
-    ...(signature.depthStencil !== undefined && obj.pipelineState.depth !== undefined
-      ? { depthStencil: {
-            format: signature.depthStencil.format,
-            depthWriteEnabled: obj.pipelineState.depth.write,
-            depthCompare: obj.pipelineState.depth.compare,
-          } }
-      : {}),
-    ...(signature.sampleCount > 1 ? { multisample: { count: signature.sampleCount } } : {}),
+    ...(ds !== undefined ? { depthStencil: ds } : {}),
+    ...(multisample !== undefined ? { multisample } : {}),
   };
   const pipeline = compileRenderPipeline(device, pipelineDesc);
 
