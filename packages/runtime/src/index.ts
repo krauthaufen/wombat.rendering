@@ -19,8 +19,6 @@ export {
 } from "./renderTo.js";
 
 export {
-  encodeTree,
-  collectLeaves,
-  makeCache,
-  type PreparedCache,
-} from "./treeWalker.js";
+  ScenePass,
+  type WalkerStats,
+} from "./scenePass.js";

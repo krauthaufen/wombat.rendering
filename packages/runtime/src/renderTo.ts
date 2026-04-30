@@ -30,9 +30,9 @@ import {
   allocateFramebuffer,
   type FramebufferSize,
 } from "@aardworx/wombat.rendering-resources";
-import { clear } from "@aardworx/wombat.rendering-commands";
+import { beginPassDescriptor } from "@aardworx/wombat.rendering-commands";
 import { type AdaptiveToken, type aval } from "@aardworx/wombat.adaptive";
-import { encodeTree, makeCache, type PreparedCache } from "./treeWalker.js";
+import { ScenePass } from "./scenePass.js";
 import type { RuntimeContext } from "./renderTask.js";
 
 export interface RenderToOptions {
@@ -64,28 +64,39 @@ export interface RenderToResult {
 }
 
 class RenderToFramebuffer extends AdaptiveResource<IFramebuffer> {
-  private readonly cache: PreparedCache = makeCache();
+  private scenePass: ScenePass | undefined;
 
   constructor(
     private readonly ctx: RuntimeContext,
     private readonly fbo: AdaptiveResource<IFramebuffer>,
     private readonly scene: RenderTree,
     private readonly clearValues: ClearValues | undefined,
+    private readonly signature: FramebufferSignature,
   ) { super(); }
 
-  protected override create(): void { this.fbo.acquire(); }
+  protected override create(): void {
+    this.fbo.acquire();
+    this.scenePass = new ScenePass(
+      this.ctx.device, this.signature, this.scene, this.ctx.compileEffect,
+    );
+  }
 
   protected override destroy(): void {
-    this.cache.releaseAll();
+    this.scenePass?.dispose();
+    this.scenePass = undefined;
     this.fbo.release();
   }
 
   override compute(token: AdaptiveToken): IFramebuffer {
     const fb = this.fbo.getValue(token);
     const enc = RenderContext.encoder;
-    if (enc !== null) {
-      if (this.clearValues !== undefined) clear(enc, fb, this.clearValues);
-      encodeTree(enc, fb, this.scene, token, this.cache, this.ctx.compileEffect, this.ctx.device);
+    if (enc !== null && this.scenePass !== undefined) {
+      const leaves = this.scenePass.resolve(token);
+      if (leaves.length > 0 || this.clearValues !== undefined) {
+        const pass = enc.beginRenderPass(beginPassDescriptor(fb, this.clearValues));
+        for (const leaf of leaves) leaf.record(pass, token);
+        pass.end();
+      }
     }
     return fb;
   }
@@ -103,6 +114,7 @@ export function renderTo(
   const renderToFbo = new RenderToFramebuffer(
     ctx, fbo, scene,
     opts.clear,
+    opts.signature,
   );
   return {
     framebuffer: renderToFbo,
