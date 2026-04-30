@@ -432,6 +432,8 @@ export function prepareRenderObject(
     ...(opts.effectId !== undefined ? { effectId: opts.effectId } : {}),
     vertexShaderSource: vsStage.source,
     fragmentShaderSource: fsStage.source,
+    ...(vsStage.sourceMap ? { vertexSourceMap: vsStage.sourceMap } : {}),
+    ...(fsStage.sourceMap ? { fragmentSourceMap: fsStage.sourceMap } : {}),
     vertexEntryPoint: vsStage.entryName,
     fragmentEntryPoint: fsStage.entryName,
     vertexBufferLayouts: vertexLayouts,

@@ -1,21 +1,13 @@
-// Hello-triangle example. Demonstrates the wombat.rendering stack
-// end-to-end in a browser:
-//   - attachCanvas + runFrame from packages/window
-//   - real wombat.shader effect via parseShader + stage
-//   - RenderObject with two vertex attributes (position, color)
-//   - Per-frame clear color cycling driven by a cval
+// Hello-triangle example — uses the wombat.shader Vite plugin's
+// inline `vertex(...) / fragment(...)` marker workflow. The
+// plugin transforms each marker call into a build-time
+// `__wombat_stage(...)` expression that produces a real `Effect`
+// at runtime — no `parseShader → stage` plumbing in user code.
 //
 // To run:
 //   cd examples/hello-triangle
 //   npm install
-//   npm run dev
-// Then open http://localhost:5174/ in a real browser (Chrome /
-// Edge with WebGPU enabled). Headless Chromium via Playwright's
-// `chromium_headless_shell` build does not present the swap-chain
-// to a screenshot-able compositor, so verifying the example via
-// `node check.mjs` will only show a black canvas. The underlying
-// rendering works — see tests-browser/ for pixel-level checks
-// on real GPU via copyTextureToBuffer readback.
+//   npm run dev          # serves http://localhost:5174/
 
 import {
   AList,
@@ -24,10 +16,8 @@ import {
   transact,
   type aval,
 } from "@aardworx/wombat.adaptive";
-import { V4f } from "@aardworx/wombat.base";
-import { parseShader, type EntryRequest } from "@aardworx/wombat.shader-frontend";
-import { stage } from "@aardworx/wombat.shader-runtime";
-import { Tf32, Vec, type Type } from "@aardworx/wombat.shader-ir";
+import { V2f, V3f, V4f } from "@aardworx/wombat.base";
+import { effect, fragment, vertex } from "@aardworx/wombat.shader-runtime";
 import {
   IBuffer,
   RenderTree,
@@ -39,42 +29,24 @@ import {
 import { Runtime } from "@aardworx/wombat.rendering-runtime";
 import { attachCanvas, runFrame } from "@aardworx/wombat.rendering-window";
 
-const Tvec2f: Type = Vec(Tf32, 2);
-const Tvec3f: Type = Vec(Tf32, 3);
-const Tvec4f: Type = Vec(Tf32, 4);
-
-function buildEffect() {
-  const source = `
-    function vsMain(input: { a_position: V2f; a_color: V3f }): { gl_Position: V4f; v_color: V3f } {
-      return {
-        gl_Position: new V4f(input.a_position.x, input.a_position.y, 0.0, 1.0),
-        v_color: input.a_color,
-      };
-    }
-    function fsMain(input: { v_color: V3f }): { outColor: V4f } {
-      return { outColor: new V4f(input.v_color.x, input.v_color.y, input.v_color.z, 1.0) };
-    }
-  `;
-  const entries: EntryRequest[] = [
-    {
-      name: "vsMain", stage: "vertex",
-      inputs: [
-        { name: "a_position", type: Tvec2f, semantic: "Position", decorations: [{ kind: "Location", value: 0 }] },
-        { name: "a_color",    type: Tvec3f, semantic: "Color",    decorations: [{ kind: "Location", value: 1 }] },
-      ],
-      outputs: [
-        { name: "gl_Position", type: Tvec4f, semantic: "Position", decorations: [{ kind: "Builtin", value: "position" }] },
-        { name: "v_color",     type: Tvec3f, semantic: "Color",    decorations: [{ kind: "Location", value: 0 }] },
-      ],
-    },
-    {
-      name: "fsMain", stage: "fragment",
-      inputs:  [{ name: "v_color",  type: Tvec3f, semantic: "Color", decorations: [{ kind: "Location", value: 0 }] }],
-      outputs: [{ name: "outColor", type: Tvec4f, semantic: "Color", decorations: [{ kind: "Location", value: 0 }] }],
-    },
-  ];
-  return stage(parseShader({ source, entries }));
-}
+// The Vite plugin uses the TS type-checker to recover types — any
+// of these compose:
+//   - lambda parameter / return annotations
+//   - marker generic args (`vertex<I, O>(...)`)
+//   - bare `V4f` return → `gl_Position` for vertex,
+//     `outColor` for fragment
+//
+// Below: only the input record is annotated; the return type is
+// inferred from the lambda body, and the fragment uses bare V4f.
+const helloTriangleEffect = effect(
+  vertex<{ a_position: V2f; a_color: V3f }>(input => ({
+    gl_Position: new V4f(input.a_position.x, input.a_position.y, 0.0, 1.0),
+    v_color: input.a_color,
+  })),
+  fragment<{ v_color: V3f }>(input =>
+    new V4f(input.v_color.x, input.v_color.y, input.v_color.z, 1.0),
+  ),
+);
 
 const status = document.getElementById("status")!;
 
@@ -98,7 +70,7 @@ async function main() {
   const colors    = new Float32Array([1, 0, 0,  0, 1, 0,  0, 0, 1]);
 
   const obj: RenderObject = {
-    effect: buildEffect(),
+    effect: helloTriangleEffect,
     pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } },
     vertexAttributes: HashMap.empty<string, aval<BufferView>>()
       .add("a_position", cval<BufferView>({

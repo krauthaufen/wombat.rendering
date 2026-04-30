@@ -53,6 +53,25 @@ export class Runtime {
   get device(): GPUDevice { return this.ctx.device; }
   get isDeviceLost(): boolean { return this._deviceLost; }
 
+  // Recovery story (after `device.lost`):
+  //
+  // 1. The `lost`-handler above fires `disposeAll()`, releasing all
+  //    `IRenderTask`s and the `PreparedRenderObject`s they hold.
+  //    User-level avals (`cval`, `clist`, `cset`) survive — they're
+  //    device-agnostic.
+  // 2. Caller re-requests an adapter + device, constructs a new
+  //    `Runtime` from it, and re-`compile()`s their original
+  //    `alist<Command>`. The new Runtime builds fresh
+  //    PreparedRenderObjects + a fresh ScenePass tree from the same
+  //    user data; the per-device caches inside compile-pipeline /
+  //    sampler / mip-gen are keyed on `WeakMap<GPUDevice, ...>` so
+  //    they re-populate naturally for the new device.
+  //
+  // We don't expose a single-call `replaceDevice()` because every
+  // prepared object's GPU handles are baked in at construction; the
+  // cleanest path is to discard the old Runtime and construct a new
+  // one from the same source `alist<Command>`.
+
   /** Compile an `alist<Command>` into a runnable `IRenderTask`. */
   compile(commands: alist<Command>): IRenderTask {
     if (this._disposed) throw new Error("Runtime: compile after disposeAll");

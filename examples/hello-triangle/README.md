@@ -4,10 +4,14 @@ Minimal browser example showing the full wombat.rendering stack:
 
 - `attachCanvas` + `runFrame` from `@aardworx/wombat.rendering-window`
   for canvas binding + a `requestAnimationFrame` loop.
-- A real `Effect` built via `parseShader` + `stage` from
-  `@aardworx/wombat.shader-runtime` (the inline `vertex(...)` /
-  `fragment(...)` Vite-plugin marker workflow is a deferred
-  follow-up).
+- A real `Effect` built via the inline `vertex(...)` /
+  `fragment(...)` Vite-plugin marker workflow
+  (`@aardworx/wombat.shader-vite`). The plugin transforms each
+  marker call at build time into a `__wombat_stage(...)` call
+  carrying a frozen IR template; runtime composition via
+  `effect(vs, fs)` produces a real `Effect` with stable
+  `Effect.id`. Free identifiers in the lambda body are lifted
+  to `ReadInput("Closure", ...)`.
 - A `RenderObject` with two vertex attributes (position + color)
   and a `Clear` + `Render` command list driven by the runtime.
 - A `cval` cycling the clear color over time, demonstrating the

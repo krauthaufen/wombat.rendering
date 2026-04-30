@@ -24,6 +24,9 @@ export interface CompileRenderPipelineDescription {
   readonly effectId?: string;
   readonly vertexShaderSource: string;
   readonly fragmentShaderSource: string;
+  /** Optional source map for the vertex stage. Used to enrich compile-error logs. */
+  readonly vertexSourceMap?: import("@aardworx/wombat.shader-ir").SourceMap | null;
+  readonly fragmentSourceMap?: import("@aardworx/wombat.shader-ir").SourceMap | null;
   readonly vertexEntryPoint: string;
   readonly fragmentEntryPoint: string;
   readonly vertexBufferLayouts: readonly GPUVertexBufferLayout[];
@@ -33,6 +36,8 @@ export interface CompileRenderPipelineDescription {
   readonly primitive: GPUPrimitiveState;
   readonly multisample?: GPUMultisampleState;
 }
+
+import { installShaderDiagnostics } from "./shaderDiagnostics.js";
 
 interface DeviceCache {
   modules: Map<string, GPUShaderModule>;
@@ -49,12 +54,21 @@ function cacheFor(device: GPUDevice): DeviceCache {
   return c;
 }
 
-function moduleFor(device: GPUDevice, source: string, label?: string): GPUShaderModule {
+function moduleFor(
+  device: GPUDevice,
+  source: string,
+  label?: string,
+  sourceMap?: import("@aardworx/wombat.shader-ir").SourceMap | null,
+): GPUShaderModule {
   const cache = cacheFor(device);
   let m = cache.modules.get(source);
   if (m === undefined) {
     m = device.createShaderModule({ code: source, ...(label !== undefined ? { label } : {}) });
     cache.modules.set(source, m);
+    installShaderDiagnostics(m, source, {
+      ...(label !== undefined ? { label } : {}),
+      ...(sourceMap !== undefined && sourceMap !== null ? { sourceMap } : {}),
+    });
   }
   return m;
 }
@@ -68,10 +82,10 @@ export function compileRenderPipeline(
   let p = cache.pipelines.get(k);
   if (p !== undefined) return p;
 
-  const vsModule = moduleFor(device, desc.vertexShaderSource, desc.label ? `${desc.label}.vs` : undefined);
+  const vsModule = moduleFor(device, desc.vertexShaderSource, desc.label ? `${desc.label}.vs` : undefined, desc.vertexSourceMap);
   const fsModule = desc.vertexShaderSource === desc.fragmentShaderSource
     ? vsModule
-    : moduleFor(device, desc.fragmentShaderSource, desc.label ? `${desc.label}.fs` : undefined);
+    : moduleFor(device, desc.fragmentShaderSource, desc.label ? `${desc.label}.fs` : undefined, desc.fragmentSourceMap);
 
   const layout = device.createPipelineLayout({
     bindGroupLayouts: desc.bindGroupLayouts as GPUBindGroupLayout[],

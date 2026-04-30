@@ -34,6 +34,16 @@ export {
 } from "./renderPipeline.js";
 
 export {
+  installShaderDiagnostics,
+  type ShaderDiagnosticsOptions,
+} from "./shaderDiagnostics.js";
+
+export {
+  generateMips,
+  type GenerateMipsOptions,
+} from "./mipGen.js";
+
+export {
   prepareRenderObject,
   PreparedRenderObject,
   type PrepareRenderObjectOptions,
