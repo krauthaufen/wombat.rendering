@@ -1,0 +1,26 @@
+{
+  "name": "@aardworx/wombat.rendering-example-hello-triangle",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@aardworx/wombat.adaptive": "file:../../../wombat.adaptive",
+    "@aardworx/wombat.base": "file:../../../wombat.base",
+    "@aardworx/wombat.rendering-core": "*",
+    "@aardworx/wombat.rendering-resources": "*",
+    "@aardworx/wombat.rendering-runtime": "*",
+    "@aardworx/wombat.rendering-window": "*",
+    "@aardworx/wombat.shader-frontend": "file:../../../wombat.shader/packages/frontend",
+    "@aardworx/wombat.shader-ir": "file:../../../wombat.shader/packages/ir",
+    "@aardworx/wombat.shader-runtime": "file:../../../wombat.shader/packages/runtime"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.69",
+    "typescript": "^5.4.0",
+    "vite": "^5.0.0"
+  }
+}

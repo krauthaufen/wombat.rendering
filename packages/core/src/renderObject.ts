@@ -19,11 +19,21 @@ import type { Effect } from "./shader.js";
 
 export interface RenderObject {
   /**
-   * A wombat.shader Effect — the user-facing object produced by
-   * `vertex(...) / fragment(...) / effect(...)` or by
-   * hand-building stages with `stage(module, ...)`. The runtime
-   * calls `effect.compile({ target: "wgsl" })` (cached by the
-   * effect's own hole-value key + target) before lowering.
+   * A wombat.shader `Effect` — produced by the `vertex(...) /
+   * fragment(...) / effect(...)` markers (transformed at build
+   * time by `@aardworx/wombat.shader-vite`) or hand-built via
+   * `stage(module, ...)`. The runtime calls
+   * `effect.compile({ target: "wgsl" })` (Effect's own
+   * hole-value-keyed cache makes this free per frame).
+   *
+   * `Effect.id` (stable build-time hash) feeds the pipeline cache
+   * key, which means renaming a captured value invalidates only
+   * its specialization; everything else stays cached.
+   *
+   * For users with a precompiled `CompiledEffect` (e.g. from
+   * `compileShaderSource(...)`), wrap it with the test helper
+   * `fakeEffectFromCompiled` or call `stage(module)` to produce
+   * a real Effect.
    */
   readonly effect: Effect;
   readonly pipelineState: PipelineState;
