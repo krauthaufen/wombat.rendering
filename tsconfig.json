@@ -4,6 +4,7 @@
     { "path": "./packages/core" },
     { "path": "./packages/resources" },
     { "path": "./packages/commands" },
-    { "path": "./packages/runtime" }
+    { "path": "./packages/runtime" },
+    { "path": "./packages/window" }
   ]
 }

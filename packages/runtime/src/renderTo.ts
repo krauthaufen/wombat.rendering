@@ -41,6 +41,13 @@ export interface RenderToOptions {
   /** What to clear the FBO with each frame. Omit to skip the clear pass. */
   readonly clear?: ClearValues;
   readonly label?: string;
+  /**
+   * Extra GPU texture usage flags for every color attachment.
+   * `RENDER_ATTACHMENT | TEXTURE_BINDING` are always set; pass
+   * `COPY_SRC` here to enable readback, `STORAGE_BINDING` for
+   * compute writes, etc.
+   */
+  readonly extraUsage?: GPUTextureUsageFlags;
 }
 
 export interface RenderToResult {
@@ -91,6 +98,7 @@ export function renderTo(
 ): RenderToResult {
   const fbo = allocateFramebuffer(ctx.device, opts.signature, opts.size, {
     ...(opts.label !== undefined ? { labelPrefix: opts.label } : {}),
+    ...(opts.extraUsage !== undefined ? { extraUsage: opts.extraUsage } : {}),
   });
   const renderToFbo = new RenderToFramebuffer(
     ctx, fbo, scene,

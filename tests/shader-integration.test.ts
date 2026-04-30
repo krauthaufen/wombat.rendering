@@ -100,7 +100,7 @@ describe("shader integration: real wombat.shader → wombat.rendering", () => {
 
     const runtime = new Runtime({ device: gpu.device });
     const cmds = AList.ofArray<Command>([
-      { kind: "Render", output: fbo.getValue(AdaptiveToken.top), tree: RenderTree.leaf(obj) },
+      { kind: "Render", output: fbo, tree: RenderTree.leaf(obj) },
     ]);
     const task = runtime.compile(cmds);
     task.run(AdaptiveToken.top);
@@ -149,8 +149,8 @@ describe("shader integration: real wombat.shader → wombat.rendering", () => {
 
     const runtime = new Runtime({ device: gpu.device });
     const cmds = AList.ofArray<Command>([
-      { kind: "Render", output: fboA.getValue(AdaptiveToken.top), tree: RenderTree.leaf(obj) },
-      { kind: "Render", output: fboB.getValue(AdaptiveToken.top), tree: RenderTree.leaf(obj) },
+      { kind: "Render", output: fboA, tree: RenderTree.leaf(obj) },
+      { kind: "Render", output: fboB, tree: RenderTree.leaf(obj) },
     ]);
     const task = runtime.compile(cmds);
     task.run(AdaptiveToken.top);
@@ -179,7 +179,7 @@ describe("shader integration: real wombat.shader → wombat.rendering", () => {
     fbo.acquire();
     const runtime = new Runtime({ device: gpu.device });
     const cmds = AList.ofArray<Command>([
-      { kind: "Render", output: fbo.getValue(AdaptiveToken.top), tree: RenderTree.ordered(RenderTree.leaf(mk()), RenderTree.leaf(mk())) },
+      { kind: "Render", output: fbo, tree: RenderTree.ordered(RenderTree.leaf(mk()), RenderTree.leaf(mk())) },
     ]);
     const task = runtime.compile(cmds);
     task.run(AdaptiveToken.top);

@@ -135,10 +135,8 @@ describe("renderTo", () => {
     const outerSig = createFramebufferSignature({ colors: { color: "rgba8unorm" } });
     const backbuffer = allocateFramebuffer(gpu.device, outerSig, cval({ width: 64, height: 64 }));
     backbuffer.acquire();
-    const ifb = backbuffer.getValue(AdaptiveToken.top);
-
     const cmds = AList.ofArray<Command>([
-      { kind: "Render", output: ifb, tree: RenderTree.leaf(outerObj) },
+      { kind: "Render", output: backbuffer, tree: RenderTree.leaf(outerObj) },
     ]);
     const task = runtime.compile(cmds);
     task.run(AdaptiveToken.top);

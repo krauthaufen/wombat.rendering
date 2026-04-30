@@ -86,14 +86,13 @@ describe("Runtime.compile(alist<Command>)", () => {
     const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
     const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
     fbo.acquire();
-    const ifb = fbo.getValue(AdaptiveToken.top);
     const tree = RenderTree.leaf(obj());
     const clearValues: ClearValues = {
       colors: HashMap.empty<string, V4f>().add("outColor", new V4f(0, 0, 0, 1)),
     };
     const commands = AList.ofArray<Command>([
-      { kind: "Clear",  output: ifb, values: clearValues },
-      { kind: "Render", output: ifb, tree },
+      { kind: "Clear",  output: fbo, values: clearValues },
+      { kind: "Render", output: fbo, tree },
     ]);
     const task = runtime.compile(commands);
     task.run(AdaptiveToken.top);
@@ -114,9 +113,8 @@ describe("Runtime.compile(alist<Command>)", () => {
     const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
     const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
     fbo.acquire();
-    const ifb = fbo.getValue(AdaptiveToken.top);
     const tree = RenderTree.ordered(RenderTree.leaf(obj()), RenderTree.leaf(obj()));
-    const cmds = AList.ofArray<Command>([{ kind: "Render", output: ifb, tree }]);
+    const cmds = AList.ofArray<Command>([{ kind: "Render", output: fbo, tree }]);
     const task = runtime.compile(cmds);
     task.run(AdaptiveToken.top);
     expect(gpu.renderPasses).toHaveLength(1);

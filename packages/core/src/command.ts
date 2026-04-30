@@ -9,6 +9,7 @@
 // AdaptiveResource update logic and run implicitly when a Render
 // command needs a dirty resource.
 
+import type { aval } from "@aardworx/wombat.adaptive";
 import type { ClearValues } from "./clear.js";
 import type { IFramebuffer } from "./framebuffer.js";
 import type { RenderTree } from "./renderTree.js";
@@ -35,8 +36,15 @@ export interface TextureCopy {
 
 export type CopySpec = BufferCopy | TextureCopy;
 
+/**
+ * `Render` and `Clear` take an `aval<IFramebuffer>` for their output
+ * so that swap-chain framebuffers (which produce a fresh
+ * `GPUTextureView` every animation frame) flow through cleanly.
+ * For static FBOs, wrap with `cval(...)` from `@aardworx/wombat.adaptive`
+ * — the runtime evaluates the aval per frame.
+ */
 export type Command =
-  | { readonly kind: "Render"; readonly output: IFramebuffer; readonly tree: RenderTree }
-  | { readonly kind: "Clear"; readonly output: IFramebuffer; readonly values: ClearValues }
+  | { readonly kind: "Render"; readonly output: aval<IFramebuffer>; readonly tree: RenderTree }
+  | { readonly kind: "Clear"; readonly output: aval<IFramebuffer>; readonly values: ClearValues }
   | { readonly kind: "Copy"; readonly copy: CopySpec }
   | { readonly kind: "Custom"; readonly encode: (cmd: GPUCommandEncoder) => void };

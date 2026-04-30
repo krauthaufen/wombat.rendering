@@ -67,10 +67,10 @@ class RenderTask implements IRenderTask {
 
   private encodeCommand(enc: GPUCommandEncoder, c: Command, token: AdaptiveToken): void {
     switch (c.kind) {
-      case "Clear":  clear(enc, c.output, c.values); return;
+      case "Clear":  clear(enc, c.output.getValue(token), c.values); return;
       case "Copy":   copy(enc, c.copy); return;
       case "Custom": c.encode(enc); return;
-      case "Render": this.encodeRender(enc, c.output, c.tree, token); return;
+      case "Render": this.encodeRender(enc, c.output.getValue(token), c.tree, token); return;
     }
   }
 

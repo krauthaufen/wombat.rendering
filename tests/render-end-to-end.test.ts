@@ -93,7 +93,7 @@ describe("end-to-end render", () => {
     const runtime = new Runtime({ device: gpu.device });
     const task = runtime.compile(
       AList.ofArray([
-        { kind: "Render" as const, output: fbo.getValue(AdaptiveToken.top), tree: RenderTree.leaf(obj) },
+        { kind: "Render" as const, output: fbo, tree: RenderTree.leaf(obj) },
       ]),
     );
     task.run(AdaptiveToken.top);

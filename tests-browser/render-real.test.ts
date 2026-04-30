@@ -118,21 +118,21 @@ describe("hello-triangle — real GPU", () => {
         extraUsage: TextureUsage.COPY_SRC,
       });
       fbo.acquire();
-      const ifb = fbo.getValue(AdaptiveToken.top);
       const clearValues: ClearValues = {
         colors: HashMap.empty<string, V4f>().add("outColor", new V4f(0, 0, 0, 1)),
       };
 
       const runtime = new Runtime({ device });
       const cmds = AList.ofArray<Command>([
-        { kind: "Clear",  output: ifb, values: clearValues },
-        { kind: "Render", output: ifb, tree: RenderTree.leaf(obj) },
+        { kind: "Clear",  output: fbo, values: clearValues },
+        { kind: "Render", output: fbo, tree: RenderTree.leaf(obj) },
       ]);
       const task = runtime.compile(cmds);
       task.run(AdaptiveToken.top);
       await device.queue.onSubmittedWorkDone();
       expect(errors).toEqual([]);
 
+      const ifb = fbo.getValue(AdaptiveToken.top);
       const tex = ifb.colorTextures!.tryFind("outColor")!;
       const pixels = await readTexturePixels(device, tex);
 

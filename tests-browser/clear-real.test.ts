@@ -29,15 +29,16 @@ describe("clear pass — real GPU", () => {
       fbo.acquire();
 
       const runtime = new Runtime({ device });
-      const ifb = fbo.getValue(AdaptiveToken.top);
       const clearValues: ClearValues = {
         colors: HashMap.empty<string, V4f>().add("color", new V4f(1, 0.5, 0.25, 1)),
       };
       const task = runtime.compile(AList.ofArray<Command>([
-        { kind: "Clear", output: ifb, values: clearValues },
+        { kind: "Clear", output: fbo, values: clearValues },
       ]));
       task.run(AdaptiveToken.top);
+      await device.queue.onSubmittedWorkDone();
 
+      const ifb = fbo.getValue(AdaptiveToken.top);
       const tex = ifb.colorTextures!.tryFind("color")!;
       const pixels = await readTexturePixels(device, tex);
       // 2×2 RGBA = 16 bytes. Each pixel must be roughly (255, 128, 64, 255).
