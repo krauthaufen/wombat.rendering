@@ -1,21 +1,9 @@
 // prepareRenderObject — turn a `RenderObject` + `CompiledEffect`
 // + `FramebufferSignature` into a runnable `PreparedRenderObject`.
 //
-// Slice landed in this revision:
-//   - Vertex attributes by name.
-//   - Uniform buffers (one per `ProgramInterface.uniformBuffers`).
-//   - Textures + samplers (one bind-group entry per
-//     `ProgramInterface.textures` / `.samplers`).
-//   - Storage buffers (one bind-group entry per
-//     `ProgramInterface.storageBuffers`; user passes the source as
-//     `aval<IBuffer>`, runtime wraps via `prepareAdaptiveBuffer`).
-//   - Index buffer / draw call.
-//   - Pipeline (cached).
-//
-// Not yet handled (see TODO.md):
-//   - Instance attributes / per-attribute stepMode.
-//   - Blend / stencil / multisample plumbing.
-//   - `BufferView.indexFormat` (currently hardcoded `uint32`).
+// Reads the wombat.shader `ProgramInterface` for everything needed
+// to lay out vertex buffers, bind groups, color targets, and draw
+// state.
 
 import {
   AdaptiveResource,
@@ -27,7 +15,10 @@ import {
 import {
   type AdaptiveToken,
   type aval,
+  type HashMap,
+  cval,
 } from "@aardworx/wombat.adaptive";
+import type { Type } from "@aardworx/wombat.shader-ir";
 import { prepareAdaptiveBuffer } from "./adaptiveBuffer.js";
 import { prepareAdaptiveTexture } from "./adaptiveTexture.js";
 import { prepareAdaptiveSampler } from "./adaptiveSampler.js";
@@ -61,10 +52,18 @@ interface VertexBindingInfo {
   readonly name: string;
   readonly slot: number;
   readonly format: GPUVertexFormat;
+  readonly byteSize: number;
 }
 
-function vertexBufferLayoutsFor(iface: ProgramInterface): VertexBindingInfo[] {
-  return iface.vertexAttributes.map(a => ({ name: a.name, slot: a.location, format: a.format }));
+function vertexBindingsFor(iface: ProgramInterface): VertexBindingInfo[] {
+  // `iface.attributes` is already filtered to non-builtin vertex inputs
+  // by wombat.shader's interface builder.
+  return iface.attributes.map(a => ({
+    name: a.name,
+    slot: a.location,
+    format: a.format as GPUVertexFormat,
+    byteSize: a.byteSize,
+  }));
 }
 
 function colorTargetsFor(iface: ProgramInterface, sig: FramebufferSignature): GPUColorTargetState[] {
@@ -77,6 +76,20 @@ function colorTargetsFor(iface: ProgramInterface, sig: FramebufferSignature): GP
     out[o.location] = { format: fmt };
   }
   return out;
+}
+
+/** Map a wombat.shader IR Type for a sampled texture to WebGPU's GPUTextureSampleType. */
+function sampleTypeFor(type: Type): GPUTextureSampleType {
+  if (type.kind === "Texture") {
+    if (type.comparison === true) return "depth";
+    const s = type.sampled;
+    if (s.kind === "Int") return s.signed ? "sint" : "uint";
+    return "float";
+  }
+  // Storage textures don't have a sampleType in the binding-layout
+  // sense; this code path is only for sampled textures. If we see
+  // anything else default to filterable float.
+  return "float";
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +165,6 @@ export class PreparedRenderObject {
     for (const g of this.groups) for (const e of g.entries) e.resource.release();
   }
 
-  /** Encode this object into an open render pass. */
   record(pass: GPURenderPassEncoder, token: AdaptiveToken): void {
     pass.setPipeline(this.pipeline);
 
@@ -209,15 +221,17 @@ export function prepareRenderObject(
   opts: PrepareRenderObjectOptions = {},
 ): PreparedRenderObject {
   const iface = effect.interface;
-  const vertexBindings = vertexBufferLayoutsFor(iface);
+  const vertexBindings = vertexBindingsFor(iface);
 
-  // Vertex buffers.
+  // Vertex buffers (one per shader-required attribute).
   const vertexBuffers = new Map<string, AdaptiveResource<GPUBuffer>>();
   const vertexLayouts: GPUVertexBufferLayout[] = [];
   for (const vb of vertexBindings) {
     const av = obj.vertexAttributes.tryFind(vb.name);
     if (av === undefined) throw new Error(`prepareRenderObject: missing vertex attribute "${vb.name}"`);
-    const stride = vertexFormatStride(vb.format);
+    const stride = vb.byteSize !== undefined && vb.byteSize > 0
+      ? vb.byteSize
+      : vertexFormatStride(vb.format);
     const bufAval = av.map(view => view.buffer);
     const res = prepareAdaptiveBuffer(device, bufAval, {
       usage: BufferUsage.VERTEX,
@@ -242,22 +256,29 @@ export function prepareRenderObject(
     indexFormat = "uint32"; // TODO: pull from BufferView once `indexFormat` field lands
   }
 
-  // Per-group entry collection.
+  // Per-group entry collection. Use `slot` (real shape) instead of `binding`.
+  const slotOf = (e: { group: number; slot: number }) => e.slot;
+  const groupOf = (e: { group: number }) => e.group;
   const maxGroup = Math.max(
     -1,
-    ...iface.uniformBuffers.map(u => u.group),
-    ...iface.samplers.map(s => s.group),
-    ...iface.textures.map(t => t.group),
-    ...iface.storageBuffers.map(s => s.group),
+    ...iface.uniformBlocks.map(groupOf),
+    ...iface.samplers.map(groupOf),
+    ...iface.textures.map(groupOf),
+    ...iface.storageBuffers.map(groupOf),
   );
   const perGroup: EntryDesc[][] = [];
   for (let g = 0; g <= maxGroup; g++) perGroup.push([]);
 
-  for (const ub of iface.uniformBuffers) {
-    const res = prepareUniformBuffer(device, ub, obj.uniforms, {
+  for (const ub of iface.uniformBlocks) {
+    // Merge user-supplied uniforms (`obj.uniforms`) with effect-bound
+    // avals (`compiledEffect.avalBindings`). User entries win on name
+    // conflict — the rendering caller is the source of truth.
+    const merged = mergeUniformInputs(obj.uniforms, effect.avalBindings, ub);
+    const block = ubAsBlock(ub);
+    const res = prepareUniformBuffer(device, block, merged, {
       ...(opts.label !== undefined ? { label: `${opts.label}.${ub.name}` } : {}),
     });
-    perGroup[ub.group]!.push({ kind: "ubuf", binding: ub.binding, resource: res });
+    perGroup[ub.group]!.push({ kind: "ubuf", binding: slotOf(ub), resource: res });
   }
 
   for (const t of iface.textures) {
@@ -266,14 +287,14 @@ export function prepareRenderObject(
     const res = prepareAdaptiveTexture(device, av, {
       ...(opts.label !== undefined ? { label: `${opts.label}.${t.name}` } : {}),
     });
-    perGroup[t.group]!.push({ kind: "tex", binding: t.binding, resource: res, sampleType: t.sampleType });
+    perGroup[t.group]!.push({ kind: "tex", binding: slotOf(t), resource: res, sampleType: sampleTypeFor(t.type) });
   }
 
   for (const s of iface.samplers) {
     const av = obj.samplers.tryFind(s.name);
     if (av === undefined) throw new Error(`prepareRenderObject: missing sampler "${s.name}"`);
     const res = prepareAdaptiveSampler(device, av);
-    perGroup[s.group]!.push({ kind: "sampler", binding: s.binding, resource: res });
+    perGroup[s.group]!.push({ kind: "sampler", binding: slotOf(s), resource: res });
   }
 
   for (const sb of iface.storageBuffers) {
@@ -285,7 +306,7 @@ export function prepareRenderObject(
       usage,
       ...(opts.label !== undefined ? { label: `${opts.label}.${sb.name}` } : {}),
     });
-    perGroup[sb.group]!.push({ kind: "sbuf", binding: sb.binding, resource: res, access: sb.access });
+    perGroup[sb.group]!.push({ kind: "sbuf", binding: slotOf(sb), resource: res, access: sb.access });
   }
 
   const groups = buildGroups(device, perGroup);
@@ -301,8 +322,8 @@ export function prepareRenderObject(
     ...(opts.label !== undefined ? { label: opts.label } : {}),
     vertexShaderSource: vsStage.source,
     fragmentShaderSource: fsStage.source,
-    vertexEntryPoint: "main",
-    fragmentEntryPoint: "main",
+    vertexEntryPoint: vsStage.entryName,
+    fragmentEntryPoint: fsStage.entryName,
     vertexBufferLayouts: vertexLayouts,
     bindGroupLayouts: groups.map(g => g.layout),
     colorTargets,
@@ -330,4 +351,42 @@ export function prepareRenderObject(
     obj.drawCall,
     pipeline,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Uniform input merging — `obj.uniforms` wins; `avalBindings` is fallback.
+// ---------------------------------------------------------------------------
+
+function mergeUniformInputs(
+  user: HashMap<string, aval<unknown>>,
+  bindings: Readonly<Record<string, () => unknown>> | undefined,
+  block: import("@aardworx/wombat.rendering-core").UniformBlockInfo,
+): HashMap<string, aval<unknown>> {
+  let merged = user;
+  if (bindings === undefined) return merged;
+  for (const f of block.fields) {
+    if (merged.tryFind(f.name) !== undefined) continue;
+    const getter = bindings[f.name];
+    if (getter === undefined) continue;
+    const v = getter();
+    // wombat.shader's avalBindings store either an `aval<T>` or a
+    // raw value; wrap the raw case as a constant aval.
+    if (isAval(v)) merged = merged.add(f.name, v as aval<unknown>);
+    else merged = merged.add(f.name, cval(v));
+  }
+  return merged;
+}
+
+function isAval(v: unknown): boolean {
+  return typeof v === "object" && v !== null && typeof (v as { getValue?: unknown }).getValue === "function";
+}
+
+/**
+ * Adapter — wombat.shader's `UniformBlockInfo` and our internal
+ * UBO packer expect the same field shape (`offset`, `size`, etc.),
+ * so this is just a structural pass-through. Keeps the call sites
+ * type-clean.
+ */
+function ubAsBlock(ub: import("@aardworx/wombat.rendering-core").UniformBlockInfo): import("@aardworx/wombat.rendering-core").UniformBlockInfo {
+  return ub;
 }

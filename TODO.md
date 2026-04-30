@@ -72,17 +72,21 @@ What's NOT yet implemented in v0.1, in rough priority order.
 
 ## Shader integration
 
-- **Real `compileEffect`** wired to `@aardworx/wombat.shader-runtime`.
-  Today `Runtime` takes a `compileEffect: (Effect) => CompiledEffect`
-  callback; tests use an identity passthrough that lets users put a
-  hand-built `CompiledEffect` directly in `RenderObject.effect`.
+- ~~**Real `compileEffect`**.~~ DONE: `core/shader.ts` re-exports
+  the real `Effect` / `CompiledEffect` / `ProgramInterface` from
+  `@aardworx/wombat.shader-runtime`; `Runtime` defaults to
+  `effect.compile({ target: "wgsl" })`; integration test in
+  `tests/shader-integration.test.ts` runs full source → WGSL →
+  pipeline.
 - **Effect IDs as cache keys.** wombat.shader produces stable
-  build-time IDs; once integrated, key the pipeline cache on
-  `(effectId, signature.hash, pipelineState.hash)` instead of on
-  shader source strings.
-- **Source-map plumbing.** `CompiledEffect.stages[].sourceMap`
-  is in the shader runtime but not surfaced in our minimal
-  `CompiledEffect` placeholder type.
+  build-time IDs (`Effect.id`); plumb into `compileRenderPipeline`'s
+  cache key in place of shader-source FNV hashing.
+- **Source-map plumbing.** `CompiledStage.sourceMap` is now
+  re-exported but not yet surfaced in the rendering layer for
+  shader-compile error reporting.
+- **Vite plugin examples.** Real users use the
+  `vertex(...) / fragment(...)` markers + `@aardworx/wombat.shader-vite`
+  plugin to get an `Effect` directly. No example yet.
 
 ## Examples / tooling
 
@@ -97,11 +101,6 @@ What's NOT yet implemented in v0.1, in rough priority order.
 
 ## Type-level loose ends
 
-- `Effect` type in `core/shader.ts` is a placeholder
-  `{ readonly __wombatEffect: unique symbol } & object` — replace
-  with the real wombat.shader Effect type.
-- `CompiledEffect.stages[].stage` is currently typed as `string`;
-  tighten to `"vertex" | "fragment" | "compute"`.
-- `ProgramInterface` is a minimum-viable subset of the
-  wombat.shader interface; align with the real shape once
-  integrated.
+- ~~`Effect` placeholder.~~ DONE: replaced with real type.
+- ~~`ProgramInterface` minimum-viable subset.~~ DONE: real
+  re-export.

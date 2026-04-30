@@ -82,10 +82,23 @@ export type {
 } from "./texture.js";
 
 export type {
+  AttributeInfo,
   CompiledEffect,
+  CompiledStage,
   Effect,
+  HoleGetter,
+  HoleGetters,
+  LooseUniformInfo,
+  OutputInfo,
   ProgramInterface,
-  UniformBufferLayout,
+  SamplerInfo,
+  Stage,
+  StageInfo,
+  StorageBufferInfo,
+  Target,
+  TextureInfo,
+  UniformBlockInfo,
+  UniformFieldInfo,
 } from "./shader.js";
 
 export {

@@ -1,5 +1,5 @@
 // prepareUniformBuffer — pack a name-keyed bag of `aval<unknown>`
-// uniforms into a single UBO described by a `UniformBufferLayout`
+// uniforms into a single UBO described by a `UniformBlockInfo`
 // (from wombat.shader's ProgramInterface).
 //
 // The layout dictates byte offsets + sizes per field; this packer
@@ -23,7 +23,7 @@ import {
   AdaptiveResource,
   tryAcquire,
   tryRelease,
-  type UniformBufferLayout,
+  type UniformBlockInfo,
 } from "@aardworx/wombat.rendering-core";
 import {
   type AdaptiveToken,
@@ -45,12 +45,12 @@ class UniformBufferResource extends AdaptiveResource<GPUBuffer> {
 
   constructor(
     private readonly device: GPUDevice,
-    private readonly layout: UniformBufferLayout,
+    private readonly layout: UniformBlockInfo,
     private readonly inputs: HashMap<string, aval<unknown>>,
     private readonly label: string | undefined,
   ) {
     super();
-    const bytes = new ArrayBuffer(roundUp4(layout.sizeBytes));
+    const bytes = new ArrayBuffer(roundUp4(layout.size));
     this._scratch = {
       bytes,
       f32: new Float32Array(bytes),
@@ -134,7 +134,7 @@ export interface PrepareUniformBufferOptions {
 
 export function prepareUniformBuffer(
   device: GPUDevice,
-  layout: UniformBufferLayout,
+  layout: UniformBlockInfo,
   inputs: HashMap<string, aval<unknown>>,
   opts: PrepareUniformBufferOptions = {},
 ): AdaptiveResource<GPUBuffer> {

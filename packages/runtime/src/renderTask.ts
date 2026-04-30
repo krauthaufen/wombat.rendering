@@ -21,6 +21,12 @@ import { encodeTree, makeCache, type PreparedCache } from "./treeWalker.js";
 
 export interface RuntimeContext {
   readonly device: GPUDevice;
+  /**
+   * Resolve a wombat.shader `Effect` to a `CompiledEffect`. Default
+   * (provided by `Runtime`) is `effect.compile({ target: "wgsl" })`.
+   * Override only to supply a hand-built CompiledEffect for tests
+   * or to customise compile options (e.g. `skipMatrixReversal`).
+   */
   readonly compileEffect: (effect: Effect) => CompiledEffect;
 }
 

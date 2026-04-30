@@ -4,18 +4,23 @@ import { describe, expect, it } from "vitest";
 import { AdaptiveToken, HashMap, cval, transact, type aval } from "@aardworx/wombat.adaptive";
 import { V4f, M44f } from "@aardworx/wombat.base";
 import { prepareUniformBuffer } from "@aardworx/wombat.rendering-resources";
-import type { UniformBufferLayout } from "@aardworx/wombat.rendering-core";
+import type { UniformBlockInfo } from "@aardworx/wombat.rendering-core";
+import type { Type } from "@aardworx/wombat.shader-ir";
 import { MockGPU } from "./_mockGpu.js";
 
-const layout: UniformBufferLayout = {
+const f32:   Type = { kind: "Float", width: 32 };
+const vec4f: Type = { kind: "Vector", element: f32, dim: 4 };
+const mat4f: Type = { kind: "Matrix", element: f32, rows: 4, cols: 4 };
+
+const layout: UniformBlockInfo = {
   name: "Globals",
   group: 0,
-  binding: 0,
-  sizeBytes: 16 + 16 + 64, // tint:vec4 + offset:vec4 (with 16-byte alignment) + viewProj:mat4
+  slot: 0,
+  size: 16 + 16 + 64,
   fields: [
-    { name: "tint",     offset: 0,  sizeBytes: 16 },
-    { name: "scale",    offset: 16, sizeBytes: 4 },
-    { name: "viewProj", offset: 32, sizeBytes: 64 },
+    { name: "tint",     type: vec4f, offset: 0,  size: 16, align: 16 },
+    { name: "scale",    type: f32,   offset: 16, size: 4,  align: 4 },
+    { name: "viewProj", type: mat4f, offset: 32, size: 64, align: 16 },
   ],
 };
 

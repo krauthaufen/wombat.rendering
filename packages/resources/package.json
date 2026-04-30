@@ -18,7 +18,9 @@
   "dependencies": {
     "@aardworx/wombat.adaptive": "file:../../../wombat.adaptive",
     "@aardworx/wombat.base": "file:../../../wombat.base",
-    "@aardworx/wombat.rendering-core": "*"
+    "@aardworx/wombat.rendering-core": "*",
+    "@aardworx/wombat.shader-ir": "file:../../../wombat.shader/packages/ir",
+    "@aardworx/wombat.shader-runtime": "file:../../../wombat.shader/packages/runtime"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.69"

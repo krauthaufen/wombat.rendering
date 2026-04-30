@@ -9,14 +9,24 @@ import { renderTo, type RenderToOptions, type RenderToResult } from "./renderTo.
 
 export interface RuntimeOptions {
   readonly device: GPUDevice;
-  readonly compileEffect: (effect: Effect) => CompiledEffect;
+  /**
+   * Optional override for `Effect → CompiledEffect`. Defaults to
+   * `effect.compile({ target: "wgsl" })`. Override when tests want
+   * a hand-built CompiledEffect or when the caller needs custom
+   * `CompileOptions` (`skipMatrixReversal`, source-file labelling,
+   * …).
+   */
+  readonly compileEffect?: (effect: Effect) => CompiledEffect;
 }
 
 export class Runtime {
   private readonly ctx: RuntimeContext;
 
   constructor(opts: RuntimeOptions) {
-    this.ctx = { device: opts.device, compileEffect: opts.compileEffect };
+    this.ctx = {
+      device: opts.device,
+      compileEffect: opts.compileEffect ?? ((e: Effect) => e.compile({ target: "wgsl" })),
+    };
   }
 
   get device(): GPUDevice { return this.ctx.device; }

@@ -19,6 +19,12 @@
   },
   "dependencies": {
     "@aardworx/wombat.adaptive": "file:../wombat.adaptive",
-    "@aardworx/wombat.base": "file:../wombat.base"
+    "@aardworx/wombat.base": "file:../wombat.base",
+    "@aardworx/wombat.shader-frontend": "file:../wombat.shader/packages/frontend",
+    "@aardworx/wombat.shader-glsl": "file:../wombat.shader/packages/glsl",
+    "@aardworx/wombat.shader-ir": "file:../wombat.shader/packages/ir",
+    "@aardworx/wombat.shader-passes": "file:../wombat.shader/packages/passes",
+    "@aardworx/wombat.shader-runtime": "file:../wombat.shader/packages/runtime",
+    "@aardworx/wombat.shader-wgsl": "file:../wombat.shader/packages/wgsl"
   }
 }

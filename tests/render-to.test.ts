@@ -43,19 +43,30 @@ function bv(format: GPUVertexFormat = "float32x3"): aval<BufferView> {
   });
 }
 
+import type { Type } from "@aardworx/wombat.shader-ir";
+
+const f32:   Type = { kind: "Float", width: 32 };
+const vec3f: Type = { kind: "Vector", element: f32, dim: 3 };
+const vec4f: Type = { kind: "Vector", element: f32, dim: 4 };
+const tex2d: Type = { kind: "Texture", target: "2D", sampled: { kind: "Float" }, arrayed: false, multisampled: false };
+const samp:  Type = { kind: "Sampler", target: "2D", sampled: { kind: "Float" }, comparison: false };
+
 function passEffect(): CompiledEffect {
   return {
     target: "wgsl",
     stages: [
-      { stage: "vertex",   source: "@vertex fn main(){} /*pass*/" },
-      { stage: "fragment", source: "@fragment fn main(){} /*pass*/" },
+      { stage: "vertex",   entryName: "main", source: "@vertex fn main(){} /*pass*/",  bindings: [] as never, meta: {} as never, sourceMap: null },
+      { stage: "fragment", entryName: "main", source: "@fragment fn main(){} /*pass*/", bindings: [] as never, meta: {} as never, sourceMap: null },
     ],
     interface: {
-      vertexAttributes: [{ name: "position", location: 0, format: "float32x3" }],
-      fragmentOutputs:  [{ name: "color",    location: 0 }],
-      uniformBuffers:   [],
+      target: "wgsl",
+      stages: [],
+      attributes: [{ name: "position", location: 0, type: vec3f, format: "float32x3", components: 3, byteSize: 12 }],
+      fragmentOutputs: [{ name: "color", location: 0, type: vec4f }],
+      uniforms: [], uniformBlocks: [],
       samplers: [], textures: [], storageBuffers: [],
     },
+    avalBindings: {},
   };
 }
 
@@ -63,17 +74,20 @@ function texturedEffect(): CompiledEffect {
   return {
     target: "wgsl",
     stages: [
-      { stage: "vertex",   source: "@vertex fn main(){} /*tex*/" },
-      { stage: "fragment", source: "@fragment fn main(){} /*tex*/" },
+      { stage: "vertex",   entryName: "main", source: "@vertex fn main(){} /*tex*/",  bindings: [] as never, meta: {} as never, sourceMap: null },
+      { stage: "fragment", entryName: "main", source: "@fragment fn main(){} /*tex*/", bindings: [] as never, meta: {} as never, sourceMap: null },
     ],
     interface: {
-      vertexAttributes: [{ name: "position", location: 0, format: "float32x3" }],
-      fragmentOutputs:  [{ name: "color",    location: 0 }],
-      uniformBuffers: [],
-      textures: [{ name: "src", group: 0, binding: 0, sampleType: "float" }],
-      samplers: [{ name: "samp", group: 0, binding: 1 }],
+      target: "wgsl",
+      stages: [],
+      attributes: [{ name: "position", location: 0, type: vec3f, format: "float32x3", components: 3, byteSize: 12 }],
+      fragmentOutputs: [{ name: "color", location: 0, type: vec4f }],
+      uniforms: [], uniformBlocks: [],
+      textures: [{ name: "src",  group: 0, slot: 0, type: tex2d }],
+      samplers: [{ name: "samp", group: 0, slot: 1, type: samp }],
       storageBuffers: [],
     },
+    avalBindings: {},
   };
 }
 

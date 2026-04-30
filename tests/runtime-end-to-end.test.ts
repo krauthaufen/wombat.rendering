@@ -38,22 +38,32 @@ function bv(bytes: number, format: GPUVertexFormat, count = 3): aval<BufferView>
   });
 }
 
+import type { Type } from "@aardworx/wombat.shader-ir";
+
+const f32:   Type = { kind: "Float", width: 32 };
+const vec3f: Type = { kind: "Vector", element: f32, dim: 3 };
+const vec4f: Type = { kind: "Vector", element: f32, dim: 4 };
+
 function effect(): CompiledEffect {
   return {
     target: "wgsl",
     stages: [
-      { stage: "vertex",   source: "@vertex fn main(){}" },
-      { stage: "fragment", source: "@fragment fn main(){}" },
+      { stage: "vertex",   entryName: "main", source: "@vertex fn main(){}",  bindings: [] as never, meta: {} as never, sourceMap: null },
+      { stage: "fragment", entryName: "main", source: "@fragment fn main(){}", bindings: [] as never, meta: {} as never, sourceMap: null },
     ],
     interface: {
-      vertexAttributes: [{ name: "position", location: 0, format: "float32x3" }],
-      fragmentOutputs:  [{ name: "color",    location: 0 }],
-      uniformBuffers:   [{
-        name: "Globals", group: 0, binding: 0, sizeBytes: 16,
-        fields: [{ name: "tint", offset: 0, sizeBytes: 16 }],
+      target: "wgsl",
+      stages: [],
+      attributes: [{ name: "position", location: 0, type: vec3f, format: "float32x3", components: 3, byteSize: 12 }],
+      fragmentOutputs: [{ name: "color", location: 0, type: vec4f }],
+      uniforms: [],
+      uniformBlocks: [{
+        name: "Globals", group: 0, slot: 0, size: 16,
+        fields: [{ name: "tint", type: vec4f, offset: 0, size: 16, align: 16 }],
       }],
       samplers: [], textures: [], storageBuffers: [],
     },
+    avalBindings: {},
   };
 }
 
