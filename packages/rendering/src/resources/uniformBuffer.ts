@@ -93,7 +93,7 @@ class UniformBufferResource extends AdaptiveResource<GPUBuffer> {
     for (const field of this.layout.fields) {
       const av = this.inputs.tryFind(field.name);
       if (av === undefined) continue;
-      writeField(this._scratch, field.offset, av.getValue(token));
+      writeField(this._scratch, field.offset, av.getValue(token), field.type);
     }
     if (this._gpu === undefined) {
       const desc: GPUBufferDescriptor = {

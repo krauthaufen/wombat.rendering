@@ -29,6 +29,6 @@
   "dependencies": {
     "@aardworx/wombat.adaptive": "^0.2.1",
     "@aardworx/wombat.base": "^0.3.0",
-    "@aardworx/wombat.shader": "^0.2.1"
+    "@aardworx/wombat.shader": "^0.3.0"
   }
 }
