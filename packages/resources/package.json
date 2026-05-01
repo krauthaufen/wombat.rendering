@@ -2,7 +2,7 @@
   "name": "@aardworx/wombat.rendering-resources",
   "version": "0.0.0",
   "private": true,
-  "description": "wombat.rendering layer 2 — resource-creator functions on GPUDevice. Lifts user-provided aval<IBuffer> / aval<ITexture> / etc. into AdaptiveResource<GPUBuffer> / AdaptiveResource<GPUTexture> with upload + ref-counted lifetime.",
+  "description": "wombat.rendering layer 2 \u2014 resource-creator functions on GPUDevice. Lifts user-provided aval<IBuffer> / aval<ITexture> / etc. into AdaptiveResource<GPUBuffer> / AdaptiveResource<GPUTexture> with upload + ref-counted lifetime.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -22,8 +22,7 @@
     "@aardworx/wombat.adaptive": "^0.2.1",
     "@aardworx/wombat.base": "^0.3.0",
     "@aardworx/wombat.rendering-core": "*",
-    "@aardworx/wombat.shader-ir": "^0.1.0",
-    "@aardworx/wombat.shader-runtime": "^0.1.0"
+    "@aardworx/wombat.shader": "*"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.69"

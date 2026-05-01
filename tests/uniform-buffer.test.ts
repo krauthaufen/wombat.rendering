@@ -5,7 +5,7 @@ import { AdaptiveToken, HashMap, cval, transact, type aval } from "@aardworx/wom
 import { V4f, M44f } from "@aardworx/wombat.base";
 import { prepareUniformBuffer } from "@aardworx/wombat.rendering-resources";
 import type { UniformBlockInfo } from "@aardworx/wombat.rendering-core";
-import type { Type } from "@aardworx/wombat.shader-ir";
+import type { Type } from "@aardworx/wombat.shader/ir";
 import { MockGPU } from "./_mockGpu.js";
 
 const f32:   Type = { kind: "Float", width: 32 };

@@ -8,7 +8,7 @@
 // (file, line, col). Heavier source-map work (multi-segment lines,
 // names array, sections) isn't needed because we never emit it.
 
-import type { SourceMap } from "@aardworx/wombat.shader-ir";
+import type { SourceMap } from "@aardworx/wombat.shader/ir";
 
 const VLQ_INDEX = new Map<string, number>();
 {

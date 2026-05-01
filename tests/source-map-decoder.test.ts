@@ -5,7 +5,7 @@
 // pin the round-trip behaviour here.
 
 import { describe, it, expect } from "vitest";
-import { buildSourceMap, type Span } from "@aardworx/wombat.shader-ir";
+import { buildSourceMap, type Span } from "@aardworx/wombat.shader/ir";
 import { decodeLine } from "../packages/resources/src/sourceMapDecoder.js";
 
 const fileA = "a.ts";

@@ -18,7 +18,7 @@ import {
   type HashMap,
   cval,
 } from "@aardworx/wombat.adaptive";
-import type { Type } from "@aardworx/wombat.shader-ir";
+import type { Type } from "@aardworx/wombat.shader/ir";
 import { prepareAdaptiveBuffer } from "./adaptiveBuffer.js";
 import { prepareAdaptiveTexture } from "./adaptiveTexture.js";
 import { prepareAdaptiveSampler } from "./adaptiveSampler.js";

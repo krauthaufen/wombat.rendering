@@ -12,7 +12,7 @@ export type {
   CompiledEffect,
   CompiledStage,
   Target,
-} from "@aardworx/wombat.shader-runtime";
+} from "@aardworx/wombat.shader";
 
 export type {
   ProgramInterface,
@@ -25,4 +25,4 @@ export type {
   SamplerInfo,
   TextureInfo,
   StorageBufferInfo,
-} from "@aardworx/wombat.shader-runtime";
+} from "@aardworx/wombat.shader";

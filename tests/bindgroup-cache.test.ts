@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { AList, AdaptiveToken, HashMap, cval, transact, type aval } from "@aardworx/wombat.adaptive";
 import { V4f } from "@aardworx/wombat.base";
-import { Tf32, Vec, type Type } from "@aardworx/wombat.shader-ir";
+import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
 import {
   IBuffer,
   RenderTree,

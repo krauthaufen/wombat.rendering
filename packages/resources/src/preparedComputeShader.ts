@@ -22,7 +22,7 @@ import {
   type ComputeShader,
   type ProgramInterface,
 } from "@aardworx/wombat.rendering-core";
-import type { Type } from "@aardworx/wombat.shader-ir";
+import type { Type } from "@aardworx/wombat.shader/ir";
 import { ShaderStage } from "./webgpuFlags.js";
 import { installShaderDiagnostics } from "./shaderDiagnostics.js";
 import { makePackedView, writeField, type PackedView } from "./uniformBuffer.js";

@@ -25,8 +25,8 @@ export interface CompileRenderPipelineDescription {
   readonly vertexShaderSource: string;
   readonly fragmentShaderSource: string;
   /** Optional source map for the vertex stage. Used to enrich compile-error logs. */
-  readonly vertexSourceMap?: import("@aardworx/wombat.shader-ir").SourceMap | null;
-  readonly fragmentSourceMap?: import("@aardworx/wombat.shader-ir").SourceMap | null;
+  readonly vertexSourceMap?: import("@aardworx/wombat.shader/ir").SourceMap | null;
+  readonly fragmentSourceMap?: import("@aardworx/wombat.shader/ir").SourceMap | null;
   readonly vertexEntryPoint: string;
   readonly fragmentEntryPoint: string;
   readonly vertexBufferLayouts: readonly GPUVertexBufferLayout[];
@@ -58,7 +58,7 @@ function moduleFor(
   device: GPUDevice,
   source: string,
   label?: string,
-  sourceMap?: import("@aardworx/wombat.shader-ir").SourceMap | null,
+  sourceMap?: import("@aardworx/wombat.shader/ir").SourceMap | null,
 ): GPUShaderModule {
   const cache = cacheFor(device);
   let m = cache.modules.get(source);

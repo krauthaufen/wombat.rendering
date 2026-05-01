@@ -14,9 +14,9 @@
 // table is derived automatically from those so type dispatch
 // works (e.g. `texture(samp, uv)` resolves to the right intrinsic).
 
-import { parseShader, type EntryRequest } from "@aardworx/wombat.shader-frontend";
-import { stage, type Effect } from "@aardworx/wombat.shader-runtime";
-import type { Module, Type, ValueDef } from "@aardworx/wombat.shader-ir";
+import { parseShader, type EntryRequest } from "@aardworx/wombat.shader/frontend";
+import { stage, type Effect } from "@aardworx/wombat.shader";
+import type { Module, Type, ValueDef } from "@aardworx/wombat.shader/ir";
 
 export function makeEffect(
   source: string,

@@ -5,11 +5,11 @@
 // `gid + offset`.
 
 import { describe, expect, it } from "vitest";
-import { parseShader, type EntryRequest } from "@aardworx/wombat.shader-frontend";
-import { computeShader, type ComputeShader } from "@aardworx/wombat.shader-runtime";
+import { parseShader, type EntryRequest } from "@aardworx/wombat.shader/frontend";
+import { computeShader, type ComputeShader } from "@aardworx/wombat.shader";
 import {
   Tu32, Vec, type Module, type Type, type ValueDef,
-} from "@aardworx/wombat.shader-ir";
+} from "@aardworx/wombat.shader/ir";
 import {
   prepareComputeShader,
   type DispatchSize,

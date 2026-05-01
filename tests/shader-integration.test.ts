@@ -13,7 +13,7 @@ import {
   cval,
   type aval,
 } from "@aardworx/wombat.adaptive";
-import { Tf32, Vec, type Type } from "@aardworx/wombat.shader-ir";
+import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
 import {
   IBuffer,
   RenderTree,

@@ -17,7 +17,7 @@ import {
   type aval,
 } from "@aardworx/wombat.adaptive";
 import { V2f, V3f, V4f } from "@aardworx/wombat.base";
-import { effect, fragment, vertex } from "@aardworx/wombat.shader-runtime";
+import { effect, fragment, vertex } from "@aardworx/wombat.shader";
 import {
   IBuffer,
   RenderTree,

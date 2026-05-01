@@ -6,9 +6,9 @@
 import { describe, expect, it } from "vitest";
 import { AList, AdaptiveToken, HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
 import { V4f } from "@aardworx/wombat.base";
-import { parseShader, type EntryRequest } from "@aardworx/wombat.shader-frontend";
-import { stage, type Effect } from "@aardworx/wombat.shader-runtime";
-import { Tf32, Vec, type Type } from "@aardworx/wombat.shader-ir";
+import { parseShader, type EntryRequest } from "@aardworx/wombat.shader/frontend";
+import { stage, type Effect } from "@aardworx/wombat.shader";
+import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
 import {
   IBuffer,
   RenderTree,

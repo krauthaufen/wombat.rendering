@@ -5,7 +5,7 @@
 // messages including the originating TS source location decoded
 // from the supplied source map.
 
-import type { SourceMap } from "@aardworx/wombat.shader-ir";
+import type { SourceMap } from "@aardworx/wombat.shader/ir";
 import { decodeLine } from "./sourceMapDecoder.js";
 
 export interface ShaderDiagnosticsOptions {
