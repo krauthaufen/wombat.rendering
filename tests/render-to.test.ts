@@ -4,7 +4,7 @@
 // tests-browser/renderto-real.test.ts.
 
 import { describe, expect, it } from "vitest";
-import { AdaptiveToken, AVal, HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
+import { AdaptiveToken, HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
 import {
   IBuffer,
@@ -60,7 +60,7 @@ describe("renderTo lifecycle", () => {
     const innerObj: RenderObject = {
       effect: passEffect(),
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-      vertexAttributes: AVal.constant(HashMap.empty<string, aval<BufferView>>().add("position", bv())),
+      vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv()),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),

@@ -10,8 +10,7 @@ import { describe, expect, it } from "vitest";
 import {
   AList,
   AdaptiveToken,
-  AVal,
-  HashMap,
+    HashMap,
   ChangeableIndexListOps as CList,
   cval,
   clist,
@@ -67,9 +66,9 @@ function makeRO(eff = flatRedEffect()): RenderObject {
   return {
     effect: eff,
     pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-    vertexAttributes: AVal.constant(HashMap.empty<string, aval<BufferView>>().add("position", cval<BufferView>({
+    vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", cval<BufferView>({
       buffer: IBuffer.fromHost(new ArrayBuffer(36)), offset: 0, count: 3, stride: 12, format: "float32x3",
-    }))),
+    })),
     uniforms: HashMap.empty(),
     textures: HashMap.empty(),
     samplers: HashMap.empty(),

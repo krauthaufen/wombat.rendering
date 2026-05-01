@@ -23,7 +23,6 @@ import {
   type AdaptiveToken,
   type aval,
   HashMap,
-  AVal,
   cval,
 } from "@aardworx/wombat.adaptive";
 import type { BufferView } from "../core/bufferView.js";
@@ -375,7 +374,6 @@ export class PreparedRenderObject {
     private readonly drawCall: aval<import("../core/index.js").DrawCall>,
     pipelineCtx: PipelineBuildContext,
     pipelineState: import("../core/index.js").PipelineState,
-    private readonly validity: aval<boolean>,
   ) {
     this.groups = groups;
     this._pipelineCtx = pipelineCtx;
@@ -406,10 +404,6 @@ export class PreparedRenderObject {
    * surrounding sort / record path can read it without forcing.
    */
   update(token: AdaptiveToken): void {
-    // Pull validity into the upstream walker's dependency set so a
-    // key-set change on the reactive vertex-attribute aval propagates
-    // even when the shape happens not to influence the pipeline cache.
-    this.validity.getValue(token);
     const snap = snapshotPipeline(this._pipelineState, token);
     const key = pipelineKeyOf(snap);
     let pipeline = this._pipelineCache.get(key);
@@ -420,20 +414,7 @@ export class PreparedRenderObject {
     this.pipeline = pipeline;
   }
 
-  private _warnedMissing = false;
-
   record(pass: GPURenderPassEncoder, token: AdaptiveToken): void {
-    // Validity gate: when the reactive attribute set fails to cover
-    // the shader's required-input names, warn-once and skip the draw.
-    // Reading validity here keeps the dependency on the outer attr
-    // avals chained into the consumer's tracking.
-    if (!this.validity.getValue(token)) {
-      if (!this._warnedMissing) {
-        console.warn("[wombat.rendering] PreparedRenderObject.record: vertex-attribute set is missing one or more shader-required names; skipping draw.");
-        this._warnedMissing = true;
-      }
-      return;
-    }
     // Resolve current pipeline. If `update` was already called by the
     // walker this is a no-op cache hit; otherwise we still pick the
     // right pipeline for the token-evaluated values.
@@ -536,47 +517,28 @@ export function prepareRenderObject(
   const iface = effect.interface;
   const vertexBindings = vertexBindingsFor(iface);
 
-  // Construction-boundary read of the outer attribute avals. We use
-  // these initial maps ONLY to determine per-binding step-mode
-  // (vertex vs instance) — that is structural and baked into the
-  // GPU pipeline's vertex-buffer layout, so it cannot be reactive
-  // without re-preparation. The buffers themselves AND the rest of
-  // the map (its key set) remain fully reactive on the live path.
-  const vertexAttributesAval = obj.vertexAttributes;
-  const instanceAttributesAval = obj.instanceAttributes
-    ?? (AVal.constant(emptyAttrMap()) as aval<HashMap<string, aval<BufferView>>>);
-  const initialVertex = vertexAttributesAval.force();
-  const initialInstance = obj.instanceAttributes !== undefined
-    ? obj.instanceAttributes.force()
-    : emptyAttrMap();
+  // The set of attribute names is fixed structurally; only the
+  // per-attribute BufferView avals are reactive. We resolve names →
+  // step-mode now (vertex vs instance) from the maps directly.
+  const vertexMap = obj.vertexAttributes;
+  const instanceMap = obj.instanceAttributes ?? emptyAttrMap();
 
   const vertexBuffers = new Map<string, AdaptiveResource<GPUBuffer>>();
   const vertexLayouts: GPUVertexBufferLayout[] = [];
   for (const vb of vertexBindings) {
-    const inVertex = initialVertex.tryFind(vb.name) !== undefined;
-    const inInstance = initialInstance.tryFind(vb.name) !== undefined;
-    if (!inVertex && !inInstance) {
+    const fromVertex = vertexMap.tryFind(vb.name);
+    const fromInstance = instanceMap.tryFind(vb.name);
+    if (fromVertex === undefined && fromInstance === undefined) {
       throw new Error(`prepareRenderObject: missing vertex attribute "${vb.name}"`);
     }
-    const stepMode: GPUVertexStepMode = inInstance && !inVertex ? "instance" : "vertex";
+    const isInstance = fromVertex === undefined && fromInstance !== undefined;
+    const stepMode: GPUVertexStepMode = isInstance ? "instance" : "vertex";
     const stride = vb.byteSize !== undefined && vb.byteSize > 0
       ? vb.byteSize
       : vertexFormatStride(vb.format);
 
-    // Reactive lookup: chain (outer map aval) → (inner BufferView aval)
-    // → buffer. AVal.bind preserves the dependency on the outer map
-    // so a key-set change re-runs the lookup without losing tracking.
-    // Missing-name on a frame is signalled via a sentinel that record()
-    // detects and skips the draw with a warn-once.
-    const bufAval = AVal.bind(vertexAttributesAval, vMap => {
-      const found = vMap.tryFind(vb.name);
-      if (found !== undefined) return found.map(view => view.buffer);
-      return AVal.bind(instanceAttributesAval, iMap => {
-        const f2 = iMap.tryFind(vb.name);
-        if (f2 !== undefined) return f2.map(view => view.buffer);
-        return AVal.constant(MISSING_BUFFER);
-      });
-    });
+    const viewAval = (fromVertex ?? fromInstance)!;
+    const bufAval = viewAval.map(view => view.buffer);
     const res = prepareAdaptiveBuffer(device, bufAval, {
       usage: BufferUsage.VERTEX,
       ...(opts.label !== undefined ? { label: `${opts.label}.${vb.name}` } : {}),
@@ -588,19 +550,6 @@ export function prepareRenderObject(
       attributes: [{ shaderLocation: vb.slot, offset: 0, format: vb.format }],
     };
   }
-
-  // Validity aval: depends on the outer attribute avals so any key-set
-  // change re-runs the check. Used by record() to skip draws when the
-  // shader's required-input set isn't satisfied (warn-once).
-  const requiredNames = vertexBindings.map(b => b.name);
-  const validityAval: aval<boolean> = AVal.zip(vertexAttributesAval, instanceAttributesAval).map(
-    (vMap, iMap) => {
-      for (const n of requiredNames) {
-        if (vMap.tryFind(n) === undefined && iMap.tryFind(n) === undefined) return false;
-      }
-      return true;
-    },
-  );
 
   // Index buffer — `indexFormat` from BufferView wins; defaults to uint32.
   let indexBuffer: AdaptiveResource<GPUBuffer> | undefined;
@@ -703,22 +652,8 @@ export function prepareRenderObject(
     obj.drawCall,
     pipelineCtx,
     obj.pipelineState,
-    validityAval,
   );
 }
-
-/**
- * Sentinel host-buffer returned by the per-attribute lookup aval when
- * the named attribute is absent from a frame's outer attribute map.
- * The PreparedRO's validity aval flips false in the same situation;
- * record() observes the validity flip and skips the draw before any
- * sentinel buffer is ever bound.
- */
-const MISSING_BUFFER: import("../core/index.js").IBuffer = {
-  kind: "host",
-  data: new Uint8Array(4),
-  sizeBytes: 4,
-};
 
 function emptyAttrMap(): HashMap<string, aval<BufferView>> {
   return HashMap.empty<string, aval<BufferView>>();

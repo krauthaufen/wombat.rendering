@@ -41,14 +41,13 @@ export interface RenderObject {
   /**
    * name → vertex buffer view; e.g. "position", "normal", "uv".
    *
-   * Reactive: the whole map (set of names AND values) is an aval.
-   * The buffers AND the set of attribute names are allowed to change
-   * over time. The shader's required-input set is fixed at compile;
-   * a frame's map must contain at least those names.
+   * The set of attribute names is fixed structurally; only the
+   * individual buffer values are reactive. The shader's required-input
+   * set is fixed at compile; the map must contain at least those names.
    */
-  readonly vertexAttributes: aval<HashMap<string, aval<BufferView>>>;
-  /** name → instance buffer view; e.g. "modelMatrix", "instanceColor". Reactive set. */
-  readonly instanceAttributes?: aval<HashMap<string, aval<BufferView>>>;
+  readonly vertexAttributes: HashMap<string, aval<BufferView>>;
+  /** name → instance buffer view; e.g. "modelMatrix", "instanceColor". */
+  readonly instanceAttributes?: HashMap<string, aval<BufferView>>;
   /** name → uniform value; runtime packs into UBO based on shader layout. */
   readonly uniforms: HashMap<string, aval<unknown>>;
   /** name → texture source (CPU image or pre-built GPUTexture). */

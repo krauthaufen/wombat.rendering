@@ -3,7 +3,7 @@
 // trivial AdaptiveResource. No GPU work — these run under Node.
 
 import { describe, expect, it } from "vitest";
-import { AdaptiveToken, AVal, HashMap, cval, transact } from "@aardworx/wombat.adaptive";
+import { AdaptiveToken, HashMap, cval, transact } from "@aardworx/wombat.adaptive";
 import { V2fArray, V4f } from "@aardworx/wombat.base";
 import {
   AdaptiveResource,
@@ -79,13 +79,13 @@ describe("core types", () => {
       pipelineState: PipelineState.constant({
         rasterizer: { topology: "triangle-list", cullMode: "back", frontFace: "ccw" },
       }),
-      vertexAttributes: AVal.constant(HashMap.empty()),
+      vertexAttributes: HashMap.empty(),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),
       drawCall: cval({ kind: "non-indexed" as const, vertexCount: 3, instanceCount: 1, firstVertex: 0, firstInstance: 0 }),
     };
-    expect(ro.vertexAttributes.force().count).toBe(0);
+    expect(ro.vertexAttributes.count).toBe(0);
   });
 });
 

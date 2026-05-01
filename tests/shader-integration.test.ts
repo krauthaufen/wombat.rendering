@@ -9,8 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   AList,
   AdaptiveToken,
-  AVal,
-  HashMap,
+    HashMap,
   cval,
   type aval,
 } from "@aardworx/wombat.adaptive";
@@ -93,9 +92,9 @@ describe("shader integration: invariants", () => {
     const obj: RenderObject = {
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-      vertexAttributes: AVal.constant(HashMap.empty<string, aval<BufferView>>()
+      vertexAttributes: HashMap.empty<string, aval<BufferView>>()
         .add("a_position", bv("float32x2"))
-        .add("a_color",    bv("float32x3"))),
+        .add("a_color",    bv("float32x3")),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),
@@ -127,9 +126,9 @@ describe("shader integration: invariants", () => {
     const mk = (): RenderObject => ({
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-      vertexAttributes: AVal.constant(HashMap.empty<string, aval<BufferView>>()
+      vertexAttributes: HashMap.empty<string, aval<BufferView>>()
         .add("a_position", bv("float32x2"))
-        .add("a_color",    bv("float32x3"))),
+        .add("a_color",    bv("float32x3")),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),

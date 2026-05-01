@@ -54,17 +54,12 @@ describe("no .force() on the render path", () => {
     const file = readFileSync(resolve(srcRoot, "resources", "preparedRenderObject.ts"), "utf8");
     const matches = [...file.matchAll(/\.force\(/g)];
     // Construction-boundary forces, all at prepare-time:
-    //   - `vertexAttributesAval.force()` — initial map snapshot used to
-    //     decide per-binding step-mode (vertex vs instance) for the
-    //     pipeline's vertex layout.
-    //   - `obj.instanceAttributes.force()` — same, for the instance map.
     //   - `obj.indices.force()` — index-format discovery from the
     //     initial BufferView.
-    // None of these run on the live render path; per-frame reads use
-    // `getValue(token)` and chain dependencies through aval.bind / map.
-    expect(matches.length).toBe(3);
-    expect(file).toMatch(/vertexAttributesAval\.force\(\)/);
-    expect(file).toMatch(/obj\.instanceAttributes\.force\(\)/);
+    // The vertex/instance attribute maps are no longer aval-wrapped
+    // at the outer level (the set of names is structural), so no
+    // force is needed to read them.
+    expect(matches.length).toBe(1);
     expect(file).toMatch(/obj\.indices\.force\(\)/);
   });
 });
