@@ -4,7 +4,7 @@
 // tests-browser/render-real.test.ts.
 
 import { describe, expect, it } from "vitest";
-import { AdaptiveToken, HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
+import { AdaptiveToken, AVal, HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
 import {
   IBuffer,
@@ -70,9 +70,9 @@ describe("prepareRenderObject", () => {
     const make = () => prepareRenderObject(gpu.device, {
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-      vertexAttributes: HashMap.empty<string, aval<BufferView>>()
+      vertexAttributes: AVal.constant(HashMap.empty<string, aval<BufferView>>()
         .add("position", bv(36, "float32x3", 3))
-        .add("normal",   bv(36, "float32x3", 3)),
+        .add("normal",   bv(36, "float32x3", 3))),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),

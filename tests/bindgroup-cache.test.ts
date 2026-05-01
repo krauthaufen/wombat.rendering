@@ -3,7 +3,7 @@
 // fresh createBindGroup.
 
 import { describe, expect, it } from "vitest";
-import { AList, AdaptiveToken, HashMap, cval, transact, type aval } from "@aardworx/wombat.adaptive";
+import { AList, AdaptiveToken, AVal, HashMap, cval, transact, type aval } from "@aardworx/wombat.adaptive";
 import { V4f } from "@aardworx/wombat.base";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
 import {
@@ -49,9 +49,9 @@ describe("bind-group cache", () => {
     const obj: RenderObject = {
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-      vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", cval<BufferView>({
+      vertexAttributes: AVal.constant(HashMap.empty<string, aval<BufferView>>().add("position", cval<BufferView>({
         buffer: IBuffer.fromHost(new ArrayBuffer(36)), offset: 0, count: 3, stride: 12, format: "float32x3",
-      })),
+      }))),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),
@@ -107,7 +107,7 @@ describe("bind-group cache", () => {
     const obj: RenderObject = {
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-      vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", posView),
+      vertexAttributes: AVal.constant(HashMap.empty<string, aval<BufferView>>().add("position", posView)),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),

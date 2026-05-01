@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import {
   AList,
   AdaptiveToken,
+  AVal,
   HashMap,
   cval,
   type aval,
@@ -74,7 +75,7 @@ function obj() {
   return {
     effect: singleAttribEffect(),
     pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list" as const, cullMode: "none" as const, frontFace: "ccw" as const } }),
-    vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv()),
+    vertexAttributes: AVal.constant(HashMap.empty<string, aval<BufferView>>().add("position", bv())),
     uniforms: HashMap.empty(),
     textures: HashMap.empty(),
     samplers: HashMap.empty(),

@@ -50,11 +50,21 @@ describe("no .force() on the render path", () => {
     expect(offenders, `unexpected .force() call sites:\n${offenders.join("\n")}`).toEqual([]);
   });
 
-  it("preparedRenderObject only forces the index BufferView once for indexFormat", () => {
+  it("preparedRenderObject only forces at construction-boundary spots", () => {
     const file = readFileSync(resolve(srcRoot, "resources", "preparedRenderObject.ts"), "utf8");
     const matches = [...file.matchAll(/\.force\(/g)];
-    // Exactly one occurrence — `obj.indices.force()` for index format.
-    expect(matches.length).toBe(1);
+    // Construction-boundary forces, all at prepare-time:
+    //   - `vertexAttributesAval.force()` — initial map snapshot used to
+    //     decide per-binding step-mode (vertex vs instance) for the
+    //     pipeline's vertex layout.
+    //   - `obj.instanceAttributes.force()` — same, for the instance map.
+    //   - `obj.indices.force()` — index-format discovery from the
+    //     initial BufferView.
+    // None of these run on the live render path; per-frame reads use
+    // `getValue(token)` and chain dependencies through aval.bind / map.
+    expect(matches.length).toBe(3);
+    expect(file).toMatch(/vertexAttributesAval\.force\(\)/);
+    expect(file).toMatch(/obj\.instanceAttributes\.force\(\)/);
     expect(file).toMatch(/obj\.indices\.force\(\)/);
   });
 });
