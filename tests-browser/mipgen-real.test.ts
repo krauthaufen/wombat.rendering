@@ -4,7 +4,7 @@
 // verify the 2× downsample produces the expected averages.
 
 import { describe, expect, it } from "vitest";
-import { generateMips } from "@aardworx/wombat.rendering-resources";
+import { generateMips } from "@aardworx/wombat.rendering/resources";
 import { requestRealDevice } from "./_realGpu.js";
 
 async function readMip(device: GPUDevice, tex: GPUTexture, mip: number): Promise<Uint8Array> {

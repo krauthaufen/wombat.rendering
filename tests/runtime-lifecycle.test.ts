@@ -4,8 +4,8 @@
 
 import { describe, expect, it } from "vitest";
 import { AList } from "@aardworx/wombat.adaptive";
-import type { Command } from "@aardworx/wombat.rendering-core";
-import { Runtime } from "@aardworx/wombat.rendering-runtime";
+import type { Command } from "@aardworx/wombat.rendering/core";
+import { Runtime } from "@aardworx/wombat.rendering/runtime";
 import { MockGPU } from "./_mockGpu.js";
 
 describe("Runtime lifecycle", () => {

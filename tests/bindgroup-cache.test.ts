@@ -13,9 +13,9 @@ import {
   type Command,
   type DrawCall,
   type RenderObject,
-} from "@aardworx/wombat.rendering-core";
-import { allocateFramebuffer, createFramebufferSignature } from "@aardworx/wombat.rendering-resources";
-import { Runtime } from "@aardworx/wombat.rendering-runtime";
+} from "@aardworx/wombat.rendering/core";
+import { allocateFramebuffer, createFramebufferSignature } from "@aardworx/wombat.rendering/resources";
+import { Runtime } from "@aardworx/wombat.rendering/runtime";
 import { makeEffect } from "./_makeEffect.js";
 import { MockGPU } from "./_mockGpu.js";
 

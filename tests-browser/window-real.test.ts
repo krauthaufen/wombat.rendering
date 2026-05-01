@@ -6,9 +6,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AList, AdaptiveToken, HashMap, cval, transact } from "@aardworx/wombat.adaptive";
 import { V4f } from "@aardworx/wombat.base";
-import type { ClearValues, Command } from "@aardworx/wombat.rendering-core";
-import { Runtime } from "@aardworx/wombat.rendering-runtime";
-import { attachCanvas, runFrame } from "@aardworx/wombat.rendering-window";
+import type { ClearValues, Command } from "@aardworx/wombat.rendering/core";
+import { Runtime } from "@aardworx/wombat.rendering/runtime";
+import { attachCanvas, runFrame } from "@aardworx/wombat.rendering/window";
 import { requestRealDevice } from "./_realGpu.js";
 
 let device!: GPUDevice;

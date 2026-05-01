@@ -1,5 +1,5 @@
 {
-  "name": "@aardworx/wombat.rendering-example-hello-triangle",
+  "name": "wombat.rendering-example-hello-triangle",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,12 +10,9 @@
   "dependencies": {
     "@aardworx/wombat.adaptive": "^0.2.1",
     "@aardworx/wombat.base": "^0.3.0",
-    "@aardworx/wombat.rendering-core": "*",
-    "@aardworx/wombat.rendering-resources": "*",
-    "@aardworx/wombat.rendering-runtime": "*",
-    "@aardworx/wombat.rendering-window": "*",
-    "@aardworx/wombat.shader-vite": "^0.2.0",
-    "@aardworx/wombat.shader": "*"
+    "@aardworx/wombat.rendering": "*",
+    "@aardworx/wombat.shader": "*",
+    "@aardworx/wombat.shader-vite": "^0.2.1"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.69",

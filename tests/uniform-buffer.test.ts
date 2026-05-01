@@ -3,8 +3,8 @@
 import { describe, expect, it } from "vitest";
 import { AdaptiveToken, HashMap, cval, transact, type aval } from "@aardworx/wombat.adaptive";
 import { V4f, M44f } from "@aardworx/wombat.base";
-import { prepareUniformBuffer } from "@aardworx/wombat.rendering-resources";
-import type { UniformBlockInfo } from "@aardworx/wombat.rendering-core";
+import { prepareUniformBuffer } from "@aardworx/wombat.rendering/resources";
+import type { UniformBlockInfo } from "@aardworx/wombat.rendering/core";
 import type { Type } from "@aardworx/wombat.shader/ir";
 import { MockGPU } from "./_mockGpu.js";
 

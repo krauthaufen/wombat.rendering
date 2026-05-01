@@ -3,8 +3,8 @@
 
 import { describe, expect, it } from "vitest";
 import { AList, AdaptiveToken } from "@aardworx/wombat.adaptive";
-import type { Command } from "@aardworx/wombat.rendering-core";
-import { Runtime } from "@aardworx/wombat.rendering-runtime";
+import type { Command } from "@aardworx/wombat.rendering/core";
+import { Runtime } from "@aardworx/wombat.rendering/runtime";
 import { requestRealDevice } from "./_realGpu.js";
 
 describe("runtime — Custom and Copy on real GPU", () => {

@@ -7,7 +7,7 @@ import {
   allocateFramebuffer,
   createFramebufferSignature,
   type FramebufferSize,
-} from "@aardworx/wombat.rendering-resources";
+} from "@aardworx/wombat.rendering/resources";
 import { MockGPU } from "./_mockGpu.js";
 
 describe("createFramebufferSignature", () => {

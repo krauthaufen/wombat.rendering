@@ -16,7 +16,7 @@ import {
 import {
   prepareComputeShader,
   type DispatchSize,
-} from "@aardworx/wombat.rendering-resources";
+} from "@aardworx/wombat.rendering/resources";
 import { requestRealDevice } from "./_realGpu.js";
 
 const SIZE = 64;

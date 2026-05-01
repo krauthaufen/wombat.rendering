@@ -8,13 +8,13 @@
 import { describe, expect, it } from "vitest";
 import { AList, AdaptiveToken, HashMap, cval } from "@aardworx/wombat.adaptive";
 import { V4f } from "@aardworx/wombat.base";
-import type { ClearValues, Command } from "@aardworx/wombat.rendering-core";
+import type { ClearValues, Command } from "@aardworx/wombat.rendering/core";
 import {
   allocateFramebuffer,
   createFramebufferSignature,
   TextureUsage,
-} from "@aardworx/wombat.rendering-resources";
-import { Runtime } from "@aardworx/wombat.rendering-runtime";
+} from "@aardworx/wombat.rendering/resources";
+import { Runtime } from "@aardworx/wombat.rendering/runtime";
 import { readTexturePixels, requestRealDevice } from "./_realGpu.js";
 
 describe("clear pass — real GPU", () => {

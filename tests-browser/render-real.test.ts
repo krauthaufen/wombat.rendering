@@ -17,14 +17,14 @@ import {
   type Command,
   type DrawCall,
   type RenderObject,
-} from "@aardworx/wombat.rendering-core";
+} from "@aardworx/wombat.rendering/core";
 import {
   allocateFramebuffer,
   BufferUsage,
   createFramebufferSignature,
   TextureUsage,
-} from "@aardworx/wombat.rendering-resources";
-import { Runtime } from "@aardworx/wombat.rendering-runtime";
+} from "@aardworx/wombat.rendering/resources";
+import { Runtime } from "@aardworx/wombat.rendering/runtime";
 import { readTexturePixels, requestRealDevice } from "./_realGpu.js";
 
 const Tvec2f: Type = Vec(Tf32, 2);

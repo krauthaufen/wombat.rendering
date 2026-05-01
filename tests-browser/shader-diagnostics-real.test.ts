@@ -3,7 +3,7 @@
 // and confirm we capture the compilation messages.
 
 import { describe, expect, it } from "vitest";
-import { installShaderDiagnostics } from "@aardworx/wombat.rendering-resources";
+import { installShaderDiagnostics } from "@aardworx/wombat.rendering/resources";
 import { requestRealDevice } from "./_realGpu.js";
 
 describe("shader diagnostics — real GPU", () => {

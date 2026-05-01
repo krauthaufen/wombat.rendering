@@ -6,7 +6,7 @@
 
 import { describe, it, expect } from "vitest";
 import { buildSourceMap, type Span } from "@aardworx/wombat.shader/ir";
-import { decodeLine, decodePosition } from "../packages/resources/src/sourceMapDecoder.js";
+import { decodeLine, decodePosition } from "@aardworx/wombat.rendering/resources";
 
 const fileA = "a.ts";
 const fileB = "b.ts";

@@ -10,11 +10,11 @@ import {
   IBuffer,
   type BufferView,
   type DrawCall,
-} from "@aardworx/wombat.rendering-core";
+} from "@aardworx/wombat.rendering/core";
 import {
   createFramebufferSignature,
   prepareRenderObject,
-} from "@aardworx/wombat.rendering-resources";
+} from "@aardworx/wombat.rendering/resources";
 import { makeEffect } from "./_makeEffect.js";
 import { MockGPU } from "./_mockGpu.js";
 

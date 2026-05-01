@@ -25,9 +25,9 @@ import {
   type Command,
   type DrawCall,
   type RenderObject,
-} from "@aardworx/wombat.rendering-core";
-import { Runtime } from "@aardworx/wombat.rendering-runtime";
-import { attachCanvas, runFrame } from "@aardworx/wombat.rendering-window";
+} from "@aardworx/wombat.rendering/core";
+import { Runtime } from "@aardworx/wombat.rendering/runtime";
+import { attachCanvas, runFrame } from "@aardworx/wombat.rendering/window";
 
 // The Vite plugin uses the TS type-checker to recover types — any
 // of these compose:

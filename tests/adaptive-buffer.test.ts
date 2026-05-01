@@ -4,8 +4,8 @@
 import { describe, expect, it } from "vitest";
 import { AdaptiveToken, cval, transact } from "@aardworx/wombat.adaptive";
 import { V2fArray } from "@aardworx/wombat.base";
-import { IBuffer } from "@aardworx/wombat.rendering-core";
-import { prepareAdaptiveBuffer } from "@aardworx/wombat.rendering-resources";
+import { IBuffer } from "@aardworx/wombat.rendering/core";
+import { prepareAdaptiveBuffer } from "@aardworx/wombat.rendering/resources";
 import { MockGPU, type MockBuffer } from "./_mockGpu.js";
 
 const VERTEX_USAGE = 0x20; // GPUBufferUsage.VERTEX

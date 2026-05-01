@@ -3,8 +3,8 @@
 
 import { describe, expect, it } from "vitest";
 import { AdaptiveToken, cval, transact } from "@aardworx/wombat.adaptive";
-import { ITexture } from "@aardworx/wombat.rendering-core";
-import { prepareAdaptiveTexture } from "@aardworx/wombat.rendering-resources";
+import { ITexture } from "@aardworx/wombat.rendering/core";
+import { prepareAdaptiveTexture } from "@aardworx/wombat.rendering/resources";
 import { MockGPU, type MockTexture } from "./_mockGpu.js";
 
 function asMock(t: GPUTexture): MockTexture {

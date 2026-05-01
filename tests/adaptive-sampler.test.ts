@@ -2,8 +2,8 @@
 
 import { describe, expect, it } from "vitest";
 import { AdaptiveToken, cval, transact } from "@aardworx/wombat.adaptive";
-import { ISampler } from "@aardworx/wombat.rendering-core";
-import { prepareAdaptiveSampler } from "@aardworx/wombat.rendering-resources";
+import { ISampler } from "@aardworx/wombat.rendering/core";
+import { prepareAdaptiveSampler } from "@aardworx/wombat.rendering/resources";
 import { MockGPU } from "./_mockGpu.js";
 
 describe("prepareAdaptiveSampler", () => {

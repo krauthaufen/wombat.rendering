@@ -16,7 +16,7 @@ import {
   type FramebufferSignature,
   type IFramebuffer,
   type RenderObject,
-} from "@aardworx/wombat.rendering-core";
+} from "@aardworx/wombat.rendering/core";
 
 const sig: FramebufferSignature = {
   colors: HashMap.empty<string, GPUTextureFormat>().add("albedo", "rgba8unorm"),
