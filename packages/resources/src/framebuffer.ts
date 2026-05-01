@@ -31,6 +31,7 @@ export interface AllocateFramebufferOptions {
 
 class AdaptiveFramebuffer extends AdaptiveResource<IFramebuffer> {
   private _ownedColors = new Map<string, GPUTexture>();
+  private _ownedResolves = new Map<string, GPUTexture>();
   private _ownedDepth: GPUTexture | undefined;
   private _lastSize: FramebufferSize | undefined;
 
@@ -48,6 +49,8 @@ class AdaptiveFramebuffer extends AdaptiveResource<IFramebuffer> {
   protected destroy(): void {
     for (const t of this._ownedColors.values()) t.destroy();
     this._ownedColors.clear();
+    for (const t of this._ownedResolves.values()) t.destroy();
+    this._ownedResolves.clear();
     if (this._ownedDepth !== undefined) {
       this._ownedDepth.destroy();
       this._ownedDepth = undefined;
@@ -65,16 +68,28 @@ class AdaptiveFramebuffer extends AdaptiveResource<IFramebuffer> {
       this.reallocate(size);
       this._lastSize = size;
     }
+    const msaa = this.signature.sampleCount > 1;
     let colorViews = HashMap.empty<string, GPUTextureView>();
     let colorTextures = HashMap.empty<string, GPUTexture>();
+    let resolveViews = HashMap.empty<string, GPUTextureView>();
     for (const [name, tex] of this._ownedColors.entries()) {
       colorViews = colorViews.add(name, tex.createView());
-      colorTextures = colorTextures.add(name, tex);
+      if (msaa) {
+        const resolve = this._ownedResolves.get(name);
+        if (resolve === undefined) {
+          throw new Error(`framebuffer: missing resolve target for "${name}"`);
+        }
+        resolveViews = resolveViews.add(name, resolve.createView());
+        colorTextures = colorTextures.add(name, resolve);
+      } else {
+        colorTextures = colorTextures.add(name, tex);
+      }
     }
     return {
       signature: this.signature,
       colors: colorViews,
       colorTextures,
+      ...(msaa ? { resolveColors: resolveViews } : {}),
       ...(this._ownedDepth ? { depthStencil: this._ownedDepth.createView(), depthStencilTexture: this._ownedDepth } : {}),
       width: size.width,
       height: size.height,
@@ -85,25 +100,46 @@ class AdaptiveFramebuffer extends AdaptiveResource<IFramebuffer> {
     // Destroy old.
     for (const t of this._ownedColors.values()) t.destroy();
     this._ownedColors.clear();
+    for (const t of this._ownedResolves.values()) t.destroy();
+    this._ownedResolves.clear();
     if (this._ownedDepth !== undefined) {
       this._ownedDepth.destroy();
       this._ownedDepth = undefined;
     }
-    const usage = TextureUsage.RENDER_ATTACHMENT
+    const sampleCount = this.signature.sampleCount;
+    const msaa = sampleCount > 1;
+    // Multisample textures are not directly sampleable; they only
+    // serve as render attachments, with a separate single-sample
+    // resolve target carrying TEXTURE_BINDING.
+    const colorUsage = msaa
+      ? TextureUsage.RENDER_ATTACHMENT
+      : TextureUsage.RENDER_ATTACHMENT
+        | TextureUsage.TEXTURE_BINDING
+        | (this.opts.extraUsage ?? 0);
+    const resolveUsage = TextureUsage.RENDER_ATTACHMENT
       | TextureUsage.TEXTURE_BINDING
       | (this.opts.extraUsage ?? 0);
-    const sampleCount = this.signature.sampleCount;
     const labelPrefix = this.opts.labelPrefix ?? "fbo";
 
     for (const [name, format] of this.signature.colors) {
       const tex = this.device.createTexture({
         size: { width: size.width, height: size.height, depthOrArrayLayers: 1 },
         format,
-        usage,
+        usage: colorUsage,
         sampleCount,
-        label: `${labelPrefix}.${name}`,
+        label: msaa ? `${labelPrefix}.${name}.msaa` : `${labelPrefix}.${name}`,
       });
       this._ownedColors.set(name, tex);
+      if (msaa) {
+        const resolve = this.device.createTexture({
+          size: { width: size.width, height: size.height, depthOrArrayLayers: 1 },
+          format,
+          usage: resolveUsage,
+          sampleCount: 1,
+          label: `${labelPrefix}.${name}.resolve`,
+        });
+        this._ownedResolves.set(name, resolve);
+      }
     }
     if (this.signature.depthStencil !== undefined) {
       this._ownedDepth = this.device.createTexture({

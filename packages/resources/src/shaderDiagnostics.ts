@@ -2,15 +2,11 @@
 // is synchronous and never throws on parse errors; the errors
 // surface only via `module.getCompilationInfo()`, which is async.
 // We fire-and-forget that call after creation and log structured
-// messages — including a hint at the originating source map — to
-// the console.
-//
-// A perfect line-by-line mapping from WGSL → TS would require a
-// full v3 source-map decoder. For now we just surface the source
-// map's `sources[]` (the user files involved) and leave the
-// per-line lookup to browser dev-tools / external tooling.
+// messages including the originating TS source location decoded
+// from the supplied source map.
 
 import type { SourceMap } from "@aardworx/wombat.shader-ir";
+import { decodeLine } from "./sourceMapDecoder.js";
 
 export interface ShaderDiagnosticsOptions {
   /** Human-friendly tag prefixed to log messages. */
@@ -35,15 +31,18 @@ export function installShaderDiagnostics(
 
   info.call(module).then((compInfo) => {
     if (compInfo.messages.length === 0) return;
-    const sources = opts.sourceMap?.sources ?? [];
-    const sourcesNote = sources.length > 0
-      ? `(originated in ${sources.join(", ")})`
-      : "";
+    const map = opts.sourceMap ?? null;
     for (const m of compInfo.messages) {
       const lineText = source.split("\n")[Math.max(0, m.lineNum - 1)] ?? "";
       const head = `[${tag}] ${m.type} ${m.lineNum}:${m.linePos}: ${m.message}`;
       const body = lineText.length > 0 ? `\n  ${lineText.trim()}` : "";
-      const line = `${head}${body}${sourcesNote ? "\n  " + sourcesNote : ""}`;
+      const decoded = map ? decodeLine(map, m.lineNum) : null;
+      const origin = decoded
+        ? `\n  → ${decoded.file}:${decoded.line}:${decoded.column}`
+        : (map && map.sources.length > 0
+          ? `\n  (originated in ${map.sources.join(", ")})`
+          : "");
+      const line = `${head}${body}${origin}`;
       if (m.type === "error") log.error(line);
       else log.warn(line);
     }

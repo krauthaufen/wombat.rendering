@@ -58,6 +58,30 @@ describe("allocateFramebuffer", () => {
     fbo.release();
   });
 
+  it("MSAA: allocates msaa color + single-sample resolve target, exposes resolve as colorTextures", () => {
+    const gpu = new MockGPU();
+    const sig = createFramebufferSignature({
+      colors: { c: "rgba8unorm" },
+      depthStencil: { format: "depth24plus" },
+      sampleCount: 4,
+    });
+    const size = cval<FramebufferSize>({ width: 8, height: 8 });
+    const fbo = allocateFramebuffer(gpu.device, sig, size, { labelPrefix: "msaa" });
+    fbo.acquire();
+    const ifb = fbo.getValue(AdaptiveToken.top);
+    // 1 msaa color + 1 resolve + 1 msaa depth = 3 textures.
+    expect(gpu.textures).toHaveLength(3);
+    const msaaColor = gpu.textures.find(t => t.descriptor.label === "msaa.c.msaa");
+    const resolve = gpu.textures.find(t => t.descriptor.label === "msaa.c.resolve");
+    expect(msaaColor?.descriptor.sampleCount).toBe(4);
+    expect(resolve?.descriptor.sampleCount).toBe(1);
+    // colorTextures (the sampleable side) points at the resolve target.
+    expect(ifb.colorTextures?.tryFind("c")).toBe(resolve);
+    // resolveColors is populated for MSAA framebuffers.
+    expect(ifb.resolveColors?.tryFind("c")).toBeDefined();
+    fbo.release();
+  });
+
   it("same-size update does not reallocate", () => {
     const gpu = new MockGPU();
     const sig = createFramebufferSignature({ colors: { c: "rgba8unorm" } });

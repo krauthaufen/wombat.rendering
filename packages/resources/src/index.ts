@@ -39,6 +39,11 @@ export {
 } from "./shaderDiagnostics.js";
 
 export {
+  decodeLine,
+  type DecodedPosition,
+} from "./sourceMapDecoder.js";
+
+export {
   generateMips,
   type GenerateMipsOptions,
 } from "./mipGen.js";
@@ -48,6 +53,14 @@ export {
   PreparedRenderObject,
   type PrepareRenderObjectOptions,
 } from "./preparedRenderObject.js";
+
+export {
+  prepareComputeShader,
+  PreparedComputeShader,
+  ComputeInputBinding,
+  type PrepareComputeShaderOptions,
+  type DispatchSize,
+} from "./preparedComputeShader.js";
 
 export {
   createFramebufferSignature,

@@ -32,11 +32,21 @@ import {
 } from "@aardworx/wombat.adaptive";
 import { BufferUsage } from "./webgpuFlags.js";
 
-interface PackedView {
+export interface PackedView {
   readonly bytes: ArrayBuffer;
   readonly f32: Float32Array;
   readonly i32: Int32Array;
   readonly u32: Uint32Array;
+}
+
+export function makePackedView(byteSize: number): PackedView {
+  const bytes = new ArrayBuffer(roundUp4(byteSize));
+  return {
+    bytes,
+    f32: new Float32Array(bytes),
+    i32: new Int32Array(bytes),
+    u32: new Uint32Array(bytes),
+  };
 }
 
 class UniformBufferResource extends AdaptiveResource<GPUBuffer> {
@@ -98,7 +108,7 @@ class UniformBufferResource extends AdaptiveResource<GPUBuffer> {
   }
 }
 
-function writeField(view: PackedView, offset: number, value: unknown): void {
+export function writeField(view: PackedView, offset: number, value: unknown): void {
   if (typeof value === "number") {
     view.f32[offset >> 2] = value;
     return;

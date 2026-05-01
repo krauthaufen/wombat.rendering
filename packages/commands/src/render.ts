@@ -26,20 +26,29 @@ export interface Recordable {
  */
 export function beginPassDescriptor(output: IFramebuffer, clear?: ClearValues): GPURenderPassDescriptor {
   const colorAttachments: GPURenderPassColorAttachment[] = [];
+  const msaa = output.signature.sampleCount > 1;
   for (const [name] of output.signature.colors) {
     const view = output.colors.tryFind(name);
     if (view === undefined) {
       throw new Error(`render: framebuffer is missing color attachment "${name}"`);
+    }
+    const resolveTarget = msaa ? output.resolveColors?.tryFind(name) : undefined;
+    if (msaa && resolveTarget === undefined) {
+      throw new Error(`render: MSAA framebuffer is missing resolve target for "${name}"`);
     }
     const cv = clear?.colors?.tryFind(name);
     if (cv !== undefined) {
       const d = cv as unknown as { _data: ArrayLike<number> };
       colorAttachments.push({
         view, loadOp: "clear", storeOp: "store",
+        ...(resolveTarget !== undefined ? { resolveTarget } : {}),
         clearValue: { r: d._data[0]!, g: d._data[1]!, b: d._data[2]!, a: d._data[3]! },
       });
     } else {
-      colorAttachments.push({ view, loadOp: "load", storeOp: "store" });
+      colorAttachments.push({
+        view, loadOp: "load", storeOp: "store",
+        ...(resolveTarget !== undefined ? { resolveTarget } : {}),
+      });
     }
   }
   let depthStencilAttachment: GPURenderPassDepthStencilAttachment | undefined;

@@ -21,16 +21,12 @@ describe("Runtime lifecycle", () => {
     expect(() => runtime.compile(AList.empty<Command>())).toThrow(/disposeAll/);
   });
 
-  it("device.lost handler fires disposeAll on real WebGPU lost-promise", async () => {
-    let lostResolve: (info: GPUDeviceLostInfo) => void = () => {};
-    const lost = new Promise<GPUDeviceLostInfo>((r) => { lostResolve = r; });
+  it("device.lost handler fires disposeAll on lost-promise resolution", async () => {
     const gpu = new MockGPU();
-    // Inject the lost-promise on the mock device.
-    Object.defineProperty(gpu.device, "lost", { value: lost, configurable: true });
     const runtime = new Runtime({ device: gpu.device });
     runtime.compile(AList.empty<Command>());
     expect(runtime.isDeviceLost).toBe(false);
-    lostResolve({ reason: "destroyed", message: "test" } as GPUDeviceLostInfo);
+    gpu.simulateLost({ reason: "destroyed", message: "test" } as GPUDeviceLostInfo);
     await runtime.deviceLost;
     expect(runtime.isDeviceLost).toBe(true);
     expect(() => runtime.compile(AList.empty<Command>())).toThrow();

@@ -86,9 +86,22 @@ export class MockGPU {
   copyBufferCalls: CopyBufferToBufferCall[] = [];
 
   readonly device: GPUDevice;
+  /**
+   * Manually-resolvable `device.lost` promise. Tests that exercise
+   * the runtime's auto-dispose path call `simulateLost(...)` to fire
+   * it. Mirrors WebGPU's spec shape (`{ reason, message }`).
+   */
+  private _lostResolve!: (info: GPUDeviceLostInfo) => void;
+  readonly lost: Promise<GPUDeviceLostInfo>;
+
+  /** Resolve the device.lost promise with the supplied info. */
+  simulateLost(info: GPUDeviceLostInfo = { reason: "destroyed", message: "test" } as GPUDeviceLostInfo): void {
+    this._lostResolve(info);
+  }
 
   constructor() {
     const self = this;
+    this.lost = new Promise<GPUDeviceLostInfo>((r) => { this._lostResolve = r; });
     const queue = {
       writeBuffer(
         buffer: GPUBuffer,
@@ -121,6 +134,7 @@ export class MockGPU {
 
     this.device = {
       queue,
+      get lost() { return self.lost; },
       createCommandEncoder: () => self.createCommandEncoder(),
       createShaderModule(desc: GPUShaderModuleDescriptor): GPUShaderModule {
         self.shaderModules.push(desc);

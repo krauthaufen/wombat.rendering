@@ -1,77 +1,55 @@
 # wombat.rendering — deferred work
 
-What's NOT yet implemented, in rough priority order. Items
-removed once they're truly done — Phase B–H DONE markers have
-been pruned; the live list below is the work that remains.
+What's NOT yet implemented. DONE markers are pruned periodically
+to keep this list scannable.
 
-## Resource layer
+## Spec coverage
 
-- ~~**Mip-map generation**.~~ DONE (manual): `generateMips(device,
-  encoder, texture)` records 2×2 box-filter compute dispatches
-  for every mip pair below the base level. Pipelines are cached
-  per (device, format). Real-GPU validation in
-  `tests-browser/mipgen-real.test.ts`. *Auto-wiring* into
-  `prepareAdaptiveTexture` (so a fresh upload regenerates mips
-  without a user-issued `Custom` command) needs a two-phase
-  resolve refactor (texture upload before render-pass open) —
-  call `generateMips(...)` directly from a `Custom` command for
-  now. Pre-existing TODO note updated.
-- ~~**Storage-buffer fast path**.~~ Audited: the "double wrap"
-  case (`prepareAdaptiveBuffer` over a user-provided
-  `AdaptiveResource<GPUBuffer>`) costs one extra evaluation hop
-  per frame, which is noise. `tryAcquire`/`tryRelease` already
-  propagate through correctly. Closed without code change.
-- ~~**Buffer staging path**.~~ Audited: `queue.writeBuffer` is
-  already backed by an internal staging pool in Chrome / Dawn;
-  beating it requires our own pool with explicit staging-buffer
-  reuse, which is an optimisation we should drive from real
-  profiling data not speculation. Closed without code change;
-  reopen if profiling shows `writeBuffer` overhead.
+- **Multi-attachment renderTo.** Today `renderTo` returns a single
+  `RenderToResult`; multi-target renders work but the user has to
+  consume each color attachment via `result.color(name)` one at a
+  time. Sufficient for v0.1.
+- **MSAA on the canvas.** `allocateFramebuffer` handles MSAA color +
+  resolve targets for offscreen / `renderTo` framebuffers, but the
+  window/canvas swap chain stays single-sample. MSAA-to-canvas would
+  need a hidden multisample target + resolve-into-swap-chain in
+  `runFrame`. Add when a use case calls for it.
 
-## Runtime
+## Source-map decoder for shader-compile errors
 
-- ~~**`device.lost` recovery**.~~ Documented: on lost, the
-  Runtime auto-disposes; user-level avals (`cval` / `clist` /
-  `cset`) survive; caller constructs a fresh Runtime from a new
-  device and re-compiles the same `alist<Command>`. The
-  per-device caches use `WeakMap<GPUDevice, …>` so they re-key
-  naturally. A single-call `replaceDevice` isn't useful since
-  every prepared object bakes the device in — discard + rebuild
-  is the right path. JSDoc on `Runtime.deviceLost` explains it.
+`installShaderDiagnostics` now decodes the v3 source-map's `mappings`
+and reports each WGSL-line message with its originating
+`(file, line, col)` (falling back to the most recent mapped line
+when the exact one is unmapped). Per-token granularity would require
+the IR emitters to thread per-Expr spans into the writer; not worth
+the cost yet.
 
-## Shader integration
+## Compute primitive
 
-- **Source-map surfacing.** `CompiledStage.sourceMap` is
-  re-exported but not surfaced when WebGPU rejects the WGSL —
-  errors point at emitted source, not the original TS.
-- **Vite-plugin example.** No example uses the `vertex(...) /
-  fragment(...)` marker workflow with `@aardworx/wombat.shader-vite`;
-  `examples/hello-triangle` calls `parseShader → stage` at runtime.
+`prepareComputeShader` lifts a `ComputeShader` (single-stage peer of
+`Effect`) into an imperative dispatch surface: `createInputBinding()`
+yields a mutable, name-keyed binding (`setUniform` / `setBuffer` /
+`setTexture` / `setSampler`); `dispatch(binding, groups)` opens an
+encoder, encodes the compute pass, submits, and awaits. Storage
+buffers are validated end-to-end on real GPU.
 
-## Upstream wombat.shader (all fixed in this round)
+What's still open:
 
-- ~~**`liftReturns` no-op for bare V4f returns**.~~ FIXED:
-  `liftReturns` now handles bare-value returns when the entry has
-  exactly one declared output. Vertex bare V4f → WriteOutput on
-  the @builtin(position) target; fragment bare V4f → WriteOutput
-  on the colour @location(0) target. Spans preserved through
-  the rewrite so source maps continue to work.
-- ~~**Inline plugin emitted `__wombat_*` entry-point names**.~~
-  FIXED: WGSL forbids leading double underscores; renamed to
-  `wombat_<marker>_<offset>`.
-- ~~**Inline plugin only read parameter annotations**.~~ FIXED:
-  uses the TS type-checker's `getContextualType` →
-  `getCallSignatures` chain to recover the lambda's parameter +
-  return types. Generic args (`vertex<I, O>(...)`), explicit
-  lambda annotations, and body-driven inference all work, in any
-  combination. `unknown` / `any` / `never` skipped; body
-  return-expression type used as the final fallback.
-  `vertex<I, O = unknown>` and `fragment` got default type-arg
-  values so partial generic specification works.
-- ~~**Bare-V4f returns produced no entry outputs in the
-  inline-plugin path**.~~ FIXED: `withDerivedOutputs` now
-  synthesises a default output — vertex → `gl_Position`
-  (@builtin position), fragment → `outColor` (@location 0).
+- **Storage textures in compute bindings.** `setTexture` only handles
+  sampled textures today; storage-texture writes need a separate
+  binding entry path with the right `storageTexture` layout.
+- **End-to-end uniform-block test for compute.** `setUniform` shares
+  the byte-poke / layout machinery the render path's UBO test
+  already covers, but a compute-side test that exercises the full
+  uniform-binding path (parseShader + uniform ValueDef → iface
+  uniform-block → write-buffer) is still missing.
+
+## Examples
+
+- Only `examples/hello-triangle`. Per the user's plan, more
+  examples (`hello-cube` with a UBO + camera, instanced grid,
+  post-processing chain) wait for the scenegraph layer that will
+  produce RenderObjects from a declarative tree.
 
 ## Out-of-scope (recorded so they don't surprise us)
 
@@ -81,3 +59,10 @@ been pruned; the live list below is the work that remains.
 - **Mock-tested deltas vs real-GPU.** Mock tests assert
   implementation invariants (call-pattern, cache hits, ordering);
   real-GPU tests assert pixel correctness. Both kept.
+- **`device.lost` rebuild-recovery.** Documented: on lost, the
+  Runtime auto-disposes; user-level avals (`cval` / `clist` /
+  `cset`) survive; caller constructs a fresh Runtime from a new
+  device and re-compiles the same `alist<Command>`. Per-device
+  caches use `WeakMap<GPUDevice, …>` so they re-key naturally.
+  The mock now exposes a manually-resolvable `device.lost` via
+  `MockGPU.simulateLost(...)` for the auto-dispose test.

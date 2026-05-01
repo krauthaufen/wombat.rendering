@@ -85,6 +85,7 @@ export type {
   AttributeInfo,
   CompiledEffect,
   CompiledStage,
+  ComputeShader,
   Effect,
   HoleGetter,
   HoleGetters,

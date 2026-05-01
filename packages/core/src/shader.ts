@@ -5,6 +5,7 @@
 
 export type {
   Effect,
+  ComputeShader,
   Stage,
   HoleGetter,
   HoleGetters,
