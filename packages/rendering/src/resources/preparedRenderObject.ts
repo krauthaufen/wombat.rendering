@@ -4,6 +4,13 @@
 // Reads the wombat.shader `ProgramInterface` for everything needed
 // to lay out vertex buffers, bind groups, color targets, and draw
 // state.
+//
+// Pipeline state is fully reactive: the pipeline-influencing avals
+// (rasterizer / depth / stencil ops / blends / alphaToCoverage) are
+// snapshotted at token-evaluation time into a cache key; the
+// resulting `GPURenderPipeline` is cached per-key in the
+// PreparedRenderObject so flipping a non-pipeline-affecting field
+// (`stencilReference`, `blendConstant`) does NOT trigger a recompile.
 
 import {
   AdaptiveResource,
@@ -56,8 +63,6 @@ interface VertexBindingInfo {
 }
 
 function vertexBindingsFor(iface: ProgramInterface): VertexBindingInfo[] {
-  // `iface.attributes` is already filtered to non-builtin vertex inputs
-  // by wombat.shader's interface builder.
   return iface.attributes.map(a => ({
     name: a.name,
     slot: a.location,
@@ -66,19 +71,127 @@ function vertexBindingsFor(iface: ProgramInterface): VertexBindingInfo[] {
   }));
 }
 
-function colorTargetsFor(
+// ---------------------------------------------------------------------------
+// Plain pipeline-state snapshot — what we evaluate avals into per-frame.
+// ---------------------------------------------------------------------------
+
+interface BlendComponentSnap {
+  readonly operation: GPUBlendOperation;
+  readonly srcFactor: GPUBlendFactor;
+  readonly dstFactor: GPUBlendFactor;
+}
+interface BlendSnap {
+  readonly color: BlendComponentSnap;
+  readonly alpha: BlendComponentSnap;
+  readonly writeMask: number;
+}
+interface StencilFaceSnap {
+  readonly compare: GPUCompareFunction;
+  readonly failOp: GPUStencilOperation;
+  readonly depthFailOp: GPUStencilOperation;
+  readonly passOp: GPUStencilOperation;
+}
+interface StencilSnap {
+  readonly enabled: boolean;
+  readonly readMask: number;
+  readonly writeMask: number;
+  readonly front: StencilFaceSnap;
+  readonly back: StencilFaceSnap;
+}
+interface PipelineSnap {
+  readonly topology: GPUPrimitiveTopology;
+  readonly cullMode: import("../core/index.js").CullMode;
+  readonly frontFace: import("../core/index.js").FrontFace;
+  readonly depthBias: { readonly constant: number; readonly slopeScale: number; readonly clamp: number } | undefined;
+  readonly depthWrite: boolean | undefined;
+  readonly depthCompare: GPUCompareFunction | undefined;
+  readonly depthClamp: boolean | undefined;
+  readonly stencil: StencilSnap | undefined;
+  readonly blends: ReadonlyArray<readonly [string, BlendSnap]> | undefined;
+  readonly alphaToCoverage: boolean;
+}
+
+function snapshotPipeline(
+  ps: import("../core/index.js").PipelineState,
+  token: AdaptiveToken,
+): PipelineSnap {
+  const r = ps.rasterizer;
+  const depthBias = r.depthBias !== undefined ? r.depthBias.getValue(token) : undefined;
+  let stencil: StencilSnap | undefined;
+  if (ps.stencil !== undefined) {
+    const s = ps.stencil;
+    stencil = {
+      enabled: s.enabled.getValue(token),
+      readMask: s.readMask.getValue(token),
+      writeMask: s.writeMask.getValue(token),
+      front: {
+        compare: s.front.compare.getValue(token),
+        failOp: s.front.failOp.getValue(token),
+        depthFailOp: s.front.depthFailOp.getValue(token),
+        passOp: s.front.passOp.getValue(token),
+      },
+      back: {
+        compare: s.back.compare.getValue(token),
+        failOp: s.back.failOp.getValue(token),
+        depthFailOp: s.back.depthFailOp.getValue(token),
+        passOp: s.back.passOp.getValue(token),
+      },
+    };
+  }
+  let blends: ReadonlyArray<readonly [string, BlendSnap]> | undefined;
+  if (ps.blends !== undefined) {
+    const m = ps.blends.getValue(token);
+    const arr: [string, BlendSnap][] = [];
+    for (const [k, b] of m) {
+      arr.push([k, {
+        color: {
+          operation: b.color.operation.getValue(token),
+          srcFactor: b.color.srcFactor.getValue(token),
+          dstFactor: b.color.dstFactor.getValue(token),
+        },
+        alpha: {
+          operation: b.alpha.operation.getValue(token),
+          srcFactor: b.alpha.srcFactor.getValue(token),
+          dstFactor: b.alpha.dstFactor.getValue(token),
+        },
+        writeMask: b.writeMask.getValue(token),
+      }]);
+    }
+    arr.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+    blends = arr;
+  }
+  return {
+    topology: r.topology.getValue(token),
+    cullMode: r.cullMode.getValue(token),
+    frontFace: r.frontFace.getValue(token),
+    depthBias,
+    depthWrite: ps.depth?.write.getValue(token),
+    depthCompare: ps.depth?.compare.getValue(token),
+    depthClamp: ps.depth?.clamp?.getValue(token),
+    stencil,
+    blends,
+    alphaToCoverage: ps.alphaToCoverage?.getValue(token) ?? false,
+  };
+}
+
+function pipelineKeyOf(snap: PipelineSnap): string {
+  return JSON.stringify(snap);
+}
+
+function colorTargetsForSnap(
   iface: ProgramInterface,
   sig: FramebufferSignature,
-  blends: import("@aardworx/wombat.adaptive").HashMap<string, import("../core/index.js").BlendState> | undefined,
+  blends: ReadonlyArray<readonly [string, BlendSnap]> | undefined,
 ): GPUColorTargetState[] {
   const out: GPUColorTargetState[] = [];
+  const blendMap = blends !== undefined ? new Map<string, BlendSnap>(blends as readonly (readonly [string, BlendSnap])[]) : undefined;
   for (const o of iface.fragmentOutputs) {
     const fmt = sig.colors.tryFind(o.name);
     if (fmt === undefined) {
       throw new Error(`prepareRenderObject: fragment output "${o.name}" has no matching signature attachment`);
     }
     const target: GPUColorTargetState = { format: fmt };
-    const blend = blends?.tryFind(o.name);
+    const blend = blendMap?.get(o.name);
     if (blend !== undefined) {
       target.blend = {
         color: { operation: blend.color.operation, srcFactor: blend.color.srcFactor, dstFactor: blend.color.dstFactor },
@@ -91,27 +204,27 @@ function colorTargetsFor(
   return out;
 }
 
-function depthStencilStateFor(
+function depthStencilStateForSnap(
   sig: FramebufferSignature,
-  ps: import("../core/index.js").PipelineState,
+  snap: PipelineSnap,
 ): GPUDepthStencilState | undefined {
   if (sig.depthStencil === undefined) return undefined;
-  if (ps.depth === undefined && ps.stencil === undefined) return undefined;
+  if (snap.depthCompare === undefined && snap.depthWrite === undefined && snap.stencil === undefined) return undefined;
   const out: GPUDepthStencilState = {
     format: sig.depthStencil.format,
-    depthWriteEnabled: ps.depth?.write ?? false,
-    depthCompare: ps.depth?.compare ?? "always",
+    depthWriteEnabled: snap.depthWrite ?? false,
+    depthCompare: snap.depthCompare ?? "always",
   };
-  if (ps.stencil !== undefined) {
-    out.stencilFront = ps.stencil.front;
-    out.stencilBack = ps.stencil.back;
-    out.stencilReadMask = ps.stencil.readMask;
-    out.stencilWriteMask = ps.stencil.writeMask;
+  if (snap.stencil !== undefined && snap.stencil.enabled) {
+    out.stencilFront = snap.stencil.front;
+    out.stencilBack = snap.stencil.back;
+    out.stencilReadMask = snap.stencil.readMask;
+    out.stencilWriteMask = snap.stencil.writeMask;
   }
-  if (ps.rasterizer.depthBias !== undefined) {
-    out.depthBias = ps.rasterizer.depthBias.constant;
-    out.depthBiasSlopeScale = ps.rasterizer.depthBias.slopeScale;
-    out.depthBiasClamp = ps.rasterizer.depthBias.clamp;
+  if (snap.depthBias !== undefined) {
+    out.depthBias = snap.depthBias.constant;
+    out.depthBiasSlopeScale = snap.depthBias.slopeScale;
+    out.depthBiasClamp = snap.depthBias.clamp;
   }
   return out;
 }
@@ -124,9 +237,6 @@ function sampleTypeFor(type: Type): GPUTextureSampleType {
     if (s.kind === "Int") return s.signed ? "sint" : "uint";
     return "float";
   }
-  // Storage textures don't have a sampleType in the binding-layout
-  // sense; this code path is only for sampled textures. If we see
-  // anything else default to filterable float.
   return "float";
 }
 
@@ -168,8 +278,7 @@ function buildGroups(device: GPUDevice, descs: readonly EntryDesc[][]): GroupDes
   return out;
 }
 
-// Per-handle identity counter for the bind-group cache key. WebGPU
-// handles have no built-in id; we attach one via a WeakMap.
+// Per-handle identity counter for the bind-group cache key.
 const handleIds = new WeakMap<object, number>();
 let nextHandleId = 1;
 function handleId(h: object): number {
@@ -182,14 +291,75 @@ function handleId(h: object): number {
 // PreparedRenderObject
 // ---------------------------------------------------------------------------
 
+interface PipelineBuildContext {
+  readonly device: GPUDevice;
+  readonly iface: ProgramInterface;
+  readonly signature: FramebufferSignature;
+  readonly vertexLayouts: readonly GPUVertexBufferLayout[];
+  readonly bindGroupLayouts: readonly GPUBindGroupLayout[];
+  readonly vsSource: string;
+  readonly fsSource: string;
+  readonly vsEntry: string;
+  readonly fsEntry: string;
+  readonly vsSourceMap: import("@aardworx/wombat.shader/ir").SourceMap | null | undefined;
+  readonly fsSourceMap: import("@aardworx/wombat.shader/ir").SourceMap | null | undefined;
+  readonly label?: string | undefined;
+  readonly effectId?: string | undefined;
+}
+
+function buildPipelineForSnap(
+  ctx: PipelineBuildContext,
+  snap: PipelineSnap,
+): GPURenderPipeline {
+  const colorTargets = colorTargetsForSnap(ctx.iface, ctx.signature, snap.blends);
+  const ds = depthStencilStateForSnap(ctx.signature, snap);
+  const multisample: GPUMultisampleState | undefined =
+    ctx.signature.sampleCount > 1 || snap.alphaToCoverage
+      ? {
+          count: ctx.signature.sampleCount,
+          ...(snap.alphaToCoverage ? { alphaToCoverageEnabled: true } : {}),
+        }
+      : undefined;
+  const desc: CompileRenderPipelineDescription = {
+    ...(ctx.label !== undefined ? { label: ctx.label } : {}),
+    ...(ctx.effectId !== undefined ? { effectId: ctx.effectId } : {}),
+    vertexShaderSource: ctx.vsSource,
+    fragmentShaderSource: ctx.fsSource,
+    ...(ctx.vsSourceMap ? { vertexSourceMap: ctx.vsSourceMap } : {}),
+    ...(ctx.fsSourceMap ? { fragmentSourceMap: ctx.fsSourceMap } : {}),
+    vertexEntryPoint: ctx.vsEntry,
+    fragmentEntryPoint: ctx.fsEntry,
+    vertexBufferLayouts: ctx.vertexLayouts,
+    bindGroupLayouts: ctx.bindGroupLayouts,
+    colorTargets,
+    primitive: {
+      topology: snap.topology,
+      ...(snap.cullMode !== "none" ? { cullMode: snap.cullMode } : {}),
+      frontFace: snap.frontFace,
+      ...(snap.depthClamp === true ? { unclippedDepth: true } : {}),
+    },
+    ...(ds !== undefined ? { depthStencil: ds } : {}),
+    ...(multisample !== undefined ? { multisample } : {}),
+  };
+  return compileRenderPipeline(ctx.device, desc);
+}
+
 export class PreparedRenderObject {
-  readonly pipeline: GPURenderPipeline;
+  /**
+   * Most recently resolved pipeline. Set by `update(token)`. Reading
+   * this before `update` was ever called yields a sentinel object
+   * suitable only for identity comparison; the actual pipeline is
+   * resolved on the first `update`/`record` call.
+   */
+  pipeline: GPURenderPipeline;
   readonly groups: readonly GroupDesc[];
 
-  // Per-group bind group cache. Keyed on the concatenated identity
-  // of the underlying GPU handles (`buffer:N`, `tex:N`, etc.); a
-  // cache hit means none of the resources reallocated since the
-  // last record(), so the GPUBindGroup is reusable.
+  // Per-PreparedRO pipeline cache keyed by snapshot string.
+  private readonly _pipelineCache = new Map<string, GPURenderPipeline>();
+  private _pipelineCtx: PipelineBuildContext;
+  private _pipelineState: import("../core/index.js").PipelineState;
+
+  // Per-group bind group cache.
   private readonly _bindGroupCache: { key: string | null; group: GPUBindGroup | null }[];
 
   constructor(
@@ -201,12 +371,19 @@ export class PreparedRenderObject {
     private readonly indices: aval<import("../core/index.js").BufferView> | undefined,
     groups: readonly GroupDesc[],
     private readonly drawCall: aval<import("../core/index.js").DrawCall>,
-    pipeline: GPURenderPipeline,
+    pipelineCtx: PipelineBuildContext,
+    pipelineState: import("../core/index.js").PipelineState,
   ) {
-    this.pipeline = pipeline;
     this.groups = groups;
+    this._pipelineCtx = pipelineCtx;
+    this._pipelineState = pipelineState;
     this._bindGroupCache = groups.map(() => ({ key: null, group: null }));
+    // Sentinel pipeline — replaced on the first `update(token)`.
+    this.pipeline = SENTINEL_PIPELINE;
   }
+
+  /** Internal — exposed for tests. The PipelineState the RO is reading. */
+  get pipelineState(): import("../core/index.js").PipelineState { return this._pipelineState; }
 
   acquire(): void {
     for (const r of this.vertexBuffers.values()) r.acquire();
@@ -220,15 +397,42 @@ export class PreparedRenderObject {
     for (const g of this.groups) for (const e of g.entries) e.resource.release();
   }
 
+  /**
+   * Resolve the pipeline for the current values of the
+   * pipeline-influencing avals. Updates `this.pipeline` so that the
+   * surrounding sort / record path can read it without forcing.
+   */
+  update(token: AdaptiveToken): void {
+    const snap = snapshotPipeline(this._pipelineState, token);
+    const key = pipelineKeyOf(snap);
+    let pipeline = this._pipelineCache.get(key);
+    if (pipeline === undefined) {
+      pipeline = buildPipelineForSnap(this._pipelineCtx, snap);
+      this._pipelineCache.set(key, pipeline);
+    }
+    this.pipeline = pipeline;
+  }
+
   record(pass: GPURenderPassEncoder, token: AdaptiveToken): void {
+    // Resolve current pipeline. If `update` was already called by the
+    // walker this is a no-op cache hit; otherwise we still pick the
+    // right pipeline for the token-evaluated values.
+    this.update(token);
     pass.setPipeline(this.pipeline);
+
+    // Per-frame state — does NOT influence the pipeline cache key.
+    const ps = this._pipelineState;
+    if (ps.blendConstant !== undefined) {
+      const c = ps.blendConstant.getValue(token);
+      pass.setBlendConstant(c);
+    }
+    if (ps.stencil !== undefined) {
+      const ref = ps.stencil.reference.getValue(token);
+      pass.setStencilReference(ref);
+    }
 
     for (let gi = 0; gi < this.groups.length; gi++) {
       const g = this.groups[gi]!;
-      // Build a cache key from the resolved GPU handle identities;
-      // resources may be re-allocated by their AdaptiveResource on
-      // capacity growth or shape change, so we need to key on the
-      // CURRENT handles, not on the AdaptiveResource references.
       let cacheKey = "";
       const resolved: { binding: number; resource: GPUBindingResource }[] = [];
       for (const e of g.entries) {
@@ -243,10 +447,6 @@ export class PreparedRenderObject {
           case "tex": {
             const tex = e.resource.getValue(token);
             cacheKey += `${e.binding}:t${handleId(tex)};`;
-            // We create a new view per record because views are cheap
-            // and texture identity already keys the cache. (A
-            // real-perf-tuned implementation would also cache the
-            // view per texture.)
             resolved.push({ binding: e.binding, resource: tex.createView() });
             break;
           }
@@ -316,9 +516,6 @@ export function prepareRenderObject(
   const iface = effect.interface;
   const vertexBindings = vertexBindingsFor(iface);
 
-  // Vertex + instance buffers — same shape; only stepMode differs.
-  // Each shader-required attribute is looked up in obj.vertexAttributes
-  // first (per-vertex) then obj.instanceAttributes (per-instance).
   const vertexBuffers = new Map<string, AdaptiveResource<GPUBuffer>>();
   const vertexLayouts: GPUVertexBufferLayout[] = [];
   for (const vb of vertexBindings) {
@@ -352,12 +549,14 @@ export function prepareRenderObject(
       usage: BufferUsage.INDEX,
       ...(opts.label !== undefined ? { label: `${opts.label}.indices` } : {}),
     });
+    // Construction-time read to discover the index format. The
+    // BufferView aval is expected to settle on a stable format —
+    // changing index format would require a fresh PreparedRO.
     const initial = obj.indices.force();
     indexFormat = initial.indexFormat
       ?? (initial.format === "uint16" ? "uint16" : "uint32");
   }
 
-  // Per-group entry collection. Use `slot` (real shape) instead of `binding`.
   const slotOf = (e: { group: number; slot: number }) => e.slot;
   const groupOf = (e: { group: number }) => e.group;
   const maxGroup = Math.max(
@@ -371,9 +570,6 @@ export function prepareRenderObject(
   for (let g = 0; g <= maxGroup; g++) perGroup.push([]);
 
   for (const ub of iface.uniformBlocks) {
-    // Merge user-supplied uniforms (`obj.uniforms`) with effect-bound
-    // avals (`compiledEffect.avalBindings`). User entries win on name
-    // conflict — the rendering caller is the source of truth.
     const merged = mergeUniformInputs(obj.uniforms, effect.avalBindings, ub);
     const block = ubAsBlock(ub);
     const res = prepareUniformBuffer(device, block, merged, {
@@ -412,42 +608,30 @@ export function prepareRenderObject(
 
   const groups = buildGroups(device, perGroup);
 
-  // Pipeline.
-  const colorTargets = colorTargetsFor(iface, signature, obj.pipelineState.blends);
-  const vsStage = effect.stages.find(s => s.stage === "vertex");
-  const fsStage = effect.stages.find(s => s.stage === "fragment");
+  // Pipeline — set up the build context and produce the initial
+  // GPURenderPipeline. We snapshot via AdaptiveToken.top here; that's
+  // a one-time construction-boundary read, NOT inside an adaptive
+  // computation. Subsequent recompiles happen inside `update(token)`.
+  const vsStage = effect.stages.find(st => st.stage === "vertex");
+  const fsStage = effect.stages.find(st => st.stage === "fragment");
   if (vsStage === undefined) throw new Error("prepareRenderObject: CompiledEffect has no vertex stage");
   if (fsStage === undefined) throw new Error("prepareRenderObject: CompiledEffect has no fragment stage");
 
-  const ds = depthStencilStateFor(signature, obj.pipelineState);
-  const multisample: GPUMultisampleState | undefined =
-    signature.sampleCount > 1 || obj.pipelineState.alphaToCoverage === true
-      ? {
-          count: signature.sampleCount,
-          ...(obj.pipelineState.alphaToCoverage === true ? { alphaToCoverageEnabled: true } : {}),
-        }
-      : undefined;
-  const pipelineDesc: CompileRenderPipelineDescription = {
+  const pipelineCtx: PipelineBuildContext = {
+    device,
+    iface,
+    signature,
+    vertexLayouts,
+    bindGroupLayouts: groups.map(g => g.layout),
+    vsSource: vsStage.source,
+    fsSource: fsStage.source,
+    vsEntry: vsStage.entryName,
+    fsEntry: fsStage.entryName,
+    vsSourceMap: vsStage.sourceMap,
+    fsSourceMap: fsStage.sourceMap,
     ...(opts.label !== undefined ? { label: opts.label } : {}),
     ...(opts.effectId !== undefined ? { effectId: opts.effectId } : {}),
-    vertexShaderSource: vsStage.source,
-    fragmentShaderSource: fsStage.source,
-    ...(vsStage.sourceMap ? { vertexSourceMap: vsStage.sourceMap } : {}),
-    ...(fsStage.sourceMap ? { fragmentSourceMap: fsStage.sourceMap } : {}),
-    vertexEntryPoint: vsStage.entryName,
-    fragmentEntryPoint: fsStage.entryName,
-    vertexBufferLayouts: vertexLayouts,
-    bindGroupLayouts: groups.map(g => g.layout),
-    colorTargets,
-    primitive: {
-      topology: obj.pipelineState.rasterizer.topology,
-      ...(obj.pipelineState.rasterizer.cullMode !== "none" ? { cullMode: obj.pipelineState.rasterizer.cullMode } : {}),
-      frontFace: obj.pipelineState.rasterizer.frontFace,
-    },
-    ...(ds !== undefined ? { depthStencil: ds } : {}),
-    ...(multisample !== undefined ? { multisample } : {}),
   };
-  const pipeline = compileRenderPipeline(device, pipelineDesc);
 
   return new PreparedRenderObject(
     device,
@@ -455,9 +639,19 @@ export function prepareRenderObject(
     indexBuffer, indexFormat, obj.indices,
     groups,
     obj.drawCall,
-    pipeline,
+    pipelineCtx,
+    obj.pipelineState,
   );
 }
+
+/**
+ * Sentinel pipeline placeholder. PreparedRenderObject's `pipeline`
+ * field is non-null for ergonomic typing; before the first
+ * `update(token)` it points at this sentinel which is only used as
+ * a sort-rank identity (never bound to a render pass — `record`
+ * always calls `update` first).
+ */
+const SENTINEL_PIPELINE = { __sentinel: "PreparedRenderObject.pipeline" } as unknown as GPURenderPipeline;
 
 // ---------------------------------------------------------------------------
 // Uniform input merging — `obj.uniforms` wins; `avalBindings` is fallback.
@@ -475,8 +669,6 @@ function mergeUniformInputs(
     const getter = bindings[f.name];
     if (getter === undefined) continue;
     const v = getter();
-    // wombat.shader's avalBindings store either an `aval<T>` or a
-    // raw value; wrap the raw case as a constant aval.
     if (isAval(v)) merged = merged.add(f.name, v as aval<unknown>);
     else merged = merged.add(f.name, cval(v));
   }
@@ -487,12 +679,6 @@ function isAval(v: unknown): boolean {
   return typeof v === "object" && v !== null && typeof (v as { getValue?: unknown }).getValue === "function";
 }
 
-/**
- * Adapter — wombat.shader's `UniformBlockInfo` and our internal
- * UBO packer expect the same field shape (`offset`, `size`, etc.),
- * so this is just a structural pass-through. Keeps the call sites
- * type-clean.
- */
 function ubAsBlock(ub: import("../core/index.js").UniformBlockInfo): import("../core/index.js").UniformBlockInfo {
   return ub;
 }

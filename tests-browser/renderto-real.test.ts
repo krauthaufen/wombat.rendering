@@ -17,6 +17,7 @@ import {
   type ClearValues,
   type DrawCall,
   type RenderObject,
+  PipelineState,
 } from "@aardworx/wombat.rendering/core";
 import {
   TextureUsage,
@@ -62,7 +63,7 @@ describe("renderTo — real GPU", () => {
       const positions = new Float32Array([-1, -1,  3, -1, -1, 3]);
       const obj: RenderObject = {
         effect: fullscreenColorEffect(),
-        pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } },
+        pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
         vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("a_position", cval<BufferView>({
           buffer: IBuffer.fromHost(positions), offset: 0, count: 3, stride: 8, format: "float32x2",
         })),

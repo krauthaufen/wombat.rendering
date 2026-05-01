@@ -47,14 +47,23 @@ export type {
   BlendComponentState,
   BlendState,
   CullMode,
+  DepthBiasState,
   DepthState,
   FrontFace,
-  PipelineState,
+  PlainBlendComponentState,
+  PlainBlendState,
+  PlainDepthState,
+  PlainPipelineState,
+  PlainRasterizerState,
+  PlainStencilFaceState,
+  PlainStencilState,
   RasterizerState,
   StencilFaceState,
   StencilState,
   Topology,
 } from "./pipelineState.js";
+
+export { PipelineState } from "./pipelineState.js";
 
 export type {
   RenderObject,

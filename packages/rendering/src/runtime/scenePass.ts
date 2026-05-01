@@ -79,7 +79,12 @@ class LeafWalker extends NodeWalker {
     this.prepared.acquire();
     ctx.stats.prepareCount++;
   }
-  update(): void {}
+  update(token: AdaptiveToken): void {
+    // Resolve the current pipeline so the upstream sort comparator
+    // sees a stable identity for this frame's pipeline-influencing
+    // aval values.
+    this.prepared.update(token);
+  }
   emit(out: PreparedRenderObject[]): void { out.push(this.prepared); }
   dispose(): void { this.prepared.release(); }
 }

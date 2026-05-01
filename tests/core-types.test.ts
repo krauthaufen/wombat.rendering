@@ -16,6 +16,7 @@ import {
   type FramebufferSignature,
   type IFramebuffer,
   type RenderObject,
+  PipelineState,
 } from "@aardworx/wombat.rendering/core";
 
 const sig: FramebufferSignature = {
@@ -75,9 +76,9 @@ describe("core types", () => {
   it("RenderObject can be constructed with HashMap-typed input bags", () => {
     const ro: RenderObject = {
       effect: {} as never,
-      pipelineState: {
+      pipelineState: PipelineState.constant({
         rasterizer: { topology: "triangle-list", cullMode: "back", frontFace: "ccw" },
-      },
+      }),
       vertexAttributes: HashMap.empty(),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),

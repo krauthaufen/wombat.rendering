@@ -17,6 +17,7 @@ import {
   type Command,
   type DrawCall,
   type RenderObject,
+  PipelineState,
 } from "@aardworx/wombat.rendering/core";
 import {
   allocateFramebuffer,
@@ -99,7 +100,7 @@ describe("hello-triangle — real GPU", () => {
 
       const obj: RenderObject = {
         effect: helloTriangleEffect(),
-        pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } },
+        pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
         vertexAttributes: HashMap.empty<string, aval<BufferView>>()
           .add("a_position", cval<BufferView>({
             buffer: IBuffer.fromHost(positions), offset: 0, count: 3, stride: 8, format: "float32x2",

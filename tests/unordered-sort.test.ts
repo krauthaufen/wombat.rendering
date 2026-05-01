@@ -12,6 +12,7 @@ import {
   type Command,
   type DrawCall,
   type RenderObject,
+  PipelineState,
 } from "@aardworx/wombat.rendering/core";
 import {
   allocateFramebuffer,
@@ -51,7 +52,7 @@ function ro(face: "ccw" | "cw"): RenderObject {
   return {
     effect: effectWithFrontFace(face),
     // Different frontFace → different pipeline → different sort rank.
-    pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "back", frontFace: face } },
+    pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "back", frontFace: face } }),
     vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", cval<BufferView>({
       buffer: IBuffer.fromHost(new ArrayBuffer(36)), offset: 0, count: 3, stride: 12, format: "float32x3",
     })),

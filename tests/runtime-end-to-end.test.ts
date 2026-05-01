@@ -22,6 +22,7 @@ import {
   type Command,
   type DrawCall,
   type RenderObject,
+  PipelineState,
 } from "@aardworx/wombat.rendering/core";
 import {
   allocateFramebuffer,
@@ -72,7 +73,7 @@ function bv(): aval<BufferView> {
 function obj() {
   return {
     effect: singleAttribEffect(),
-    pipelineState: { rasterizer: { topology: "triangle-list" as const, cullMode: "none" as const, frontFace: "ccw" as const } },
+    pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list" as const, cullMode: "none" as const, frontFace: "ccw" as const } }),
     vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv()),
     uniforms: HashMap.empty(),
     textures: HashMap.empty(),

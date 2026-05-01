@@ -27,6 +27,7 @@ import {
   type Command,
   type DrawCall,
   type RenderObject,
+  PipelineState,
 } from "@aardworx/wombat.rendering/core";
 import {
   allocateFramebuffer,
@@ -64,7 +65,7 @@ function flatRedEffect() {
 function makeRO(eff = flatRedEffect()): RenderObject {
   return {
     effect: eff,
-    pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } },
+    pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
     vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", cval<BufferView>({
       buffer: IBuffer.fromHost(new ArrayBuffer(36)), offset: 0, count: 3, stride: 12, format: "float32x3",
     })),

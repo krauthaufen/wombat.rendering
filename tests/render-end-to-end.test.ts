@@ -4,12 +4,13 @@
 // tests-browser/render-real.test.ts.
 
 import { describe, expect, it } from "vitest";
-import { HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
+import { AdaptiveToken, HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
 import {
   IBuffer,
   type BufferView,
   type DrawCall,
+  PipelineState,
 } from "@aardworx/wombat.rendering/core";
 import {
   createFramebufferSignature,
@@ -68,7 +69,7 @@ describe("prepareRenderObject", () => {
     const compiled = eff.compile({ target: "wgsl" });
     const make = () => prepareRenderObject(gpu.device, {
       effect: eff,
-      pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } },
+      pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
       vertexAttributes: HashMap.empty<string, aval<BufferView>>()
         .add("position", bv(36, "float32x3", 3))
         .add("normal",   bv(36, "float32x3", 3)),
@@ -79,6 +80,8 @@ describe("prepareRenderObject", () => {
     }, compiled, sig, { effectId: eff.id });
     const a = make();
     const b = make();
+    a.update(AdaptiveToken.top);
+    b.update(AdaptiveToken.top);
     expect(a.pipeline).toBe(b.pipeline);
     expect(gpu.pipelines).toHaveLength(1);
   });

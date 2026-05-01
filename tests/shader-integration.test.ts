@@ -21,6 +21,7 @@ import {
   type Command,
   type DrawCall,
   type RenderObject,
+  PipelineState,
 } from "@aardworx/wombat.rendering/core";
 import {
   allocateFramebuffer,
@@ -90,7 +91,7 @@ describe("shader integration: invariants", () => {
     const eff = helloTriangle();
     const obj: RenderObject = {
       effect: eff,
-      pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } },
+      pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
       vertexAttributes: HashMap.empty<string, aval<BufferView>>()
         .add("a_position", bv("float32x2"))
         .add("a_color",    bv("float32x3")),
@@ -124,7 +125,7 @@ describe("shader integration: invariants", () => {
     const eff = helloTriangle();
     const mk = (): RenderObject => ({
       effect: eff,
-      pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } },
+      pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
       vertexAttributes: HashMap.empty<string, aval<BufferView>>()
         .add("a_position", bv("float32x2"))
         .add("a_color",    bv("float32x3")),

@@ -12,6 +12,7 @@ import {
   type BufferView,
   type DrawCall,
   type RenderObject,
+  PipelineState,
 } from "@aardworx/wombat.rendering/core";
 import {
   createFramebufferSignature,
@@ -58,7 +59,7 @@ describe("renderTo lifecycle", () => {
     const runtime = new Runtime({ device: gpu.device });
     const innerObj: RenderObject = {
       effect: passEffect(),
-      pipelineState: { rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } },
+      pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
       vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv()),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
