@@ -12,6 +12,12 @@
 // The size aval is fed by a `ResizeObserver`; on size change we
 // re-`configure()` the canvas context and bump a cval that the
 // framebuffer aval depends on.
+//
+// MSAA: when `sampleCount > 1`, we allocate a hidden multisample
+// color (and depth) texture sized to the canvas; the swap-chain
+// texture becomes the resolve target. The render-pass descriptor
+// builder in `@aardworx/wombat.rendering-commands` already wires
+// `resolveTarget` based on the framebuffer's `resolveColors`.
 
 import {
   type IFramebuffer,
@@ -36,6 +42,13 @@ export interface AttachCanvasOptions {
   readonly devicePixelRatio?: number;
   /** Color attachment name in the resulting `FramebufferSignature`. Default `"color"`. */
   readonly colorAttachmentName?: string;
+  /**
+   * MSAA sample count. Default 1. With `> 1`, a hidden multisample
+   * color texture (and depth, if `depthFormat` is set) is allocated
+   * sized to the canvas; the swap-chain texture becomes the resolve
+   * target. Common values: 1 (off), 4 (fast MSAA).
+   */
+  readonly sampleCount?: number;
 }
 
 export interface CanvasAttachment {
@@ -61,6 +74,7 @@ export function attachCanvas(
   const colorName = opts.colorAttachmentName ?? "color";
   const format = opts.format ?? navigator.gpu.getPreferredCanvasFormat();
   const alphaMode = opts.alphaMode ?? "premultiplied";
+  const sampleCount = opts.sampleCount ?? 1;
 
   const dpr = opts.devicePixelRatio ?? (typeof window !== "undefined" ? window.devicePixelRatio : 1);
   // initial size from the canvas's CSS size (or its native dimensions for OffscreenCanvas).
@@ -72,6 +86,22 @@ export function attachCanvas(
   configure(ctx, device, format, alphaMode);
   applySize(canvas, initial.width, initial.height);
 
+  // Hidden multisample color texture, present only when sampleCount > 1.
+  let msaaColor: GPUTexture | undefined;
+  const ensureMsaaColor = (w: number, h: number): GPUTexture | undefined => {
+    if (sampleCount <= 1) return undefined;
+    if (msaaColor !== undefined) msaaColor.destroy();
+    msaaColor = device.createTexture({
+      size: { width: w, height: h, depthOrArrayLayers: 1 },
+      format,
+      sampleCount,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      label: "canvas.color.msaa",
+    });
+    return msaaColor;
+  };
+  ensureMsaaColor(initial.width, initial.height);
+
   // Optional shared depth texture re-allocated on size change.
   let depthTexture: GPUTexture | undefined;
   const ensureDepth = (w: number, h: number): GPUTexture | undefined => {
@@ -80,6 +110,7 @@ export function attachCanvas(
     depthTexture = device.createTexture({
       size: { width: w, height: h, depthOrArrayLayers: 1 },
       format: opts.depthFormat,
+      sampleCount,
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
       label: "canvas.depth",
     });
@@ -98,6 +129,7 @@ export function attachCanvas(
         const h = Math.max(1, Math.floor(cssHeight * dpr));
         if (w !== sizeC.value.width || h !== sizeC.value.height) {
           applySize(canvas, w, h);
+          ensureMsaaColor(w, h);
           ensureDepth(w, h);
           transact(() => {
             sizeC.value = { width: w, height: h };
@@ -110,7 +142,7 @@ export function attachCanvas(
 
   const signature: FramebufferSignature = {
     colors: HashMap.empty<string, GPUTextureFormat>().add(colorName, format),
-    sampleCount: 1,
+    sampleCount,
     ...(opts.depthFormat !== undefined
       ? { depthStencil: depthAttachmentSig(opts.depthFormat) }
       : {}),
@@ -120,7 +152,7 @@ export function attachCanvas(
   // a fresh swap-chain texture; the frameC bump after each markFrame()
   // is what re-fires the chain on the same size.
   const framebuffer: aval<IFramebuffer> = sizeC.bind((sz) =>
-    frameC.map(() => makeFramebuffer(ctx, signature, sz, depthTexture, colorName)),
+    frameC.map(() => makeFramebuffer(ctx, signature, sz, msaaColor, depthTexture, colorName)),
   );
 
   return {
@@ -132,6 +164,7 @@ export function attachCanvas(
     },
     dispose() {
       if (observer !== undefined) observer.disconnect();
+      if (msaaColor !== undefined) { msaaColor.destroy(); msaaColor = undefined; }
       if (depthTexture !== undefined) { depthTexture.destroy(); depthTexture = undefined; }
       try { ctx.unconfigure(); } catch { /* already gone */ }
     },
@@ -178,17 +211,31 @@ function makeFramebuffer(
   ctx: GPUCanvasContext,
   signature: FramebufferSignature,
   size: { width: number; height: number },
+  msaaColor: GPUTexture | undefined,
   depthTexture: GPUTexture | undefined,
   colorName: string,
 ): IFramebuffer {
-  const tex = ctx.getCurrentTexture();
-  const view = tex.createView();
-  const colors = HashMap.empty<string, GPUTextureView>().add(colorName, view);
-  const colorTextures = HashMap.empty<string, GPUTexture>().add(colorName, tex);
+  const swap = ctx.getCurrentTexture();
+  const swapView = swap.createView();
+  const msaa = signature.sampleCount > 1;
+  // Pass attachment view: the multisample texture when MSAA is on,
+  // otherwise the swap-chain texture directly.
+  const passView = msaa
+    ? (msaaColor ?? swap).createView()
+    : swapView;
+  const colors = HashMap.empty<string, GPUTextureView>().add(colorName, passView);
+  const resolveColors = msaa
+    ? HashMap.empty<string, GPUTextureView>().add(colorName, swapView)
+    : undefined;
+  // `colorTextures` exposes the *sampleable* texture (always the
+  // swap-chain — multisample textures are not sampleable in the
+  // normal sense).
+  const colorTextures = HashMap.empty<string, GPUTexture>().add(colorName, swap);
   const fb: IFramebuffer = {
     signature,
     colors,
     colorTextures,
+    ...(resolveColors !== undefined ? { resolveColors } : {}),
     width: size.width,
     height: size.height,
     ...(depthTexture !== undefined

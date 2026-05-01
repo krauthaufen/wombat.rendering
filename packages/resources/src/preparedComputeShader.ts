@@ -22,7 +22,7 @@ import {
   type ComputeShader,
   type ProgramInterface,
 } from "@aardworx/wombat.rendering-core";
-import type { Type } from "@aardworx/wombat.shader/ir";
+import type { StorageTextureFormat, Type } from "@aardworx/wombat.shader/ir";
 import { ShaderStage } from "./webgpuFlags.js";
 import { installShaderDiagnostics } from "./shaderDiagnostics.js";
 import { makePackedView, writeField, type PackedView } from "./uniformBuffer.js";
@@ -36,12 +36,21 @@ type EntryDesc =
   | { kind: "ubuf";   binding: number; uniformBlock: import("@aardworx/wombat.rendering-core").UniformBlockInfo }
   | { kind: "sbuf";   binding: number; name: string; access: "read" | "read_write" }
   | { kind: "tex";    binding: number; name: string; sampleType: GPUTextureSampleType }
-  | { kind: "sampler";binding: number; name: string };
+  | { kind: "sampler";binding: number; name: string }
+  | { kind: "stex";   binding: number; name: string; format: GPUTextureFormat; access: GPUStorageTextureAccess };
 
 interface GroupDesc {
   readonly group: number;
   readonly layout: GPUBindGroupLayout;
   readonly entries: readonly EntryDesc[];
+}
+
+function storageAccessToGPU(a: "read" | "write" | "read_write"): GPUStorageTextureAccess {
+  switch (a) {
+    case "read":       return "read-only";
+    case "write":      return "write-only";
+    case "read_write": return "read-write";
+  }
 }
 
 function sampleTypeFor(type: Type): GPUTextureSampleType {
@@ -68,6 +77,7 @@ function buildGroups(device: GPUDevice, descs: readonly EntryDesc[][]): GroupDes
         };
         case "tex":     return { binding: e.binding, visibility, texture: { sampleType: e.sampleType } };
         case "sampler": return { binding: e.binding, visibility, sampler: { type: "filtering" } };
+        case "stex":    return { binding: e.binding, visibility, storageTexture: { access: e.access, format: e.format } };
       }
     });
     const layout = device.createBindGroupLayout({ entries: layoutEntries });
@@ -86,11 +96,16 @@ export interface DispatchSize {
   readonly z: number;
 }
 
+interface UboField {
+  readonly offset: number;
+  readonly type: import("@aardworx/wombat.rendering-core").UniformFieldInfo["type"];
+}
+
 interface UboState {
   readonly group: number;
   readonly binding: number;
   readonly view: PackedView;
-  readonly fieldOffsets: ReadonlyMap<string, number>;
+  readonly fields: ReadonlyMap<string, UboField>;
   buffer: GPUBuffer | undefined;
   dirty: boolean;
 }
@@ -101,6 +116,9 @@ export class ComputeInputBinding {
   private readonly _buffers = new Map<string, GPUBuffer>();          // name → buffer
   private readonly _textures = new Map<string, GPUTextureView>();    // name → view
   private readonly _samplers = new Map<string, GPUSampler>();        // name → sampler
+  private readonly _storageTextures = new Map<string, GPUTextureView>(); // name → view (storage)
+  /** Names declared by the shader as storage textures (vs sampled). */
+  private readonly _storageTextureNames: ReadonlySet<string>;
 
   /** @internal — built by `PreparedComputeShader`. */
   constructor(
@@ -109,11 +127,16 @@ export class ComputeInputBinding {
     private readonly iface: ProgramInterface,
     private readonly label: string | undefined,
   ) {
+    this._storageTextureNames = new Set(
+      iface.samplers.filter(s => s.type.kind === "StorageTexture").map(s => s.name),
+    );
     for (const ub of iface.uniformBlocks) {
       const view = makePackedView(ub.size);
-      const fieldOffsets = new Map<string, number>(ub.fields.map(f => [f.name, f.offset]));
+      const fields = new Map<string, UboField>(
+        ub.fields.map(f => [f.name, { offset: f.offset, type: f.type }]),
+      );
       const state: UboState = {
-        group: ub.group, binding: ub.slot, view, fieldOffsets,
+        group: ub.group, binding: ub.slot, view, fields,
         buffer: undefined, dirty: true,
       };
       this._ubos.set(ub.name, state);
@@ -129,9 +152,9 @@ export class ComputeInputBinding {
    */
   setUniform(name: string, value: unknown): this {
     for (const ub of this._ubos.values()) {
-      const offset = ub.fieldOffsets.get(name);
-      if (offset === undefined) continue;
-      writeField(ub.view, offset, value);
+      const f = ub.fields.get(name);
+      if (f === undefined) continue;
+      writeField(ub.view, f.offset, value, f.type);
       ub.dirty = true;
       return this;
     }
@@ -152,6 +175,21 @@ export class ComputeInputBinding {
     }
     const view = "createView" in source ? source.createView() : source;
     this._textures.set(name, view);
+    return this;
+  }
+
+  /**
+   * Bind a storage-texture view (write/read/read_write per the
+   * shader declaration). `view` should reference a `GPUTexture`
+   * created with `STORAGE_BINDING` usage in the format the shader
+   * expects.
+   */
+  setStorageTexture(name: string, source: GPUTexture | GPUTextureView): this {
+    if (!this._storageTextureNames.has(name)) {
+      throw new Error(`ComputeInputBinding: no storage texture "${name}"`);
+    }
+    const view = "createView" in source ? source.createView() : source;
+    this._storageTextures.set(name, view);
     return this;
   }
 
@@ -204,6 +242,11 @@ export class ComputeInputBinding {
             const samp = this._samplers.get(e.name);
             if (samp === undefined) throw new Error(`ComputeInputBinding.dispatch: missing sampler "${e.name}"`);
             return { binding: e.binding, resource: samp };
+          }
+          case "stex": {
+            const view = this._storageTextures.get(e.name);
+            if (view === undefined) throw new Error(`ComputeInputBinding.dispatch: missing storage texture "${e.name}"`);
+            return { binding: e.binding, resource: view };
           }
         }
       });
@@ -332,7 +375,15 @@ export function prepareComputeShader(
     perGroup[t.group]!.push({ kind: "tex", binding: t.slot, name: t.name, sampleType: sampleTypeFor(t.type) });
   }
   for (const s of iface.samplers) {
-    perGroup[s.group]!.push({ kind: "sampler", binding: s.slot, name: s.name });
+    if (s.type.kind === "StorageTexture") {
+      perGroup[s.group]!.push({
+        kind: "stex", binding: s.slot, name: s.name,
+        format: s.type.format as GPUTextureFormat,
+        access: storageAccessToGPU(s.type.access),
+      });
+    } else {
+      perGroup[s.group]!.push({ kind: "sampler", binding: s.slot, name: s.name });
+    }
   }
   for (const sb of iface.storageBuffers) {
     perGroup[sb.group]!.push({ kind: "sbuf", binding: sb.slot, name: sb.name, access: sb.access });

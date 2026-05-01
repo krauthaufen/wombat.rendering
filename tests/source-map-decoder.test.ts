@@ -6,7 +6,7 @@
 
 import { describe, it, expect } from "vitest";
 import { buildSourceMap, type Span } from "@aardworx/wombat.shader/ir";
-import { decodeLine } from "../packages/resources/src/sourceMapDecoder.js";
+import { decodeLine, decodePosition } from "../packages/resources/src/sourceMapDecoder.js";
 
 const fileA = "a.ts";
 const fileB = "b.ts";
@@ -77,5 +77,24 @@ describe("sourceMapDecoder", () => {
       fileContents,
     });
     expect(decodeLine(map, 1)).toEqual({ file: fileA, line: 2, column: 7 });
+  });
+
+  it("multi-segment line: decodePosition picks the closest preceding segment", () => {
+    // Generated line 1 has two segments:
+    //   col=0   → a.ts:1:1 (line0)
+    //   col=10  → a.ts:2:1 (line1 longer)
+    const map = buildSourceMap({
+      lineSegments: [[
+        { col: 0,  span: span(fileA, 0) },
+        { col: 10, span: span(fileA, 6) },
+      ]],
+      fileContents,
+    });
+    expect(decodePosition(map, 1, 0)).toEqual({ file: fileA, line: 1, column: 1 });
+    expect(decodePosition(map, 1, 5)).toEqual({ file: fileA, line: 1, column: 1 });
+    expect(decodePosition(map, 1, 10)).toEqual({ file: fileA, line: 2, column: 1 });
+    expect(decodePosition(map, 1, 99)).toEqual({ file: fileA, line: 2, column: 1 });
+    // Line-only view returns the first segment.
+    expect(decodeLine(map, 1)).toEqual({ file: fileA, line: 1, column: 1 });
   });
 });

@@ -31,7 +31,7 @@ import {
   type FramebufferSize,
 } from "@aardworx/wombat.rendering-resources";
 import { beginPassDescriptor } from "@aardworx/wombat.rendering-commands";
-import { type AdaptiveToken, type aval } from "@aardworx/wombat.adaptive";
+import { HashMap, type AdaptiveToken, type aval } from "@aardworx/wombat.adaptive";
 import { ScenePass } from "./scenePass.js";
 import type { RuntimeContext } from "./renderTask.js";
 
@@ -59,6 +59,14 @@ export interface RenderToResult {
    * activates the render-to pipeline.
    */
   color(name: string): AdaptiveResource<ITexture>;
+  /**
+   * Convenience for multi-target render passes: returns a
+   * `HashMap<string, aval<ITexture>>` covering every color
+   * attachment in the signature. Each entry shares the underlying
+   * lifetime — acquiring any (or the whole map's entries) activates
+   * the render-to pipeline.
+   */
+  colors(): HashMap<string, AdaptiveResource<ITexture>>;
   /** Returns the depth-stencil attachment as an `ITexture` (if the signature has one). */
   depthStencil(): AdaptiveResource<ITexture>;
 }
@@ -126,6 +134,13 @@ export function renderTo(
         }
         return ITexture.fromGPU(tex);
       });
+    },
+    colors() {
+      let out = HashMap.empty<string, AdaptiveResource<ITexture>>();
+      for (const [name] of opts.signature.colors) {
+        out = out.add(name, this.color(name));
+      }
+      return out;
     },
     depthStencil() {
       return renderToFbo.derive<ITexture>(fb => {

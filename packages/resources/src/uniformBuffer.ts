@@ -108,9 +108,27 @@ class UniformBufferResource extends AdaptiveResource<GPUBuffer> {
   }
 }
 
-export function writeField(view: PackedView, offset: number, value: unknown): void {
+/**
+ * Write a value into a UBO scratch buffer at the given byte offset.
+ * `fieldType`, when supplied, disambiguates a bare `number`:
+ *   - Int (signed)    → i32
+ *   - Int (unsigned)  → u32
+ *   - Float (default) → f32
+ * Without it, numbers are assumed to be f32.
+ */
+export function writeField(
+  view: PackedView,
+  offset: number,
+  value: unknown,
+  fieldType?: import("@aardworx/wombat.rendering-core").UniformFieldInfo["type"],
+): void {
   if (typeof value === "number") {
-    view.f32[offset >> 2] = value;
+    if (fieldType?.kind === "Int") {
+      if (fieldType.signed) view.i32[offset >> 2] = value;
+      else view.u32[offset >> 2] = value;
+    } else {
+      view.f32[offset >> 2] = value;
+    }
     return;
   }
   if (value instanceof Float32Array) {

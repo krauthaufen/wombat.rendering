@@ -1,12 +1,15 @@
-// Decoder for the line-granular source maps emitted by
-// `@aardworx/wombat.shader-ir`'s `buildSourceMap`. Each generated line
-// has either zero or one segment; segments encode (genCol=0,
-// sourceIdxDelta, sourceLineDelta, sourceColDelta) as base64-VLQ.
+// Decoder for v3 source maps. Supports both line-granular maps
+// (one segment per generated line at col 0) and multi-segment
+// lines (per-Expr granularity). Segments encode
+// (genColDelta, sourceIdxDelta, sourceLineDelta, sourceColDelta)
+// as base64-VLQ, with deltas accumulating across the whole map
+// except for genCol which resets at every `;` line boundary.
 //
-// We mirror only what `installShaderDiagnostics` needs: given a
-// 1-based generated line, return the 1-based originating
-// (file, line, col). Heavier source-map work (multi-segment lines,
-// names array, sections) isn't needed because we never emit it.
+// `decodeLine(map, line)` returns the position for the *first*
+// segment on the line; `decodePosition(map, line, col)` picks the
+// closest preceding segment. Both fall back to the most recent
+// mapped line if the queried line is unmapped, which is what
+// `installShaderDiagnostics` wants for "go to source" navigation.
 
 import type { SourceMap } from "@aardworx/wombat.shader/ir";
 
@@ -48,36 +51,83 @@ export interface DecodedPosition {
   readonly column: number;
 }
 
-/**
- * Look up the originating position for a 1-based generated line. The
- * generated column from the WGSL compiler is ignored because we emit
- * one mapping per line. Returns `null` if the generated line is
- * unmapped or out of range.
- */
-export function decodeLine(map: SourceMap, generatedLine: number): DecodedPosition | null {
+interface DecodedSegment {
+  readonly genCol: number;
+  readonly idx: number;
+  readonly line: number;
+  readonly col: number;
+}
+
+/** Walk the map up to (and including) `targetLine`, returning each line's segments. */
+function segmentsUpTo(map: SourceMap, targetLine: number): DecodedSegment[][] {
   const lines = map.mappings.split(";");
+  const out: DecodedSegment[][] = [];
   let srcIdx = 0;
   let srcLine = 0;
   let srcCol = 0;
-  let last: { idx: number; line: number; col: number } | null = null;
+  for (let i = 0; i <= targetLine && i < lines.length; i++) {
+    const segs = (lines[i] ?? "").split(",").filter(s => s.length > 0);
+    let prevGenCol = 0;
+    const lineOut: DecodedSegment[] = [];
+    for (const sStr of segs) {
+      const fields = vlqDecode(sStr);
+      if (fields.length < 4) continue;
+      const genCol = prevGenCol + fields[0]!;
+      srcIdx += fields[1]!;
+      srcLine += fields[2]!;
+      srcCol += fields[3]!;
+      lineOut.push({ genCol, idx: srcIdx, line: srcLine, col: srcCol });
+      prevGenCol = genCol;
+    }
+    out.push(lineOut);
+  }
+  return out;
+}
 
+function makePosition(map: SourceMap, s: DecodedSegment): DecodedPosition | null {
+  const file = map.sources[s.idx];
+  if (file === undefined) return null;
+  return { file, line: s.line + 1, column: s.col + 1 };
+}
+
+/**
+ * Closest-preceding-segment lookup. Given a 1-based generated
+ * `line` + 0-based generated `col`, returns the originating source
+ * position. Falls back to the last segment on a previous mapped
+ * line if `line` itself has no segments.
+ */
+export function decodePosition(
+  map: SourceMap,
+  generatedLine: number,
+  generatedCol = 0,
+): DecodedPosition | null {
   const target = generatedLine - 1;
   if (target < 0) return null;
-
-  for (let i = 0; i <= target && i < lines.length; i++) {
-    const seg = lines[i] ?? "";
-    if (seg.length === 0) continue;
-    const fields = vlqDecode(seg);
-    // [genCol, sourceIdxDelta, sourceLineDelta, sourceColDelta]
-    if (fields.length < 4) continue;
-    srcIdx += fields[1]!;
-    srcLine += fields[2]!;
-    srcCol += fields[3]!;
-    last = { idx: srcIdx, line: srcLine, col: srcCol };
+  const allLines = segmentsUpTo(map, target);
+  // Prefer a segment on the target line at or before generatedCol.
+  const onTarget = allLines[target];
+  if (onTarget && onTarget.length > 0) {
+    let pick: DecodedSegment | undefined;
+    for (const s of onTarget) {
+      if (s.genCol <= generatedCol) pick = s;
+      else break;
+    }
+    if (pick) return makePosition(map, pick);
+    return makePosition(map, onTarget[0]!);
   }
+  // Fallback: last segment on the most recent mapped line.
+  for (let i = target - 1; i >= 0; i--) {
+    const segs = allLines[i];
+    if (segs && segs.length > 0) return makePosition(map, segs[segs.length - 1]!);
+  }
+  return null;
+}
 
-  if (!last) return null;
-  const file = map.sources[last.idx];
-  if (file === undefined) return null;
-  return { file, line: last.line + 1, column: last.col + 1 };
+/**
+ * Backwards-compatible line-only decoder: returns the *first*
+ * segment of `generatedLine`, or the most recent mapped line for
+ * unmapped lines. Equivalent to `decodePosition(map, line, 0)`.
+ */
+export function decodeLine(map: SourceMap, generatedLine: number): DecodedPosition | null {
+  return decodePosition(map, generatedLine, 0);
 }
