@@ -18,11 +18,14 @@ export function createFramebufferSignature(
   spec: FramebufferSignatureSpec,
 ): FramebufferSignature {
   let colors = HashMap.empty<string, GPUTextureFormat>();
+  const colorNames: string[] = [];
   for (const [name, format] of Object.entries(spec.colors)) {
     colors = colors.add(name, format);
+    colorNames.push(name);
   }
   const sig: FramebufferSignature = {
     colors,
+    colorNames,
     sampleCount: spec.sampleCount ?? 1,
     ...(spec.depthStencil ? { depthStencil: depthStencilFor(spec.depthStencil.format) } : {}),
   };

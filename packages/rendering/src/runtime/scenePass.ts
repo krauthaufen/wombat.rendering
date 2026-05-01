@@ -39,7 +39,7 @@ import {
 
 interface BuildContext {
   readonly device: GPUDevice;
-  readonly compileEffect: (e: Effect) => CompiledEffect;
+  readonly compileEffect: (e: Effect, signature: FramebufferSignature) => CompiledEffect;
   readonly signature: FramebufferSignature;
   readonly stats: WalkerStats;
 }
@@ -72,7 +72,7 @@ class LeafWalker extends NodeWalker {
   private readonly prepared: PreparedRenderObject;
   constructor(ctx: BuildContext, obj: RenderObject) {
     super();
-    const eff = ctx.compileEffect(obj.effect);
+    const eff = ctx.compileEffect(obj.effect, ctx.signature);
     this.prepared = prepareRenderObject(ctx.device, obj, eff, ctx.signature, {
       effectId: obj.effect.id,
     });
@@ -254,7 +254,7 @@ export class ScenePass {
     device: GPUDevice,
     signature: FramebufferSignature,
     tree: RenderTree,
-    compileEffect: (e: Effect) => CompiledEffect,
+    compileEffect: (e: Effect, signature: FramebufferSignature) => CompiledEffect,
   ) {
     const ctx: BuildContext = { device, signature, compileEffect, stats: this.stats };
     this.root = build(tree, ctx);

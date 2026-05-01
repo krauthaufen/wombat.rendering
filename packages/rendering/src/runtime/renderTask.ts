@@ -18,6 +18,7 @@ import {
   type Command,
   type CompiledEffect,
   type Effect,
+  type FramebufferSignature,
   type IFramebuffer,
   type IRenderTask,
   type RenderTree,
@@ -29,7 +30,13 @@ import { ScenePass } from "./scenePass.js";
 
 export interface RuntimeContext {
   readonly device: GPUDevice;
-  readonly compileEffect: (effect: Effect) => CompiledEffect;
+  /**
+   * Compile an `Effect` against the target framebuffer signature.
+   * The signature determines the canonical fragment-output layout
+   * (`signature.colorNames[i]` ↔ `@location(i)`); the shader's
+   * `linkFragmentOutputs` pass uses it to re-pin and DCE outputs.
+   */
+  readonly compileEffect: (effect: Effect, signature: FramebufferSignature) => CompiledEffect;
 }
 
 class RenderTask implements IRenderTask {

@@ -2,7 +2,7 @@
 // effect-compilation hook, exposes `compile(commands)` and
 // (eventually) `renderTo(...)`.
 
-import type { Command, CompiledEffect, Effect, IRenderTask, RenderTree } from "../core/index.js";
+import type { Command, CompiledEffect, Effect, FramebufferSignature, IRenderTask, RenderTree } from "../core/index.js";
 import type { alist } from "@aardworx/wombat.adaptive";
 import { compileRenderTask, type RuntimeContext } from "./renderTask.js";
 import { renderTo, type RenderToOptions, type RenderToResult } from "./renderTo.js";
@@ -16,7 +16,20 @@ export interface RuntimeOptions {
    * `CompileOptions` (`skipMatrixReversal`, source-file labelling,
    * …).
    */
-  readonly compileEffect?: (effect: Effect) => CompiledEffect;
+  readonly compileEffect?: (effect: Effect, signature: FramebufferSignature) => CompiledEffect;
+}
+
+/**
+ * Derive the fragment-output layout from a framebuffer signature:
+ * `colorNames[i]` ↔ `@location(i)`. The shader's `linkFragmentOutputs`
+ * pass uses this to re-pin and DCE fragment outputs at compile time —
+ * so two compiles of the same Effect against differently-ordered
+ * signatures produce different shaders.
+ */
+function layoutFromSignature(sig: FramebufferSignature): { locations: ReadonlyMap<string, number> } {
+  const locations = new Map<string, number>();
+  sig.colorNames.forEach((name, i) => locations.set(name, i));
+  return { locations };
 }
 
 export class Runtime {
@@ -33,7 +46,10 @@ export class Runtime {
   constructor(opts: RuntimeOptions) {
     this.ctx = {
       device: opts.device,
-      compileEffect: opts.compileEffect ?? ((e: Effect) => e.compile({ target: "wgsl" })),
+      compileEffect: opts.compileEffect ?? ((e: Effect, sig: FramebufferSignature) => e.compile({
+        target: "wgsl",
+        fragmentOutputLayout: layoutFromSignature(sig),
+      })),
     };
     // `device.lost` is a real-WebGPU promise; mock devices may not
     // expose it. Treat as "never lost" in that case.

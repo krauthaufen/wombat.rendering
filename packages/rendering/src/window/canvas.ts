@@ -142,6 +142,7 @@ export function attachCanvas(
 
   const signature: FramebufferSignature = {
     colors: HashMap.empty<string, GPUTextureFormat>().add(colorName, format),
+    colorNames: [colorName],
     sampleCount,
     ...(opts.depthFormat !== undefined
       ? { depthStencil: depthAttachmentSig(opts.depthFormat) }

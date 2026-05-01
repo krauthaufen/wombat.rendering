@@ -120,6 +120,59 @@ describe("shader integration: invariants", () => {
     fboA.release(); fboB.release();
   });
 
+  it("colorNames ordering drives the fragment-output @location pin", () => {
+    // Two-target effect that writes both `outColor` and `pickId`. The
+    // FB signature's `colorNames` order is the source of truth for
+    // each output's `@location(i)`. Reverse the order, get reversed
+    // locations.
+    const eff = makeEffect(
+      `
+        function vs(input: { a_position: V2f }): { gl_Position: V4f } {
+          return { gl_Position: new V4f(input.a_position.x, input.a_position.y, 0.0, 1.0) };
+        }
+        function fs(): { outColor: V4f; pickId: V4f } {
+          return { outColor: new V4f(1.0, 0.0, 0.0, 1.0), pickId: new V4f(0.5, 0.0, 0.0, 1.0) };
+        }
+      `,
+      [
+        {
+          name: "vs", stage: "vertex",
+          inputs: [{ name: "a_position", type: Tvec2f, semantic: "Position", decorations: [{ kind: "Location", value: 0 }] }],
+          outputs: [{ name: "gl_Position", type: Tvec4f, semantic: "Position", decorations: [{ kind: "Builtin", value: "position" }] }],
+        },
+        {
+          name: "fs", stage: "fragment",
+          inputs: [],
+          outputs: [
+            // Effect's hand-pinned locations — irrelevant after linking.
+            { name: "outColor", type: Tvec4f, semantic: "Color", decorations: [{ kind: "Location", value: 99 }] },
+            { name: "pickId",   type: Tvec4f, semantic: "Color", decorations: [{ kind: "Location", value: 100 }] },
+          ],
+        },
+      ],
+    );
+
+    const layoutFor = (sig: { colorNames: readonly string[] }) =>
+      ({ locations: new Map(sig.colorNames.map((n, i) => [n, i])) });
+
+    const sigAB = createFramebufferSignature({ colors: { outColor: "rgba8unorm", pickId: "rgba8unorm" } });
+    const sigBA = createFramebufferSignature({ colors: { pickId: "rgba8unorm", outColor: "rgba8unorm" } });
+
+    const compiledAB = eff.compile({ target: "wgsl", fragmentOutputLayout: layoutFor(sigAB) });
+    const compiledBA = eff.compile({ target: "wgsl", fragmentOutputLayout: layoutFor(sigBA) });
+    const fsAB = compiledAB.stages.find(s => s.stage === "fragment")!.source;
+    const fsBA = compiledBA.stages.find(s => s.stage === "fragment")!.source;
+
+    // Distinct sources reflecting different location pins.
+    expect(fsAB).not.toBe(fsBA);
+    // The hand-pinned 99 / 100 from the effect source are gone.
+    expect(fsAB).not.toMatch(/@location\(99\)/);
+    expect(fsAB).not.toMatch(/@location\(100\)/);
+    // Both layouts assign distinct @location(0) and @location(1).
+    expect(fsAB).toMatch(/@location\(0\)/);
+    expect(fsAB).toMatch(/@location\(1\)/);
+  });
+
   it("(effect, signature) pipeline cache: same effect + signature → one pipeline shared", () => {
     const gpu = new MockGPU();
     const eff = helloTriangle();

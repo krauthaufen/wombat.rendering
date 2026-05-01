@@ -121,7 +121,11 @@ class AdaptiveFramebuffer extends AdaptiveResource<IFramebuffer> {
       | (this.opts.extraUsage ?? 0);
     const labelPrefix = this.opts.labelPrefix ?? "fbo";
 
-    for (const [name, format] of this.signature.colors) {
+    for (const name of this.signature.colorNames) {
+      const format = this.signature.colors.tryFind(name);
+      if (format === undefined) {
+        throw new Error(`framebuffer: signature.colorNames lists "${name}" but signature.colors has no entry`);
+      }
       const tex = this.device.createTexture({
         size: { width: size.width, height: size.height, depthOrArrayLayers: 1 },
         format,

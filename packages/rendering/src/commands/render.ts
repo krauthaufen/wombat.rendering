@@ -27,7 +27,7 @@ export interface Recordable {
 export function beginPassDescriptor(output: IFramebuffer, clear?: ClearValues): GPURenderPassDescriptor {
   const colorAttachments: GPURenderPassColorAttachment[] = [];
   const msaa = output.signature.sampleCount > 1;
-  for (const [name] of output.signature.colors) {
+  for (const name of output.signature.colorNames) {
     const view = output.colors.tryFind(name);
     if (view === undefined) {
       throw new Error(`render: framebuffer is missing color attachment "${name}"`);

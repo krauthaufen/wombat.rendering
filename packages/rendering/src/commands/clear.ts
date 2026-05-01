@@ -16,7 +16,7 @@ export function clear(
   values: ClearValues,
 ): void {
   const colorAttachments: GPURenderPassColorAttachment[] = [];
-  for (const [name] of output.signature.colors) {
+  for (const name of output.signature.colorNames) {
     const view = output.colors.tryFind(name);
     if (view === undefined) {
       throw new Error(`clear: framebuffer is missing color attachment "${name}"`);

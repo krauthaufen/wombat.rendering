@@ -137,7 +137,7 @@ export function renderTo(
     },
     colors() {
       let out = HashMap.empty<string, AdaptiveResource<ITexture>>();
-      for (const [name] of opts.signature.colors) {
+      for (const name of opts.signature.colorNames) {
         out = out.add(name, this.color(name));
       }
       return out;
