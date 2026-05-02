@@ -533,11 +533,20 @@ export function prepareRenderObject(
     }
     const isInstance = fromVertex === undefined && fromInstance !== undefined;
     const stepMode: GPUVertexStepMode = isInstance ? "instance" : "vertex";
-    const stride = vb.byteSize !== undefined && vb.byteSize > 0
-      ? vb.byteSize
-      : vertexFormatStride(vb.format);
 
     const viewAval = (fromVertex ?? fromInstance)!;
+    // Honour an explicit `stride: 0` from the BufferView for the
+    // single-value-broadcast path (a 1-element vertex buffer read by
+    // every vertex). Sampled at build time — switching stride
+    // dynamically is rare and would require a fresh pipeline anyway.
+    const initialView = viewAval.force();
+    const explicitZeroStride = initialView.stride === 0;
+    const stride = explicitZeroStride
+      ? 0
+      : (vb.byteSize !== undefined && vb.byteSize > 0
+        ? vb.byteSize
+        : vertexFormatStride(vb.format));
+
     const bufAval = viewAval.map(view => view.buffer);
     const res = prepareAdaptiveBuffer(device, bufAval, {
       usage: BufferUsage.VERTEX,
