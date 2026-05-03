@@ -118,8 +118,37 @@ export function attachCanvas(
   };
   ensureDepth(initial.width, initial.height);
 
-  // ResizeObserver — only meaningful for HTMLCanvasElement.
+  // ResizeObserver — only meaningful for HTMLCanvasElement. We defer
+  // the actual resize work (canvas.width/height write, GPU texture
+  // realloc, sizeC mutation) to the next animation frame so the RO
+  // callback itself stays cheap and side-effect-free during layout.
+  // Without this, Safari emits "ResizeObserver loop completed with
+  // undelivered notifications" and silently drops the second-pass
+  // notification — leaving the canvas at its initial (often pre-
+  // layout 1×1) backing size, hence a blank render. Coalesce
+  // multiple RO fires within a single frame so we only resize once
+  // per rAF.
   let observer: ResizeObserver | undefined;
+  let pending: { w: number; h: number } | undefined;
+  let rafScheduled = false;
+  const scheduleResize = (w: number, h: number): void => {
+    pending = { w, h };
+    if (rafScheduled) return;
+    rafScheduled = true;
+    const flush = (): void => {
+      rafScheduled = false;
+      if (pending === undefined) return;
+      const { w: pw, h: ph } = pending;
+      pending = undefined;
+      if (pw === sizeC.value.width && ph === sizeC.value.height) return;
+      applySize(canvas, pw, ph);
+      ensureMsaaColor(pw, ph);
+      ensureDepth(pw, ph);
+      transact(() => { sizeC.value = { width: pw, height: ph }; });
+    };
+    if (typeof requestAnimationFrame !== "undefined") requestAnimationFrame(flush);
+    else queueMicrotask(flush);
+  };
   if (typeof ResizeObserver !== "undefined" && canvas instanceof (globalThis as unknown as { HTMLCanvasElement: typeof HTMLCanvasElement }).HTMLCanvasElement) {
     observer = new ResizeObserver((entries) => {
       for (const e of entries) {
@@ -127,14 +156,7 @@ export function attachCanvas(
         const cssHeight = e.contentBoxSize?.[0]?.blockSize ?? canvas.clientHeight;
         const w = Math.max(1, Math.floor(cssWidth * dpr));
         const h = Math.max(1, Math.floor(cssHeight * dpr));
-        if (w !== sizeC.value.width || h !== sizeC.value.height) {
-          applySize(canvas, w, h);
-          ensureMsaaColor(w, h);
-          ensureDepth(w, h);
-          transact(() => {
-            sizeC.value = { width: w, height: h };
-          });
-        }
+        scheduleResize(w, h);
       }
     });
     observer.observe(canvas);
