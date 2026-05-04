@@ -367,6 +367,7 @@ export class PreparedRenderObject {
     private readonly device: GPUDevice,
     private readonly vertexBindings: readonly VertexBindingInfo[],
     private readonly vertexBuffers: ReadonlyMap<string, AdaptiveResource<GPUBuffer>>,
+    private readonly vertexViews: ReadonlyMap<string, aval<import("../core/index.js").BufferView>>,
     private readonly indexBuffer: AdaptiveResource<GPUBuffer> | undefined,
     private readonly indexFormat: GPUIndexFormat | undefined,
     private readonly indices: aval<import("../core/index.js").BufferView> | undefined,
@@ -474,7 +475,18 @@ export class PreparedRenderObject {
     for (const vb of this.vertexBindings) {
       const res = this.vertexBuffers.get(vb.name);
       if (res === undefined) throw new Error(`PreparedRenderObject.record: missing vertex buffer for "${vb.name}"`);
-      pass.setVertexBuffer(vb.slot, res.getValue(token));
+      const viewAval = this.vertexViews.get(vb.name);
+      const view = viewAval !== undefined ? viewAval.getValue(token) : undefined;
+      const buf = res.getValue(token);
+      if (view !== undefined && view.offset > 0) {
+        // size omitted → WebGPU uses (buffer.size − offset). The
+        // BufferView's count·stride span doesn't include the offset,
+        // so passing it here would request bytes past the end of the
+        // buffer for any non-zero offset; let WebGPU default.
+        pass.setVertexBuffer(vb.slot, buf, view.offset);
+      } else {
+        pass.setVertexBuffer(vb.slot, buf);
+      }
     }
 
     if (this.indexBuffer !== undefined && this.indices !== undefined && this.indexFormat !== undefined) {
@@ -524,6 +536,7 @@ export function prepareRenderObject(
   const instanceMap = obj.instanceAttributes ?? emptyAttrMap();
 
   const vertexBuffers = new Map<string, AdaptiveResource<GPUBuffer>>();
+  const vertexViews = new Map<string, aval<import("../core/index.js").BufferView>>();
   const vertexLayouts: GPUVertexBufferLayout[] = [];
   for (const vb of vertexBindings) {
     const fromVertex = vertexMap.tryFind(vb.name);
@@ -535,17 +548,23 @@ export function prepareRenderObject(
     const stepMode: GPUVertexStepMode = isInstance ? "instance" : "vertex";
 
     const viewAval = (fromVertex ?? fromInstance)!;
-    // Honour an explicit `stride: 0` from the BufferView for the
-    // single-value-broadcast path (a 1-element vertex buffer read by
-    // every vertex). Sampled at build time — switching stride
-    // dynamically is rare and would require a fresh pipeline anyway.
+    // BufferView's stride drives `arrayStride` so callers can pack
+    // multiple attributes into one interleaved buffer (each attribute
+    // names the same IBuffer with a different `offset`, all sharing
+    // a `stride` ≥ sum of attribute sizes). The renderer honors
+    // `view.offset` at draw time via `setVertexBuffer(slot, buf,
+    // offset)`, so each attribute reads its own slice. Sampled at
+    // build time — switching stride / offset dynamically would need
+    // a fresh pipeline.
     const initialView = viewAval.force();
     const explicitZeroStride = initialView.stride === 0;
     const stride = explicitZeroStride
       ? 0
-      : (vb.byteSize !== undefined && vb.byteSize > 0
-        ? vb.byteSize
-        : vertexFormatStride(vb.format));
+      : (initialView.stride > 0
+        ? initialView.stride
+        : (vb.byteSize !== undefined && vb.byteSize > 0
+          ? vb.byteSize
+          : vertexFormatStride(vb.format)));
 
     const bufAval = viewAval.map(view => view.buffer);
     const res = prepareAdaptiveBuffer(device, bufAval, {
@@ -553,6 +572,7 @@ export function prepareRenderObject(
       ...(opts.label !== undefined ? { label: `${opts.label}.${vb.name}` } : {}),
     });
     vertexBuffers.set(vb.name, res);
+    vertexViews.set(vb.name, viewAval);
     vertexLayouts[vb.slot] = {
       arrayStride: stride,
       stepMode,
@@ -655,7 +675,7 @@ export function prepareRenderObject(
 
   return new PreparedRenderObject(
     device,
-    vertexBindings, vertexBuffers,
+    vertexBindings, vertexBuffers, vertexViews,
     indexBuffer, indexFormat, obj.indices,
     groups,
     obj.drawCall,
