@@ -5,12 +5,22 @@
     "outDir": "dist",
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "lib": ["ES2022", "DOM"],
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
     "noEmit": true,
     "composite": false,
     "declaration": false,
     "declarationMap": false,
-    "verbatimModuleSyntax": false
+    "verbatimModuleSyntax": false,
+    "plugins": [
+      {
+        "name": "@boperators/plugin-ts-language-server"
+      }
+    ]
   },
-  "include": ["src/**/*.ts"]
+  "include": [
+    "src/**/*.ts"
+  ]
 }
