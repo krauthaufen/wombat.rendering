@@ -22,6 +22,7 @@
     "vite": "^5.0.0",
     "@boperators/plugin-vite": "^0.3.2",
     "@boperators/plugin-ts-language-server": "^0.3.2",
-    "ts-patch": "^3.2.1"
+    "ts-patch": "^3.2.1",
+    "@boperators/plugin-tsc": "^0.3.2"
   }
 }
