@@ -1,0 +1,13 @@
+diff --git a/node_modules/@boperators/plugin-ts-language-server/dist/index.js b/node_modules/@boperators/plugin-ts-language-server/dist/index.js
+index c5110b7..367c3b7 100644
+--- a/node_modules/@boperators/plugin-ts-language-server/dist/index.js
++++ b/node_modules/@boperators/plugin-ts-language-server/dist/index.js
+@@ -339,7 +339,7 @@ module.exports = function init(modules) {
+         host.getScriptSnapshot = (fileName) => {
+             var _a;
+             const snap = originalGetSnapshot === null || originalGetSnapshot === void 0 ? void 0 : originalGetSnapshot(fileName);
+-            if (!snap || !fileName.endsWith(".ts") || fileName.endsWith(".d.ts"))
++            if (!snap || !(fileName.endsWith(".ts") || fileName.endsWith(".tsx")) || fileName.endsWith(".d.ts"))
+                 return snap;
+             const version = (_a = originalGetVersion === null || originalGetVersion === void 0 ? void 0 : originalGetVersion(fileName)) !== null && _a !== void 0 ? _a : "0";
+             const cached = cache.get(fileName);
