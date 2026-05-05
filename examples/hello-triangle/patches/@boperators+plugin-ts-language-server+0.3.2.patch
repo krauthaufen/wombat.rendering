@@ -1,7 +1,16 @@
 diff --git a/node_modules/@boperators/plugin-ts-language-server/dist/index.js b/node_modules/@boperators/plugin-ts-language-server/dist/index.js
-index c5110b7..367c3b7 100644
+index c5110b7..1788349 100644
 --- a/node_modules/@boperators/plugin-ts-language-server/dist/index.js
 +++ b/node_modules/@boperators/plugin-ts-language-server/dist/index.js
+@@ -329,7 +329,7 @@ module.exports = function init(modules) {
+         config.logger.info(`Creating language service plugin for project: ${info.project.getProjectName()}`);
+         const host = info.languageServiceHost;
+         // Set up ts-morph transformation pipeline
+-        const project = new boperators_1.Project({ skipFileDependencyResolution: true });
++        const project = new boperators_1.Project({ skipFileDependencyResolution: true, compilerOptions: { jsx: 4 } });
+         const errorManager = new boperators_1.ErrorManager(config);
+         const overloadStore = new boperators_1.OverloadStore(project, errorManager, config.logger);
+         const overloadInjector = new boperators_1.OverloadInjector(project, overloadStore, config.logger);
 @@ -339,7 +339,7 @@ module.exports = function init(modules) {
          host.getScriptSnapshot = (fileName) => {
              var _a;
