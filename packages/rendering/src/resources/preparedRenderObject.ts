@@ -38,6 +38,10 @@ import { BufferUsage, ShaderStage } from "./webgpuFlags.js";
 // Helpers
 // ---------------------------------------------------------------------------
 
+function isIndexFormat(fmt: string): boolean {
+  return fmt === "uint16" || fmt === "uint32";
+}
+
 function vertexFormatStride(fmt: GPUVertexFormat): number {
   switch (fmt) {
     case "float32": return 4;
@@ -558,13 +562,20 @@ export function prepareRenderObject(
     // a fresh pipeline.
     const initialView = viewAval.force();
     const explicitZeroStride = initialView.stride === 0;
+    // The buffer's own `format` (e.g. "float32x3" for a packed-Vec3
+    // position stream) is the source of truth — use it whenever
+    // present so the layout matches what's actually in memory.
+    // WebGPU auto-pads missing components when the shader declares a
+    // wider vector (vec4 input fed by Float32x3 → w=1).
+    const viewFormat = initialView.format as GPUVertexFormat | undefined;
+    const format = (viewFormat !== undefined && !isIndexFormat(viewFormat))
+      ? viewFormat
+      : vb.format;
     const stride = explicitZeroStride
       ? 0
       : (initialView.stride > 0
         ? initialView.stride
-        : (vb.byteSize !== undefined && vb.byteSize > 0
-          ? vb.byteSize
-          : vertexFormatStride(vb.format)));
+        : vertexFormatStride(format));
 
     const bufAval = viewAval.map(view => view.buffer);
     const res = prepareAdaptiveBuffer(device, bufAval, {
@@ -576,7 +587,7 @@ export function prepareRenderObject(
     vertexLayouts[vb.slot] = {
       arrayStride: stride,
       stepMode,
-      attributes: [{ shaderLocation: vb.slot, offset: 0, format: vb.format }],
+      attributes: [{ shaderLocation: vb.slot, offset: 0, format }],
     };
   }
 

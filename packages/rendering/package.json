@@ -1,7 +1,7 @@
 {
   "name": "@aardworx/wombat.rendering",
-  "version": "0.5.3",
-  "description": "WebGPU rendering layer for the Wombat TypeScript stack — RenderObject/RenderTask/runtime + window glue, port of Aardvark.Rendering's lower layers on top of WebGPU and wombat.shader.",
+  "version": "0.5.4",
+  "description": "WebGPU rendering layer for the Wombat TypeScript stack \u2014 RenderObject/RenderTask/runtime + window glue, port of Aardvark.Rendering's lower layers on top of WebGPU and wombat.shader.",
   "license": "MIT",
   "author": "krauthaufen",
   "repository": {
@@ -55,8 +55,8 @@
   ],
   "dependencies": {
     "@aardworx/wombat.adaptive": "^0.2.1",
-    "@aardworx/wombat.base": "^0.3.0",
-    "@aardworx/wombat.shader": "^0.3.0"
+    "@aardworx/wombat.base": "^0.4.0",
+    "@aardworx/wombat.shader": "^0.4.0"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.69"
