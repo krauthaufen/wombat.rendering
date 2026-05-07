@@ -22,3 +22,13 @@ export {
   ScenePass,
   type WalkerStats,
 } from "./scenePass.js";
+
+export {
+  buildHeapScene,
+  type HeapScene,
+  type HeapSceneStats,
+  type HeapDrawSpec,
+  type HeapGeometry,
+  type HeapTextureSet,
+  type BuildHeapSceneOptions,
+} from "./heapScene.js";
