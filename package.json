@@ -1,5 +1,5 @@
 {
-  "name": "@aardworx/wombat.rendering-monorepo",
+  "name": "wombat.rendering.experimental",
   "private": true,
   "type": "module",
   "engines": {
