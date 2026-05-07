@@ -17,16 +17,11 @@ const srcRoot = resolve(here, "..", "packages", "rendering", "src");
 
 /**
  * Files that may legitimately call `.force()` — bounded "outside
- * adaptive context" boundaries. Keep this list explicit and minimal.
- *
- *   - `preparedRenderObject.ts`: one-time read of the index buffer
- *     view to discover its `indexFormat` at construction. The view
- *     aval is expected to settle on a stable format; per-frame
- *     reads inside `record(token)` use `getValue(token)` instead.
+ * adaptive context" boundaries. Each remaining force has an inline
+ * `/* allow-force *\/` comment that the regex below treats as
+ * permission. This file lists the remaining whole-file exceptions.
  */
-const ALLOWED = new Set<string>([
-  "resources/preparedRenderObject.ts",
-]);
+const ALLOWED = new Set<string>([]);
 
 describe("no .force() on the render path", () => {
   it("scans wombat.rendering src for .force(", () => {
@@ -50,20 +45,15 @@ describe("no .force() on the render path", () => {
     expect(offenders, `unexpected .force() call sites:\n${offenders.join("\n")}`).toEqual([]);
   });
 
-  it("preparedRenderObject only forces at construction-boundary spots", () => {
-    const file = readFileSync(resolve(srcRoot, "resources", "preparedRenderObject.ts"), "utf8");
+  it("BufferView.ofArray forces once for element-type discovery", () => {
+    const file = readFileSync(resolve(srcRoot, "core", "bufferView.ts"), "utf8");
     const matches = [...file.matchAll(/\.force\(/g)];
-    // Construction-boundary forces, all at prepare-time:
-    //   - `obj.indices.force()` — index-format discovery from the
-    //     initial BufferView.
-    //   - `viewAval.force()` per vertex binding — initial stride /
-    //     offset / format discovery for the buffer-grouping pass
-    //     (groups by `(IBuffer, stride, stepMode)`); the stride and
-    //     stepMode are structural and don't change frame-to-frame.
-    // The vertex/instance attribute maps are no longer aval-wrapped
-    // at the outer level (the set of names is structural).
-    expect(matches.length).toBe(2);
-    expect(file).toMatch(/obj\.indices\.force\(\)/);
-    expect(file).toMatch(/viewAval\.force\(\)/);
+    // BufferView.ofArray force is structural-eager: one-time read of
+    // the source aval to infer ElementType from the array kind. The
+    // aval is expected to keep the same array shape for its lifetime;
+    // per-frame content changes flow through the inner `aval<IBuffer>`
+    // without re-running ofArray. Marked with /* allow-force */ inline.
+    expect(matches.length).toBe(1);
+    expect(file).toMatch(/adaptive\.force\(\/\* allow-force \*\/\)/);
   });
 });

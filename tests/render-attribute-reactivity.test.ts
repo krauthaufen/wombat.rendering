@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  AList, AdaptiveToken, HashMap, cval, transact, type aval,
+  AList, AdaptiveToken, HashMap, cval, transact, type aval, AVal
 } from "@aardworx/wombat.adaptive";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
 import {
@@ -53,18 +53,17 @@ describe("RenderObject vertexAttributes — per-buffer reactivity", () => {
     const runtime = new Runtime({ device: gpu.device });
     const eff = singleAttribEffect();
 
-    const viewA: BufferView = {
-      buffer: IBuffer.fromHost(new ArrayBuffer(36)),
-      offset: 0, count: 3, stride: 12, format: "float32x3",
+    // Buffer reactivity now lives inside `BufferView.buffer: aval<IBuffer>`.
+    // Flipping that aval to a larger buffer forces the AdaptiveBuffer
+    // to reallocate — distinct GPU handle, no pipeline rebuild.
+    const bufferA = IBuffer.fromHost(new ArrayBuffer(36));
+    const bufferB = IBuffer.fromHost(new ArrayBuffer(360));
+    const bufferCval = cval<IBuffer>(bufferA);
+    const view: BufferView = {
+      buffer: bufferCval,
+      offset: 0, stride: 12, elementType: "v3f",
     };
-    // viewB has a LARGER buffer so the AdaptiveBuffer must reallocate
-    // (different GPU handle observable in setVertexBufferCalls).
-    const viewB: BufferView = {
-      buffer: IBuffer.fromHost(new ArrayBuffer(360)),
-      offset: 0, count: 30, stride: 12, format: "float32x3",
-    };
-    const positionView = cval<BufferView>(viewA);
-    const map = HashMap.empty<string, aval<BufferView>>().add("position", positionView);
+    const map = HashMap.empty<string, BufferView>().add("position", view);
 
     const obj: RenderObject = {
       effect: eff,
@@ -90,8 +89,8 @@ describe("RenderObject vertexAttributes — per-buffer reactivity", () => {
     expect(setVB1.length).toBeGreaterThan(0);
     const firstBuf = setVB1[setVB1.length - 1]!.buffer;
 
-    // Flip the inner per-attribute aval — same map, new BufferView.
-    transact(() => { positionView.value = viewB; });
+    // Flip the inner per-attribute aval — same view, new IBuffer.
+    transact(() => { bufferCval.value = bufferB; });
     task.run(AdaptiveToken.top);
 
     // Pipeline cache stays at 1 — buffer-identity swaps do not feed

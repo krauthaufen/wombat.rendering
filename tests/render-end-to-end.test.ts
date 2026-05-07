@@ -4,7 +4,7 @@
 // tests-browser/render-real.test.ts.
 
 import { describe, expect, it } from "vitest";
-import { AdaptiveToken, HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
+import { AdaptiveToken, HashMap, cval, type aval , AVal} from "@aardworx/wombat.adaptive";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
 import {
   IBuffer,
@@ -55,10 +55,10 @@ function twoAttribEffect() {
 }
 
 function bv(bytes: number, format: GPUVertexFormat, count: number): aval<BufferView> {
-  return cval<BufferView>({
-    buffer: IBuffer.fromHost(new ArrayBuffer(bytes)),
+  return {
+    buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(bytes))),
     offset: 0, count, stride: 12, format,
-  });
+  };
 }
 
 describe("prepareRenderObject", () => {
@@ -70,7 +70,7 @@ describe("prepareRenderObject", () => {
     const make = () => prepareRenderObject(gpu.device, {
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-      vertexAttributes: HashMap.empty<string, aval<BufferView>>()
+      vertexAttributes: HashMap.empty<string, BufferView>()
         .add("position", bv(36, "float32x3", 3))
         .add("normal",   bv(36, "float32x3", 3)),
       uniforms: HashMap.empty(),

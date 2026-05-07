@@ -10,7 +10,7 @@ import {
   AdaptiveToken,
     HashMap,
   cval,
-  type aval,
+  type aval, AVal
 } from "@aardworx/wombat.adaptive";
 import { V4f } from "@aardworx/wombat.base";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
@@ -64,17 +64,17 @@ function singleAttribEffect() {
 }
 
 function bv(): aval<BufferView> {
-  return cval<BufferView>({
-    buffer: IBuffer.fromHost(new ArrayBuffer(36)),
-    offset: 0, count: 3, stride: 12, format: "float32x3",
-  });
+  return {
+    buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(36))),
+    offset: 0, stride: 12, elementType: "v3f",
+  };
 }
 
 function obj() {
   return {
     effect: singleAttribEffect(),
     pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list" as const, cullMode: "none" as const, frontFace: "ccw" as const } }),
-    vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv()),
+    vertexAttributes: HashMap.empty<string, BufferView>().add("position", bv()),
     uniforms: HashMap.empty(),
     textures: HashMap.empty(),
     samplers: HashMap.empty(),

@@ -3,7 +3,7 @@
 // render pass.
 
 import { describe, expect, it } from "vitest";
-import { AList, AdaptiveToken, HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
+import { AList, AdaptiveToken, HashMap, cval, type aval , AVal} from "@aardworx/wombat.adaptive";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
 import {
   IBuffer,
@@ -53,9 +53,9 @@ function ro(face: "ccw" | "cw"): RenderObject {
     effect: effectWithFrontFace(face),
     // Different frontFace → different pipeline → different sort rank.
     pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "back", frontFace: face } }),
-    vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", cval<BufferView>({
-      buffer: IBuffer.fromHost(new ArrayBuffer(36)), offset: 0, count: 3, stride: 12, format: "float32x3",
-    })),
+    vertexAttributes: HashMap.empty<string, BufferView>().add("position", {
+      buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(36))), offset: 0, stride: 12, elementType: "v3f",
+    }),
     uniforms: HashMap.empty(),
     textures: HashMap.empty(),
     samplers: HashMap.empty(),

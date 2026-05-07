@@ -45,9 +45,9 @@ export interface RenderObject {
    * individual buffer values are reactive. The shader's required-input
    * set is fixed at compile; the map must contain at least those names.
    */
-  readonly vertexAttributes: HashMap<string, aval<BufferView>>;
+  readonly vertexAttributes: HashMap<string, BufferView>;
   /** name → instance buffer view; e.g. "modelMatrix", "instanceColor". */
-  readonly instanceAttributes?: HashMap<string, aval<BufferView>>;
+  readonly instanceAttributes?: HashMap<string, BufferView>;
   /** name → uniform value; runtime packs into UBO based on shader layout. */
   readonly uniforms: HashMap<string, aval<unknown>>;
   /** name → texture source (CPU image or pre-built GPUTexture). */
@@ -58,6 +58,6 @@ export interface RenderObject {
   readonly storageBuffers?: HashMap<string, aval<IBuffer>>;
 
   /** Index buffer for indexed draws. */
-  readonly indices?: aval<BufferView>;
+  readonly indices?: BufferView;
   readonly drawCall: aval<DrawCall>;
 }

@@ -11,9 +11,13 @@ export type {
   HostBufferSource,
 } from "./buffer.js";
 
-export type {
+export {
   BufferView,
 } from "./bufferView.js";
+
+export {
+  ElementType,
+} from "./elementType.js";
 
 export type {
   ClearColor,

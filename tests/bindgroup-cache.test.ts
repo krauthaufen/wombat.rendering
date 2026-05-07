@@ -3,7 +3,7 @@
 // fresh createBindGroup.
 
 import { describe, expect, it } from "vitest";
-import { AList, AdaptiveToken, HashMap, cval, transact, type aval } from "@aardworx/wombat.adaptive";
+import { AList, AdaptiveToken, HashMap, cval, transact, type aval , AVal} from "@aardworx/wombat.adaptive";
 import { V4f } from "@aardworx/wombat.base";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
 import {
@@ -49,9 +49,9 @@ describe("bind-group cache", () => {
     const obj: RenderObject = {
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-      vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", cval<BufferView>({
-        buffer: IBuffer.fromHost(new ArrayBuffer(36)), offset: 0, count: 3, stride: 12, format: "float32x3",
-      })),
+      vertexAttributes: HashMap.empty<string, BufferView>().add("position", {
+        buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(36))), offset: 0, stride: 12, elementType: "v3f",
+      }),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),
@@ -100,14 +100,14 @@ describe("bind-group cache", () => {
     const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
     fbo.acquire();
 
-    const posView = cval<BufferView>({
-      buffer: IBuffer.fromHost(new ArrayBuffer(36)),
-      offset: 0, count: 3, stride: 12, format: "float32x3",
-    });
+    const posView = {
+      buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(36))),
+      offset: 0, stride: 12, elementType: "v3f",
+    };
     const obj: RenderObject = {
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-      vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", posView),
+      vertexAttributes: HashMap.empty<string, BufferView>().add("position", posView),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),
@@ -122,8 +122,8 @@ describe("bind-group cache", () => {
     // Grow the host data → underlying GPUBuffer reallocates.
     transact(() => {
       posView.value = {
-        buffer: IBuffer.fromHost(new ArrayBuffer(72)),
-        offset: 0, count: 6, stride: 12, format: "float32x3",
+        buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(72))),
+        offset: 0, stride: 12, elementType: "v3f",
       };
     });
     task.run(AdaptiveToken.top);

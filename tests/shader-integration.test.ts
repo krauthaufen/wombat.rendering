@@ -11,7 +11,7 @@ import {
   AdaptiveToken,
     HashMap,
   cval,
-  type aval,
+  type aval, AVal
 } from "@aardworx/wombat.adaptive";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
 import {
@@ -70,10 +70,10 @@ function helloTriangle() {
 }
 
 function bv(format: GPUVertexFormat, bytes = 24): aval<BufferView> {
-  return cval<BufferView>({
-    buffer: IBuffer.fromHost(new ArrayBuffer(bytes)),
-    offset: 0, count: 3, stride: format === "float32x2" ? 8 : 12, format,
-  });
+  return {
+    buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(bytes))),
+    offset: 0, stride: format === "float32x2" ? 8 : 12, format,
+  };
 }
 
 describe("shader integration: invariants", () => {
@@ -92,7 +92,7 @@ describe("shader integration: invariants", () => {
     const obj: RenderObject = {
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-      vertexAttributes: HashMap.empty<string, aval<BufferView>>()
+      vertexAttributes: HashMap.empty<string, BufferView>()
         .add("a_position", bv("float32x2"))
         .add("a_color",    bv("float32x3")),
       uniforms: HashMap.empty(),
@@ -179,7 +179,7 @@ describe("shader integration: invariants", () => {
     const mk = (): RenderObject => ({
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-      vertexAttributes: HashMap.empty<string, aval<BufferView>>()
+      vertexAttributes: HashMap.empty<string, BufferView>()
         .add("a_position", bv("float32x2"))
         .add("a_color",    bv("float32x3")),
       uniforms: HashMap.empty(),

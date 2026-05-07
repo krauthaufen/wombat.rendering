@@ -49,10 +49,10 @@ function trivEffect() {
 }
 
 function bv(): aval<BufferView> {
-  return cval<BufferView>({
-    buffer: IBuffer.fromHost(new ArrayBuffer(36)),
-    offset: 0, count: 3, stride: 12, format: "float32x3",
-  });
+  return {
+    buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(36))),
+    offset: 0, stride: 12, elementType: "v3f",
+  };
 }
 
 describe("PipelineState reactivity", () => {
@@ -72,7 +72,7 @@ describe("PipelineState reactivity", () => {
           frontFace: AVal.constant("ccw"),
         },
       },
-      vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv()),
+      vertexAttributes: HashMap.empty<string, BufferView>().add("position", bv()),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),
@@ -114,7 +114,7 @@ describe("PipelineState reactivity", () => {
         },
         blendConstant: blendConstantC,
       },
-      vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv()),
+      vertexAttributes: HashMap.empty<string, BufferView>().add("position", bv()),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),
@@ -171,7 +171,7 @@ describe("PipelineState reactivity", () => {
           },
         },
       },
-      vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("position", bv()),
+      vertexAttributes: HashMap.empty<string, BufferView>().add("position", bv()),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),

@@ -14,6 +14,8 @@
 
 import {
   AdaptiveResource,
+  BufferView,
+  ElementType,
   type CompiledEffect,
   type FramebufferSignature,
   type ProgramInterface,
@@ -25,7 +27,6 @@ import {
   HashMap,
   cval,
 } from "@aardworx/wombat.adaptive";
-import type { BufferView } from "../core/bufferView.js";
 import type { Type } from "@aardworx/wombat.shader/ir";
 import { prepareAdaptiveBuffer } from "./adaptiveBuffer.js";
 import { prepareAdaptiveTexture } from "./adaptiveTexture.js";
@@ -33,32 +34,6 @@ import { prepareAdaptiveSampler } from "./adaptiveSampler.js";
 import { prepareUniformBuffer } from "./uniformBuffer.js";
 import { compileRenderPipeline, type CompileRenderPipelineDescription } from "./renderPipeline.js";
 import { BufferUsage, ShaderStage } from "./webgpuFlags.js";
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function isIndexFormat(fmt: string): boolean {
-  return fmt === "uint16" || fmt === "uint32";
-}
-
-function vertexFormatStride(fmt: GPUVertexFormat): number {
-  switch (fmt) {
-    case "float32": return 4;
-    case "float32x2": return 8;
-    case "float32x3": return 12;
-    case "float32x4": return 16;
-    case "uint32": case "sint32": return 4;
-    case "uint32x2": case "sint32x2": return 8;
-    case "uint32x3": case "sint32x3": return 12;
-    case "uint32x4": case "sint32x4": return 16;
-    case "uint16x2": case "sint16x2": case "float16x2": return 4;
-    case "uint16x4": case "sint16x4": case "float16x4": return 8;
-    case "uint8x2": case "sint8x2": case "unorm8x2": case "snorm8x2": return 2;
-    case "uint8x4": case "sint8x4": case "unorm8x4": case "snorm8x4": return 4;
-    default: throw new Error(`vertexFormatStride: unsupported format ${fmt}`);
-  }
-}
 
 interface VertexBindingInfo {
   readonly name: string;
@@ -371,10 +346,10 @@ export class PreparedRenderObject {
     private readonly device: GPUDevice,
     private readonly vertexBindings: readonly VertexBindingInfo[],
     private readonly vertexBuffers: ReadonlyMap<string, AdaptiveResource<GPUBuffer>>,
-    private readonly vertexViews: ReadonlyMap<string, aval<import("../core/index.js").BufferView>>,
+    private readonly vertexViews: ReadonlyMap<string, BufferView>,
     private readonly indexBuffer: AdaptiveResource<GPUBuffer> | undefined,
     private readonly indexFormat: GPUIndexFormat | undefined,
-    private readonly indices: aval<import("../core/index.js").BufferView> | undefined,
+    private readonly indices: BufferView | undefined,
     groups: readonly GroupDesc[],
     private readonly drawCall: aval<import("../core/index.js").DrawCall>,
     pipelineCtx: PipelineBuildContext,
@@ -479,15 +454,12 @@ export class PreparedRenderObject {
     for (const vb of this.vertexBindings) {
       const res = this.vertexBuffers.get(vb.name);
       if (res === undefined) throw new Error(`PreparedRenderObject.record: missing vertex buffer for "${vb.name}"`);
-      const viewAval = this.vertexViews.get(vb.name);
-      const view = viewAval !== undefined ? viewAval.getValue(token) : undefined;
+      const view = this.vertexViews.get(vb.name);
       const buf = res.getValue(token);
-      if (view !== undefined && view.offset > 0) {
-        // size omitted → WebGPU uses (buffer.size − offset). The
-        // BufferView's count·stride span doesn't include the offset,
-        // so passing it here would request bytes past the end of the
-        // buffer for any non-zero offset; let WebGPU default.
-        pass.setVertexBuffer(vb.slot, buf, view.offset);
+      const offset = view !== undefined ? BufferView.offsetOf(view) : 0;
+      if (offset > 0) {
+        // size omitted → WebGPU uses (buffer.size − offset).
+        pass.setVertexBuffer(vb.slot, buf, offset);
       } else {
         pass.setVertexBuffer(vb.slot, buf);
       }
@@ -495,8 +467,8 @@ export class PreparedRenderObject {
 
     if (this.indexBuffer !== undefined && this.indices !== undefined && this.indexFormat !== undefined) {
       const buf = this.indexBuffer.getValue(token);
-      const view = this.indices.getValue(token);
-      pass.setIndexBuffer(buf, this.indexFormat, view.offset, view.count * (this.indexFormat === "uint16" ? 2 : 4));
+      // size omitted → WebGPU uses (buffer.size − offset).
+      pass.setIndexBuffer(buf, this.indexFormat, BufferView.offsetOf(this.indices));
     }
 
     const dc = this.drawCall.getValue(token);
@@ -541,12 +513,16 @@ export function prepareRenderObject(
 
   // Per-attribute resolution + grouping. Multiple attributes can
   // share one underlying GPUBuffer slot when they all point at the
-  // same `IBuffer` with the same stride + stepMode (the
-  // auto-instancing rewrite emits 4 vec4 column attributes per
-  // M44 instance trafo — without packing we'd hit
-  // `maxVertexBuffers` (8) for any moderately rich instancing
-  // scope). Each attribute's `view.offset` becomes its
+  // same `aval<IBuffer>` (by reference identity) with the same
+  // stride + stepMode (the auto-instancing rewrite emits 4 vec4
+  // column attributes per M44 instance trafo — without packing
+  // we'd hit `maxVertexBuffers` (8) for any moderately rich
+  // instancing scope). Each attribute's `view.offset` becomes its
   // shader-location offset within the shared layout.
+  //
+  // BufferView is now structural-eager (elementType/offset/stride),
+  // so no `force()` is needed to discover layout — the attribute
+  // grouping reads the plain fields directly.
   interface ResolvedBinding {
     readonly name: string;
     readonly shaderLocation: number;
@@ -554,8 +530,7 @@ export function prepareRenderObject(
     readonly stride: number;
     readonly offset: number;
     readonly format: GPUVertexFormat;
-    readonly viewAval: aval<import("../core/index.js").BufferView>;
-    readonly buffer: import("../core/index.js").IBuffer;
+    readonly view: BufferView;
   }
   const resolved: ResolvedBinding[] = [];
   for (const vb of vertexBindings) {
@@ -567,33 +542,28 @@ export function prepareRenderObject(
     const isInstance = fromVertex === undefined && fromInstance !== undefined;
     const stepMode: GPUVertexStepMode = isInstance ? "instance" : "vertex";
 
-    const viewAval = (fromVertex ?? fromInstance)!;
-    const initialView = viewAval.force();
-    const viewFormat = initialView.format as GPUVertexFormat | undefined;
-    const format = (viewFormat !== undefined && !isIndexFormat(viewFormat))
-      ? viewFormat : vb.format;
-    const stride = initialView.stride === 0
-      ? 0
-      : (initialView.stride > 0 ? initialView.stride : vertexFormatStride(format));
+    const view = (fromVertex ?? fromInstance)!;
+    const format = ElementType.toVertexFormat(view.elementType, view.normalized ?? false);
+    const stride = BufferView.strideOf(view);
+    const offset = BufferView.offsetOf(view);
     resolved.push({
       name: vb.name,
       shaderLocation: vb.slot,
-      stepMode, stride, offset: initialView.offset,
-      format, viewAval, buffer: initialView.buffer,
+      stepMode, stride, offset,
+      format, view,
     });
   }
 
-  // Group resolved bindings by (IBuffer, stride, stepMode). Each
-  // group becomes one GPUVertexBufferLayout with one or more
-  // attributes; multiple bindings sharing one buffer collapse to a
-  // single setVertexBuffer call at draw time.
+  // Group resolved bindings by (IBuffer-aval identity, stride, stepMode).
+  // The aval reference is the natural identity now that BufferView
+  // owns its `aval<IBuffer>` directly.
   type GroupKey = string;
   interface BindingGroup {
     readonly key: GroupKey;
     readonly slot: number;             // GPU vertex-buffer slot index
     readonly stride: number;
     readonly stepMode: GPUVertexStepMode;
-    readonly viewAval: aval<import("../core/index.js").BufferView>;
+    readonly view: BufferView;
     readonly bufferRes: AdaptiveResource<GPUBuffer>;
     readonly members: ResolvedBinding[];
   }
@@ -607,26 +577,25 @@ export function prepareRenderObject(
   const vbGroups = new Map<GroupKey, BindingGroup>();
   let nextSlot = 0;
   const vertexBuffers = new Map<string, AdaptiveResource<GPUBuffer>>();
-  const vertexViews = new Map<string, aval<import("../core/index.js").BufferView>>();
+  const vertexViews = new Map<string, BufferView>();
   for (const r of resolved) {
-    const bufId = idOf(r.buffer as unknown as object);
+    const bufId = idOf(r.view.buffer as unknown as object);
     const key = `${bufId}|${r.stride}|${r.stepMode}`;
     let group = vbGroups.get(key);
     if (!group) {
-      const bufAval = r.viewAval.map(view => view.buffer);
-      const bufferRes = prepareAdaptiveBuffer(device, bufAval, {
+      const bufferRes = prepareAdaptiveBuffer(device, r.view.buffer, {
         usage: BufferUsage.VERTEX,
         ...(opts.label !== undefined ? { label: `${opts.label}.${r.name}` } : {}),
       });
       group = {
         key, slot: nextSlot++, stride: r.stride, stepMode: r.stepMode,
-        viewAval: r.viewAval, bufferRes, members: [],
+        view: r.view, bufferRes, members: [],
       };
       vbGroups.set(key, group);
     }
     group.members.push(r);
     vertexBuffers.set(r.name, group.bufferRes);
-    vertexViews.set(r.name, r.viewAval);
+    vertexViews.set(r.name, r.view);
   }
   const vertexLayouts: GPUVertexBufferLayout[] = [];
   for (const g of vbGroups.values()) {
@@ -663,21 +632,16 @@ export function prepareRenderObject(
   }
   vertexBindings = drawTimeBindings;
 
-  // Index buffer — `indexFormat` from BufferView wins; defaults to uint32.
+  // Index buffer — `elementType` (u16 / u32) determines `GPUIndexFormat`.
+  // Structural fields are eager on BufferView, so no force needed.
   let indexBuffer: AdaptiveResource<GPUBuffer> | undefined;
   let indexFormat: GPUIndexFormat | undefined;
   if (obj.indices !== undefined) {
-    const bufAval = obj.indices.map(v => v.buffer);
-    indexBuffer = prepareAdaptiveBuffer(device, bufAval, {
+    indexBuffer = prepareAdaptiveBuffer(device, obj.indices.buffer, {
       usage: BufferUsage.INDEX,
       ...(opts.label !== undefined ? { label: `${opts.label}.indices` } : {}),
     });
-    // Construction-time read to discover the index format. The
-    // BufferView aval is expected to settle on a stable format —
-    // changing index format would require a fresh PreparedRO.
-    const initial = obj.indices.force();
-    indexFormat = initial.indexFormat
-      ?? (initial.format === "uint16" ? "uint16" : "uint32");
+    indexFormat = ElementType.toIndexFormat(obj.indices.elementType);
   }
 
   const slotOf = (e: { group: number; slot: number }) => e.slot;
@@ -767,8 +731,8 @@ export function prepareRenderObject(
   );
 }
 
-function emptyAttrMap(): HashMap<string, aval<BufferView>> {
-  return HashMap.empty<string, aval<BufferView>>();
+function emptyAttrMap(): HashMap<string, BufferView> {
+  return HashMap.empty<string, BufferView>();
 }
 
 /**
