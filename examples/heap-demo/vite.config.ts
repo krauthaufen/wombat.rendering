@@ -8,6 +8,7 @@ const here = fileURLToPath(new URL(".", import.meta.url));
 export default defineConfig({
   plugins: [boperators(), wombatShader({ rootDir: here })],
   server: {
+    host: true,            // bind 0.0.0.0 so Tailscale / LAN clients can reach the dev server
     port: 5180,
     allowedHosts: [".ts.net", ".loca.lt", "localhost"],
   },
