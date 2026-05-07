@@ -40,25 +40,26 @@ import type { GeometryData } from "./geometry.js";
 //     lightLocation: vec4<f32>,     // 16 (.xyz used; .w padding)
 //   };
 //
-// 208 bytes per entry, 16-byte aligned. We pack matrices in
-// column-major order — WGSL `mat4x4<f32>` treats stored bytes as
-// column-major.
+// 208 bytes per entry, 16-byte aligned.
+//
+// Matrix storage convention — matches wombat.shader's uniform-block
+// upload path: raw `M44d._data` (row-major) goes to GPU; WGSL reads
+// `mat4x4<f32>` as column-major, so the GPU effectively sees M^T.
+// Every DSL matrix mul has a WGSL row-vec dual that compensates:
+//
+//     DSL `M.mul(v)`   ≡   `M · v`         →   WGSL `v * M_wgsl`
+//     DSL `v.mul(M)`   ≡   `(v · M)^T`     →   WGSL `M_wgsl * v`
+//
+// Keeping this convention in the hand-rolled path means the eventual
+// IR-rewrite port re-uses the same memory layout — no re-pack pass.
 
 const DRAW_UNIFORMS_BYTES = 64 * 3 + 16;
 const DRAW_UNIFORMS_FLOATS = DRAW_UNIFORMS_BYTES / 4;
 
-/** Row-major M44d → column-major Float32 view, written into `dst[off..off+16]`. */
-function packMat44ColMajor(m: import("@aardworx/wombat.base").M44d, dst: Float32Array, off: number): void {
-  // `m._data` is row-major (rows × cols). Transpose to column-major.
+/** Copy M44d._data verbatim into `dst[off..off+16]` (row-major, no transpose). */
+function packMat44(m: import("@aardworx/wombat.base").M44d, dst: Float32Array, off: number): void {
   const r = m._data;
-  // col 0
-  dst[off +  0] = r[0]!;  dst[off +  1] = r[4]!;  dst[off +  2] = r[8]!;   dst[off +  3] = r[12]!;
-  // col 1
-  dst[off +  4] = r[1]!;  dst[off +  5] = r[5]!;  dst[off +  6] = r[9]!;   dst[off +  7] = r[13]!;
-  // col 2
-  dst[off +  8] = r[2]!;  dst[off +  9] = r[6]!;  dst[off + 10] = r[10]!;  dst[off + 11] = r[14]!;
-  // col 3
-  dst[off + 12] = r[3]!;  dst[off + 13] = r[7]!;  dst[off + 14] = r[11]!;  dst[off + 15] = r[15]!;
+  for (let i = 0; i < 16; i++) dst[off + i] = r[i]!;
 }
 
 function packDrawUniforms(
@@ -69,9 +70,9 @@ function packDrawUniforms(
   drawIndex: number,
 ): void {
   const off = drawIndex * DRAW_UNIFORMS_FLOATS;
-  packMat44ColMajor(modelTrafo.forward,  dst, off +  0);
-  packMat44ColMajor(modelTrafo.backward, dst, off + 16);
-  packMat44ColMajor(viewProj.forward,    dst, off + 32);
+  packMat44(modelTrafo.forward,  dst, off +  0);
+  packMat44(modelTrafo.backward, dst, off + 16);
+  packMat44(viewProj.forward,    dst, off + 32);
   dst[off + 48] = lightLocation.x as number;
   dst[off + 49] = lightLocation.y as number;
   dst[off + 50] = lightLocation.z as number;
@@ -109,12 +110,16 @@ struct VsOut {
 @vertex
 fn vs(in: VsIn, @builtin(instance_index) drawIdx: u32) -> VsOut {
   let u = heap[drawIdx];
-  let wp = u.modelTrafo * vec4<f32>(in.position, 1.0);
-  // Inv-transpose normal trick: row-vec multiplication n * M^-1
-  // equals (M^-1)^T * n = NormalMatrix * n.
-  let n = (vec4<f32>(in.normal, 0.0) * u.modelTrafoInv).xyz;
+  // wombat.shader convention: matrices are uploaded row-major, WGSL
+  // reads them column-major = transposed. Use the row-vec dual:
+  //   DSL  M.mul(v)  =  M*v    -->  WGSL   v * M_wgsl
+  //   DSL  v.mul(M)  =  M^T*v  -->  WGSL   M_wgsl * v
+  let wp = vec4<f32>(in.position, 1.0) * u.modelTrafo;
+  // Inv-transpose normal trick: DSL  n.mul(MTI)  -->  WGSL  MTI_wgsl * n.
+  // Stored bytes M_wgsl = MTI^T, so the result is MTI^T * n = NormalMatrix * n.
+  let n = (u.modelTrafoInv * vec4<f32>(in.normal, 0.0)).xyz;
   var out: VsOut;
-  out.clipPos  = u.viewProjTrafo * wp;
+  out.clipPos  = wp * u.viewProjTrafo;
   out.worldPos = wp.xyz;
   out.normal   = n;
   out.color    = in.color;
