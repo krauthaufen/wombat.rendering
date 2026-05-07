@@ -543,7 +543,7 @@ export function prepareRenderObject(
     const stepMode: GPUVertexStepMode = isInstance ? "instance" : "vertex";
 
     const view = (fromVertex ?? fromInstance)!;
-    const format = ElementType.toVertexFormat(view.elementType, view.normalized ?? false);
+    const format = ElementType.toVertexFormat(view.elementType);
     const stride = BufferView.strideOf(view);
     const offset = BufferView.offsetOf(view);
     resolved.push({

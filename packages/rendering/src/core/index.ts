@@ -17,6 +17,7 @@ export {
 
 export {
   ElementType,
+  ElementKind,
 } from "./elementType.js";
 
 export type {

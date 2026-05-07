@@ -13,6 +13,7 @@ import {
   type DrawCall,
   type RenderObject,
   PipelineState,
+  ElementType,
 } from "@aardworx/wombat.rendering/core";
 import {
   createFramebufferSignature,
@@ -49,7 +50,7 @@ function passEffect() {
 function bv(): aval<BufferView> {
   return {
     buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(36))),
-    offset: 0, stride: 12, elementType: "v3f",
+    offset: 0, stride: 12, elementType: ElementType.V3f,
   };
 }
 

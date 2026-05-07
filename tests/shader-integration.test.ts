@@ -22,6 +22,7 @@ import {
   type DrawCall,
   type RenderObject,
   PipelineState,
+  ElementType,
 } from "@aardworx/wombat.rendering/core";
 import {
   allocateFramebuffer,
@@ -69,10 +70,10 @@ function helloTriangle() {
   );
 }
 
-function bv(format: GPUVertexFormat, bytes = 24): aval<BufferView> {
+function bv(elementType: ElementType, bytes = 24): BufferView {
   return {
     buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(bytes))),
-    offset: 0, stride: format === "float32x2" ? 8 : 12, format,
+    elementType,
   };
 }
 
@@ -93,8 +94,8 @@ describe("shader integration: invariants", () => {
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
       vertexAttributes: HashMap.empty<string, BufferView>()
-        .add("a_position", bv("float32x2"))
-        .add("a_color",    bv("float32x3")),
+        .add("a_position", bv(ElementType.V2f))
+        .add("a_color",    bv(ElementType.V3f)),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),
@@ -180,8 +181,8 @@ describe("shader integration: invariants", () => {
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
       vertexAttributes: HashMap.empty<string, BufferView>()
-        .add("a_position", bv("float32x2"))
-        .add("a_color",    bv("float32x3")),
+        .add("a_position", bv(ElementType.V2f))
+        .add("a_color",    bv(ElementType.V3f)),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),

@@ -28,6 +28,7 @@ import {
   type DrawCall,
   type RenderObject,
   PipelineState,
+  ElementType,
 } from "@aardworx/wombat.rendering/core";
 import {
   allocateFramebuffer,
@@ -67,7 +68,7 @@ function makeRO(eff = flatRedEffect()): RenderObject {
     effect: eff,
     pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
     vertexAttributes: HashMap.empty<string, BufferView>().add("position", {
-      buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(36))), offset: 0, stride: 12, elementType: "v3f",
+      buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(36))), offset: 0, stride: 12, elementType: ElementType.V3f,
     }),
     uniforms: HashMap.empty(),
     textures: HashMap.empty(),

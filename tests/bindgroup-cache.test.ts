@@ -14,6 +14,7 @@ import {
   type DrawCall,
   type RenderObject,
   PipelineState,
+  ElementType,
 } from "@aardworx/wombat.rendering/core";
 import { allocateFramebuffer, createFramebufferSignature } from "@aardworx/wombat.rendering/resources";
 import { Runtime } from "@aardworx/wombat.rendering/runtime";
@@ -50,7 +51,7 @@ describe("bind-group cache", () => {
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
       vertexAttributes: HashMap.empty<string, BufferView>().add("position", {
-        buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(36))), offset: 0, stride: 12, elementType: "v3f",
+        buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(36))), offset: 0, stride: 12, elementType: ElementType.V3f,
       }),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
@@ -102,7 +103,7 @@ describe("bind-group cache", () => {
 
     const posView = {
       buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(36))),
-      offset: 0, stride: 12, elementType: "v3f",
+      offset: 0, stride: 12, elementType: ElementType.V3f,
     };
     const obj: RenderObject = {
       effect: eff,
@@ -123,7 +124,7 @@ describe("bind-group cache", () => {
     transact(() => {
       posView.value = {
         buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(72))),
-        offset: 0, stride: 12, elementType: "v3f",
+        offset: 0, stride: 12, elementType: ElementType.V3f,
       };
     });
     task.run(AdaptiveToken.top);

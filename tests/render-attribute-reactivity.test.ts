@@ -16,6 +16,7 @@ import {
   type DrawCall,
   type RenderObject,
   PipelineState,
+  ElementType,
 } from "@aardworx/wombat.rendering/core";
 import { allocateFramebuffer, createFramebufferSignature } from "@aardworx/wombat.rendering/resources";
 import { Runtime } from "@aardworx/wombat.rendering/runtime";
@@ -61,7 +62,7 @@ describe("RenderObject vertexAttributes — per-buffer reactivity", () => {
     const bufferCval = cval<IBuffer>(bufferA);
     const view: BufferView = {
       buffer: bufferCval,
-      offset: 0, stride: 12, elementType: "v3f",
+      offset: 0, stride: 12, elementType: ElementType.V3f,
     };
     const map = HashMap.empty<string, BufferView>().add("position", view);
 

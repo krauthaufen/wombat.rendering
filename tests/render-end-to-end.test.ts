@@ -11,6 +11,7 @@ import {
   type BufferView,
   type DrawCall,
   PipelineState,
+  ElementType,
 } from "@aardworx/wombat.rendering/core";
 import {
   createFramebufferSignature,
@@ -54,10 +55,10 @@ function twoAttribEffect() {
   );
 }
 
-function bv(bytes: number, format: GPUVertexFormat, count: number): aval<BufferView> {
+function bv(bytes: number, elementType: ElementType): BufferView {
   return {
     buffer: AVal.constant(IBuffer.fromHost(new ArrayBuffer(bytes))),
-    offset: 0, count, stride: 12, format,
+    elementType,
   };
 }
 
@@ -71,8 +72,8 @@ describe("prepareRenderObject", () => {
       effect: eff,
       pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
       vertexAttributes: HashMap.empty<string, BufferView>()
-        .add("position", bv(36, "float32x3", 3))
-        .add("normal",   bv(36, "float32x3", 3)),
+        .add("position", bv(36, ElementType.V3f))
+        .add("normal",   bv(36, ElementType.V3f)),
       uniforms: HashMap.empty(),
       textures: HashMap.empty(),
       samplers: HashMap.empty(),
