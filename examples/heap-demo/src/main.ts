@@ -291,11 +291,16 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
 
   function buildDraws(count: number): HeapDrawSpec[] {
     if (count <= 4) {
+      // 4-RO classic layout: slot 0 lambert (live colour), slot 1
+      // flat, slot 2 lambert (live trafo), slot 3 textured. Forces
+      // 3 distinct groups to demonstrate per-group bind layouts.
+      const kindFor = (i: number): "lambert" | "flat" | "textured" =>
+        i === 0 ? "lambert" : i === 1 ? "flat" : i === 2 ? "lambert" : "textured";
       return xPositions.slice(0, count).map((x, i) => ({
         geo: rawGeos[i]!,
         modelTrafo: i === 2 ? cylTrafo : trafoOf(i, x),
         color:      i === 0 ? boxColor : colors[i]!,
-        kind:       (i % 2 === 0 ? "lambert" : "flat") as const,
+        kind:       kindFor(i),
       }));
     }
     // N-RO grid. side ≈ sqrt(N), spacing ~ 2.4. Geometry rotates
@@ -316,11 +321,14 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
           : geoIdx === 1
             ? Trafo3d.scaling(0.5, 0.5, 0.5).mul(Trafo3d.translation(new V3d(x, y, 0)))
             : Trafo3d.scaling(0.5, 0.5, 0.8).mul(Trafo3d.translation(new V3d(x, y, -0.4)));
+      // Cycle 3 group kinds so the grid mixes lambert / flat /
+      // textured in roughly equal proportions.
+      const kind = (k % 3 === 0 ? "lambert" : k % 3 === 1 ? "flat" : "textured") as const;
       out.push({
         geo,
         modelTrafo: k === 2 && count >= 3 ? cylTrafo : offsetTrafo,
         color:      k === 0 ? boxColor : colors[k % 4]!,
-        kind:       (k % 2 === 0 ? "lambert" : "flat") as const,
+        kind,
       });
     }
     return out;

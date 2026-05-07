@@ -34,6 +34,13 @@
 //   };
 //
 // User WGSL must declare `@fragment fn fs(in: VsOut) -> @location(0) vec4<f32>`.
+//
+// Per-group texture sets. WebGPU 1.0 has no bindless, so texture-set
+// is a wedge in the group key: groups with different texture sets
+// can't share a bind group. Pass a `textures: { texture, sampler }`
+// per groupKey via `BuildHeapSceneOptions.texturesByGroupKey`. The
+// package adds the texture (binding 4) + sampler (binding 5) to that
+// group's bind-group layout; the user's FS WGSL declares them.
 
 import { Trafo3d, V3d, V4f, type M44d } from "@aardworx/wombat.base";
 import { AVal, addMarkingCallback } from "@aardworx/wombat.adaptive";
@@ -227,6 +234,7 @@ function buildGroup(
   attach: CanvasAttachment,
   key: string,
   fragmentWgsl: string,
+  textureSet: HeapTextureSet | undefined,
   draws: readonly { spec: HeapDrawSpec; sourceIndex: number }[],
   modelTrafos: aval<Trafo3d>[],
   colors: aval<V4f>[],
@@ -279,14 +287,21 @@ function buildGroup(
     code: SHADER_PRELUDE + fragmentWgsl,
     label: `heapScene/${key}/shader`,
   });
+  const bindLayoutEntries: GPUBindGroupLayoutEntry[] = [
+    { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+    { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+    { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+    { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+  ];
+  if (textureSet !== undefined) {
+    bindLayoutEntries.push(
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+      { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+    );
+  }
   const bindGroupLayout = device.createBindGroupLayout({
     label: `heapScene/${key}/bgl`,
-    entries: [
-      { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
-      { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-      { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-      { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-    ],
+    entries: bindLayoutEntries,
   });
   const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
   const pipeline = device.createRenderPipeline({
@@ -299,15 +314,22 @@ function buildGroup(
       ? { depthStencil: { format: depthFormat, depthWriteEnabled: true, depthCompare: "less" as GPUCompareFunction } }
       : {}),
   });
+  const bindEntries: GPUBindGroupEntry[] = [
+    { binding: 0, resource: { buffer: globals } },
+    { binding: 1, resource: { buffer: drawHeap } },
+    { binding: 2, resource: { buffer: packed.positionsBuf } },
+    { binding: 3, resource: { buffer: packed.normalsBuf } },
+  ];
+  if (textureSet !== undefined) {
+    bindEntries.push(
+      { binding: 4, resource: textureSet.textureView ?? textureSet.texture.createView() },
+      { binding: 5, resource: textureSet.sampler },
+    );
+  }
   const bindGroup = device.createBindGroup({
     label: `heapScene/${key}/bg`,
     layout: bindGroupLayout,
-    entries: [
-      { binding: 0, resource: { buffer: globals } },
-      { binding: 1, resource: { buffer: drawHeap } },
-      { binding: 2, resource: { buffer: packed.positionsBuf } },
-      { binding: 3, resource: { buffer: packed.normalsBuf } },
-    ],
+    entries: bindEntries,
   });
 
   return {
@@ -343,9 +365,26 @@ export interface HeapScene {
   dispose(): void;
 }
 
+/**
+ * Per-group texture set. Bindless isn't standard WebGPU, so a group
+ * with sampled textures gets a distinct bind-group layout and is
+ * keyed separately from groups with no textures or different sets.
+ */
+export interface HeapTextureSet {
+  readonly texture: GPUTexture;
+  readonly textureView?: GPUTextureView;
+  readonly sampler: GPUSampler;
+}
+
 export interface BuildHeapSceneOptions {
   /** WGSL fragment-stage source per group key — must declare `fs(in: VsOut) -> @location(0) vec4<f32>`. */
   readonly fragmentShaders: ReadonlyMap<string, string>;
+  /**
+   * Per-group texture set. When present, the group's bind-group
+   * layout adds a `texture_2d<f32>` at binding 4 and a sampler at
+   * binding 5. The user's FS WGSL must declare them.
+   */
+  readonly texturesByGroupKey?: ReadonlyMap<string, HeapTextureSet>;
 }
 
 /**
@@ -380,7 +419,8 @@ export function buildHeapScene(
     if (fs === undefined) {
       throw new Error(`buildHeapScene: no fragment shader supplied for groupKey '${key}'`);
     }
-    groups.push(buildGroup(device, attach, key, fs, members, modelTrafos, colors));
+    const textureSet = opts.texturesByGroupKey?.get(key);
+    groups.push(buildGroup(device, attach, key, fs, textureSet, members, modelTrafos, colors));
   }
 
   const stats: HeapSceneStats = {

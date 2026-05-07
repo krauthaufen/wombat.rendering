@@ -29,5 +29,6 @@ export {
   type HeapSceneStats,
   type HeapDrawSpec,
   type HeapGeometry,
+  type HeapTextureSet,
   type BuildHeapSceneOptions,
 } from "./heapScene.js";
