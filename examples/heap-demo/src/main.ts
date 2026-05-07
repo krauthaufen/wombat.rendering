@@ -38,6 +38,8 @@ import { buildHeapRenderer, type HeapDrawSpec } from "./heap.js";
 // bypasses Runtime/prepareRenderObject and drives WebGPU directly.
 // Anything else → the existing per-RO baseline.
 const useHeap = new URLSearchParams(location.search).get("heap") === "1";
+const countParam = new URLSearchParams(location.search).get("count");
+const ROCount = countParam !== null ? Math.max(1, parseInt(countParam, 10) | 0) : 4;
 
 // ---------------------------------------------------------------------------
 // Status banner
@@ -116,8 +118,9 @@ function buildView(eye: V3d, target: V3d, worldUp: V3d): Trafo3d {
   return Trafo3d.viewTrafoRH(eye, upRe, fwd);
 }
 const view = AVal.constant(buildView(eye, target, up));
-const projFor = (aspect: number): Trafo3d =>
-  Trafo3d.perspectiveProjectionRHFov(Math.PI / 3, aspect, 0.1, 100);  // 60° hFoV
+function projFor(aspect: number, far = 100): Trafo3d {
+  return Trafo3d.perspectiveProjectionRHFov(Math.PI / 3, aspect, 0.1, far);
+}
 
 // ---------------------------------------------------------------------------
 // Per-RO uniforms
@@ -277,25 +280,54 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
         : Trafo3d.scaling(1.5, 1.5, 1.5)                  // box / box
             .mul(Trafo3d.translation(new V3d(x - 0.75, -0.75, -0.75)));
 
-  // ─── Heap path ───────────────────────────────────────────────────────
+  // ─── Build N RO specs ───────────────────────────────────────────────
+  // ROCount = 4 → original demo (4 named ROs along x, with live cylinder + box).
+  // ROCount > 4 → scatter ROs in a square grid; deterministic colors
+  // and primitive-kind selection. The first 4 keep the live animation
+  // so the slot-writer path stays exercised.
+  const cylBase  = trafoOf(2, xPositions[2]!);
+  const cylTrafo = cval(cylBase);
+  const boxColor = cval(colors[0]!);
+
+  function buildDraws(count: number): HeapDrawSpec[] {
+    if (count <= 4) {
+      return xPositions.slice(0, count).map((x, i) => ({
+        geo: rawGeos[i]!,
+        modelTrafo: i === 2 ? cylTrafo : trafoOf(i, x),
+        color:      i === 0 ? boxColor : colors[i]!,
+        kind:       (i % 2 === 0 ? "lambert" : "flat") as const,
+      }));
+    }
+    // N-RO grid. side ≈ sqrt(N), spacing ~ 2.4. Geometry rotates
+    // through the 3 primitives; colour palette is the 4 base colours.
+    const side    = Math.ceil(Math.sqrt(count));
+    const spacing = 2.4;
+    const center  = (side - 1) * 0.5;
+    const out: HeapDrawSpec[] = [];
+    for (let k = 0; k < count; k++) {
+      const ix = k % side, iy = Math.floor(k / side);
+      const x = (ix - center) * spacing;
+      const y = (iy - center) * spacing;
+      const geoIdx = k % 3;                              // 0=box, 1=sphere, 2=cylinder
+      const geo: GeometryData = geoIdx === 0 ? rawBox : geoIdx === 1 ? rawSph : rawCyl;
+      const offsetTrafo: Trafo3d =
+        geoIdx === 0
+          ? Trafo3d.scaling(0.7, 0.7, 0.7).mul(Trafo3d.translation(new V3d(x - 0.35, y - 0.35, -0.35)))
+          : geoIdx === 1
+            ? Trafo3d.scaling(0.5, 0.5, 0.5).mul(Trafo3d.translation(new V3d(x, y, 0)))
+            : Trafo3d.scaling(0.5, 0.5, 0.8).mul(Trafo3d.translation(new V3d(x, y, -0.4)));
+      out.push({
+        geo,
+        modelTrafo: k === 2 && count >= 3 ? cylTrafo : offsetTrafo,
+        color:      k === 0 ? boxColor : colors[k % 4]!,
+        kind:       (k % 2 === 0 ? "lambert" : "flat") as const,
+      });
+    }
+    return out;
+  }
+
   if (useHeap) {
-    // Slot 2 (cylinder): live rotation. Slot 0 (orange box): live
-    // colour pulse. Both drive the slot-writer path — per-draw bytes
-    // tick up in the stats banner. Other slots stay static (cval
-    // wrapping a constant).
-    const cylBase = trafoOf(2, xPositions[2]!);
-    const cylTrafo = cval(cylBase);
-    const boxColor = cval(colors[0]!);
-    // Two pipeline-state groups: slots 0,2 use Lambert lighting,
-    // slots 1,3 use a flat (no-lighting) shader. The renderer
-    // buckets draws by kind, builds one pipeline + bind group +
-    // heap per kind.
-    const draws: HeapDrawSpec[] = xPositions.map((x, i) => ({
-      geo: rawGeos[i]!,
-      modelTrafo: i === 2 ? cylTrafo : trafoOf(i, x),
-      color:      i === 0 ? boxColor : colors[i]!,
-      kind:       (i % 2 === 0 ? "lambert" : "flat") as const,
-    }));
+    const draws: HeapDrawSpec[] = buildDraws(ROCount);
     const renderer = buildHeapRenderer(device, attach, draws);
 
     // Animate camera in a slow orbit around origin so we drive the
@@ -304,10 +336,23 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     // Plain rAF instead of runFrame: the demo wants continuous
     // re-render; runFrame is dirty-skip and would idle after one
     // frame for a non-aval-driven loop.
-    const baseRadius = 18;
-    const baseHeight = 8;
+    // Camera radius scales with grid extent so all ROs stay framed.
+    const gridSide = Math.ceil(Math.sqrt(draws.length));
+    const baseRadius = Math.max(18, gridSide * 1.6);
+    const baseHeight = Math.max(8, gridSide * 0.7);
+    const farPlane   = Math.max(100, gridSide * 4);
     const start = performance.now();
     let frames = 0, lastReport = start;
+    // Rolling frame-time samples for p50/p99.
+    const samples = new Float32Array(240);
+    let sampleI = 0, sampleN = 0;
+    function pct(p: number): number {
+      const n = sampleN;
+      if (n === 0) return 0;
+      const sorted = Array.from(samples.subarray(0, n)).sort((a, b) => a - b);
+      const idx = Math.min(n - 1, Math.max(0, Math.floor(p * (n - 1))));
+      return sorted[idx]!;
+    }
 
     const tick = (): void => {
       const t = (performance.now() - start) * 0.0005;          // ~0.5 rad/s
@@ -320,7 +365,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
 
       const { width, height } = AVal.force(attach.size);
       const aspect = Math.max(1e-3, width / Math.max(1, height));
-      const viewProjT = viewNow.mul(projFor(aspect));
+      const viewProjT = viewNow.mul(projFor(aspect, farPlane));
 
       // Drive slot-2 (cylinder) trafo + slot-0 (box) colour through
       // the cvals — addMarkingCallback inside the renderer fires,
@@ -333,17 +378,25 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       });
 
       attach.markFrame();
+      const t0 = performance.now();
       renderer.frame(viewProjT, eyeNow);
+      const dt = performance.now() - t0;
+      samples[sampleI] = dt;
+      sampleI = (sampleI + 1) % samples.length;
+      if (sampleN < samples.length) sampleN++;
 
       frames++;
       const now = performance.now();
       if (now - lastReport > 500) {
         const fps = (frames * 1000 / (now - lastReport)).toFixed(0);
+        const p50 = pct(0.5).toFixed(2);
+        const p99 = pct(0.99).toFixed(2);
+        const geoKb = renderer.stats.geometryBytes / 1024;
         setStatus(
-          `heap, ${renderer.stats.totalDraws} draws across ${renderer.stats.groups} groups · ${fps} fps · ` +
-          `globals/frame: ${renderer.stats.globalsBytes} B · ` +
-          `per-draw/frame: ${renderer.stats.drawBytes} B · ` +
-          `geometry (one-time): ${(renderer.stats.geometryBytes / 1024).toFixed(1)} KiB`,
+          `heap · ${renderer.stats.totalDraws} draws / ${renderer.stats.groups} grp · ${fps} fps ` +
+          `· encode ms p50=${p50} p99=${p99} · ` +
+          `globals: ${renderer.stats.globalsBytes} B · per-draw: ${renderer.stats.drawBytes} B · ` +
+          `geometry: ${geoKb.toFixed(1)} KiB`,
         );
         frames = 0;
         lastReport = now;
@@ -369,11 +422,36 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     return viewT.mul(projT);            // view first, then proj
   });
 
-  const ros: RenderObject[] = xPositions.map((x, i) => makeRO({
-    geo: geos[i]!,
-    modelTrafo: trafoOf(i, x),
-    color: colors[i]!,
-  }, viewProj));
+  // Build N RO specs — same grid as the heap path so the visual
+  // result is comparable. The Runtime path doesn't share buffers
+  // across ROs the way the heap path does, so this is the apples-
+  // to-apples scaling test.
+  const ros: RenderObject[] = [];
+  if (ROCount <= 4) {
+    for (let i = 0; i < ROCount; i++) {
+      ros.push(makeRO({
+        geo: geos[i]!,
+        modelTrafo: trafoOf(i, xPositions[i]!),
+        color: colors[i]!,
+      }, viewProj));
+    }
+  } else {
+    const side = Math.ceil(Math.sqrt(ROCount));
+    const spacing = 2.4;
+    const center = (side - 1) * 0.5;
+    for (let k = 0; k < ROCount; k++) {
+      const ix = k % side, iy = Math.floor(k / side);
+      const x = (ix - center) * spacing, y = (iy - center) * spacing;
+      const geoIdx = k % 3;
+      const bundle = geoIdx === 0 ? bBox : geoIdx === 1 ? bSph : bCyl;
+      const t = geoIdx === 0
+        ? Trafo3d.scaling(0.7, 0.7, 0.7).mul(Trafo3d.translation(new V3d(x - 0.35, y - 0.35, -0.35)))
+        : geoIdx === 1
+          ? Trafo3d.scaling(0.5, 0.5, 0.5).mul(Trafo3d.translation(new V3d(x, y, 0)))
+          : Trafo3d.scaling(0.5, 0.5, 0.8).mul(Trafo3d.translation(new V3d(x, y, -0.4)));
+      ros.push(makeRO({ geo: bundle, modelTrafo: t, color: colors[k % 4]! }, viewProj));
+    }
+  }
 
   const tree = RenderTree.ordered(...ros.map(o => RenderTree.leaf(o)));
   const clear: ClearValues = {
@@ -385,6 +463,41 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     { kind: "Render", output: attach.framebuffer, tree },
   ]);
   const task = runtime.compile(cmds);
+  // Frame-time samples (same shape as heap path). Note the per-RO
+  // baseline is dirty-skip via runFrame, so for static scenes only
+  // the first frame fires and stats won't tick. To stress-time it
+  // continuously, use the heap path (which has the orbit-driven
+  // continuous loop).
+  const samples = new Float32Array(240);
+  let sampleI = 0, sampleN = 0, frames = 0, lastReport = performance.now();
+  const pct = (p: number): number => {
+    if (sampleN === 0) return 0;
+    const sorted = Array.from(samples.subarray(0, sampleN)).sort((a, b) => a - b);
+    return sorted[Math.min(sampleN - 1, Math.max(0, Math.floor(p * (sampleN - 1))))]!;
+  };
   setStatus(`ready — per-RO path, ${ros.length} render objects (append ?heap=1 for heap path)`);
-  runFrame(attach, (token) => task.run(token));
+  runFrame(attach, (token) => {
+    const t0 = performance.now();
+    task.run(token);
+    const dt = performance.now() - t0;
+    samples[sampleI] = dt;
+    sampleI = (sampleI + 1) % samples.length;
+    if (sampleN < samples.length) sampleN++;
+    frames++;
+    const now = performance.now();
+    // runFrame is dirty-skip: a static scene runs ~1 frame and idles.
+    // Report after the first frame so we still get the encode number;
+    // afterwards roll the 500ms window for live scenes.
+    const shouldReport = sampleN === 1 || now - lastReport > 500;
+    if (shouldReport) {
+      const elapsed = Math.max(1, now - lastReport);
+      const fps = (frames * 1000 / elapsed).toFixed(0);
+      setStatus(
+        `per-RO · ${ros.length} draws · ${frames} frames in ${elapsed.toFixed(0)} ms (~${fps} fps) · ` +
+        `encode ms p50=${pct(0.5).toFixed(2)} p99=${pct(0.99).toFixed(2)}`,
+      );
+      frames = 0;
+      lastReport = now;
+    }
+  });
 })();
