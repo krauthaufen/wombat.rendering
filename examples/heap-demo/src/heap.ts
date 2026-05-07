@@ -196,7 +196,7 @@ export function buildHeapRenderer(
   draws: readonly HeapDrawSpec[],
 ): HeapRenderer {
   const sig = attach.signature;
-  const colorFormat = sig.colors.tryFind("color");
+  const colorFormat = sig.colors.tryFind("outColor");
   if (colorFormat === undefined) throw new Error("buildHeapRenderer: attachment has no 'color' attachment");
   const depthFormat = sig.depthStencil?.format;
 
@@ -265,15 +265,15 @@ export function buildHeapRenderer(
 
     // 2. Acquire framebuffer.
     const fb = forceFramebuffer(attach);
-    const colorView = fb.colors.tryFind("color");
+    const colorView = fb.colors.tryFind("outColor");
     if (colorView === undefined) throw new Error("heap-demo: framebuffer has no 'color'");
-    const depthView = fb.depthStencil?.view;
+    const depthView = fb.depthStencil;
 
     // 3. Encode the pass.
     const enc = device.createCommandEncoder({ label: "heap-demo: encoder" });
     const pass = enc.beginRenderPass({
       colorAttachments: [{
-        view: colorView.view,
+        view: colorView,
         clearValue: { r: 0.07, g: 0.07, b: 0.08, a: 1.0 },
         loadOp: "clear", storeOp: "store",
       }],
@@ -281,7 +281,7 @@ export function buildHeapRenderer(
         depthStencilAttachment: {
           view: depthView,
           depthClearValue: 1.0, depthLoadOp: "clear", depthStoreOp: "store",
-        },
+        } satisfies GPURenderPassDepthStencilAttachment,
       } : {}),
     });
 

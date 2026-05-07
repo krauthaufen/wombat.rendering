@@ -544,7 +544,15 @@ export function prepareRenderObject(
 
     const view = (fromVertex ?? fromInstance)!;
     const format = ElementType.toVertexFormat(view.elementType);
-    const stride = BufferView.strideOf(view);
+    // Single-value broadcast — `BufferView.ofValue(...)` allocates a
+    // tight one-element buffer and asks every vertex/instance to read
+    // it. WebGPU reads the same element when arrayStride is 0
+    // (regardless of stepMode), so override the default tight stride
+    // here. Without this the second vertex would read past the end
+    // of the 16-byte buffer and pick up zeros — colorAval would tint
+    // only the first vertex of each draw.
+    const isBroadcast = view.singleValue !== undefined;
+    const stride = isBroadcast ? 0 : BufferView.strideOf(view);
     const offset = BufferView.offsetOf(view);
     resolved.push({
       name: vb.name,

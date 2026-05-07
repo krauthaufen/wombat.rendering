@@ -15,8 +15,7 @@ export const trafoVS = vertex((v: {
   Colors:    V4f;
 }) => {
   const wp = uniform.ModelTrafo.mul(v.Positions);
-  // Inv-transpose normal trick — same as defaultSurfaces.trafo.
-  const n4 = new V4f(v.Normals.xyz, 0.0).mul(uniform.ModelTrafoInv);
+  const n4 = new V4f(v.Normals.xyz, 0.0);   // raw object-space normal, no matrix
   return {
     gl_Position:    uniform.ViewProjTrafo.mul(wp),
     WorldPositions: wp,
