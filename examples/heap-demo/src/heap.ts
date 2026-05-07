@@ -1,23 +1,19 @@
-// heap.ts — Phase 2 of the heap-everything architecture, prototyped
-// in the demo before being ported into wombat.rendering.
+// heap.ts — Phase 3: split heap.
 //
-//   Phase 1 (prior commit): one shared GPURenderPipeline + bind
-//     group, per-draw uniforms in a storage buffer, firstInstance
-//     routing into the heap. Per-RO vertex / index / color buffers.
+//   Globals (uniform buffer): viewProj, lightLocation. Re-uploaded
+//     every frame (camera moves) but small (≤ 96 bytes regardless
+//     of draw count).
+//   Per-draw heap (storage buffer): modelTrafo, modelTrafoInv,
+//     color, vertexBase. Uploaded ONCE at construction; only
+//     re-uploaded if a specific draw's transform / color changes —
+//     adaptive slot writers can target the precise byte range.
 //
-//   Phase 2 (this file): vertex pulling. Positions and normals come
-//     from packed storage buffers (one for each attribute). The
-//     per-RO color folds into the heap entry. Indices for all draws
-//     concatenate into one shared GPUBuffer; the per-draw firstIndex
-//     selects each RO's range. Net result: ZERO vertex buffers, ONE
-//     index buffer, THREE storage-buffer bindings, N drawIndexed
-//     calls — all sharing one pipeline + one bind group.
-//
-// What stays from Phase 1:
-//   - drawIdx routing via @builtin(instance_index) (= firstInstance,
-//     since instanceCount=1).
-//   - wombat.shader matrix convention: row-major upload, WGSL uses
-//     row-vec dual.
+// Phase 1 packed everything into per-draw entries (240 B × N each
+// frame). Phase 2 added vertex pulling. Phase 3 splits per-frame
+// state from per-draw state — the same shape every real renderer
+// converges on, and exactly what makes the adaptive-slot story
+// crisp: globals cost is independent of N; per-draw cost is paid
+// only when an aval marks.
 
 import { Trafo3d, V3d, V4f } from "@aardworx/wombat.base";
 import type { aval } from "@aardworx/wombat.adaptive";
@@ -25,24 +21,25 @@ import type { CanvasAttachment } from "@aardworx/wombat.rendering.experimental/w
 import type { GeometryData } from "./geometry.js";
 
 // ---------------------------------------------------------------------------
-// DrawHeader layout (std430, 16-byte aligned)
+// Layouts
 // ---------------------------------------------------------------------------
 //
-//   struct DrawHeader {
-//     modelTrafo:    mat4x4<f32>,   // 64
-//     modelTrafoInv: mat4x4<f32>,   // 64
-//     viewProjTrafo: mat4x4<f32>,   // 64
-//     lightLocation: vec4<f32>,     // 16  (.xyz used, .w padding)
-//     color:         vec4<f32>,     // 16
-//     vertexBase:    u32,           //  4
-//     _pad:          vec3<u32>,     // 12  (align next entry to 16)
-//   };  // 240 bytes total
+// struct Globals {              // uniform buffer, 16-byte aligned
+//   viewProj:      mat4x4<f32>, // 64
+//   lightLocation: vec4<f32>,   // 16
+// };  // 80 B
 //
-// Tighter layouts are possible (collapse pad with vertexBase if we
-// ever add more u32s) — leave room here for future per-draw scalars
-// (PickId, Time, …).
+// struct DrawHeader {            // storage buffer, std430
+//   modelTrafo:    mat4x4<f32>,  // 64
+//   modelTrafoInv: mat4x4<f32>,  // 64
+//   color:         vec4<f32>,    // 16
+//   vertexBase:    u32,          //  4
+//   _pad0,_pad1,_pad2: u32,      // 12  (align next to 16)
+// };  // 160 B
 
-const DRAW_HEADER_BYTES = 64 * 3 + 16 + 16 + 16;
+const GLOBALS_BYTES = 64 + 16;
+const GLOBALS_FLOATS = GLOBALS_BYTES / 4;
+const DRAW_HEADER_BYTES = 64 * 2 + 16 + 16;
 const DRAW_HEADER_FLOATS = DRAW_HEADER_BYTES / 4;
 
 function packMat44(m: import("@aardworx/wombat.base").M44d, dst: Float32Array, off: number): void {
@@ -50,10 +47,20 @@ function packMat44(m: import("@aardworx/wombat.base").M44d, dst: Float32Array, o
   for (let i = 0; i < 16; i++) dst[off + i] = r[i]!;
 }
 
-function packDrawHeader(
-  modelTrafo: Trafo3d,
+function packGlobals(
   viewProj: Trafo3d,
   lightLocation: V3d,
+  dst: Float32Array,
+): void {
+  packMat44(viewProj.forward, dst, 0);
+  dst[16] = lightLocation.x as number;
+  dst[17] = lightLocation.y as number;
+  dst[18] = lightLocation.z as number;
+  dst[19] = 0;
+}
+
+function packDrawHeader(
+  modelTrafo: Trafo3d,
   color: V4f,
   vertexBase: number,
   dst: Float32Array,
@@ -62,31 +69,29 @@ function packDrawHeader(
   const off = drawIndex * DRAW_HEADER_FLOATS;
   packMat44(modelTrafo.forward,  dst, off +  0);
   packMat44(modelTrafo.backward, dst, off + 16);
-  packMat44(viewProj.forward,    dst, off + 32);
-  dst[off + 48] = lightLocation.x as number;
-  dst[off + 49] = lightLocation.y as number;
-  dst[off + 50] = lightLocation.z as number;
-  dst[off + 51] = 0;
-  dst[off + 52] = color.x;
-  dst[off + 53] = color.y;
-  dst[off + 54] = color.z;
-  dst[off + 55] = color.w;
+  dst[off + 32] = color.x;
+  dst[off + 33] = color.y;
+  dst[off + 34] = color.z;
+  dst[off + 35] = color.w;
   // u32 vertexBase via the underlying buffer view.
-  new Uint32Array(dst.buffer, dst.byteOffset, dst.length)[off + 56] = vertexBase;
-  // [off + 57..59] left as pad.
+  new Uint32Array(dst.buffer, dst.byteOffset, dst.length)[off + 36] = vertexBase;
+  // [off + 37..39] left as pad.
 }
 
 // ---------------------------------------------------------------------------
-// Hand-rolled WGSL — vertex pull positions + normals from storage,
-// no vertex buffers. Color comes from the per-draw heap entry.
+// WGSL — pulls geometry from storage; reads globals + per-draw header
+// per vertex.
 // ---------------------------------------------------------------------------
 
 const SHADER_WGSL = /* wgsl */`
+struct Globals {
+  viewProj:      mat4x4<f32>,
+  lightLocation: vec4<f32>,
+};
+
 struct DrawHeader {
   modelTrafo:    mat4x4<f32>,
   modelTrafoInv: mat4x4<f32>,
-  viewProjTrafo: mat4x4<f32>,
-  lightLocation: vec4<f32>,
   color:         vec4<f32>,
   vertexBase:    u32,
   _pad0:         u32,
@@ -94,9 +99,10 @@ struct DrawHeader {
   _pad2:         u32,
 };
 
-@group(0) @binding(0) var<storage, read> draws:     array<DrawHeader>;
-@group(0) @binding(1) var<storage, read> positions: array<f32>;     // 3 floats per vertex
-@group(0) @binding(2) var<storage, read> normals:   array<f32>;     // 3 floats per vertex
+@group(0) @binding(0) var<uniform>             globals:   Globals;
+@group(0) @binding(1) var<storage, read>       draws:     array<DrawHeader>;
+@group(0) @binding(2) var<storage, read>       positions: array<f32>;
+@group(0) @binding(3) var<storage, read>       normals:   array<f32>;
 
 struct VsOut {
   @builtin(position) clipPos:  vec4<f32>,
@@ -116,17 +122,17 @@ fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) drawIdx: u32) ->
   let base = (d.vertexBase + vid) * 3u;
   let pos = fetchVec3(&positions, base);
   let nor = fetchVec3(&normals,   base);
-  // wombat.shader convention: matrices uploaded row-major; WGSL reads
-  // them as col-major = transposed. v * M is the row-vec dual of
-  // M.mul(v) (= M*v math).
+  // wombat.shader convention: matrices uploaded row-major; WGSL
+  // reads them as col-major = transposed. v * M is the row-vec dual
+  // of M.mul(v) (= M*v math).
   let wp = vec4<f32>(pos, 1.0) * d.modelTrafo;
   let n  = (vec4<f32>(nor, 0.0) * d.modelTrafo).xyz;
   var out: VsOut;
-  out.clipPos  = wp * d.viewProjTrafo;
+  out.clipPos  = wp * globals.viewProj;
   out.worldPos = wp.xyz;
   out.normal   = n;
   out.color    = d.color;
-  out.lightLoc = d.lightLocation.xyz;
+  out.lightLoc = globals.lightLocation.xyz;
   return out;
 }
 
@@ -142,18 +148,13 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 `;
 
 // ---------------------------------------------------------------------------
-// Geometry heap — pack all draws' positions, normals, indices into
-// three big buffers, and remember the per-draw offsets.
+// Geometry heap (unchanged from Phase 2)
 // ---------------------------------------------------------------------------
 
 interface PackedGeometry {
-  /** Storage: tightly-packed Float32 positions across all draws. */
   readonly positionsBuf: GPUBuffer;
-  /** Storage: tightly-packed Float32 normals across all draws. */
   readonly normalsBuf:   GPUBuffer;
-  /** Index: concatenated Uint32 indices across all draws. */
   readonly indexBuf:     GPUBuffer;
-  /** Per-draw [vertexBase, indexCount, firstIndex]. */
   readonly entries:      ReadonlyArray<{ vertexBase: number; indexCount: number; firstIndex: number }>;
 }
 
@@ -167,7 +168,6 @@ function packGeometry(device: GPUDevice, geos: readonly GeometryData[]): PackedG
   const normals   = new Float32Array(totalVerts * 3);
   const indices   = new Uint32Array(totalIndices);
   const entries: { vertexBase: number; indexCount: number; firstIndex: number }[] = [];
-
   let vOff = 0, iOff = 0;
   for (const g of geos) {
     const vCount = g.positions.length / 3;
@@ -178,7 +178,6 @@ function packGeometry(device: GPUDevice, geos: readonly GeometryData[]): PackedG
     vOff += vCount;
     iOff += g.indices.length;
   }
-
   const mk = (data: ArrayBufferView, usage: GPUBufferUsageFlags, label: string): GPUBuffer => {
     const buf = device.createBuffer({
       size: alignUp(data.byteLength, 4),
@@ -208,9 +207,24 @@ export interface HeapDrawSpec {
   readonly color: V4f;
 }
 
+export interface HeapStats {
+  /** Bytes uploaded to globals (every frame). */
+  readonly globalsBytes: number;
+  /** Bytes uploaded to per-draw heap on this frame. */
+  drawBytes: number;
+  /** Bytes uploaded to geometry heap (positions + normals + indices) total at construction. */
+  readonly geometryBytes: number;
+}
+
 export interface HeapRenderer {
-  /** Render one frame; called from the runFrame callback. */
+  /** Render one frame. */
   frame(viewProj: Trafo3d, lightLocation: V3d): void;
+  /** Mark draw `i` dirty so its header is re-uploaded next frame.
+   *  Used by the demo's slot-writer test; in production the
+   *  rendering layer would subscribe to per-aval marks. */
+  markDirty(drawIndex: number): void;
+  /** Upload counters; updated each `frame()`. */
+  readonly stats: HeapStats;
   dispose(): void;
 }
 
@@ -224,26 +238,44 @@ export function buildHeapRenderer(
   if (colorFormat === undefined) throw new Error("buildHeapRenderer: attachment has no 'outColor'");
   const depthFormat = sig.depthStencil?.format;
 
-  // ---- Geometry heap ----
   const packed = packGeometry(device, draws.map(d => d.geo));
 
-  // ---- Draw header heap (storage) ----
+  // ---- Globals UBO ----
+  const globalsBuf = device.createBuffer({
+    size: alignUp(GLOBALS_BYTES, 16),
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    label: "heap-demo: globals",
+  });
+  const globalsStaging = new Float32Array(GLOBALS_FLOATS);
+
+  // ---- Per-draw heap (storage). Pack ONCE at construction. ----
   const heapBytes = DRAW_HEADER_BYTES * draws.length;
-  const heap = device.createBuffer({
+  const drawHeap = device.createBuffer({
     size: alignUp(heapBytes, 16),
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     label: "heap-demo: draws",
   });
-  const heapStaging = new Float32Array(DRAW_HEADER_FLOATS * draws.length);
+  const drawStaging = new Float32Array(DRAW_HEADER_FLOATS * draws.length);
+  for (let i = 0; i < draws.length; i++) {
+    const d = draws[i]!;
+    packDrawHeader(d.modelTrafo, d.color, packed.entries[i]!.vertexBase, drawStaging, i);
+  }
+  device.queue.writeBuffer(drawHeap, 0, drawStaging.buffer, drawStaging.byteOffset, heapBytes);
+
+  // Slot-writer dirty set — coalesces consecutive marks into a single
+  // writeBuffer per range. For the demo this is just a Set; the
+  // production version would coalesce into byte ranges.
+  const dirty = new Set<number>();
 
   // ---- Pipeline ----
   const module = device.createShaderModule({ code: SHADER_WGSL, label: "heap-demo: shader" });
   const bindGroupLayout = device.createBindGroupLayout({
     label: "heap-demo: bgl",
     entries: [
-      { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
       { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
       { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
     ],
   });
   const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
@@ -257,26 +289,51 @@ export function buildHeapRenderer(
       ? { format: depthFormat, depthWriteEnabled: true, depthCompare: "less" }
       : undefined,
   });
-
   const bindGroup = device.createBindGroup({
     label: "heap-demo: bg",
     layout: bindGroupLayout,
     entries: [
-      { binding: 0, resource: { buffer: heap } },
-      { binding: 1, resource: { buffer: packed.positionsBuf } },
-      { binding: 2, resource: { buffer: packed.normalsBuf } },
+      { binding: 0, resource: { buffer: globalsBuf } },
+      { binding: 1, resource: { buffer: drawHeap } },
+      { binding: 2, resource: { buffer: packed.positionsBuf } },
+      { binding: 3, resource: { buffer: packed.normalsBuf } },
     ],
   });
 
-  function frame(viewProj: Trafo3d, lightLocation: V3d): void {
-    // Pack the draw header heap.
-    for (let i = 0; i < draws.length; i++) {
-      const d = draws[i]!;
-      packDrawHeader(d.modelTrafo, viewProj, lightLocation, d.color,
-                     packed.entries[i]!.vertexBase, heapStaging, i);
-    }
-    device.queue.writeBuffer(heap, 0, heapStaging.buffer, heapStaging.byteOffset, heapBytes);
+  // ---- Geometry-bytes accounting (for stats only) ----
+  const geometryBytes =
+    packed.entries.reduce((acc, e) => acc + e.indexCount * 4, 0) +
+    draws.reduce((acc, d) => acc + d.geo.positions.byteLength + d.geo.normals.byteLength, 0);
 
+  const stats: HeapStats = { globalsBytes: GLOBALS_BYTES, drawBytes: 0, geometryBytes };
+
+  function frame(viewProj: Trafo3d, lightLocation: V3d): void {
+    // 1. Globals — small, every frame.
+    packGlobals(viewProj, lightLocation, globalsStaging);
+    device.queue.writeBuffer(globalsBuf, 0, globalsStaging.buffer, globalsStaging.byteOffset, GLOBALS_BYTES);
+
+    // 2. Per-draw heap — only dirty slots. (Empty for a static scene.)
+    let dirtyBytes = 0;
+    if (dirty.size > 0) {
+      // For each dirty slot, re-pack and upload exactly the 160-byte
+      // entry. Production would batch contiguous ranges; here we
+      // upload each separately to make the per-slot path obvious.
+      for (const i of dirty) {
+        const d = draws[i]!;
+        packDrawHeader(d.modelTrafo, d.color, packed.entries[i]!.vertexBase, drawStaging, i);
+        const byteOff = i * DRAW_HEADER_BYTES;
+        device.queue.writeBuffer(
+          drawHeap, byteOff,
+          drawStaging.buffer, drawStaging.byteOffset + byteOff,
+          DRAW_HEADER_BYTES,
+        );
+        dirtyBytes += DRAW_HEADER_BYTES;
+      }
+      dirty.clear();
+    }
+    stats.drawBytes = dirtyBytes;
+
+    // 3. Encode + submit.
     const fb = forceFramebuffer(attach);
     const colorView = fb.colors.tryFind("outColor")!;
     const depthView = fb.depthStencil;
@@ -295,36 +352,34 @@ export function buildHeapRenderer(
         } satisfies GPURenderPassDepthStencilAttachment,
       } : {}),
     });
-
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.setIndexBuffer(packed.indexBuf, "uint32");
-
     for (let i = 0; i < draws.length; i++) {
       const e = packed.entries[i]!;
-      // firstInstance = i routes the VS to draws[i]; baseVertex = 0
-      // because we offset via d.vertexBase inside the shader.
       pass.drawIndexed(e.indexCount, 1, e.firstIndex, 0, i);
     }
-
     pass.end();
     device.queue.submit([enc.finish()]);
   }
 
+  function markDirty(drawIndex: number): void {
+    if (drawIndex < 0 || drawIndex >= draws.length) {
+      throw new RangeError(`markDirty: index ${drawIndex} out of range`);
+    }
+    dirty.add(drawIndex);
+  }
+
   function dispose(): void {
-    heap.destroy();
+    globalsBuf.destroy();
+    drawHeap.destroy();
     packed.positionsBuf.destroy();
     packed.normalsBuf.destroy();
     packed.indexBuf.destroy();
   }
 
-  return { frame, dispose };
+  return { frame, markDirty, stats, dispose };
 }
-
-// ---------------------------------------------------------------------------
-// Internal — force the canvas attachment's framebuffer aval (we
-// bypass the runtime here, so we read it ourselves once per frame).
-// ---------------------------------------------------------------------------
 
 function forceFramebuffer(attach: CanvasAttachment): import("@aardworx/wombat.rendering.experimental/core").IFramebuffer {
   return (attach.framebuffer as aval<import("@aardworx/wombat.rendering.experimental/core").IFramebuffer>)

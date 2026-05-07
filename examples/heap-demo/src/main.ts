@@ -284,17 +284,50 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       color: colors[i]!,
     }));
     const renderer = buildHeapRenderer(device, attach, draws);
-    setStatus(`ready — heap path, ${draws.length} draws (1 pipeline, 1 bind group)`);
 
-    runFrame(attach, () => {
+    // Animate camera in a slow orbit around origin so we drive the
+    // globals-upload path every frame while the per-draw heap stays
+    // stale (= 0 bytes/frame, demonstrating the slot-writer payoff).
+    // Plain rAF instead of runFrame: the demo wants continuous
+    // re-render; runFrame is dirty-skip and would idle after one
+    // frame for a non-aval-driven loop.
+    const baseRadius = 18;
+    const baseHeight = 8;
+    const start = performance.now();
+    let frames = 0, lastReport = start;
+
+    const tick = (): void => {
+      const t = (performance.now() - start) * 0.0005;          // ~0.5 rad/s
+      const eyeNow = new V3d(
+        Math.sin(t) * baseRadius,
+        -Math.cos(t) * baseRadius,
+        baseHeight,
+      );
+      const viewNow = buildView(eyeNow, target, up);
+
       const { width, height } = AVal.force(attach.size);
       const aspect = Math.max(1e-3, width / Math.max(1, height));
-      // Aardvark convention: a.mul(b) = "do a first, then b".
-      // World → clip = view first, then proj, so view.mul(proj).
-      const viewProjT = AVal.force(view).mul(projFor(aspect));
-      // Camera-headlight: light = eye position.
-      renderer.frame(viewProjT, eye);
-    });
+      const viewProjT = viewNow.mul(projFor(aspect));
+
+      attach.markFrame();
+      renderer.frame(viewProjT, eyeNow);
+
+      frames++;
+      const now = performance.now();
+      if (now - lastReport > 500) {
+        const fps = (frames * 1000 / (now - lastReport)).toFixed(0);
+        setStatus(
+          `heap, ${draws.length} draws · ${fps} fps · ` +
+          `globals/frame: ${renderer.stats.globalsBytes} B · ` +
+          `per-draw/frame: ${renderer.stats.drawBytes} B · ` +
+          `geometry (one-time): ${(renderer.stats.geometryBytes / 1024).toFixed(1)} KiB`,
+        );
+        frames = 0;
+        lastReport = now;
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
     return;
   }
 
