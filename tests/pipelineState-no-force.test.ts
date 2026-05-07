@@ -56,10 +56,14 @@ describe("no .force() on the render path", () => {
     // Construction-boundary forces, all at prepare-time:
     //   - `obj.indices.force()` — index-format discovery from the
     //     initial BufferView.
+    //   - `viewAval.force()` per vertex binding — initial stride /
+    //     offset / format discovery for the buffer-grouping pass
+    //     (groups by `(IBuffer, stride, stepMode)`); the stride and
+    //     stepMode are structural and don't change frame-to-frame.
     // The vertex/instance attribute maps are no longer aval-wrapped
-    // at the outer level (the set of names is structural), so no
-    // force is needed to read them.
-    expect(matches.length).toBe(1);
+    // at the outer level (the set of names is structural).
+    expect(matches.length).toBe(2);
     expect(file).toMatch(/obj\.indices\.force\(\)/);
+    expect(file).toMatch(/viewAval\.force\(\)/);
   });
 });

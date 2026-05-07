@@ -531,7 +531,7 @@ export function prepareRenderObject(
   opts: PrepareRenderObjectOptions = {},
 ): PreparedRenderObject {
   const iface = effect.interface;
-  const vertexBindings = vertexBindingsFor(iface);
+  let vertexBindings = vertexBindingsFor(iface);
 
   // The set of attribute names is fixed structurally; only the
   // per-attribute BufferView avals are reactive. We resolve names →
@@ -539,9 +539,25 @@ export function prepareRenderObject(
   const vertexMap = obj.vertexAttributes;
   const instanceMap = obj.instanceAttributes ?? emptyAttrMap();
 
-  const vertexBuffers = new Map<string, AdaptiveResource<GPUBuffer>>();
-  const vertexViews = new Map<string, aval<import("../core/index.js").BufferView>>();
-  const vertexLayouts: GPUVertexBufferLayout[] = [];
+  // Per-attribute resolution + grouping. Multiple attributes can
+  // share one underlying GPUBuffer slot when they all point at the
+  // same `IBuffer` with the same stride + stepMode (the
+  // auto-instancing rewrite emits 4 vec4 column attributes per
+  // M44 instance trafo — without packing we'd hit
+  // `maxVertexBuffers` (8) for any moderately rich instancing
+  // scope). Each attribute's `view.offset` becomes its
+  // shader-location offset within the shared layout.
+  interface ResolvedBinding {
+    readonly name: string;
+    readonly shaderLocation: number;
+    readonly stepMode: GPUVertexStepMode;
+    readonly stride: number;
+    readonly offset: number;
+    readonly format: GPUVertexFormat;
+    readonly viewAval: aval<import("../core/index.js").BufferView>;
+    readonly buffer: import("../core/index.js").IBuffer;
+  }
+  const resolved: ResolvedBinding[] = [];
   for (const vb of vertexBindings) {
     const fromVertex = vertexMap.tryFind(vb.name);
     const fromInstance = instanceMap.tryFind(vb.name);
@@ -552,44 +568,100 @@ export function prepareRenderObject(
     const stepMode: GPUVertexStepMode = isInstance ? "instance" : "vertex";
 
     const viewAval = (fromVertex ?? fromInstance)!;
-    // BufferView's stride drives `arrayStride` so callers can pack
-    // multiple attributes into one interleaved buffer (each attribute
-    // names the same IBuffer with a different `offset`, all sharing
-    // a `stride` ≥ sum of attribute sizes). The renderer honors
-    // `view.offset` at draw time via `setVertexBuffer(slot, buf,
-    // offset)`, so each attribute reads its own slice. Sampled at
-    // build time — switching stride / offset dynamically would need
-    // a fresh pipeline.
     const initialView = viewAval.force();
-    const explicitZeroStride = initialView.stride === 0;
-    // The buffer's own `format` (e.g. "float32x3" for a packed-Vec3
-    // position stream) is the source of truth — use it whenever
-    // present so the layout matches what's actually in memory.
-    // WebGPU auto-pads missing components when the shader declares a
-    // wider vector (vec4 input fed by Float32x3 → w=1).
     const viewFormat = initialView.format as GPUVertexFormat | undefined;
     const format = (viewFormat !== undefined && !isIndexFormat(viewFormat))
-      ? viewFormat
-      : vb.format;
-    const stride = explicitZeroStride
+      ? viewFormat : vb.format;
+    const stride = initialView.stride === 0
       ? 0
-      : (initialView.stride > 0
-        ? initialView.stride
-        : vertexFormatStride(format));
-
-    const bufAval = viewAval.map(view => view.buffer);
-    const res = prepareAdaptiveBuffer(device, bufAval, {
-      usage: BufferUsage.VERTEX,
-      ...(opts.label !== undefined ? { label: `${opts.label}.${vb.name}` } : {}),
+      : (initialView.stride > 0 ? initialView.stride : vertexFormatStride(format));
+    resolved.push({
+      name: vb.name,
+      shaderLocation: vb.slot,
+      stepMode, stride, offset: initialView.offset,
+      format, viewAval, buffer: initialView.buffer,
     });
-    vertexBuffers.set(vb.name, res);
-    vertexViews.set(vb.name, viewAval);
-    vertexLayouts[vb.slot] = {
-      arrayStride: stride,
-      stepMode,
-      attributes: [{ shaderLocation: vb.slot, offset: 0, format }],
+  }
+
+  // Group resolved bindings by (IBuffer, stride, stepMode). Each
+  // group becomes one GPUVertexBufferLayout with one or more
+  // attributes; multiple bindings sharing one buffer collapse to a
+  // single setVertexBuffer call at draw time.
+  type GroupKey = string;
+  interface BindingGroup {
+    readonly key: GroupKey;
+    readonly slot: number;             // GPU vertex-buffer slot index
+    readonly stride: number;
+    readonly stepMode: GPUVertexStepMode;
+    readonly viewAval: aval<import("../core/index.js").BufferView>;
+    readonly bufferRes: AdaptiveResource<GPUBuffer>;
+    readonly members: ResolvedBinding[];
+  }
+  const bufferIds = new WeakMap<object, number>();
+  let nextBufId = 0;
+  const idOf = (b: object): number => {
+    let n = bufferIds.get(b);
+    if (n === undefined) { n = nextBufId++; bufferIds.set(b, n); }
+    return n;
+  };
+  const vbGroups = new Map<GroupKey, BindingGroup>();
+  let nextSlot = 0;
+  const vertexBuffers = new Map<string, AdaptiveResource<GPUBuffer>>();
+  const vertexViews = new Map<string, aval<import("../core/index.js").BufferView>>();
+  for (const r of resolved) {
+    const bufId = idOf(r.buffer as unknown as object);
+    const key = `${bufId}|${r.stride}|${r.stepMode}`;
+    let group = vbGroups.get(key);
+    if (!group) {
+      const bufAval = r.viewAval.map(view => view.buffer);
+      const bufferRes = prepareAdaptiveBuffer(device, bufAval, {
+        usage: BufferUsage.VERTEX,
+        ...(opts.label !== undefined ? { label: `${opts.label}.${r.name}` } : {}),
+      });
+      group = {
+        key, slot: nextSlot++, stride: r.stride, stepMode: r.stepMode,
+        viewAval: r.viewAval, bufferRes, members: [],
+      };
+      vbGroups.set(key, group);
+    }
+    group.members.push(r);
+    vertexBuffers.set(r.name, group.bufferRes);
+    vertexViews.set(r.name, r.viewAval);
+  }
+  const vertexLayouts: GPUVertexBufferLayout[] = [];
+  for (const g of vbGroups.values()) {
+    vertexLayouts[g.slot] = {
+      arrayStride: g.stride,
+      stepMode: g.stepMode,
+      attributes: g.members.map((m) => ({
+        shaderLocation: m.shaderLocation,
+        offset: m.offset,
+        format: m.format,
+      })),
     };
   }
+  // The IR-side `vertexBindings.slot` was the per-attribute shader
+  // location. The runtime needs the GPU buffer-slot index. Build a
+  // parallel array keyed by binding name so the per-frame
+  // `setVertexBuffer` loop calls the right slot once per group.
+  const groupSlotByBindingName = new Map<string, number>();
+  for (const g of vbGroups.values()) {
+    for (const m of g.members) groupSlotByBindingName.set(m.name, g.slot);
+  }
+  // Build the unique-per-slot binding list the prepared object uses
+  // at draw time. Pick the first member of each group to represent
+  // the buffer; per-attribute view offsets live in the layout.
+  const drawTimeBindings: VertexBindingInfo[] = [];
+  for (const g of vbGroups.values()) {
+    const head = g.members[0]!;
+    drawTimeBindings.push({
+      name: head.name,
+      slot: g.slot,
+      format: head.format,
+      byteSize: 0,
+    });
+  }
+  vertexBindings = drawTimeBindings;
 
   // Index buffer — `indexFormat` from BufferView wins; defaults to uint32.
   let indexBuffer: AdaptiveResource<GPUBuffer> | undefined;
