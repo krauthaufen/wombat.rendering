@@ -9,6 +9,7 @@ import {
   AList,
   HashMap,
   cval,
+  transact,
   type aval,
 } from "@aardworx/wombat.adaptive";
 import {
@@ -278,10 +279,17 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
 
   // ─── Heap path ───────────────────────────────────────────────────────
   if (useHeap) {
+    // Slot 2 (cylinder): live rotation. Slot 0 (orange box): live
+    // colour pulse. Both drive the slot-writer path — per-draw bytes
+    // tick up in the stats banner. Other slots stay static (cval
+    // wrapping a constant).
+    const cylBase = trafoOf(2, xPositions[2]!);
+    const cylTrafo = cval(cylBase);
+    const boxColor = cval(colors[0]!);
     const draws: HeapDrawSpec[] = xPositions.map((x, i) => ({
       geo: rawGeos[i]!,
-      modelTrafo: trafoOf(i, x),
-      color: colors[i]!,
+      modelTrafo: i === 2 ? cylTrafo : trafoOf(i, x),
+      color:      i === 0 ? boxColor : colors[i]!,
     }));
     const renderer = buildHeapRenderer(device, attach, draws);
 
@@ -308,6 +316,16 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       const { width, height } = AVal.force(attach.size);
       const aspect = Math.max(1e-3, width / Math.max(1, height));
       const viewProjT = viewNow.mul(projFor(aspect));
+
+      // Drive slot-2 (cylinder) trafo + slot-0 (box) colour through
+      // the cvals — addMarkingCallback inside the renderer fires,
+      // marks the slots dirty, and the next frame() picks them up.
+      transact(() => {
+        const angle = t * 4;                                   // spin faster than the camera orbit
+        cylTrafo.value = Trafo3d.rotationZ(angle).mul(cylBase);
+        const r = 0.5 + 0.5 * Math.sin(t * 6);
+        boxColor.value = new V4f(r, 0.55 * (1 - r * 0.5), 0.25, 1);
+      });
 
       attach.markFrame();
       renderer.frame(viewProjT, eyeNow);

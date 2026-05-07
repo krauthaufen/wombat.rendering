@@ -16,7 +16,8 @@
 // only when an aval marks.
 
 import { Trafo3d, V3d, V4f } from "@aardworx/wombat.base";
-import type { aval } from "@aardworx/wombat.adaptive";
+import type { aval, IDisposable } from "@aardworx/wombat.adaptive";
+import { AVal, addMarkingCallback } from "@aardworx/wombat.adaptive";
 import type { CanvasAttachment } from "@aardworx/wombat.rendering.experimental/window";
 import type { GeometryData } from "./geometry.js";
 
@@ -203,8 +204,10 @@ function alignUp(n: number, a: number): number { return (n + a - 1) & ~(a - 1); 
 
 export interface HeapDrawSpec {
   readonly geo: GeometryData;
-  readonly modelTrafo: Trafo3d;
-  readonly color: V4f;
+  /** Per-draw model transform; mark fires → slot's matrix block re-uploaded. */
+  readonly modelTrafo: aval<Trafo3d> | Trafo3d;
+  /** Per-draw colour broadcast; mark fires → slot's colour bytes re-uploaded. */
+  readonly color: aval<V4f> | V4f;
 }
 
 export interface HeapStats {
@@ -240,6 +243,16 @@ export function buildHeapRenderer(
 
   const packed = packGeometry(device, draws.map(d => d.geo));
 
+  // Lift per-draw inputs to avals so the rest of the renderer is
+  // shape-uniform — caller may pass either a plain value or an aval.
+  function asAval<T>(v: aval<T> | T): aval<T> {
+    return (typeof v === "object" && v !== null && typeof (v as { getValue?: unknown }).getValue === "function")
+      ? (v as aval<T>)
+      : AVal.constant(v as T);
+  }
+  const modelTrafos: aval<Trafo3d>[] = draws.map(d => asAval(d.modelTrafo));
+  const colors:      aval<V4f>[]    = draws.map(d => asAval(d.color));
+
   // ---- Globals UBO ----
   const globalsBuf = device.createBuffer({
     size: alignUp(GLOBALS_BYTES, 16),
@@ -257,15 +270,27 @@ export function buildHeapRenderer(
   });
   const drawStaging = new Float32Array(DRAW_HEADER_FLOATS * draws.length);
   for (let i = 0; i < draws.length; i++) {
-    const d = draws[i]!;
-    packDrawHeader(d.modelTrafo, d.color, packed.entries[i]!.vertexBase, drawStaging, i);
+    packDrawHeader(
+      modelTrafos[i]!.force(/* allow-force */),
+      colors[i]!.force(/* allow-force */),
+      packed.entries[i]!.vertexBase, drawStaging, i,
+    );
   }
   device.queue.writeBuffer(drawHeap, 0, drawStaging.buffer, drawStaging.byteOffset, heapBytes);
 
-  // Slot-writer dirty set — coalesces consecutive marks into a single
-  // writeBuffer per range. For the demo this is just a Set; the
-  // production version would coalesce into byte ranges.
+  // Slot-writer dirty set — coalesces consecutive marks into a
+  // single writeBuffer per range. For the demo this is just a Set;
+  // the production version would coalesce into byte ranges.
   const dirty = new Set<number>();
+
+  // Subscribe to each per-draw aval so marks propagate to `dirty`.
+  // addMarkingCallback fires once per mark cycle; pulling the new
+  // value happens lazily during the next frame() pack.
+  const subs: IDisposable[] = [];
+  for (let i = 0; i < draws.length; i++) {
+    subs.push(addMarkingCallback(modelTrafos[i] as never, () => dirty.add(i)));
+    subs.push(addMarkingCallback(colors[i]      as never, () => dirty.add(i)));
+  }
 
   // ---- Pipeline ----
   const module = device.createShaderModule({ code: SHADER_WGSL, label: "heap-demo: shader" });
@@ -315,12 +340,15 @@ export function buildHeapRenderer(
     // 2. Per-draw heap — only dirty slots. (Empty for a static scene.)
     let dirtyBytes = 0;
     if (dirty.size > 0) {
-      // For each dirty slot, re-pack and upload exactly the 160-byte
-      // entry. Production would batch contiguous ranges; here we
-      // upload each separately to make the per-slot path obvious.
+      // For each dirty slot, force the latest aval values and upload
+      // exactly the 160-byte entry. Production would batch contiguous
+      // ranges; uploaded per-slot here to make the cost explicit.
       for (const i of dirty) {
-        const d = draws[i]!;
-        packDrawHeader(d.modelTrafo, d.color, packed.entries[i]!.vertexBase, drawStaging, i);
+        packDrawHeader(
+          modelTrafos[i]!.force(/* allow-force */),
+          colors[i]!.force(/* allow-force */),
+          packed.entries[i]!.vertexBase, drawStaging, i,
+        );
         const byteOff = i * DRAW_HEADER_BYTES;
         device.queue.writeBuffer(
           drawHeap, byteOff,
@@ -371,6 +399,7 @@ export function buildHeapRenderer(
   }
 
   function dispose(): void {
+    for (const s of subs) s.dispose();
     globalsBuf.destroy();
     drawHeap.destroy();
     packed.positionsBuf.destroy();
