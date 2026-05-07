@@ -286,10 +286,15 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     const cylBase = trafoOf(2, xPositions[2]!);
     const cylTrafo = cval(cylBase);
     const boxColor = cval(colors[0]!);
+    // Two pipeline-state groups: slots 0,2 use Lambert lighting,
+    // slots 1,3 use a flat (no-lighting) shader. The renderer
+    // buckets draws by kind, builds one pipeline + bind group +
+    // heap per kind.
     const draws: HeapDrawSpec[] = xPositions.map((x, i) => ({
       geo: rawGeos[i]!,
       modelTrafo: i === 2 ? cylTrafo : trafoOf(i, x),
       color:      i === 0 ? boxColor : colors[i]!,
+      kind:       (i % 2 === 0 ? "lambert" : "flat") as const,
     }));
     const renderer = buildHeapRenderer(device, attach, draws);
 
@@ -335,7 +340,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       if (now - lastReport > 500) {
         const fps = (frames * 1000 / (now - lastReport)).toFixed(0);
         setStatus(
-          `heap, ${draws.length} draws · ${fps} fps · ` +
+          `heap, ${renderer.stats.totalDraws} draws across ${renderer.stats.groups} groups · ${fps} fps · ` +
           `globals/frame: ${renderer.stats.globalsBytes} B · ` +
           `per-draw/frame: ${renderer.stats.drawBytes} B · ` +
           `geometry (one-time): ${(renderer.stats.geometryBytes / 1024).toFixed(1)} KiB`,

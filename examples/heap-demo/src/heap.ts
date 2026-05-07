@@ -1,19 +1,18 @@
-// heap.ts — Phase 3: split heap.
+// heap.ts — Phase 5: multi-group heap.
 //
-//   Globals (uniform buffer): viewProj, lightLocation. Re-uploaded
-//     every frame (camera moves) but small (≤ 96 bytes regardless
-//     of draw count).
-//   Per-draw heap (storage buffer): modelTrafo, modelTrafoInv,
-//     color, vertexBase. Uploaded ONCE at construction; only
-//     re-uploaded if a specific draw's transform / color changes —
-//     adaptive slot writers can target the precise byte range.
+//   Group = (pipeline-state key) → its own
+//     - GPURenderPipeline
+//     - GPUBindGroup (globals UBO + per-draw heap + position/normal slabs)
+//     - DrawHeader[] storage buffer
+//     - geometry slab (positions + normals + indices)
+//   Same per-group invariants as Phase 4. The only new thing is a
+//   top-level dispatcher that buckets draws by group key, builds
+//   one group per bucket, and rebinds + redraws per group on each
+//   frame.
 //
-// Phase 1 packed everything into per-draw entries (240 B × N each
-// frame). Phase 2 added vertex pulling. Phase 3 splits per-frame
-// state from per-draw state — the same shape every real renderer
-// converges on, and exactly what makes the adaptive-slot story
-// crisp: globals cost is independent of N; per-draw cost is paid
-// only when an aval marks.
+// Group key for the demo is just `kind: "lambert" | "flat"` — the
+// shader. Production keys would also include framebuffer signature,
+// rasterizer / depth / blend / topology / texture-set-id.
 
 import { Trafo3d, V3d, V4f } from "@aardworx/wombat.base";
 import type { aval, IDisposable } from "@aardworx/wombat.adaptive";
@@ -22,21 +21,8 @@ import type { CanvasAttachment } from "@aardworx/wombat.rendering.experimental/w
 import type { GeometryData } from "./geometry.js";
 
 // ---------------------------------------------------------------------------
-// Layouts
+// Layouts (same as Phase 3/4)
 // ---------------------------------------------------------------------------
-//
-// struct Globals {              // uniform buffer, 16-byte aligned
-//   viewProj:      mat4x4<f32>, // 64
-//   lightLocation: vec4<f32>,   // 16
-// };  // 80 B
-//
-// struct DrawHeader {            // storage buffer, std430
-//   modelTrafo:    mat4x4<f32>,  // 64
-//   modelTrafoInv: mat4x4<f32>,  // 64
-//   color:         vec4<f32>,    // 16
-//   vertexBase:    u32,          //  4
-//   _pad0,_pad1,_pad2: u32,      // 12  (align next to 16)
-// };  // 160 B
 
 const GLOBALS_BYTES = 64 + 16;
 const GLOBALS_FLOATS = GLOBALS_BYTES / 4;
@@ -47,59 +33,41 @@ function packMat44(m: import("@aardworx/wombat.base").M44d, dst: Float32Array, o
   const r = m._data;
   for (let i = 0; i < 16; i++) dst[off + i] = r[i]!;
 }
-
-function packGlobals(
-  viewProj: Trafo3d,
-  lightLocation: V3d,
-  dst: Float32Array,
-): void {
+function packGlobals(viewProj: Trafo3d, lightLocation: V3d, dst: Float32Array): void {
   packMat44(viewProj.forward, dst, 0);
   dst[16] = lightLocation.x as number;
   dst[17] = lightLocation.y as number;
   dst[18] = lightLocation.z as number;
   dst[19] = 0;
 }
-
 function packDrawHeader(
-  modelTrafo: Trafo3d,
-  color: V4f,
-  vertexBase: number,
-  dst: Float32Array,
-  drawIndex: number,
+  modelTrafo: Trafo3d, color: V4f, vertexBase: number,
+  dst: Float32Array, drawIndex: number,
 ): void {
   const off = drawIndex * DRAW_HEADER_FLOATS;
   packMat44(modelTrafo.forward,  dst, off +  0);
   packMat44(modelTrafo.backward, dst, off + 16);
-  dst[off + 32] = color.x;
-  dst[off + 33] = color.y;
-  dst[off + 34] = color.z;
-  dst[off + 35] = color.w;
-  // u32 vertexBase via the underlying buffer view.
+  dst[off + 32] = color.x; dst[off + 33] = color.y;
+  dst[off + 34] = color.z; dst[off + 35] = color.w;
   new Uint32Array(dst.buffer, dst.byteOffset, dst.length)[off + 36] = vertexBase;
-  // [off + 37..39] left as pad.
 }
 
 // ---------------------------------------------------------------------------
-// WGSL — pulls geometry from storage; reads globals + per-draw header
-// per vertex.
+// Per-kind shaders
 // ---------------------------------------------------------------------------
 
-const SHADER_WGSL = /* wgsl */`
+const SHADER_COMMON_HEAD = /* wgsl */`
 struct Globals {
   viewProj:      mat4x4<f32>,
   lightLocation: vec4<f32>,
 };
-
 struct DrawHeader {
   modelTrafo:    mat4x4<f32>,
   modelTrafoInv: mat4x4<f32>,
   color:         vec4<f32>,
   vertexBase:    u32,
-  _pad0:         u32,
-  _pad1:         u32,
-  _pad2:         u32,
+  _pad0: u32, _pad1: u32, _pad2: u32,
 };
-
 @group(0) @binding(0) var<uniform>             globals:   Globals;
 @group(0) @binding(1) var<storage, read>       draws:     array<DrawHeader>;
 @group(0) @binding(2) var<storage, read>       positions: array<f32>;
@@ -123,9 +91,6 @@ fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) drawIdx: u32) ->
   let base = (d.vertexBase + vid) * 3u;
   let pos = fetchVec3(&positions, base);
   let nor = fetchVec3(&normals,   base);
-  // wombat.shader convention: matrices uploaded row-major; WGSL
-  // reads them as col-major = transposed. v * M is the row-vec dual
-  // of M.mul(v) (= M*v math).
   let wp = vec4<f32>(pos, 1.0) * d.modelTrafo;
   let n  = (vec4<f32>(nor, 0.0) * d.modelTrafo).xyz;
   var out: VsOut;
@@ -136,7 +101,9 @@ fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) drawIdx: u32) ->
   out.lightLoc = globals.lightLocation.xyz;
   return out;
 }
+`;
 
+const SHADER_LAMBERT_FS = /* wgsl */`
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let n = normalize(in.normal);
@@ -148,8 +115,23 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 }
 `;
 
+const SHADER_FLAT_FS = /* wgsl */`
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+  return in.color;
+}
+`;
+
+export type ShaderKind = "lambert" | "flat";
+
+const WGSL_FOR: Record<ShaderKind, string> = {
+  lambert: SHADER_COMMON_HEAD + SHADER_LAMBERT_FS,
+  flat:    SHADER_COMMON_HEAD + SHADER_FLAT_FS,
+};
+
 // ---------------------------------------------------------------------------
-// Geometry heap (unchanged from Phase 2)
+// Geometry packing — per group. Same code as before, parameterised
+// over which subset of the input draws falls into the group.
 // ---------------------------------------------------------------------------
 
 interface PackedGeometry {
@@ -157,9 +139,10 @@ interface PackedGeometry {
   readonly normalsBuf:   GPUBuffer;
   readonly indexBuf:     GPUBuffer;
   readonly entries:      ReadonlyArray<{ vertexBase: number; indexCount: number; firstIndex: number }>;
+  readonly bytes:        number;
 }
 
-function packGeometry(device: GPUDevice, geos: readonly GeometryData[]): PackedGeometry {
+function packGeometry(device: GPUDevice, geos: readonly GeometryData[], label: string): PackedGeometry {
   let totalVerts = 0, totalIndices = 0;
   for (const g of geos) {
     totalVerts   += g.positions.length / 3;
@@ -179,123 +162,98 @@ function packGeometry(device: GPUDevice, geos: readonly GeometryData[]): PackedG
     vOff += vCount;
     iOff += g.indices.length;
   }
-  const mk = (data: ArrayBufferView, usage: GPUBufferUsageFlags, label: string): GPUBuffer => {
+  const mk = (data: ArrayBufferView, usage: GPUBufferUsageFlags, lbl: string): GPUBuffer => {
     const buf = device.createBuffer({
       size: alignUp(data.byteLength, 4),
       usage: usage | GPUBufferUsage.COPY_DST,
-      label,
+      label: lbl,
     });
     device.queue.writeBuffer(buf, 0, data.buffer, data.byteOffset, data.byteLength);
     return buf;
   };
   return {
-    positionsBuf: mk(positions, GPUBufferUsage.STORAGE, "heap-demo: positions"),
-    normalsBuf:   mk(normals,   GPUBufferUsage.STORAGE, "heap-demo: normals"),
-    indexBuf:     mk(indices,   GPUBufferUsage.INDEX,   "heap-demo: indices"),
+    positionsBuf: mk(positions, GPUBufferUsage.STORAGE, `${label}/pos`),
+    normalsBuf:   mk(normals,   GPUBufferUsage.STORAGE, `${label}/nor`),
+    indexBuf:     mk(indices,   GPUBufferUsage.INDEX,   `${label}/idx`),
     entries,
+    bytes: positions.byteLength + normals.byteLength + indices.byteLength,
   };
 }
 
 function alignUp(n: number, a: number): number { return (n + a - 1) & ~(a - 1); }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Per-group internal state
 // ---------------------------------------------------------------------------
 
-export interface HeapDrawSpec {
-  readonly geo: GeometryData;
-  /** Per-draw model transform; mark fires → slot's matrix block re-uploaded. */
-  readonly modelTrafo: aval<Trafo3d> | Trafo3d;
-  /** Per-draw colour broadcast; mark fires → slot's colour bytes re-uploaded. */
-  readonly color: aval<V4f> | V4f;
+interface Group {
+  readonly kind: ShaderKind;
+  readonly pipeline: GPURenderPipeline;
+  readonly bindGroup: GPUBindGroup;
+  readonly globals: GPUBuffer;
+  readonly globalsStaging: Float32Array;
+  readonly drawHeap: GPUBuffer;
+  readonly drawStaging: Float32Array;
+  readonly packed: PackedGeometry;
+  /** Source RO indices (in caller order) that were packed into this group. */
+  readonly memberIndices: number[];
+  readonly trafos: aval<Trafo3d>[];
+  readonly colors: aval<V4f>[];
+  readonly dirty: Set<number>;     // local-to-group slot indices
+  readonly subs: IDisposable[];
 }
 
-export interface HeapStats {
-  /** Bytes uploaded to globals (every frame). */
-  readonly globalsBytes: number;
-  /** Bytes uploaded to per-draw heap on this frame. */
-  drawBytes: number;
-  /** Bytes uploaded to geometry heap (positions + normals + indices) total at construction. */
-  readonly geometryBytes: number;
-}
-
-export interface HeapRenderer {
-  /** Render one frame. */
-  frame(viewProj: Trafo3d, lightLocation: V3d): void;
-  /** Mark draw `i` dirty so its header is re-uploaded next frame.
-   *  Used by the demo's slot-writer test; in production the
-   *  rendering layer would subscribe to per-aval marks. */
-  markDirty(drawIndex: number): void;
-  /** Upload counters; updated each `frame()`. */
-  readonly stats: HeapStats;
-  dispose(): void;
-}
-
-export function buildHeapRenderer(
+function buildGroup(
   device: GPUDevice,
   attach: CanvasAttachment,
-  draws: readonly HeapDrawSpec[],
-): HeapRenderer {
+  kind: ShaderKind,
+  draws: readonly { spec: HeapDrawSpec; sourceIndex: number }[],
+  modelTrafos: aval<Trafo3d>[],
+  colors: aval<V4f>[],
+): Group {
   const sig = attach.signature;
-  const colorFormat = sig.colors.tryFind("outColor");
-  if (colorFormat === undefined) throw new Error("buildHeapRenderer: attachment has no 'outColor'");
+  const colorFormat = sig.colors.tryFind("outColor")!;
   const depthFormat = sig.depthStencil?.format;
 
-  const packed = packGeometry(device, draws.map(d => d.geo));
+  const memberIndices = draws.map(d => d.sourceIndex);
+  const myTrafos = memberIndices.map(i => modelTrafos[i]!);
+  const myColors = memberIndices.map(i => colors[i]!);
 
-  // Lift per-draw inputs to avals so the rest of the renderer is
-  // shape-uniform — caller may pass either a plain value or an aval.
-  function asAval<T>(v: aval<T> | T): aval<T> {
-    return (typeof v === "object" && v !== null && typeof (v as { getValue?: unknown }).getValue === "function")
-      ? (v as aval<T>)
-      : AVal.constant(v as T);
-  }
-  const modelTrafos: aval<Trafo3d>[] = draws.map(d => asAval(d.modelTrafo));
-  const colors:      aval<V4f>[]    = draws.map(d => asAval(d.color));
+  const packed = packGeometry(device, draws.map(d => d.spec.geo), `heap-demo/${kind}`);
 
-  // ---- Globals UBO ----
-  const globalsBuf = device.createBuffer({
+  const globals = device.createBuffer({
     size: alignUp(GLOBALS_BYTES, 16),
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    label: "heap-demo: globals",
+    label: `heap-demo/${kind}/globals`,
   });
   const globalsStaging = new Float32Array(GLOBALS_FLOATS);
 
-  // ---- Per-draw heap (storage). Pack ONCE at construction. ----
   const heapBytes = DRAW_HEADER_BYTES * draws.length;
   const drawHeap = device.createBuffer({
     size: alignUp(heapBytes, 16),
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    label: "heap-demo: draws",
+    label: `heap-demo/${kind}/draws`,
   });
   const drawStaging = new Float32Array(DRAW_HEADER_FLOATS * draws.length);
   for (let i = 0; i < draws.length; i++) {
     packDrawHeader(
-      modelTrafos[i]!.force(/* allow-force */),
-      colors[i]!.force(/* allow-force */),
+      myTrafos[i]!.force(/* allow-force */),
+      myColors[i]!.force(/* allow-force */),
       packed.entries[i]!.vertexBase, drawStaging, i,
     );
   }
   device.queue.writeBuffer(drawHeap, 0, drawStaging.buffer, drawStaging.byteOffset, heapBytes);
 
-  // Slot-writer dirty set — coalesces consecutive marks into a
-  // single writeBuffer per range. For the demo this is just a Set;
-  // the production version would coalesce into byte ranges.
   const dirty = new Set<number>();
-
-  // Subscribe to each per-draw aval so marks propagate to `dirty`.
-  // addMarkingCallback fires once per mark cycle; pulling the new
-  // value happens lazily during the next frame() pack.
   const subs: IDisposable[] = [];
   for (let i = 0; i < draws.length; i++) {
-    subs.push(addMarkingCallback(modelTrafos[i] as never, () => dirty.add(i)));
-    subs.push(addMarkingCallback(colors[i]      as never, () => dirty.add(i)));
+    subs.push(addMarkingCallback(myTrafos[i] as never, () => dirty.add(i)));
+    subs.push(addMarkingCallback(myColors[i] as never, () => dirty.add(i)));
   }
 
-  // ---- Pipeline ----
-  const module = device.createShaderModule({ code: SHADER_WGSL, label: "heap-demo: shader" });
+  const module = device.createShaderModule({ code: WGSL_FOR[kind], label: `heap-demo/${kind}/shader` });
   const bindGroupLayout = device.createBindGroupLayout({
-    label: "heap-demo: bgl",
+    label: `heap-demo/${kind}/bgl`,
     entries: [
       { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
       { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
@@ -305,7 +263,7 @@ export function buildHeapRenderer(
   });
   const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
   const pipeline = device.createRenderPipeline({
-    label: "heap-demo: pipeline",
+    label: `heap-demo/${kind}/pipeline`,
     layout: pipelineLayout,
     vertex:   { module, entryPoint: "vs", buffers: [] },
     fragment: { module, entryPoint: "fs", targets: [{ format: colorFormat }] },
@@ -315,99 +273,170 @@ export function buildHeapRenderer(
       : undefined,
   });
   const bindGroup = device.createBindGroup({
-    label: "heap-demo: bg",
+    label: `heap-demo/${kind}/bg`,
     layout: bindGroupLayout,
     entries: [
-      { binding: 0, resource: { buffer: globalsBuf } },
+      { binding: 0, resource: { buffer: globals } },
       { binding: 1, resource: { buffer: drawHeap } },
       { binding: 2, resource: { buffer: packed.positionsBuf } },
       { binding: 3, resource: { buffer: packed.normalsBuf } },
     ],
   });
 
-  // ---- Geometry-bytes accounting (for stats only) ----
-  const geometryBytes =
-    packed.entries.reduce((acc, e) => acc + e.indexCount * 4, 0) +
-    draws.reduce((acc, d) => acc + d.geo.positions.byteLength + d.geo.normals.byteLength, 0);
+  return {
+    kind, pipeline, bindGroup, globals, globalsStaging, drawHeap, drawStaging,
+    packed, memberIndices, trafos: myTrafos, colors: myColors, dirty, subs,
+  };
+}
 
-  const stats: HeapStats = { globalsBytes: GLOBALS_BYTES, drawBytes: 0, geometryBytes };
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+export interface HeapDrawSpec {
+  readonly geo: GeometryData;
+  readonly modelTrafo: aval<Trafo3d> | Trafo3d;
+  readonly color: aval<V4f> | V4f;
+  /** Group key — selects which pipeline-state group this RO joins. */
+  readonly kind: ShaderKind;
+}
+
+export interface HeapStats {
+  readonly groups: number;
+  readonly totalDraws: number;
+  readonly globalsBytes: number;     // total per-frame globals across all groups
+  drawBytes: number;                 // per-frame mutated heap bytes across all groups (this frame)
+  readonly geometryBytes: number;    // total one-time geometry across all groups
+}
+
+export interface HeapRenderer {
+  frame(viewProj: Trafo3d, lightLocation: V3d): void;
+  readonly stats: HeapStats;
+  dispose(): void;
+}
+
+export function buildHeapRenderer(
+  device: GPUDevice,
+  attach: CanvasAttachment,
+  draws: readonly HeapDrawSpec[],
+): HeapRenderer {
+  // Lift inputs to avals (shape-uniform downstream).
+  function asAval<T>(v: aval<T> | T): aval<T> {
+    return (typeof v === "object" && v !== null && typeof (v as { getValue?: unknown }).getValue === "function")
+      ? (v as aval<T>)
+      : AVal.constant(v as T);
+  }
+  const modelTrafos: aval<Trafo3d>[] = draws.map(d => asAval(d.modelTrafo));
+  const colors:      aval<V4f>[]    = draws.map(d => asAval(d.color));
+
+  // Bucket by group key. Each group sees only its members, but we
+  // remember source indices so per-group dirty state stays aligned
+  // with the user's RO list.
+  const buckets = new Map<ShaderKind, { spec: HeapDrawSpec; sourceIndex: number }[]>();
+  for (let i = 0; i < draws.length; i++) {
+    const d = draws[i]!;
+    let bucket = buckets.get(d.kind);
+    if (bucket === undefined) {
+      bucket = [];
+      buckets.set(d.kind, bucket);
+    }
+    bucket.push({ spec: d, sourceIndex: i });
+  }
+  const groups: Group[] = [];
+  for (const [kind, members] of buckets) {
+    groups.push(buildGroup(device, attach, kind, members, modelTrafos, colors));
+  }
+
+  const stats: HeapStats = {
+    groups: groups.length,
+    totalDraws: draws.length,
+    globalsBytes: GLOBALS_BYTES * groups.length,
+    drawBytes: 0,
+    geometryBytes: groups.reduce((acc, g) => acc + g.packed.bytes, 0),
+  };
 
   function frame(viewProj: Trafo3d, lightLocation: V3d): void {
-    // 1. Globals — small, every frame.
-    packGlobals(viewProj, lightLocation, globalsStaging);
-    device.queue.writeBuffer(globalsBuf, 0, globalsStaging.buffer, globalsStaging.byteOffset, GLOBALS_BYTES);
-
-    // 2. Per-draw heap — only dirty slots. (Empty for a static scene.)
-    let dirtyBytes = 0;
-    if (dirty.size > 0) {
-      // For each dirty slot, force the latest aval values and upload
-      // exactly the 160-byte entry. Production would batch contiguous
-      // ranges; uploaded per-slot here to make the cost explicit.
-      for (const i of dirty) {
-        packDrawHeader(
-          modelTrafos[i]!.force(/* allow-force */),
-          colors[i]!.force(/* allow-force */),
-          packed.entries[i]!.vertexBase, drawStaging, i,
-        );
-        const byteOff = i * DRAW_HEADER_BYTES;
-        device.queue.writeBuffer(
-          drawHeap, byteOff,
-          drawStaging.buffer, drawStaging.byteOffset + byteOff,
-          DRAW_HEADER_BYTES,
-        );
-        dirtyBytes += DRAW_HEADER_BYTES;
-      }
-      dirty.clear();
-    }
-    stats.drawBytes = dirtyBytes;
-
-    // 3. Encode + submit.
     const fb = forceFramebuffer(attach);
     const colorView = fb.colors.tryFind("outColor")!;
+    const depthFormat = attach.signature.depthStencil?.format;
     const depthView = fb.depthStencil;
 
+    let totalDirtyBytes = 0;
+
+    // Encode a single render pass with all groups stitched together.
+    // First group does loadOp=clear; subsequent groups load to keep
+    // prior groups' pixels.
     const enc = device.createCommandEncoder({ label: "heap-demo: encoder" });
-    const pass = enc.beginRenderPass({
-      colorAttachments: [{
-        view: colorView,
-        clearValue: { r: 0.07, g: 0.07, b: 0.08, a: 1.0 },
-        loadOp: "clear", storeOp: "store",
-      }],
-      ...(depthView !== undefined && depthFormat !== undefined ? {
-        depthStencilAttachment: {
-          view: depthView,
-          depthClearValue: 1.0, depthLoadOp: "clear", depthStoreOp: "store",
-        } satisfies GPURenderPassDepthStencilAttachment,
-      } : {}),
-    });
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.setIndexBuffer(packed.indexBuf, "uint32");
-    for (let i = 0; i < draws.length; i++) {
-      const e = packed.entries[i]!;
-      pass.drawIndexed(e.indexCount, 1, e.firstIndex, 0, i);
+
+    let firstPass = true;
+    for (const g of groups) {
+      // 1. Globals — small, every frame, per group.
+      packGlobals(viewProj, lightLocation, g.globalsStaging);
+      device.queue.writeBuffer(g.globals, 0, g.globalsStaging.buffer, g.globalsStaging.byteOffset, GLOBALS_BYTES);
+
+      // 2. Per-draw dirty slots.
+      if (g.dirty.size > 0) {
+        for (const i of g.dirty) {
+          packDrawHeader(
+            g.trafos[i]!.force(/* allow-force */),
+            g.colors[i]!.force(/* allow-force */),
+            g.packed.entries[i]!.vertexBase, g.drawStaging, i,
+          );
+          const byteOff = i * DRAW_HEADER_BYTES;
+          device.queue.writeBuffer(
+            g.drawHeap, byteOff,
+            g.drawStaging.buffer, g.drawStaging.byteOffset + byteOff,
+            DRAW_HEADER_BYTES,
+          );
+          totalDirtyBytes += DRAW_HEADER_BYTES;
+        }
+        g.dirty.clear();
+      }
+
+      // 3. Render the group.
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: colorView,
+          clearValue: { r: 0.07, g: 0.07, b: 0.08, a: 1.0 },
+          loadOp: firstPass ? "clear" : "load",
+          storeOp: "store",
+        }],
+        ...(depthView !== undefined && depthFormat !== undefined ? {
+          depthStencilAttachment: {
+            view: depthView,
+            depthClearValue: 1.0,
+            depthLoadOp: firstPass ? "clear" : "load",
+            depthStoreOp: "store",
+          } satisfies GPURenderPassDepthStencilAttachment,
+        } : {}),
+      });
+      pass.setPipeline(g.pipeline);
+      pass.setBindGroup(0, g.bindGroup);
+      pass.setIndexBuffer(g.packed.indexBuf, "uint32");
+      for (let i = 0; i < g.packed.entries.length; i++) {
+        const e = g.packed.entries[i]!;
+        pass.drawIndexed(e.indexCount, 1, e.firstIndex, 0, i);
+      }
+      pass.end();
+      firstPass = false;
     }
-    pass.end();
+
+    stats.drawBytes = totalDirtyBytes;
     device.queue.submit([enc.finish()]);
   }
 
-  function markDirty(drawIndex: number): void {
-    if (drawIndex < 0 || drawIndex >= draws.length) {
-      throw new RangeError(`markDirty: index ${drawIndex} out of range`);
-    }
-    dirty.add(drawIndex);
-  }
-
   function dispose(): void {
-    for (const s of subs) s.dispose();
-    globalsBuf.destroy();
-    drawHeap.destroy();
-    packed.positionsBuf.destroy();
-    packed.normalsBuf.destroy();
-    packed.indexBuf.destroy();
+    for (const g of groups) {
+      for (const s of g.subs) s.dispose();
+      g.globals.destroy();
+      g.drawHeap.destroy();
+      g.packed.positionsBuf.destroy();
+      g.packed.normalsBuf.destroy();
+      g.packed.indexBuf.destroy();
+    }
   }
 
-  return { frame, markDirty, stats, dispose };
+  return { frame, stats, dispose };
 }
 
 function forceFramebuffer(attach: CanvasAttachment): import("@aardworx/wombat.rendering.experimental/core").IFramebuffer {
