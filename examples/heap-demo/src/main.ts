@@ -31,6 +31,12 @@ import { Runtime } from "@aardworx/wombat.rendering.experimental/runtime";
 import { attachCanvas, runFrame } from "@aardworx/wombat.rendering.experimental/window";
 import { surface } from "./effects.js";
 import { buildBox, buildSphere, buildCylinder, type GeometryData } from "./geometry.js";
+import { buildHeapRenderer, type HeapDrawSpec } from "./heap.js";
+
+// `?heap=1` selects the experimental heap-backed render path, which
+// bypasses Runtime/prepareRenderObject and drives WebGPU directly.
+// Anything else → the existing per-RO baseline.
+const useHeap = new URLSearchParams(location.search).get("heap") === "1";
 
 // ---------------------------------------------------------------------------
 // Status banner
@@ -174,14 +180,14 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   const attach = attachCanvas(device, canvas, {
     depthFormat: "depth24plus",
   });
-  const runtime = new Runtime({ device });
 
-  // Precompute geometry bundles.
-  const bBox = bundleOf(buildBox());
-  const bSph = bundleOf(buildSphere(32));
-  const bCyl = bundleOf(buildCylinder(32));
+  // Precompute geometry bundles. Both paths consume the same raw
+  // GeometryData; the per-RO baseline wraps it in BufferViews, the
+  // heap path uploads to its own GPUBuffers.
+  const rawBox = buildBox();
+  const rawSph = buildSphere(32);
+  const rawCyl = buildCylinder(32);
 
-  // Six instances along X. Solids on z = 0; alternate the species.
   const xPositions = [-6, -2, 2, 6];
   const colors = [
     new V4f(1.00, 0.55, 0.25, 1),
@@ -189,9 +195,45 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     new V4f(0.95, 0.85, 0.35, 1),
     new V4f(0.55, 0.95, 0.55, 1),
   ];
+  const rawGeos = [rawBox, rawSph, rawCyl, rawBox];
+  const trafoOf = (i: number, x: number): Trafo3d =>
+    i === 1
+      ? Trafo3d.scaling(1.0, 1.0, 1.0)                   // sphere
+          .mul(Trafo3d.translation(new V3d(x, 0, 0)))
+      : i === 2
+        ? Trafo3d.scaling(1.0, 1.0, 1.5)                 // cylinder
+            .mul(Trafo3d.translation(new V3d(x, 0, -0.75)))
+        : Trafo3d.scaling(1.5, 1.5, 1.5)                  // box / box
+            .mul(Trafo3d.translation(new V3d(x - 0.75, -0.75, -0.75)));
+
+  // ─── Heap path ───────────────────────────────────────────────────────
+  if (useHeap) {
+    const draws: HeapDrawSpec[] = xPositions.map((x, i) => ({
+      geo: rawGeos[i]!,
+      modelTrafo: trafoOf(i, x),
+      color: colors[i]!,
+    }));
+    const renderer = buildHeapRenderer(device, attach, draws);
+    setStatus(`ready — heap path, ${draws.length} draws (1 pipeline, 1 bind group)`);
+
+    runFrame(attach, () => {
+      const { width, height } = AVal.force(attach.size);
+      const aspect = Math.max(1e-3, width / Math.max(1, height));
+      const viewProjT = projFor(aspect).mul(AVal.force(view));
+      // Camera-headlight: light = eye position.
+      renderer.frame(viewProjT, eye);
+    });
+    return;
+  }
+
+  // ─── Per-RO baseline (Runtime + prepareRenderObject) ────────────────
+  const runtime = new Runtime({ device });
+
+  const bBox = bundleOf(rawBox);
+  const bSph = bundleOf(rawSph);
+  const bCyl = bundleOf(rawCyl);
   const geos = [bBox, bSph, bCyl, bBox];
 
-  // Live aspect — recomputes when the canvas resizes.
   const viewProj: aval<Trafo3d> = attach.size.map(({ width, height }) => {
     const aspect = Math.max(1e-3, width / Math.max(1, height));
     const projT  = projFor(aspect);
@@ -201,20 +243,10 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
 
   const ros: RenderObject[] = xPositions.map((x, i) => makeRO({
     geo: geos[i]!,
-    // Box is in [0,1]^3 — recentre via -0.5 offset and scale to ~1.5.
-    // Sphere/cylinder are unit-sized at origin already.
-    modelTrafo: i === 1
-      ? Trafo3d.scaling(1.0, 1.0, 1.0)               // sphere
-        .mul(Trafo3d.translation(new V3d(x, 0, 0)))
-      : i === 2
-        ? Trafo3d.scaling(1.0, 1.0, 1.5)             // cylinder
-            .mul(Trafo3d.translation(new V3d(x, 0, -0.75)))
-        : Trafo3d.scaling(1.5, 1.5, 1.5)              // box / box
-            .mul(Trafo3d.translation(new V3d(x - 0.75, -0.75, -0.75))),
+    modelTrafo: trafoOf(i, x),
     color: colors[i]!,
   }, viewProj));
 
-  // Build the command list. One Render command, all ROs as ordered children.
   const tree = RenderTree.ordered(...ros.map(o => RenderTree.leaf(o)));
   const clear: ClearValues = {
     colors: HashMap.empty<string, V4f>().add("color", new V4f(0.07, 0.07, 0.08, 1)),
@@ -224,11 +256,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     { kind: "Clear", target: attach.framebuffer, values: clear },
     { kind: "Render", output: attach.framebuffer, tree },
   ]);
-
   const task = runtime.compile(cmds);
-  setStatus(`ready — ${ros.length} render objects`);
-
-  runFrame(attach, (token) => {
-    task.run(token);
-  });
+  setStatus(`ready — per-RO path, ${ros.length} render objects (append ?heap=1 for heap path)`);
+  runFrame(attach, (token) => task.run(token));
 })();
