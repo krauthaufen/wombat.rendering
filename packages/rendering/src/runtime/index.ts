@@ -32,3 +32,5 @@ export {
   type HeapTextureSet,
   type BuildHeapSceneOptions,
 } from "./heapScene.js";
+
+export { compileHeapFragment } from "./heapShader.js";
