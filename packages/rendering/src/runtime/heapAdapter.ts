@@ -47,6 +47,27 @@ function asUint32(data: HostBufferSource): Uint32Array {
   return new Uint32Array(data);
 }
 
+// IndexPool keys on aval identity → ROs sharing the same
+// `ro.indices.buffer` must produce the SAME downstream
+// `aval<Uint32Array>`. A fresh `.map(…)` per RO would defeat the
+// pool's identity-based sharing and balloon GPU memory (e.g. 11K
+// spheres each allocating their own copy of the 6144-index buffer
+// → 270 MB).
+const indicesAvalCache = new WeakMap<aval<IBuffer>, aval<Uint32Array>>();
+function indicesAvalFor(ibAval: aval<IBuffer>): aval<Uint32Array> {
+  let av = indicesAvalCache.get(ibAval);
+  if (av === undefined) {
+    av = ibAval.map((ib: IBuffer) => {
+      if (ib.kind !== "host") {
+        throw new Error("heapAdapter: index buffer flipped to native GPUBuffer; classifier should have caught this");
+      }
+      return asUint32(ib.data);
+    });
+    indicesAvalCache.set(ibAval, av);
+  }
+  return av;
+}
+
 /**
  * Convert a heap-eligible `RenderObject` into a `HeapDrawSpec`. The
  * caller (hybrid render task) is responsible for ensuring eligibility
@@ -68,12 +89,7 @@ export function renderObjectToHeapSpec(ro: RenderObject, token: AdaptiveToken): 
   if (ro.indices === undefined) {
     throw new Error("heapAdapter: RenderObject without indices not supported (heap is indexed-only)");
   }
-  const indices: aval<Uint32Array> = ro.indices.buffer.map((ib: IBuffer) => {
-    if (ib.kind !== "host") {
-      throw new Error("heapAdapter: index buffer flipped to native GPUBuffer; classifier should have caught this");
-    }
-    return asUint32(ib.data);
-  });
+  const indices: aval<Uint32Array> = indicesAvalFor(ro.indices.buffer);
 
   // 3. Texture/sampler: single-pair v1. Classifier already capped
   //    counts at 1 each.

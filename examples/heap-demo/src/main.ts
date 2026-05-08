@@ -222,9 +222,16 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     return;
   }
 
-  const adapter = await navigator.gpu.requestAdapter();
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
   if (adapter === null) { setStatus("no GPU adapter", true); return; }
-  const device  = await adapter.requestDevice();
+  // Raise default device limits to whatever the adapter offers — defaults
+  // are 128 MB binding / 256 MB buffer; iOS adapters often expose 1 GB.
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    },
+  });
   device.addEventListener("uncapturederror", (ev) => {
     const e = (ev as unknown as { error: GPUError }).error;
     console.error("WebGPU uncaptured error:", e.message);
@@ -547,8 +554,11 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   // continuous loop).
   const samples = new Float32Array(240);
   const frameSamples = new Float32Array(240);
+  const gpuSamples = new Float32Array(240);
   let sampleI = 0, sampleN = 0, frames = 0, lastReport = performance.now();
   let frameSampleI = 0, frameSampleN = 0, lastRafNow = 0;
+  let gpuSampleI = 0, gpuSampleN = 0;
+  let gpuSubmitT = 0;
   const pctOf = (buf: Float32Array, n: number, p: number): number => {
     if (n === 0) return 0;
     const sorted = Array.from(buf.subarray(0, n)).sort((a, b) => a - b);
@@ -556,6 +566,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   };
   const pct = (p: number): number => pctOf(samples, sampleN, p);
   const fpct = (p: number): number => pctOf(frameSamples, frameSampleN, p);
+  const gpct = (p: number): number => pctOf(gpuSamples, gpuSampleN, p);
   setStatus(`ready — per-RO path, ${ros.length} render objects (append ?heap=1 for heap path)`);
   const fbAval = attach.framebuffer as aval<import("@aardworx/wombat.rendering.experimental/core").IFramebuffer>;
   const startTime = performance.now();
@@ -576,6 +587,8 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     sampleI = (sampleI + 1) % samples.length;
     if (sampleN < samples.length) sampleN++;
     frames++;
+    gpuSubmitT = performance.now();
+
     const now = performance.now();
     const shouldReport = sampleN === 1 || now - lastReport > 500;
     if (shouldReport) {
@@ -585,17 +598,21 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       const churnTag = churn > 0 ? ` · churn=${churn}/frame` : "";
       setStatus(
         `${tag} · ${ros.length} draws${churnTag} · ${fps} fps · ` +
-        `encode p50=${pct(0.5).toFixed(2)} p99=${pct(0.99).toFixed(2)} · ` +
-        `frame p50=${fpct(0.5).toFixed(1)} p99=${fpct(0.99).toFixed(1)} ms`,
+        `encode ${pct(0.5).toFixed(2)}/${pct(0.99).toFixed(2)} · ` +
+        `gpu ${gpct(0.5).toFixed(1)}/${gpct(0.99).toFixed(1)} · ` +
+        `frame ${fpct(0.5).toFixed(1)}/${fpct(0.99).toFixed(1)} ms (p50/p99)`,
       );
       frames = 0;
       lastReport = now;
     }
   }, {
-    // Tick `time` after each frame's eval. runFrame wraps this in a
-    // transact() so the mark cascades AFTER `outOfDate=false` reset,
-    // reaching the wrapping aval's marking callback and scheduling
-    // the next rAF. Without this, the loop idles after one frame.
+    pacer: async () => {
+      await device.queue.onSubmittedWorkDone();
+      const gpuT = performance.now() - gpuSubmitT;
+      gpuSamples[gpuSampleI] = gpuT;
+      gpuSampleI = (gpuSampleI + 1) % gpuSamples.length;
+      if (gpuSampleN < gpuSamples.length) gpuSampleN++;
+    },
     onAfterFrame: () => {
       time.value = performance.now() - startTime;
       if (sceneSet !== undefined && churn > 0) {

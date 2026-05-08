@@ -39,6 +39,20 @@ export interface RunFrameOptions {
    * behavior.
    */
   readonly onAfterFrame?: () => void;
+  /**
+   * Frame pacer. When provided, runFrame awaits this promise after
+   * each frame's eval and BEFORE invoking `onAfterFrame` / scheduling
+   * the next rAF. Caps the JS encode rate to whatever the pacer
+   * resolves at — typically `() => device.queue.onSubmittedWorkDone()`
+   * to keep the GPU queue at depth 1 instead of letting submit-
+   * returns-immediately balloon the queue under load.
+   *
+   * Without a pacer, JS happily encodes 60 frames/s into a GPU that's
+   * actually running at 10 fps — the compositor then drops frames
+   * silently and the perceived rate has nothing to do with rAF rate.
+   * Always supply a pacer for continuous-redraw scenes.
+   */
+  readonly pacer?: () => Promise<void>;
 }
 
 export type FrameCallback = (token: AdaptiveToken, info: FrameInfo) => void;
@@ -79,6 +93,17 @@ export function runFrame(
     return frameNo;
   });
 
+  const finalizeFrame = (): void => {
+    if (stopped) return;
+    if (opts.onAfterFrame !== undefined) {
+      transact(opts.onAfterFrame);
+    }
+    if (opts.maxFrames !== undefined && frameNo >= opts.maxFrames) {
+      stopped = true;
+      sub.dispose();
+    }
+  };
+
   const tick = (): void => {
     if (stopped) return;
     pending = false;
@@ -93,12 +118,13 @@ export function runFrame(
     // Inside the eval the same mark would race the
     // `outOfDate=false` reset and animation would stall after one
     // frame.
-    if (opts.onAfterFrame !== undefined) {
-      transact(opts.onAfterFrame);
-    }
-    if (opts.maxFrames !== undefined && frameNo >= opts.maxFrames) {
-      stopped = true;
-      sub.dispose();
+    if (opts.pacer !== undefined) {
+      opts.pacer().then(finalizeFrame, (e) => {
+        stopped = true;
+        console.error("runFrame: pacer rejected", e);
+      });
+    } else {
+      finalizeFrame();
     }
   };
 

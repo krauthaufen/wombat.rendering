@@ -449,7 +449,7 @@ function generatePrelude(
     : "";
 
   const megacallDecls = megacall
-    ? `\n@group(0) @binding(4) var<storage, read> drawTable:    array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage: array<u32>;`
+    ? `\n@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;\n@group(0) @binding(6) var<storage, read> firstDrawInTile: array<u32>;`
     : "";
 
   return /* wgsl */`
@@ -828,7 +828,7 @@ function rewriteFragment(
  * unchanged.
  */
 export function megacallSearchPrelude(): string {
-  return `  var lo: u32 = 0u;\n  var hi: u32 = arrayLength(&drawTable) / 4u - 1u;\n  loop {\n    if (lo >= hi) { break; }\n    let _mid = (lo + hi + 1u) >> 1u;\n    if (drawTable[_mid * 4u] <= emitIdx) { lo = _mid; } else { hi = _mid - 1u; }\n  }\n  let _slot = lo;\n  let drawIdx = drawTable[_slot * 4u + 1u];\n  let _indexStart = drawTable[_slot * 4u + 2u];\n  let vid = indexStorage[_indexStart + (emitIdx - drawTable[_slot * 4u])];\n`;
+  return `  let _tileIdx = emitIdx >> 6u;\n  var lo: u32 = firstDrawInTile[_tileIdx];\n  var hi: u32 = firstDrawInTile[_tileIdx + 1u];\n  loop {\n    if (lo >= hi) { break; }\n    let _mid = (lo + hi + 1u) >> 1u;\n    if (drawTable[_mid * 4u] <= emitIdx) { lo = _mid; } else { hi = _mid - 1u; }\n  }\n  let _slot = lo;\n  let drawIdx = drawTable[_slot * 4u + 1u];\n  let _indexStart = drawTable[_slot * 4u + 2u];\n  let vid = indexStorage[_indexStart + (emitIdx - drawTable[_slot * 4u])];\n`;
 }
 
 function escapeRegExp(s: string): string {

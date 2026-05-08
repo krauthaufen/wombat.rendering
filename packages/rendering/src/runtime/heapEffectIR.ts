@@ -553,7 +553,7 @@ export function compileHeapEffectIR(
  */
 function applyMegacallToEmittedVs(vs: string): string {
   let s = vs;
-  const decl = `\n@group(0) @binding(4) var<storage, read> drawTable:    array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage: array<u32>;\n`;
+  const decl = `\n@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;\n@group(0) @binding(6) var<storage, read> firstDrawInTile: array<u32>;\n`;
   // Locate the @vertex fn header, then balance parens manually since
   // params can carry `@builtin(name)` decorations (regex `[^)]*` would
   // halt at the first inner `)`).

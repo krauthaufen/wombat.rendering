@@ -23,15 +23,15 @@ const trafoIdentity = { forward: { toArray: () => IDENTITY44 } } as unknown;
 const v3 = (x: number, y: number, z: number) => ({ x, y, z }) as unknown;
 const v4 = (x: number, y: number, z: number, w: number) => ({ x, y, z, w }) as unknown;
 
-// Raw VS handling megacall: emitIdx → binary search drawTable → derive
-// (drawIdx, vid). Uses the heap-scene prelude bindings + the megacall
-// extra bindings (drawTable @ binding 4, indexStorage @ binding 5).
+// Raw VS handling megacall: emitIdx → tile-bounded binary search →
+// derive (drawIdx, vid). Uses the heap-scene prelude bindings:
+// drawTable @ 4, indexStorage @ 5, firstDrawInTile @ 6.
 const VS_WGSL = /* wgsl */`
 @vertex
 fn vs(@builtin(vertex_index) emitIdx: u32) -> VsOut {
-  // binary search drawTable for the slot that owns this emitIdx
-  var lo: u32 = 0u;
-  var hi: u32 = arrayLength(&drawTable) / 4u - 1u;
+  let tileIdx = emitIdx >> 6u;
+  var lo: u32 = firstDrawInTile[tileIdx];
+  var hi: u32 = firstDrawInTile[tileIdx + 1u];
   loop {
     if (lo >= hi) { break; }
     let mid = (lo + hi + 1u) >> 1u;
@@ -157,6 +157,8 @@ describe("heap-scene megacall integration", () => {
       const debug = (scene as unknown as { _debug: { bucketsForTest(): readonly {
         indirectBuf: GPUBuffer | undefined;
         drawTableBuf: GPUBuffer | undefined;
+        firstDrawInTileBuf: GPUBuffer | undefined;
+        totalEmitEstimate: number;
         recordCount: number;
       }[] } })._debug;
       const dbgBuckets = debug.bucketsForTest();
@@ -272,6 +274,8 @@ describe("heap-scene megacall integration", () => {
       const debug = (scene as unknown as { _debug: { bucketsForTest(): readonly {
         indirectBuf: GPUBuffer | undefined;
         drawTableBuf: GPUBuffer | undefined;
+        firstDrawInTileBuf: GPUBuffer | undefined;
+        totalEmitEstimate: number;
         recordCount: number;
       }[] } })._debug;
       const dbgBuckets = debug.bucketsForTest();
@@ -352,6 +356,96 @@ describe("heap-scene megacall integration", () => {
       scene.dispose();
       colorTex.destroy();
       depthTex.destroy();
+    } finally {
+      device.destroy();
+    }
+  }, 30000);
+
+  it("populates firstDrawInTile with correct (lo, hi) per tile and sentinel slot", async () => {
+    const TILE_K = 64;
+    const device = await requestRealDevice();
+    const errors: GPUError[] = [];
+    device.onuncapturederror = (e) => errors.push(e.error);
+    try {
+      const sig = createFramebufferSignature({
+        colors: { outColor: "rgba8unorm" },
+        depthStencil: { format: "depth24plus" },
+      });
+      const sharedShader = { vs: VS_WGSL, fs: FS_WGSL };
+      const geom = triGeom();
+      // Mix of small and large indexCounts so we cover both single-tile
+      // records and records that span many tiles. Total emit lands well
+      // above 256 so we exercise multiple tiles.
+      const indexCounts: number[] = [];
+      for (let i = 0; i < 50; i++) indexCounts.push(((i * 17) % 23) + 3);
+      indexCounts.push(300);
+      indexCounts.push(150);
+      for (let i = 0; i < 30; i++) indexCounts.push(((i * 13) % 19) + 5);
+      const draws: HeapDrawSpec[] = indexCounts.map((n) => {
+        const idx = new Uint32Array(n);
+        for (let i = 0; i < n; i++) idx[i] = i % 3;
+        return {
+          effect: sharedShader,
+          inputs: {
+            Positions: geom.positions, Normals: geom.normals,
+            ModelTrafo: trafoIdentity, Color: v4(0.5, 0.5, 1, 1),
+            ViewProjTrafo: trafoIdentity, LightLocation: v3(0, 0, 1),
+          },
+          indices: idx,
+        };
+      });
+
+      const scene = buildHeapScene(device, sig, draws, {
+        fragmentOutputLayout: { locations: new Map([["outColor", 0]]) },
+        megacall: true,
+      });
+
+      scene.update(AdaptiveToken.top);
+      const enc = device.createCommandEncoder({ label: "test/firstDrawInTile" });
+      scene.encodeComputePrep(enc, AdaptiveToken.top);
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+
+      const debug = (scene as unknown as { _debug: { bucketsForTest(): readonly {
+        indirectBuf: GPUBuffer | undefined;
+        drawTableBuf: GPUBuffer | undefined;
+        firstDrawInTileBuf: GPUBuffer | undefined;
+        totalEmitEstimate: number;
+        recordCount: number;
+      }[] } })._debug;
+      const dbgBuckets = debug.bucketsForTest();
+      expect(dbgBuckets.length).toBe(1);
+      const b = dbgBuckets[0]!;
+      const numRecords = b.recordCount;
+      expect(numRecords).toBe(indexCounts.length);
+
+      // CPU reference prefix-sum.
+      const firstEmitRef: number[] = [];
+      let acc = 0;
+      for (const c of indexCounts) { firstEmitRef.push(acc); acc += c; }
+      const totalEmit = acc;
+      const numTiles = Math.ceil(totalEmit / TILE_K);
+
+      const fdtBytes = (numTiles + 1) * 4;
+      const fdt = await readU32(device, b.firstDrawInTileBuf!, fdtBytes);
+
+      for (let t = 0; t < numTiles; t++) {
+        const lo = fdt[t]!;
+        // For each tile, the stored slot must satisfy:
+        //   firstEmit[lo] <= t*TILE_K, AND
+        //   if lo+1 < numRecords, firstEmit[lo+1] > t*TILE_K.
+        const tileStart = t * TILE_K;
+        expect(lo).toBeLessThan(numRecords);
+        expect(firstEmitRef[lo]!).toBeLessThanOrEqual(tileStart);
+        if (lo + 1 < numRecords) {
+          expect(firstEmitRef[lo + 1]!).toBeGreaterThan(tileStart);
+        }
+      }
+      // Sentinel slot.
+      expect(fdt[numTiles]).toBe(numRecords);
+
+      expect(errors).toEqual([]);
+      scene.dispose();
     } finally {
       device.destroy();
     }
