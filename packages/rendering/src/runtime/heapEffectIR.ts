@@ -19,7 +19,7 @@
 
 import { compileModule, stage as makeStage, effect as makeEffect } from "@aardworx/wombat.shader";
 import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
-import { substituteInputs } from "@aardworx/wombat.shader/passes";
+import { substituteInputs, readInputs } from "@aardworx/wombat.shader/passes";
 import {
   type Module, type Expr, type Stmt, type Type, type ValueDef,
   type EntryDef, type EntryParameter, type ParamDecoration,
@@ -54,8 +54,8 @@ const select = (cond: Expr, ifTrue: Expr, ifFalse: Expr, type: Type): Expr => ({
 const newVec = (components: Expr[], type: Type): Expr => ({
   kind: "NewVector", components, type,
 });
-const matFromCols = (cols: Expr[], type: Type): Expr => ({
-  kind: "MatrixFromCols", cols, type,
+const matFromRows = (rows: Expr[], type: Type): Expr => ({
+  kind: "MatrixFromRows", rows, type,
 });
 
 // Runtime-sized array types for the heap storage buffers.
@@ -127,7 +127,7 @@ function loadUniformByRef(refIdent: Expr, wgslType: string): Expr {
         const idx = i === 0 ? base : add(base, constU32(i), Tu32);
         cols.push(item(heapV4f, idx, Tvec4));
       }
-      return matFromCols(cols, { kind: "Matrix", element: Tf32, rows: 4, cols: 4 } as Type);
+      return matFromRows(cols, { kind: "Matrix", element: Tf32, rows: 4, cols: 4 } as Type);
     }
     case "vec4<f32>":
       return item(heapV4f, div(add(refIdent, constU32(16), Tu32), constU32(16), Tu32), Tvec4);
@@ -245,19 +245,29 @@ function injectVsBuiltins(m: Module): Module {
 // use `vertex_index` and cyclic addressing.
 
 function rewriteVertexBodies(m: Module, layout: BucketLayout): Module {
-  // Map every uniform field name → its heap-load expression.
-  const drawIdx = readScope("Builtin", "instance_index", Tu32);
-  const vid     = readScope("Builtin", "vertex_index",   Tu32);
+  // For instanced buckets the bucket holds a single slot — drawIdx is
+  // baked to 0u and `instance_index` becomes iidx (per-instance index
+  // within the array uniform). For non-instanced buckets drawIdx ==
+  // instance_index (firstInstance trick) and iidx == 0u.
+  const drawIdx = layout.isInstanced
+    ? constU32(0)
+    : readScope("Builtin", "instance_index", Tu32);
+  const iidx = layout.isInstanced
+    ? readScope("Builtin", "instance_index", Tu32)
+    : constU32(0);
+  const vid = readScope("Builtin", "vertex_index", Tu32);
   const uniformMapping = new Map<string, Expr>();
   const attrMapping    = new Map<string, Expr>();
   const stride = layout.strideU32;
   for (const f of layout.drawHeaderFields) {
     const refExpr = loadHeaderRef(drawIdx, f.byteOffset, stride);
     if (f.kind === "uniform-ref") {
-      uniformMapping.set(f.name, loadUniformByRef(refExpr, f.uniformWgslType ?? ""));
+      const value = layout.perInstanceUniforms.has(f.name)
+        ? loadInstanceByRef(refExpr, iidx, f.uniformWgslType ?? "")
+        : loadUniformByRef(refExpr, f.uniformWgslType ?? "");
+      uniformMapping.set(f.name, value);
     } else {
-      const refExprAttr = loadHeaderRef(drawIdx, f.byteOffset, stride);
-      attrMapping.set(f.name, loadAttributeByRef(refExprAttr, vid, f.attributeWgslType ?? ""));
+      attrMapping.set(f.name, loadAttributeByRef(refExpr, vid, f.attributeWgslType ?? ""));
     }
   }
   // Restrict to vertex stages: the FS substitution needs the threaded
@@ -272,11 +282,54 @@ function rewriteVertexBodies(m: Module, layout: BucketLayout): Module {
 }
 
 function mapVertexEntryBodies(m: Module, fn: (body: Stmt) => Stmt): Module {
+  return mapStageEntryBodies(m, "vertex", fn);
+}
+
+function mapStageEntryBodies(
+  m: Module,
+  stage: "vertex" | "fragment" | "compute",
+  fn: (body: Stmt) => Stmt,
+): Module {
   const values = m.values.map((v): typeof v => {
-    if (v.kind !== "Entry" || v.entry.stage !== "vertex") return v;
+    if (v.kind !== "Entry" || v.entry.stage !== stage) return v;
     return { ...v, entry: { ...v.entry, body: fn(v.entry.body) } };
   });
   return { ...m, values };
+}
+
+/** Append `extras` to every VS entry's outputs and every FS entry's inputs. */
+function addInterstageParams(
+  m: Module,
+  extras: readonly EntryParameter[],
+): Module {
+  if (extras.length === 0) return m;
+  const values = m.values.map((v): typeof v => {
+    if (v.kind !== "Entry") return v;
+    if (v.entry.stage === "vertex") {
+      return { ...v, entry: { ...v.entry, outputs: [...v.entry.outputs, ...extras] } };
+    }
+    if (v.entry.stage === "fragment") {
+      return { ...v, entry: { ...v.entry, inputs: [...v.entry.inputs, ...extras] } };
+    }
+    return v;
+  });
+  return { ...m, values };
+}
+
+/**
+ * Prepend `stmts` to every VS entry's body. Flatten when the body is
+ * already a `Sequential` — CSE numbers `_cse0..N` per Sequential, so
+ * nested Sequentials produce colliding declarations in the emitted
+ * WGSL.
+ */
+function prependVsBodyStmts(m: Module, stmts: readonly Stmt[]): Module {
+  if (stmts.length === 0) return m;
+  return mapVertexEntryBodies(m, body => {
+    if (body.kind === "Sequential") {
+      return { kind: "Sequential", body: [...stmts, ...body.body] };
+    }
+    return { kind: "Sequential", body: [...stmts, body] };
+  });
 }
 
 function mapStmtSubstInputScope(
@@ -299,6 +352,142 @@ function mapStmtSubstInputScope(
   return ent.entry.body;
 }
 
+// ─── FS uniform threading ──────────────────────────────────────────
+//
+// FS can't access `instance_index` directly, so we thread the per-
+// uniform refs through VsOut as flat-interpolated u32 varyings:
+//
+//   - For each FS-used uniform `X` whose layout entry is uniform-ref:
+//       VS output: `_h_<X>Ref: u32 @interpolate(flat)`
+//       VS body:   `WriteOutput("_h_<X>Ref", loadHeaderRef(drawIdx, X))`
+//       FS input:  `_h_<X>Ref: u32 @interpolate(flat)`
+//       FS body:   `ReadInput("Uniform", X)` →
+//                  `loadUniformByRef(ReadInput("Input", "_h_<X>Ref"), …)`
+//
+// For per-instance uniforms (layout.perInstanceUniforms), iidx is also
+// threaded as `_iidx: u32 @interpolate(flat)` and the FS uses
+// `loadInstanceByRef` instead.
+
+function wgslTypeFromHeapField(wgslType: string): Type {
+  switch (wgslType) {
+    case "mat4x4<f32>": return { kind: "Matrix", element: Tf32, rows: 4, cols: 4 } as Type;
+    case "vec4<f32>":   return Tvec4;
+    case "vec3<f32>":   return Tvec3;
+    case "vec2<f32>":   return Tvec2;
+    case "f32":         return Tf32;
+    case "u32":         return Tu32;
+    default: throw new Error(`heapEffectIR: unknown uniform wgsl type '${wgslType}'`);
+  }
+}
+
+function rewriteFsUniforms(m: Module, layout: BucketLayout): Module {
+  // Scan FS bodies for uniform-scope reads.
+  const used = new Set<string>();
+  for (const v of m.values) {
+    if (v.kind !== "Entry" || v.entry.stage !== "fragment") continue;
+    for (const sn of readInputs(v.entry.body).values()) {
+      if (sn.scope === "Uniform") used.add(sn.name);
+    }
+  }
+  if (used.size === 0) return m;
+
+  const fieldByName = new Map(layout.drawHeaderFields.map(f => [f.name, f]));
+  const drawIdxExpr = readScope("Builtin", "instance_index", Tu32);
+  const threadParams: EntryParameter[] = [];
+  const vsWrites: Stmt[] = [];
+  const fsSubst = new Map<string, Expr>();
+
+  for (const name of used) {
+    const f = fieldByName.get(name);
+    if (f === undefined || f.kind !== "uniform-ref") continue;
+    const refParamName = `_h_${name}Ref`;
+    const refExprWriter = loadHeaderRef(drawIdxExpr, f.byteOffset, layout.strideU32);
+    threadParams.push({
+      name: refParamName, type: Tu32, semantic: refParamName,
+      decorations: [{ kind: "Interpolation", mode: "flat" } as ParamDecoration],
+    });
+    vsWrites.push({
+      kind: "WriteOutput", name: refParamName,
+      value: { kind: "Expr", value: refExprWriter },
+    });
+    const refReadFs = readScope("Input", refParamName, Tu32);
+    const value = layout.perInstanceUniforms.has(name)
+      ? loadInstanceByRef(refReadFs, readScope("Input", "_iidx", Tu32), f.uniformWgslType ?? "")
+      : loadUniformByRef(refReadFs, f.uniformWgslType ?? "");
+    fsSubst.set(name, value);
+  }
+
+  // Per-instance: also thread iidx if any FS-used uniform is per-instance.
+  const fsHasPerInstance = [...used].some(n => layout.perInstanceUniforms.has(n));
+  if (fsHasPerInstance) {
+    threadParams.push({
+      name: "_iidx", type: Tu32, semantic: "_iidx",
+      decorations: [{ kind: "Interpolation", mode: "flat" } as ParamDecoration],
+    });
+    vsWrites.push({
+      kind: "WriteOutput", name: "_iidx",
+      value: { kind: "Expr", value: readScope("Builtin", "instance_index", Tu32) },
+    });
+  }
+
+  let out = m;
+  out = addInterstageParams(out, threadParams);
+  out = prependVsBodyStmts(out, vsWrites);
+  out = mapStageEntryBodies(out, "fragment", body =>
+    mapStmtSubstInputScope(body, "Uniform", n => fsSubst.get(n)));
+  return out;
+}
+
+/**
+ * Per-instance uniform load: indexes into a packed array allocation
+ * by `iidx` (instance index in [0, instanceCount-1]).
+ */
+function loadInstanceByRef(refIdent: Expr, iidx: Expr, wgslType: string): Expr {
+  const baseV4 = div(add(refIdent, constU32(16), Tu32), constU32(16), Tu32);
+  const baseF32 = div(add(refIdent, constU32(16), Tu32), constU32(4), Tu32);
+  switch (wgslType) {
+    case "mat4x4<f32>": {
+      const start = add(baseV4, mul(iidx, constU32(4), Tu32), Tu32);
+      const cols: Expr[] = [];
+      for (let i = 0; i < 4; i++) {
+        cols.push(item(heapV4f, i === 0 ? start : add(start, constU32(i), Tu32), Tvec4));
+      }
+      return matFromRows(cols, { kind: "Matrix", element: Tf32, rows: 4, cols: 4 } as Type);
+    }
+    case "vec4<f32>":
+      return item(heapV4f, add(baseV4, iidx, Tu32), Tvec4);
+    case "vec3<f32>": {
+      const off = mul(iidx, constU32(3), Tu32);
+      const base = add(baseF32, off, Tu32);
+      return newVec([
+        item(heapF32, base, Tf32),
+        item(heapF32, add(base, constU32(1), Tu32), Tf32),
+        item(heapF32, add(base, constU32(2), Tu32), Tf32),
+      ], Tvec3);
+    }
+    case "vec2<f32>": {
+      const off = mul(iidx, constU32(2), Tu32);
+      const base = add(baseF32, off, Tu32);
+      return newVec([
+        item(heapF32, base, Tf32),
+        item(heapF32, add(base, constU32(1), Tu32), Tf32),
+      ], Tvec2);
+    }
+    case "f32":
+      return item(heapF32, add(baseF32, iidx, Tu32), Tf32);
+    case "u32":
+      return item(heapU32, add(baseF32, iidx, Tu32), Tu32);
+    default:
+      throw new Error(`heapEffectIR: no IR loader for per-instance uniform type '${wgslType}'`);
+  }
+}
+
+// `wgslTypeFromHeapField` will be used once we propagate proper types
+// onto the synthesised threading params; for now we only emit u32-typed
+// refs, so the type lookup isn't called from the generated IR. Keep
+// the import alive.
+void wgslTypeFromHeapField;
+
 // ─── Public entry point ────────────────────────────────────────────
 
 /**
@@ -315,27 +504,34 @@ export function compileHeapEffectIR(
   userEffect: Effect,
   layout: BucketLayout,
   compileOptions: CompileOptions,
-): { vs: string; fs: string; preludeWgsl: string } {
+): { vs: string; fs: string; preludeWgsl: string; vsEntry: string; fsEntry: string } {
   // Build a single Module from all of the effect's stages by
   // composing them. Then apply heap rewrites to that combined module.
   // The composed module preserves stage entry boundaries.
   let combined: Module = mergeStages(userEffect);
   combined = injectVsBuiltins(combined);
+  // FS uniform threading must run BEFORE VS body rewriting, since it
+  // adds WriteOutput stmts that the VS rewriter shouldn't touch (the
+  // refs they write reference `instance_index` directly, not the
+  // substituted heap-load expressions).
+  combined = rewriteFsUniforms(combined, layout);
   combined = rewriteVertexBodies(combined, layout);
   // Add heap storage buffers as bindings.
   combined = { ...combined, values: [...heapStorageBufferDecls(), ...combined.values] };
 
-  // Recompose into a fresh Effect → compile via the standard pipeline.
-  // (Bypassing `effect()` composition since the module is already
-  // assembled; we wrap with `stage(template)` and trust composeStages
-  // / linkCrossStage / DCE to do their thing on the merged input.)
-  const fresh = makeStage(combined);
-  const compiled = fresh.compile(compileOptions);
+  // Skip frontend resolveHoles / liftReturns since they expect the
+  // template not to have been pre-modified. Compile via compileModule
+  // directly which still runs assignLocations + linkCrossStage + DCE +
+  // emit. (`makeStage` wrapper goes through Effect.compile which calls
+  // compileModule too.)
+  const compiled = compileModule(combined, compileOptions);
   const vsStage = compiled.stages.find(s => s.stage === "vertex");
   const fsStage = compiled.stages.find(s => s.stage === "fragment");
   return {
     vs: vsStage?.source ?? "",
     fs: fsStage?.source ?? "",
+    vsEntry: vsStage?.entryName ?? "vs",
+    fsEntry: fsStage?.entryName ?? "fs",
     preludeWgsl: "",
   };
 }

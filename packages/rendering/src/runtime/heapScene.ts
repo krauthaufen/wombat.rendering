@@ -53,6 +53,7 @@ import {
   buildBucketLayout, compileHeapEffect, rewriteForLayout, stripTextureSamplerDecls,
   type BucketLayout, type FragmentOutputLayout, type HeapEffectSchema,
 } from "./heapEffect.js";
+import { compileHeapEffectIR } from "./heapEffectIR.js";
 
 // ---------------------------------------------------------------------------
 // Per-allocation arena layout
@@ -1248,44 +1249,48 @@ export function buildHeapScene(
       perInstanceUniforms: instanceOpts.perInstanceUniforms,
     };
     let layout: BucketLayout;
-    let vs: string, fs: string;
-    let preludeWgsl: string;
+    let vsModule: GPUShaderModule;
+    let fsModule: GPUShaderModule;
+    let vsEntry = "vs";
+    let fsEntry = "fs";
     if (isRawShaderPair(effect)) {
       // Pick the schema variant that matches the user's textures arg:
       // textured raw shader uses the schema with checker/checkerSmp
       // bindings; the plain default has no texture/sampler entries.
       const rawSchema = textures !== undefined ? RAW_TEXTURED_SCHEMA : RAW_DEFAULT_SCHEMA;
       layout = buildBucketLayout(rawSchema, textures !== undefined, layoutOpts);
-      // Strip any texture/sampler decls the raw shader may have hand-
-      // written — the prelude is now the single source of truth for
-      // those (matching where the BGL allocates slots). Raw shaders
-      // continue to reference texture/sampler identifiers by name in
-      // the body; those references survive.
-      vs = stripTextureSamplerDecls(effect.vs);
-      fs = stripTextureSamplerDecls(effect.fs);
-      preludeWgsl = layout.preludeWgsl;
+      // Raw-WGSL escape hatch: keep the regex-based path. Strip any
+      // texture/sampler decls the raw shader hand-wrote (the prelude
+      // re-emits them at the BGL-correct bindings).
+      const code = layout.preludeWgsl
+        + stripTextureSamplerDecls(effect.vs)
+        + stripTextureSamplerDecls(effect.fs);
+      const single = device.createShaderModule({ code, label: `heapScene/${bk}/shader` });
+      vsModule = single; fsModule = single;
     } else {
+      // DSL effect: route through the IR-based rewriter. The schema
+      // (for the BucketLayout) still comes from the unmodified effect
+      // — IR rewriting substitutes uniform/attribute reads with heap
+      // loads, so post-rewrite the original names are gone from the
+      // ProgramInterface.
       const compiled = compileHeapEffect(effect, opts.fragmentOutputLayout);
       layout = buildBucketLayout(compiled.schema, textures !== undefined, layoutOpts);
-      const rewritten = rewriteForLayout(compiled.rawVs, compiled.rawFs, layout);
-      vs = rewritten.vs; fs = rewritten.fs;
-      // Augmented prelude: VsOut grew flat-interpolated `_h_<name>Ref`
-      // varyings for every uniform the FS reads, so the FS preamble
-      // can pull them via `in._h_<name>Ref` instead of doing its own
-      // `headersU32` indirection per fragment.
-      preludeWgsl = rewritten.preludeWgsl;
+      const ir = compileHeapEffectIR(effect, layout, {
+        target: "wgsl",
+        ...(opts.fragmentOutputLayout !== undefined ? { fragmentOutputLayout: opts.fragmentOutputLayout } : {}),
+      });
+      vsModule = device.createShaderModule({ code: ir.vs, label: `heapScene/${bk}/vs` });
+      fsModule = device.createShaderModule({ code: ir.fs, label: `heapScene/${bk}/fs` });
+      vsEntry = ir.vsEntry;
+      fsEntry = ir.fsEntry;
     }
     const { pipelineLayout } = getBgl(layout);
 
-    const module = device.createShaderModule({
-      code: preludeWgsl + vs + fs,
-      label: `heapScene/${bk}/shader`,
-    });
     const pipeline = device.createRenderPipeline({
       label: `heapScene/${bk}/pipeline`,
       layout: pipelineLayout,
-      vertex:   { module, entryPoint: "vs", buffers: [] },
-      fragment: { module, entryPoint: "fs", targets: [{ format: colorFormat }] },
+      vertex:   { module: vsModule, entryPoint: vsEntry, buffers: [] },
+      fragment: { module: fsModule, entryPoint: fsEntry, targets: [{ format: colorFormat }] },
       primitive: { topology: ps.topology, cullMode: ps.cullMode, frontFace: ps.frontFace },
       ...(depthFormat !== undefined && ps.depth !== undefined
         ? { depthStencil: { format: depthFormat, depthWriteEnabled: ps.depth.write, depthCompare: ps.depth.compare } }
