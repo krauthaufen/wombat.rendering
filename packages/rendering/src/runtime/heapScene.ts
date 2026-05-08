@@ -331,7 +331,8 @@ class UniformPool {
     // (and is informative for everything else).
     u32[2] = length > 0 ? Math.floor(dataBytes / length) : 0;
     pack(value, f32, ALLOC_HEADER_PAD_TO / 4);
-    device.queue.writeBuffer(arena.buffer, ref, buf, 0, allocBytes);
+    arena.write(ref, new Uint8Array(buf));
+    void device;
     this.byAval.set(aval, { ref, dataBytes, typeId, pack, refcount: 1 });
     return ref;
   }
@@ -346,16 +347,17 @@ class UniformPool {
     this.byAval.delete(aval);
   }
 
-  /** Re-pack and upload one entry's data region. Caller pre-reads `val`. */
+  /** Re-pack one entry's data region into the arena's CPU shadow. */
   repack(device: GPUDevice, arena: AttributeArena, aval: aval<unknown>, val: unknown): void {
     const e = this.byAval.get(aval);
     if (e === undefined) return;
     const dst = new Float32Array(e.dataBytes / 4);
     e.pack(val, dst, 0);
-    device.queue.writeBuffer(
-      arena.buffer, e.ref + ALLOC_HEADER_PAD_TO,
-      dst.buffer, dst.byteOffset, e.dataBytes,
+    arena.write(
+      e.ref + ALLOC_HEADER_PAD_TO,
+      new Uint8Array(dst.buffer, dst.byteOffset, e.dataBytes),
     );
+    void device;
   }
 }
 
@@ -382,10 +384,11 @@ class IndexPool {
       return { firstIndex: existing.firstIndex, count: existing.count };
     }
     const firstIndex = indices.alloc(arr.length);
-    device.queue.writeBuffer(
-      indices.buffer, firstIndex * 4,
-      arr.buffer, arr.byteOffset, arr.byteLength,
+    indices.write(
+      firstIndex * 4,
+      new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength),
     );
+    void device;
     this.byAval.set(aval, { firstIndex, count: arr.length, refcount: 1 });
     return { firstIndex, count: arr.length };
   }
@@ -442,10 +445,46 @@ class AttributeArena {
   private cursor = 0;
   // (offset, size) free entries; first-fit reuse not yet implemented.
   private freeList: { off: number; size: number }[] = [];
-  constructor(private readonly buf: GrowBuffer) {}
+  // CPU shadow of the entire GPU buffer. Writes go here first; a
+  // single `device.queue.writeBuffer` per dirty contiguous range
+  // lifts them to the GPU at flush time. At the cost of doubling
+  // host memory we collapse N small writeBuffer calls (10K+ at
+  // initial population) to 1 per frame.
+  private shadow: Uint8Array;
+  private dirtyMin = Infinity;
+  private dirtyMax = 0;
+  constructor(private readonly buf: GrowBuffer) {
+    this.shadow = new Uint8Array(buf.capacity);
+    buf.onResize(() => {
+      const grown = new Uint8Array(buf.capacity);
+      grown.set(this.shadow);
+      this.shadow = grown;
+    });
+  }
   get buffer(): GPUBuffer { return this.buf.buffer; }
   get capacity(): number { return this.buf.capacity; }
   get usedBytes(): number { return this.cursor; }
+  /**
+   * Stage `data` to the shadow at byte offset `dst`. Tracks the
+   * dirty range so `flush(device)` can emit a single writeBuffer
+   * covering everything dirty since the last flush.
+   */
+  write(dst: number, data: Uint8Array): void {
+    this.shadow.set(data, dst);
+    if (dst < this.dirtyMin) this.dirtyMin = dst;
+    const end = dst + data.byteLength;
+    if (end > this.dirtyMax) this.dirtyMax = end;
+  }
+  flush(device: GPUDevice): void {
+    if (this.dirtyMax <= this.dirtyMin) return;
+    device.queue.writeBuffer(
+      this.buf.buffer, this.dirtyMin,
+      this.shadow.buffer, this.shadow.byteOffset + this.dirtyMin,
+      this.dirtyMax - this.dirtyMin,
+    );
+    this.dirtyMin = Infinity;
+    this.dirtyMax = 0;
+  }
   /**
    * Allocate space for one attribute. Returns the byte ref (offset
    * to the header — data lives at ref + 16).
@@ -491,9 +530,39 @@ class AttributeArena {
 class IndexAllocator {
   private cursor = 0;     // in u32s, not bytes
   private freeList: { off: number; size: number }[] = [];
-  constructor(private readonly buf: GrowBuffer) {}
+  // CPU shadow + dirty range, same shape as AttributeArena. Index
+  // uploads (one per drawn mesh's index buffer) get coalesced to a
+  // single writeBuffer per dirty range at flush time.
+  private shadow: Uint8Array;
+  private dirtyMin = Infinity;
+  private dirtyMax = 0;
+  constructor(private readonly buf: GrowBuffer) {
+    this.shadow = new Uint8Array(buf.capacity);
+    buf.onResize(() => {
+      const grown = new Uint8Array(buf.capacity);
+      grown.set(this.shadow);
+      this.shadow = grown;
+    });
+  }
   get buffer(): GPUBuffer { return this.buf.buffer; }
   get usedElements(): number { return this.cursor; }
+  /** Stage `data` (bytes) at the given byte offset; tracks dirty range. */
+  write(dstByteOffset: number, data: Uint8Array): void {
+    this.shadow.set(data, dstByteOffset);
+    if (dstByteOffset < this.dirtyMin) this.dirtyMin = dstByteOffset;
+    const end = dstByteOffset + data.byteLength;
+    if (end > this.dirtyMax) this.dirtyMax = end;
+  }
+  flush(device: GPUDevice): void {
+    if (this.dirtyMax <= this.dirtyMin) return;
+    device.queue.writeBuffer(
+      this.buf.buffer, this.dirtyMin,
+      this.shadow.buffer, this.shadow.byteOffset + this.dirtyMin,
+      this.dirtyMax - this.dirtyMin,
+    );
+    this.dirtyMin = Infinity;
+    this.dirtyMax = 0;
+  }
   alloc(elements: number): number {
     for (let i = 0; i < this.freeList.length; i++) {
       const f = this.freeList[i]!;
@@ -623,6 +692,15 @@ interface Bucket {
   readonly drawHeap: DrawHeap;
   /** Float32 staging mirror of the drawHeap, sized to its current capacity. */
   drawHeaderStaging: Float32Array;
+  /**
+   * Dirty byte range in `drawHeaderStaging` since the last flush.
+   * `packBucketHeader` updates these; `flushHeaders` issues a single
+   * `device.queue.writeBuffer` covering the whole range and clears.
+   * Replaces N small writeBuffer calls (one per addDraw / per dirty
+   * slot) with one per frame, per bucket.
+   */
+  headerDirtyMin: number;
+  headerDirtyMax: number;
 
   // Per-local-slot state (sparse; index = local slot in this bucket).
   readonly localPosRefs:  (number | undefined)[];
@@ -1313,6 +1391,7 @@ export function buildHeapScene(
       bindGroup: null as unknown as GPUBindGroup,
       drawHeap,
       drawHeaderStaging: new Float32Array(drawHeapBuf.capacity / 4),
+      headerDirtyMin: Infinity, headerDirtyMax: 0,
       localPosRefs: [], localNorRefs: [],
       localEntries: [], localToDrawId: [],
       localPerDrawAvals: [], localPerDrawRefs: [],
@@ -1451,11 +1530,9 @@ export function buildHeapScene(
 
     packBucketHeader(bucket, localSlot, perDrawRefs);
     const byteOff = localSlot * bucket.layout.drawHeaderBytes;
-    device.queue.writeBuffer(
-      bucket.drawHeap.buffer, byteOff,
-      bucket.drawHeaderStaging.buffer, bucket.drawHeaderStaging.byteOffset + byteOff,
-      bucket.layout.drawHeaderBytes,
-    );
+    if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
+    const end = byteOff + bucket.layout.drawHeaderBytes;
+    if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
 
     drawIdToBucket[drawId]    = bucket;
     drawIdToLocalSlot[drawId] = localSlot;
@@ -1558,17 +1635,34 @@ export function buildHeapScene(
           if (refs === undefined) continue;
           packBucketHeader(bucket, localSlot, refs);
           const byteOff = localSlot * bucket.layout.drawHeaderBytes;
-          device.queue.writeBuffer(
-            bucket.drawHeap.buffer, byteOff,
-            bucket.drawHeaderStaging.buffer, bucket.drawHeaderStaging.byteOffset + byteOff,
-            bucket.layout.drawHeaderBytes,
-          );
+          if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
+          const end = byteOff + bucket.layout.drawHeaderBytes;
+          if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
           totalDirtyBytes += bucket.layout.drawHeaderBytes;
         }
         bucket.dirty.clear();
       }
     });
     stats.drawBytes = totalDirtyBytes;
+
+    // ─── Flush staged uploads (one writeBuffer per dirty range) ──────
+    // Replaces N small writeBuffer calls (per addDraw, per dirty alloc,
+    // per dirty header slot) with at most one per logical buffer. At
+    // initial population for 10K ROs this collapses ~30K calls into
+    // ~5 (arena, indices, plus one per bucket).
+    arena.attrs.flush(device);
+    arena.indices.flush(device);
+    for (const bucket of buckets) {
+      if (bucket.headerDirtyMax <= bucket.headerDirtyMin) continue;
+      device.queue.writeBuffer(
+        bucket.drawHeap.buffer, bucket.headerDirtyMin,
+        bucket.drawHeaderStaging.buffer,
+        bucket.drawHeaderStaging.byteOffset + bucket.headerDirtyMin,
+        bucket.headerDirtyMax - bucket.headerDirtyMin,
+      );
+      bucket.headerDirtyMin = Infinity;
+      bucket.headerDirtyMax = 0;
+    }
   }
 
   /**
