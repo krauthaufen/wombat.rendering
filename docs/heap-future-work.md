@@ -246,6 +246,85 @@ addition. Worst case (no buckets ever cross the threshold) costs
 nothing. Best case (heavy material variety) collapses encode to
 near-O(family) regardless of effect count.
 
+## 7a. Derived uniforms as a first-class DSL primitive
+
+The implementation in §7 (next) handwrites a WGSL compute kernel,
+wires it manually into a bucket, and declares its dependencies in
+TS code. That's fine for ModelView in isolation but doesn't scale —
+every new derivation is bespoke runtime + shader plumbing.
+
+The principled version: extend wombat.shader so users *declare*
+derivations in the same DSL they already use for vertex/fragment
+stages.
+
+```ts
+deriveUniform("ModelView",     (u) => u.ViewTrafo.mul(u.ModelTrafo));
+deriveUniform("NormalMatrix",  (u) => u.ModelView.upper3x3.inverse.transpose);
+deriveUniform("ScreenBBox",    (u) => u.ViewProj.mul(u.WorldBBox));
+deriveUniform("DistanceFade",  (u) => fade(u.WorldPos.distance(u.CameraPos), u.FadeNear, u.FadeFar));
+```
+
+The wombat.shader compiler:
+
+- Detects "this lambda is a derivation" — different stage from
+  `vertex()` / `fragment()` but reuses the same IR substitution +
+  DCE machinery.
+- Statically analyzes the lambda's reads (`u.X`) → emits the
+  dependency set.
+- Emits a `@compute @workgroup_size(N) fn deriveModelView(...)`
+  entry point that reads the input slots from the arena, applies
+  the user's logic, writes the output slot.
+- Plumbs into the runtime's per-class dirty-list machinery
+  automatically. No manual bucket wiring.
+
+**Scene-graph inheritance turns this into a programming model:**
+
+- A `Camera` SG node publishes `ViewTrafo`. Children inherit.
+- A `Geodetic` modifier publishes `precision: df32`. The compiler
+  picks compensated-arithmetic codegen for any derivation
+  downstream.
+- A `Trafo` SG node publishes `ModelTrafo` (composing with parent's).
+- A leaf RO that *uses* `ModelView` (in its vertex shader) gets it
+  derived automatically — the SG tells the runtime which avals
+  feed it and which precision policy applies.
+
+The user never writes a compute pass. They write a function. The
+system figures out:
+- Which avals are inputs (from the lambda's reads).
+- Which RO slots are dirty when those avals mark.
+- What WGSL to emit (with df32 promotion if a `Geodetic` ancestor
+  demands it; with whatever precision policy applies otherwise).
+- When to dispatch (sparse per-class dirty lists, §7).
+
+**Why this is strategically distinctive:**
+
+Game engines can't offer this because their shaders are slot-
+configuration; arbitrary derivations don't fit the material-graph
+model.
+
+FRP libraries can't offer this because they don't compile to GPU;
+"derive ModelView from View × Model for 50K objects per frame" in
+JS is a non-starter.
+
+Scientific-viz toolkits don't offer this because they don't have
+arbitrary shader code at all; their derivations are built-in.
+
+The combination — reactive scene composition + custom shader DSL +
+GPU-evaluated derivations — is the unique asset wombat brings. The
+position statement falls out: **"a programming model where
+reactive scene composition, custom shaders, and derived GPU state
+are all one DSL, evaluated lazily across CPU + GPU according to
+where the work belongs."**
+
+LOD selection, occlusion testing, animation pose, distance fade,
+splat sorting, custom culling — all become one-line declarations.
+Each composes through the SG. Each gets sparse reactive change
+tracking + GPU compute for free.
+
+The implementation backbone (§7) is what this DSL extension lowers
+to. Build §7 first; this section is the user-facing API once the
+machinery exists.
+
 ## 7. GPU-computed derived uniforms (ModelView, df32 geodetic)
 
 Aardvark has a "derived uniforms" concept: ModelView, NormalMatrix,
