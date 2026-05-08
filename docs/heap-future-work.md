@@ -4,6 +4,38 @@ Open design notes for the heap fast path. None of these are committed
 plans; they're architectural threads worth pulling once a real workload
 forces the issue. Listed in rough order of "likely to matter first."
 
+## 0. Scope — what the heap path is for
+
+The heap path's job: take many small-to-medium ROs that all want
+similar treatment and crush them into ~one drawIndirect per
+(pipeline-state, texture-set, family). It's not a replacement for
+the legacy per-RO renderer; it's the fast path for the *tail* of
+"all the little things" in a scene.
+
+In a typical scientific-viz workload:
+
+- **Legacy path** (`isHeapEligible(ro) === false`): the load-bearing
+  bespoke cases. 10B pointclouds, photogrammetry mesh tiles,
+  streaming residency layers, anything where the user wants to
+  manage their own `GPUBuffer`s, run their own compute, do their
+  own LOD. Heap path doesn't try to compete here.
+- **Heap path** (`isHeapEligible(ro) === true`): markers, labels,
+  gizmos, brushes, axis indicators, vehicle props, hover
+  affordances, GIS feature symbols, point/line clouds below some
+  threshold, any RO whose total payload fits comfortably (see §2).
+  Mixed effects, mixed trafos, mixed textures (with §6 + §9).
+  Hundreds to tens of thousands of these, all collapsing to ~3
+  drawIndirect calls.
+
+The success metric isn't "render a billion points faster than your
+hand-rolled C++." It's "make the tail effectively free so users
+stop architecting around the small-stuff overhead."
+
+`isHeapEligible` evolves from a defensive screen ("reject obvious
+unsupported wedges") into a positive declaration ("this RO opts
+into the fast path because it fits"). Anything that fails the
+predicate sails through the legacy renderer untouched.
+
 ## 1. Tile-bounded binary search (in flight)
 
 The VS prelude binary-searches `drawTable[*].firstEmit` to derive
@@ -122,46 +154,182 @@ Drop-empty-chunks pairs naturally with affinity allocation — RO data
 locality keeps chunks either live or near-empty, rarely
 bimodally fragmented.
 
-## 6. Uber-shader unification
+## 6. Uber-shader families with shared header pool
 
-Observation: every effect in the heap path that doesn't use textures
-shares the same input signature (Positions, Normals, … + uniforms via
-arena). Today each unique effect compiles its own shader module +
-pipeline.
+Currently the bucket key is `(effect, pipelineState, textures)` — two
+ROs with different effects always fall into different buckets even if
+their pipeline state and texture binding match. Encode = N buckets =
+N drawIndirect calls.
 
-Idea: a single uber-VS + uber-FS with a top-level switch on a
-`shaderId` field in the drawHeader. One pipeline, one bind group
-layout, all non-textured ROs collapse into one bucket regardless of
-effect.
+Goal: collapse multiple effects into one bucket / one drawIndirect.
+Earlier framing was "uber-shader unification" — merge effects into
+one shader by unifying their schemas. Cleaner approach: don't unify
+schemas at all. Each effect keeps its native drawHeader layout. The
+machinery that gets shared is the storage and the dispatch, not the
+data format.
 
-Wins:
-- Bucket count drops dramatically. Encode loop becomes one drawIndirect
-  for the entire scene's non-textured fast path.
-- No per-effect shader-module cache, no per-effect pipeline cache.
+**Mechanism:**
 
-Costs:
-- Shader compile time scales with branch count. With many effects,
-  the merged shader could be huge and slow to compile (one-time, but
-  meaningful for cold start).
-- Branch divergence in the warp: vertices with different shaderIds
-  in the same warp execute both branches. With good slot-locality
-  (same effect = contiguous drawTable region) divergence is rare,
-  but worst-case is real.
-- Loses per-effect dead code elimination — uniforms only one effect
-  reads still need to be loadable (or guard every load behind the
-  shader-id branch, which costs predication).
-- The IR rewriter's `linkFragmentOutputs` pass currently DCEs unused
-  outputs per-effect. Uber-FS would have to either preserve all
-  fragment outputs or do DCE against the union of effects' outputs.
+- One **shared `drawHeaders` pool** (heap-style, variable-sized
+  allocations) replaces today's per-bucket header buffer. Each RO's
+  drawHeader gets allocated by byte offset, size = its effect's
+  declared header size.
+- Each draw record carries `(firstEmit, layoutId, drawHeaderRef,
+  indexStart, indexCount)`. `drawHeaderRef` = byte offset into the
+  pool. `layoutId` = which effect this RO belongs to within the
+  family.
+- The **uber-shader** has a top-level switch on `layoutId`. Each case
+  is the compiled-in code for THAT effect, including its specific
+  drawHeader load expressions. No runtime layout interpretation —
+  the layout knowledge is baked into each branch.
+- **Bucket key reduces to `(uber-shader-family, pipelineState,
+  textureSet)`**. Effects within the family share a bucket and a
+  drawIndirect.
 
-Realistic path: apply uber-shader unification *within a small set of
-"compatible" effects* (e.g. lambert + flat + wave: identical attribs,
-same FS output, just different math). Different texture/sampler
-shapes still bucket separately. Could provide 2-4× bucket reduction
-for scenes that mix a few similar materials, without paying full
-uber-shader compile cost.
+**Cost:** one extra storage read per VS — `drawHeaderRef` from the
+draw record. Same shape as the indirections we already pay
+(`heapU32[ref / 4u + offset]` etc.); essentially free.
 
-## 7. Per-vertex (drawIdx, vid) lookup table
+**Branch divergence** when adjacent emit slots have different
+layoutIds. Mitigated by sorting the drawTable by layoutId during
+the scan pass so consecutive ranges share a branch. Cheap,
+optional.
+
+**Compile time** scales with branch count in the uber-shader, but
+shape stays linear: each effect contributes its own block. Bounded
+by partitioning effects into "families" (compatible pipeline state
++ texture shape).
+
+**Wins:**
+- Bucket count collapses to ~1 per family/PS/texture combo.
+- No drawHeader-layout unification needed; no wasted bytes from
+  union-padding; no migration when adding a new effect to a family.
+- Adding a new effect = recompile the family's uber-shader + assign
+  a new layoutId. Data formats untouched.
+
+The "family" framing matters for compile cost — one mega-uber-shader
+for the entire app would be huge. Realistic granularity: one family
+per (pipeline-state class, texture-binding shape). Geodetic-df32
+becomes a natural family.
+
+**Trace-based, opt-in, async compile:**
+
+Don't merge upfront — do it adaptively when the workload says it
+helps. Keep separate buckets by default; track per-scene stats:
+`(bucketCount, slotsPerBucket histogram, encodeTime)`. When
+`bucketCount > N AND median(slotsPerBucket) < M` (something like
+N=8, M=200), the death-by-thousand-tiny-buckets shape is real and
+merging is worth the compile cost.
+
+Trigger logic:
+- Pick the family with the most buckets.
+- Kick off `device.createRenderPipelineAsync(...)` for the merged
+  uber-shader in the background. Non-blocking; encode keeps running
+  with the current separate buckets.
+- When the pipeline is ready, the next encode swaps. Concat-and-
+  renumber the old per-bucket drawTables into one unified table and
+  re-run the prefix-sum pass; copy drawHeaders into a unified pool.
+  Old buckets and their per-bucket pipelines drop their references.
+- Don't unmerge on subsequent workload shifts. One-direction
+  transition; keeps the runtime state machine small.
+
+Failure modes:
+- Compile error on the merged uber-shader → abort, keep separate
+  buckets, log + remember "this family doesn't merge cleanly" so
+  future scenes don't retry.
+- Compile time > budget (say 1s) → record the cost; next scene with
+  the same family can either pre-warm during idle frames or skip
+  merging entirely.
+
+The pre-merge state is what's already shipping — so this is a pure
+addition. Worst case (no buckets ever cross the threshold) costs
+nothing. Best case (heavy material variety) collapses encode to
+near-O(family) regardless of effect count.
+
+## 7. GPU-computed derived uniforms (ModelView, df32 geodetic)
+
+Aardvark has a "derived uniforms" concept: ModelView, NormalMatrix,
+etc. are not stored per-RO but computed from base inputs. The
+geodetic precision trick is the load-bearing case:
+
+> Geodetic coordinates put data at ~6.4×10⁶ m from origin. f32 mantissa
+> precision at that magnitude is ~0.4 m — useless for cm-scale
+> rendering. Solution: compute `view × model` in double precision so
+> the camera-relative offsets cancel cleanly, then truncate the result
+> to f32 for the shader. The shader sees a small-magnitude matrix and
+> all error compounds at f32 scale, not at planet scale.
+
+CPU implementation works but means recomputing ModelView for every RO
+on every camera move. With 50K ROs that's 50K mat4 × mat4 multiplies
++ 50K writeBuffer uploads per frame. Terrible.
+
+**GPU-side via "df32" / double-single:**
+
+Represent each scalar as `(hi: f32, lo: f32)` where value ≈ hi + lo.
+Compensated arithmetic via Knuth's TwoSum (add) + Dekker's TwoProduct
+(multiply). Not full IEEE 754 double — but enough to cancel the
+big-magnitude offsets and produce a clean small-magnitude result.
+
+**Heap-renderer integration:**
+
+Add a "derived uniform" field type to BucketLayout:
+```ts
+{ name, kind: "derived", dependencies, computeKernel, outputType }
+```
+
+- Pool allocates output storage normally (one slot per RO).
+- Dependencies (e.g. ModelTrafo_df32, ViewTrafo_df32) live in the
+  arena like any other uniform but with df32 type.
+- A new compute pass `computeDerived` dispatches one thread per RO
+  per dirty dependency. The thread reads inputs via existing
+  arena-fetch helpers, runs the kernel (mat4 × mat4 compensated
+  product), truncates to f32, writes to the output slot.
+- Reactivity is sparse and dependency-tracked. Each derived class
+  maintains a dirty list of RO slot indices whose output needs
+  recomputation. Per-RO dependency avals (e.g. that one RO's
+  `ModelTrafo`) register marking callbacks that add THAT slot.
+  Scene-global dependencies (`ViewTrafo`, `ProjTrafo`) toggle a
+  "global dirty" flag covering all slots in one stroke.
+
+  Per frame:
+  - Dirty list empty AND no global flag → skip the compute dispatch
+    entirely. Zero per-frame work for static-scene-stationary-camera.
+  - Otherwise → upload the slot-index list, dispatch one compute
+    thread per dirty slot (or all slots when the global flag is set),
+    clear the list.
+
+  Camera orbit → ViewTrafo dirty → one full dispatch per frame
+  (~50K threads ≈ 1 ms). Single moving vehicle → one thread per
+  frame. Idle viewer → nothing dispatched. The compute pass costs
+  exactly what the dependency graph says it should.
+
+  Naturally extends to N derived uniforms — each class tracks its
+  own dirty list, the runtime iterates only the classes with work.
+  Renderers that don't use derived uniforms pay nothing.
+
+**Costs:**
+
+- Storage: 2× per df32 input. ModelTrafo = 128 B instead of 64. Output
+  ModelView still 64 B (plain f32). Net: maybe +64 B per RO for the
+  static input, no per-frame ViewProj ref/upload churn.
+- Compute: ~16 mat4 entries × ~10 ops per df32 multiply-add ≈ 160 ops
+  per RO. At 50K ROs → 8M ops per camera move. Sub-millisecond on
+  any modern GPU.
+- Bandwidth: one camera move uploads 128 B for the new ViewTrafo
+  instead of N writeBuffers for N ModelView matrices. Strict win.
+
+**Architectural cleanup:**
+
+User-facing API simplifies: you provide ModelTrafo + ViewTrafo +
+ProjTrafo separately (in df32 where needed), the renderer derives
+the correctly-precision-managed combined matrices. The current
+demo's `makeUniforms` would shrink considerably.
+
+This is one of the biggest user-visible wins available — geodetic
+rendering at 50K+ objects with cm precision and no per-RO CPU work
+on camera moves.
+
+## 8. Per-vertex (drawIdx, vid) lookup table
 
 The full version of item 1 — replace per-vertex binary search with
 ONE storage read of a precomputed `(drawIdx, vid)` per emit position.
@@ -180,3 +348,84 @@ Worth chasing only if the tile-bounded BS still leaves the GPU
 bottlenecked, AND memory headroom exists. For mobile GPUs, the
 ~5 MB extra pressure could push the working set out of cache and
 make the "fast" version slower — measure before assuming.
+
+## 9. Texture array atlasing
+
+The merging story in §6 has a hard precondition: ROs that share a
+bucket must reference the SAME concrete texture/sampler resources.
+Two ROs both wanting "one albedo + one sampler" can share a bucket
+only if they want the *same* albedo. WebGPU 1.0 has no bindless
+textures, so heterogeneous-texture scenes still bucket per
+material — exactly the case that breaks the "1 drawIndirect for
+everything" promise.
+
+The escape hatch available today: pack scene textures into a few
+`texture_2d_array<f32>` resources. Per-RO state in the drawHeader
+adds `(arrayLayerIdx, uvScale, uvBias)`. The shader samples
+`textureSample(atlas, sampler, vec3(uv * scale + bias, layer))`.
+
+**The bargain — spirit-aligned with the rest of the heap path:**
+
+Pay upfront / async cost (atlas packing, residency management) for
+runtime uniformity that makes everything downstream collapse to one
+drawIndirect. Same trade as the GPU prefix-sum: bookkeeping cost
+moves to the periphery so the hot path stays branch-free and
+trivial.
+
+**Binning:**
+
+- One `texture_2d_array` per (size class, format) combo.
+  Power-of-two size classes: 256², 512², 1024², 2048², 4096². Most
+  scenes need ≤ 5 distinct combos.
+- ROs whose textures land in the same combo share a bucket.
+- Texture variation drops out of the bucket key entirely; bucket
+  key becomes `(uber-shader-family, pipelineState, atlasGroup)`
+  where `atlasGroup` covers all RO atlases the bucket references.
+
+**Costs:**
+
+- **Atlas packing**: incremental layer assignment. Pack on demand,
+  evict LRU when full. Standard texture-cache pain, well-understood
+  problem (UE5 virtual textures, Sebastian Aaltonen's talks). Not
+  novel; just real.
+- **Resolution mismatch**: small textures pack into the next-larger
+  size class. Wastes some memory; same proportional waste as any
+  pow2 allocator.
+- **MIP regen**: `generateMipmaps` across array layers requires a
+  custom compute or per-layer render pass. Doable; one-time per
+  layer-write.
+- **Sub-region sampling**: shader does `fract(uv * scale + bias)`
+  to handle wrapping/repeat manually since the array layer is the
+  whole texture. One extra ALU per sample.
+
+**What's gained:**
+
+- The entire scene's textured ROs collapse to one drawIndirect per
+  (size class, format). Typical scenes: 1–3 drawcalls covering all
+  materials.
+- Scene heterogeneity stops scaling encode time. Cost is paid in
+  atlas churn (bounded, async, off-the-hot-path).
+
+**Where this is the right trade:**
+
+For finite-and-known texture sets (GIS feature symbols, marker
+icons, vehicle skins, photogrammetry tile thumbnails) — exactly
+the kind of mid-scale heterogeneity the heap path targets. Atlas
+fits naturally; the working set is bounded.
+
+For unbounded streaming (procedural materials, infinite zoom) —
+this is where you'd want true bindless or virtual textures. Not
+available in WebGPU 1.0; revisit when the spec catches up.
+
+**WebGPU 1.0+ migration path:**
+
+Bindless texture support, when it lands, replaces the atlas
+machinery without changing the user-facing API. The drawHeader
+already carries an "image reference" (today: layer index, future:
+bindless handle) so the migration is internal. Atlas residency
+management stays useful as a fallback for older browsers.
+
+This is the right escape hatch *today* AND a clean migration path
+to the eventual bindless future. Spirit-aligned with the rest of
+the architecture: pay the price in management complexity at the
+periphery, gain unconditional uniformity in the hot path.
