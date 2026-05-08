@@ -176,13 +176,19 @@ interface RoSpec {
   readonly color: V4f;
 }
 
+// Shared PipelineState across all ROs — the heap path's bucket key
+// includes PipelineState identity, so a fresh-per-RO call would
+// create N buckets (= N pipelines + shader modules) for N
+// structurally-identical states. Sharing collapses to one bucket.
+const sharedPipelineState = PipelineState.constant({
+  rasterizer: { topology: "triangle-list", cullMode: "back", frontFace: "ccw" },
+  depth: { write: true, compare: "less" },
+});
+
 function makeRO(spec: RoSpec, viewProj: aval<Trafo3d>): RenderObject {
   return {
     effect: surface,
-    pipelineState: PipelineState.constant({
-      rasterizer: { topology: "triangle-list", cullMode: "back", frontFace: "ccw" },
-      depth: { write: true, compare: "less" },
-    }),
+    pipelineState: sharedPipelineState,
     vertexAttributes: HashMap.empty<string, BufferView>()
       .add("Positions", spec.geo.positions)
       .add("Normals",   spec.geo.normals)

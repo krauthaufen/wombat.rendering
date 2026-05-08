@@ -27,12 +27,14 @@ export function flattenRenderTree(tree: RenderTree): aset<RenderObject> {
       return ASet.single(tree.object);
     case "Ordered":
     case "Unordered": {
-      // N-ary fold over binary union. Static children, so this is
-      // a one-shot construction; the resulting aset is reactive at
-      // each child's level (a child can itself be Adaptive).
+      // N-ary union via `unionMany(aset<aset<T>>)`. The naïve
+      // `children.reduce(ASet.union)` builds a 2N-deep nested-union
+      // tree; the reader's traversal recurses through it and blows
+      // the stack at ~2K leaves. `unionMany` is O(1)-deep regardless.
       const children = tree.children.map(flattenRenderTree);
       if (children.length === 0) return ASet.empty<RenderObject>();
-      return children.reduce((acc, c) => ASet.union(acc, c));
+      if (children.length === 1) return children[0]!;
+      return ASet.unionMany(ASet.ofArray(children));
     }
     case "Adaptive":
       return ASet.bind(flattenRenderTree, tree.tree);
