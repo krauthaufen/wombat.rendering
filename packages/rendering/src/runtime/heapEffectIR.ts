@@ -25,7 +25,7 @@ import {
   type EntryDef, type EntryParameter, type ParamDecoration,
   Tu32, Tf32, Vec,
 } from "@aardworx/wombat.shader/ir";
-import type { BucketLayout } from "./heapEffect.js";
+import { megacallSearchPrelude, type BucketLayout } from "./heapEffect.js";
 
 // ─── IR builders ────────────────────────────────────────────────────
 
@@ -527,13 +527,71 @@ export function compileHeapEffectIR(
   const compiled = compileModule(combined, compileOptions);
   const vsStage = compiled.stages.find(s => s.stage === "vertex");
   const fsStage = compiled.stages.find(s => s.stage === "fragment");
+  let vsSrc = vsStage?.source ?? "";
+  if (layout.megacall && vsSrc.length > 0) {
+    vsSrc = applyMegacallToEmittedVs(vsSrc);
+  }
   return {
-    vs: vsStage?.source ?? "",
+    vs: vsSrc,
     fs: fsStage?.source ?? "",
     vsEntry: vsStage?.entryName ?? "vs",
     fsEntry: fsStage?.entryName ?? "fs",
     preludeWgsl: "",
   };
+}
+
+/**
+ * Megacall post-processing for the IR-emitted VS source. The IR uses
+ * `@builtin(vertex_index) vertex_index` + `@builtin(instance_index)
+ * instance_index` as the param names; rather than rewrite the IR
+ * (which would require building the binary-search loop in IR), we
+ * post-process the emitted WGSL: strip instance_index from the
+ * @vertex signature, rename vertex_index to emitIdx, and inject a
+ * prelude that defines `instance_index` + `vertex_index` as locals
+ * via the drawTable binary search so existing body references keep
+ * resolving. Also injects the drawTable/indexStorage binding decls.
+ */
+function applyMegacallToEmittedVs(vs: string): string {
+  let s = vs;
+  const decl = `\n@group(0) @binding(4) var<storage, read> drawTable:    array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage: array<u32>;\n`;
+  // Locate the @vertex fn header, then balance parens manually since
+  // params can carry `@builtin(name)` decorations (regex `[^)]*` would
+  // halt at the first inner `)`).
+  const startRe = /@vertex\s+fn\s+(\w+)\s*\(/;
+  const startMatch = s.match(startRe);
+  if (startMatch === null) return s;
+  const fnName = startMatch[1]!;
+  const paramOpen = startMatch.index! + startMatch[0]!.length;
+  let depth = 1;
+  let i = paramOpen;
+  for (; i < s.length && depth > 0; i++) {
+    const c = s[i];
+    if (c === "(") depth++;
+    else if (c === ")") depth--;
+  }
+  if (depth !== 0) return s;
+  const paramList = s.slice(paramOpen, i - 1);
+  // After the closing `)` we expect `\s*->\s*<retType>\s*\{`.
+  const tailRe = /\s*->\s*([\w<>,\s]+?)\s*\{/y;
+  tailRe.lastIndex = i;
+  const tailMatch = tailRe.exec(s);
+  if (tailMatch === null) return s;
+  const retType = tailMatch[1]!.trim();
+  const headerEnd = tailRe.lastIndex;
+  const headerStart = startMatch.index!;
+  const params = paramList.split(",").map(p => p.trim()).filter(p => p.length > 0);
+  const kept: string[] = [];
+  for (const p of params) {
+    if (/@builtin\(\s*instance_index\s*\)/.test(p)) continue;
+    if (/@builtin\(\s*vertex_index\s*\)/.test(p)) {
+      kept.push("@builtin(vertex_index) emitIdx: u32");
+      continue;
+    }
+    kept.push(p);
+  }
+  const newHeader = `@vertex fn ${fnName}(${kept.join(", ")}) -> ${retType} {\n${megacallSearchPrelude()}  let instance_index: u32 = drawIdx;\n  let vertex_index: u32 = vid;\n`;
+  s = s.slice(0, headerStart) + newHeader + s.slice(headerEnd);
+  return decl + s;
 }
 
 function mergeStages(eff: Effect): Module {

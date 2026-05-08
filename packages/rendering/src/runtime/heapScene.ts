@@ -613,13 +613,14 @@ function buildArenaState(
   attrBytesHint: number,
   idxBytesHint: number,
   label: string,
+  idxExtraUsage: GPUBufferUsageFlags = 0,
 ): ArenaState {
   const attrs = new AttributeArena(new GrowBuffer(
     device, `${label}/attrs`, GPUBufferUsage.STORAGE,
     attrBytesHint,
   ));
   const indices = new IndexAllocator(new GrowBuffer(
-    device, `${label}/idx`, GPUBufferUsage.INDEX,
+    device, `${label}/idx`, GPUBufferUsage.INDEX | idxExtraUsage,
     idxBytesHint,
   ));
   return { attrs, indices };
@@ -669,6 +670,132 @@ function asFloat32(data: HostBufferSource): Float32Array {
   }
   return new Float32Array(data); // ArrayBuffer
 }
+
+// ---------------------------------------------------------------------------
+// Megacall GPU prefix-sum compute shader
+// ---------------------------------------------------------------------------
+
+const SCAN_TILE_SIZE = 512;
+const SCAN_WG_SIZE = 256;
+const SCAN_MAX_RECORDS = SCAN_TILE_SIZE * SCAN_TILE_SIZE; // numBlocks ≤ TILE_SIZE
+
+const HEAP_SCAN_WGSL = `
+struct Params {
+  numRecords: u32,
+  numBlocks:  u32,
+  _pad0:      u32,
+  _pad1:      u32,
+};
+
+struct Record {
+  firstEmit:  u32,
+  drawIdx:    u32,
+  indexStart: u32,
+  indexCount: u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> drawTable:    array<Record>;
+@group(0) @binding(1) var<storage, read_write> blockSums:    array<u32>;
+@group(0) @binding(2) var<storage, read_write> blockOffsets: array<u32>;
+@group(0) @binding(3) var<storage, read_write> indirect:     array<u32>;
+@group(0) @binding(4) var<uniform>             params:       Params;
+
+const TILE_SIZE: u32 = 512u;
+const WG_SIZE:   u32 = 256u;
+
+var<workgroup> sdata: array<u32, 512>;
+
+fn blellochScan(tid: u32) {
+  var offset: u32 = 1u;
+  for (var d: u32 = TILE_SIZE >> 1u; d > 0u; d = d >> 1u) {
+    workgroupBarrier();
+    if (tid < d) {
+      let ai = offset * (2u * tid + 1u) - 1u;
+      let bi = offset * (2u * tid + 2u) - 1u;
+      sdata[bi] = sdata[bi] + sdata[ai];
+    }
+    offset = offset * 2u;
+  }
+  if (tid == 0u) { sdata[TILE_SIZE - 1u] = 0u; }
+  for (var d: u32 = 1u; d < TILE_SIZE; d = d * 2u) {
+    offset = offset >> 1u;
+    workgroupBarrier();
+    if (tid < d) {
+      let ai = offset * (2u * tid + 1u) - 1u;
+      let bi = offset * (2u * tid + 2u) - 1u;
+      let t = sdata[ai];
+      sdata[ai] = sdata[bi];
+      sdata[bi] = sdata[bi] + t;
+    }
+  }
+  workgroupBarrier();
+}
+
+@compute @workgroup_size(WG_SIZE)
+fn scanTile(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) {
+  let tid = lid.x;
+  let blockOff = wgid.x * TILE_SIZE;
+  let n = params.numRecords;
+  let i0 = blockOff + tid;
+  let i1 = blockOff + tid + WG_SIZE;
+  var v0: u32 = 0u;
+  var v1: u32 = 0u;
+  if (i0 < n) { v0 = drawTable[i0].indexCount; }
+  if (i1 < n) { v1 = drawTable[i1].indexCount; }
+  sdata[tid]           = v0;
+  sdata[tid + WG_SIZE] = v1;
+  workgroupBarrier();
+  blellochScan(tid);
+  if (i0 < n) { drawTable[i0].firstEmit = sdata[tid]; }
+  if (i1 < n) { drawTable[i1].firstEmit = sdata[tid + WG_SIZE]; }
+  if (tid == WG_SIZE - 1u) {
+    blockSums[wgid.x] = sdata[tid + WG_SIZE] + v1;
+  }
+}
+
+@compute @workgroup_size(WG_SIZE)
+fn scanBlocks(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let tid = lid.x;
+  let n = params.numBlocks;
+  let i0 = tid;
+  let i1 = tid + WG_SIZE;
+  var v0: u32 = 0u;
+  var v1: u32 = 0u;
+  if (i0 < n) { v0 = blockSums[i0]; }
+  if (i1 < n) { v1 = blockSums[i1]; }
+  sdata[tid]           = v0;
+  sdata[tid + WG_SIZE] = v1;
+  workgroupBarrier();
+  blellochScan(tid);
+  if (i0 < n) { blockOffsets[i0] = sdata[tid]; }
+  if (i1 < n) { blockOffsets[i1] = sdata[tid + WG_SIZE]; }
+  workgroupBarrier();
+  if (tid == 0u) {
+    if (n > 0u) {
+      let lastIdx = n - 1u;
+      let total = blockOffsets[lastIdx] + blockSums[lastIdx];
+      indirect[0] = total;
+    } else {
+      indirect[0] = 0u;
+    }
+    indirect[1] = 1u;
+    indirect[2] = 0u;
+    indirect[3] = 0u;
+  }
+}
+
+@compute @workgroup_size(WG_SIZE)
+fn addOffsets(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) {
+  let tid = lid.x;
+  let blockOff = wgid.x * TILE_SIZE;
+  let n = params.numRecords;
+  let off = blockOffsets[wgid.x];
+  let i0 = blockOff + tid;
+  let i1 = blockOff + tid + WG_SIZE;
+  if (i0 < n) { drawTable[i0].firstEmit = drawTable[i0].firstEmit + off; }
+  if (i1 < n) { drawTable[i1].firstEmit = drawTable[i1].firstEmit + off; }
+}
+`;
 
 // ---------------------------------------------------------------------------
 // Internal state
@@ -726,6 +853,27 @@ interface Bucket {
   readonly drawSlots: number[];
   /** Local slots whose DrawHeader needs re-pack + writeBuffer next frame. */
   readonly dirty: Set<number>;
+
+  // ─── Megacall state ────────────────────────────────────────────────
+  drawTableBuf?: GrowBuffer;
+  drawTableShadow?: Uint32Array;
+  drawTableDirtyMin: number;
+  drawTableDirtyMax: number;
+  /** Number of live records (= drawTable length). GPU owns firstEmit / total. */
+  recordCount: number;
+  /** localSlot → recordIdx (or -1). */
+  slotToRecord: number[];
+  /** recordIdx → localSlot. */
+  recordToSlot: number[];
+  /** Per-bucket buffers for the GPU prefix-sum pipeline. */
+  blockSumsBuf?: GrowBuffer;
+  blockOffsetsBuf?: GrowBuffer;
+  indirectBuf?: GPUBuffer;
+  paramsBuf?: GPUBuffer;
+  scanBindGroup?: GPUBindGroup;
+  /** numRecords used to size the current render bindGroup; rebuild when it changes. */
+  renderBoundRecordCount?: number;
+  scanDirty: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -831,6 +979,15 @@ export interface HeapScene {
    */
   encodeIntoPass(passEnc: GPURenderPassEncoder): void;
   /**
+   * Encode any compute work the next `encodeIntoPass` depends on.
+   * For megacall buckets: dispatches the GPU prefix-sum scan that
+   * computes per-record `firstEmit` and writes the indirect-draw
+   * args. Must be called BEFORE `beginRenderPass` since compute can't
+   * run inside a render pass. No-op when the scene has no megacall
+   * buckets or none are dirty.
+   */
+  encodeComputePrep(enc: GPUCommandEncoder, token: AdaptiveToken): void;
+  /**
    * Add a draw at runtime. Returns a stable slot handle that can be
    * passed to `removeDraw` later. Allocators auto-grow as needed.
    */
@@ -892,6 +1049,13 @@ export interface BuildHeapSceneOptions {
    * Omitted ⇒ no pruning; every output the effect declares survives.
    */
   readonly fragmentOutputLayout?: FragmentOutputLayout;
+  /**
+   * Megacall mode: collapse N drawIndexed-per-bucket into one
+   * `pass.drawIndirect(...)` per bucket. Per-record `firstEmit` and the
+   * indirect-draw args are computed on-GPU each frame via a Blelloch
+   * scan in `encodeComputePrep`. Throws on instanced specs.
+   */
+  readonly megacall?: boolean;
 }
 
 export function buildHeapScene(
@@ -900,6 +1064,7 @@ export function buildHeapScene(
   initialDraws: readonly HeapDrawSpec[] | aset<HeapDrawSpec>,
   opts: BuildHeapSceneOptions = {},
 ): HeapScene {
+  const megacall = opts.megacall ?? false;
   const colorAttachmentName = sig.colorNames[0];
   if (colorAttachmentName === undefined) {
     throw new Error("buildHeapScene: framebuffer signature has no color attachment");
@@ -912,7 +1077,10 @@ export function buildHeapScene(
   // demand. Skip per-draw enumeration since aval-keyed sharing makes
   // the actual allocated size hard to predict (10K instanced draws
   // sharing the same Positions array → 1 alloc, not 10K).
-  const arena = buildArenaState(device, 64 * 1024, 16 * 1024, "heapScene");
+  const arena = buildArenaState(
+    device, 64 * 1024, 16 * 1024, "heapScene",
+    megacall ? GPUBufferUsage.STORAGE : 0,
+  );
 
   // ─── Per-draw global bookkeeping (sparse, indexed by drawId) ──────
   const drawIdToBucket:    (Bucket | undefined)[] = [];
@@ -1113,7 +1281,7 @@ export function buildHeapScene(
   interface BglEntry { bgl: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout }
   const bglCache = new Map<string, BglEntry>();
   function getBgl(layout: BucketLayout): BglEntry {
-    const key = `t${layout.textureBindings.length}|s${layout.samplerBindings.length}`;
+    const key = `t${layout.textureBindings.length}|s${layout.samplerBindings.length}|m${layout.megacall ? 1 : 0}`;
     let e = bglCache.get(key);
     if (e !== undefined) return e;
     // Heap data buffers are read by both stages: FS uniform-via-varying
@@ -1126,6 +1294,12 @@ export function buildHeapScene(
       { binding: 2, visibility: heapVis, buffer: { type: "read-only-storage" } },
       { binding: 3, visibility: heapVis, buffer: { type: "read-only-storage" } },
     ];
+    if (layout.megacall) {
+      entries.push(
+        { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+        { binding: 5, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      );
+    }
     for (const t of layout.textureBindings) {
       entries.push({
         binding: t.binding, visibility: GPUShaderStage.FRAGMENT,
@@ -1143,6 +1317,57 @@ export function buildHeapScene(
     e = { bgl, pipelineLayout };
     bglCache.set(key, e);
     return e;
+  }
+
+  // ─── Megacall compute (prefix-sum) pipelines ──────────────────────
+  // Built once per scene (not per bucket — pipelines are identical;
+  // only the bind-group differs). All three pipelines share one
+  // bind-group layout with 5 bindings (drawTable, blockSums,
+  // blockOffsets, indirect, params).
+  let scanBgl: GPUBindGroupLayout | undefined;
+  let scanPipeTile:   GPUComputePipeline | undefined;
+  let scanPipeBlocks: GPUComputePipeline | undefined;
+  let scanPipeAdd:   GPUComputePipeline | undefined;
+  if (megacall) {
+    scanBgl = device.createBindGroupLayout({
+      label: "heapScene/scanBgl",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+      ],
+    });
+    const scanLayout = device.createPipelineLayout({ bindGroupLayouts: [scanBgl] });
+    const scanModule = device.createShaderModule({ code: HEAP_SCAN_WGSL, label: "heapScene/scan" });
+    scanPipeTile = device.createComputePipeline({
+      label: "heapScene/scan/tile", layout: scanLayout,
+      compute: { module: scanModule, entryPoint: "scanTile" },
+    });
+    scanPipeBlocks = device.createComputePipeline({
+      label: "heapScene/scan/blocks", layout: scanLayout,
+      compute: { module: scanModule, entryPoint: "scanBlocks" },
+    });
+    scanPipeAdd = device.createComputePipeline({
+      label: "heapScene/scan/add", layout: scanLayout,
+      compute: { module: scanModule, entryPoint: "addOffsets" },
+    });
+  }
+
+  function buildScanBindGroup(bucket: Bucket): GPUBindGroup {
+    if (scanBgl === undefined) throw new Error("heapScene: scan BGL missing");
+    return device.createBindGroup({
+      label: `heapScene/${bucket.label}/scanBg`,
+      layout: scanBgl,
+      entries: [
+        { binding: 0, resource: { buffer: bucket.drawTableBuf!.buffer } },
+        { binding: 1, resource: { buffer: bucket.blockSumsBuf!.buffer } },
+        { binding: 2, resource: { buffer: bucket.blockOffsetsBuf!.buffer } },
+        { binding: 3, resource: { buffer: bucket.indirectBuf! } },
+        { binding: 4, resource: { buffer: bucket.paramsBuf! } },
+      ],
+    });
   }
 
   // ─── Buckets ──────────────────────────────────────────────────────
@@ -1222,6 +1447,22 @@ export function buildHeapScene(
       { binding: 2, resource: { buffer: arena.attrs.buffer } },          // heapF32
       { binding: 3, resource: { buffer: arena.attrs.buffer } },          // heapV4f
     ];
+    if (bucket.layout.megacall) {
+      if (bucket.drawTableBuf === undefined) {
+        throw new Error("heapScene: megacall bucket without drawTableBuf");
+      }
+      // Bind drawTable with size = recordCount * 16 so the VS prelude's
+      // `arrayLength(&drawTable)/4u` returns exactly the live record
+      // count — keeps stale tail entries out of the binary search.
+      // Minimum 16 bytes (one zero-record) to satisfy WebGPU non-zero
+      // size constraint when the bucket is empty.
+      const dtBytes = Math.max(16, bucket.recordCount * 16);
+      entries.push(
+        { binding: 4, resource: { buffer: bucket.drawTableBuf.buffer, offset: 0, size: dtBytes } },
+        { binding: 5, resource: { buffer: arena.indices.buffer } },
+      );
+      bucket.renderBoundRecordCount = bucket.recordCount;
+    }
     // Schema-driven texture + sampler entries. v1 user surface still
     // accepts a single (texture, sampler) pair via HeapTextureSet —
     // we map it onto the schema's discovered names by position. If
@@ -1267,6 +1508,13 @@ export function buildHeapScene(
   arena.attrs.onResize(() => {
     for (const b of buckets) b.bindGroup = buildBucketBindGroup(b);
   });
+  // Megacall: indexStorage is bound at slot 5 from arena.indices, so
+  // a grow there also invalidates every bucket's bind group.
+  if (megacall) {
+    arena.indices.onResize(() => {
+      for (const b of buckets) b.bindGroup = buildBucketBindGroup(b);
+    });
+  }
 
   // Default schema for the raw-WGSL escape hatch — covers what the
   // demo's textured shader expects (positions, normals attribs +
@@ -1325,6 +1573,7 @@ export function buildHeapScene(
     const layoutOpts = {
       isInstanced: instanceOpts.isInstanced,
       perInstanceUniforms: instanceOpts.perInstanceUniforms,
+      megacall,
     };
     let layout: BucketLayout;
     let vsModule: GPUShaderModule;
@@ -1396,7 +1645,65 @@ export function buildHeapScene(
       localEntries: [], localToDrawId: [],
       localPerDrawAvals: [], localPerDrawRefs: [],
       drawSlots: [], dirty: new Set<number>(),
+      drawTableDirtyMin: Infinity, drawTableDirtyMax: 0,
+      recordCount: 0, slotToRecord: [], recordToSlot: [],
+      scanDirty: false,
     };
+    if (megacall) {
+      const dtBuf = new GrowBuffer(
+        device, `heapScene/${bk}/drawTable`,
+        GPUBufferUsage.STORAGE,
+        1024,
+      );
+      const blockSumsBuf = new GrowBuffer(
+        device, `heapScene/${bk}/blockSums`,
+        GPUBufferUsage.STORAGE,
+        4 * Math.max(1, Math.ceil((dtBuf.capacity / 16) / SCAN_TILE_SIZE)),
+      );
+      const blockOffsetsBuf = new GrowBuffer(
+        device, `heapScene/${bk}/blockOffsets`,
+        GPUBufferUsage.STORAGE,
+        4 * Math.max(1, Math.ceil((dtBuf.capacity / 16) / SCAN_TILE_SIZE)),
+      );
+      const indirectBuf = device.createBuffer({
+        label: `heapScene/${bk}/indirect`, size: 16,
+        usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      });
+      // Initialize to (0, 1, 0, 0) so an unscanned/empty bucket draws
+      // nothing safely.
+      device.queue.writeBuffer(indirectBuf, 0, new Uint32Array([0, 1, 0, 0]));
+      const paramsBuf = device.createBuffer({
+        label: `heapScene/${bk}/params`, size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      bucket.drawTableBuf = dtBuf;
+      bucket.drawTableShadow = new Uint32Array(dtBuf.capacity / 4);
+      bucket.blockSumsBuf = blockSumsBuf;
+      bucket.blockOffsetsBuf = blockOffsetsBuf;
+      bucket.indirectBuf = indirectBuf;
+      bucket.paramsBuf = paramsBuf;
+      const ensureScanBuffers = (): void => {
+        const needBlocks = Math.max(1, Math.ceil(bucket.recordCount / SCAN_TILE_SIZE));
+        blockSumsBuf.ensureCapacity(needBlocks * 4);
+        blockOffsetsBuf.ensureCapacity(needBlocks * 4);
+      };
+      const rebuildScanBg = (): void => {
+        bucket.scanBindGroup = buildScanBindGroup(bucket);
+      };
+      dtBuf.onResize(() => {
+        const grown = new Uint32Array(dtBuf.capacity / 4);
+        grown.set(bucket.drawTableShadow!);
+        bucket.drawTableShadow = grown;
+        ensureScanBuffers();
+        bucket.bindGroup = buildBucketBindGroup(bucket);
+        rebuildScanBg();
+        bucket.drawTableDirtyMin = 0;
+        bucket.drawTableDirtyMax = bucket.recordCount * 16;
+      });
+      blockSumsBuf.onResize(rebuildScanBg);
+      blockOffsetsBuf.onResize(rebuildScanBg);
+      bucket.scanBindGroup = buildScanBindGroup(bucket);
+    }
     bucket.bindGroup = buildBucketBindGroup(bucket);
     drawHeap.onResize(() => {
       bucket.drawHeaderStaging = new Float32Array(drawHeapBuf.capacity / 4);
@@ -1534,6 +1841,36 @@ export function buildHeapScene(
     const end = byteOff + bucket.layout.drawHeaderBytes;
     if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
 
+    if (bucket.layout.megacall) {
+      const dtBuf = bucket.drawTableBuf!;
+      const recIdx = bucket.recordCount;
+      if (recIdx >= SCAN_MAX_RECORDS) {
+        throw new Error(
+          `heapScene: megacall bucket exceeds SCAN_MAX_RECORDS (${SCAN_MAX_RECORDS}); ` +
+          `extend the scan to multi-level if you need more`,
+        );
+      }
+      const byteOff = recIdx * 16;
+      dtBuf.ensureCapacity(byteOff + 16);
+      dtBuf.setUsed(Math.max(dtBuf.usedBytes, byteOff + 16));
+      // Grow scan-side buffers if recordCount crosses a tile boundary.
+      const needBlocks = Math.max(1, Math.ceil((recIdx + 1) / SCAN_TILE_SIZE));
+      bucket.blockSumsBuf!.ensureCapacity(needBlocks * 4);
+      bucket.blockOffsetsBuf!.ensureCapacity(needBlocks * 4);
+      const shadow = bucket.drawTableShadow!;
+      // firstEmit is GPU-overwritten by the prefix-sum pass; 0 is fine.
+      shadow[recIdx * 4 + 0] = 0;
+      shadow[recIdx * 4 + 1] = localSlot;
+      shadow[recIdx * 4 + 2] = idxAlloc.firstIndex;
+      shadow[recIdx * 4 + 3] = idxAlloc.count;
+      bucket.recordCount = recIdx + 1;
+      bucket.slotToRecord[localSlot] = recIdx;
+      bucket.recordToSlot[recIdx] = localSlot;
+      if (byteOff < bucket.drawTableDirtyMin) bucket.drawTableDirtyMin = byteOff;
+      if (byteOff + 16 > bucket.drawTableDirtyMax) bucket.drawTableDirtyMax = byteOff + 16;
+      bucket.scanDirty = true;
+    }
+
     drawIdToBucket[drawId]    = bucket;
     drawIdToLocalSlot[drawId] = localSlot;
     drawIdToIndexAval[drawId] = indicesAval;
@@ -1546,6 +1883,32 @@ export function buildHeapScene(
     const bucket    = drawIdToBucket[drawId];
     const localSlot = drawIdToLocalSlot[drawId];
     if (bucket === undefined || localSlot === undefined) return;
+    if (bucket.layout.megacall) {
+      // Swap-pop: move the last record into the freed slot, decrement
+      // recordCount. firstEmit is GPU-rewritten by the next scan, so
+      // we only fix (drawIdx, indexStart, indexCount).
+      const recIdx     = bucket.slotToRecord[localSlot]!;
+      const lastRecIdx = bucket.recordCount - 1;
+      const shadow = bucket.drawTableShadow!;
+      if (recIdx !== lastRecIdx) {
+        const dst = recIdx * 4;
+        const src = lastRecIdx * 4;
+        shadow[dst + 0] = 0;
+        shadow[dst + 1] = shadow[src + 1]!;
+        shadow[dst + 2] = shadow[src + 2]!;
+        shadow[dst + 3] = shadow[src + 3]!;
+        const movedSlot = bucket.recordToSlot[lastRecIdx]!;
+        bucket.slotToRecord[movedSlot] = recIdx;
+        bucket.recordToSlot[recIdx] = movedSlot;
+        const byteOff = recIdx * 16;
+        if (byteOff < bucket.drawTableDirtyMin) bucket.drawTableDirtyMin = byteOff;
+        if (byteOff + 16 > bucket.drawTableDirtyMax) bucket.drawTableDirtyMax = byteOff + 16;
+      }
+      bucket.slotToRecord[localSlot] = -1;
+      bucket.recordToSlot[lastRecIdx] = -1;
+      bucket.recordCount = lastRecIdx;
+      bucket.scanDirty = true;
+    }
 
     // Release pool entries — refcount drops; if zero, allocation freed.
     const avals = bucket.localPerDrawAvals[localSlot];
@@ -1653,15 +2016,27 @@ export function buildHeapScene(
     arena.attrs.flush(device);
     arena.indices.flush(device);
     for (const bucket of buckets) {
-      if (bucket.headerDirtyMax <= bucket.headerDirtyMin) continue;
-      device.queue.writeBuffer(
-        bucket.drawHeap.buffer, bucket.headerDirtyMin,
-        bucket.drawHeaderStaging.buffer,
-        bucket.drawHeaderStaging.byteOffset + bucket.headerDirtyMin,
-        bucket.headerDirtyMax - bucket.headerDirtyMin,
-      );
-      bucket.headerDirtyMin = Infinity;
-      bucket.headerDirtyMax = 0;
+      if (bucket.headerDirtyMax > bucket.headerDirtyMin) {
+        device.queue.writeBuffer(
+          bucket.drawHeap.buffer, bucket.headerDirtyMin,
+          bucket.drawHeaderStaging.buffer,
+          bucket.drawHeaderStaging.byteOffset + bucket.headerDirtyMin,
+          bucket.headerDirtyMax - bucket.headerDirtyMin,
+        );
+        bucket.headerDirtyMin = Infinity;
+        bucket.headerDirtyMax = 0;
+      }
+      if (bucket.layout.megacall && bucket.drawTableDirtyMax > bucket.drawTableDirtyMin) {
+        const shadow = bucket.drawTableShadow!;
+        device.queue.writeBuffer(
+          bucket.drawTableBuf!.buffer, bucket.drawTableDirtyMin,
+          shadow.buffer,
+          shadow.byteOffset + bucket.drawTableDirtyMin,
+          bucket.drawTableDirtyMax - bucket.drawTableDirtyMin,
+        );
+        bucket.drawTableDirtyMin = Infinity;
+        bucket.drawTableDirtyMax = 0;
+      }
     }
   }
 
@@ -1671,11 +2046,15 @@ export function buildHeapScene(
    * `frame()` below and (eventually) the hybrid render task.
    */
   function encodeIntoPass(pass: GPURenderPassEncoder): void {
-    pass.setIndexBuffer(arena.indices.buffer, "uint32");
+    if (!megacall) pass.setIndexBuffer(arena.indices.buffer, "uint32");
     let curBg: GPUBindGroup | null = null;
     for (const b of buckets) {
       if (b.bindGroup !== curBg) { pass.setBindGroup(0, b.bindGroup); curBg = b.bindGroup; }
       pass.setPipeline(b.pipeline);
+      if (b.layout.megacall) {
+        if (b.recordCount > 0) pass.drawIndirect(b.indirectBuf!, 0);
+        continue;
+      }
       for (const localSlot of b.drawSlots) {
         const e = b.localEntries[localSlot]!;
         // Instanced buckets force `drawIdx = 0u` in WGSL (single slot),
@@ -1686,6 +2065,47 @@ export function buildHeapScene(
         pass.drawIndexed(e.indexCount, e.instanceCount, e.firstIndex, 0, firstInstance);
       }
     }
+  }
+
+  /**
+   * Compute prep — must be called BEFORE `beginRenderPass`. For each
+   * megacall bucket whose drawTable changed since the last frame: write
+   * fresh `params`, rebuild the render bind group if recordCount
+   * changed (drawTable view tightened), and dispatch the three-pass
+   * Blelloch scan that fills `firstEmit` and the indirect args.
+   *
+   * Single compute pass over all dirty buckets — pipelines are shared,
+   * we just swap the bind group + dispatch shape per bucket.
+   */
+  function encodeComputePrep(enc: GPUCommandEncoder, _token: AdaptiveToken): void {
+    if (!megacall) return;
+    let anyDirty = false;
+    for (const b of buckets) { if (b.scanDirty) { anyDirty = true; break; } }
+    if (!anyDirty) return;
+    const pass = enc.beginComputePass({ label: "heapScene/scan" });
+    for (const b of buckets) {
+      if (!b.scanDirty) continue;
+      // Rebuild render bind group if recordCount changed — its
+      // drawTable binding is sized to recordCount * 16.
+      if (b.renderBoundRecordCount !== b.recordCount) {
+        b.bindGroup = buildBucketBindGroup(b);
+      }
+      const numRecords = b.recordCount;
+      const numBlocks = Math.max(1, Math.ceil(numRecords / SCAN_TILE_SIZE));
+      device.queue.writeBuffer(
+        b.paramsBuf!, 0,
+        new Uint32Array([numRecords, numBlocks, 0, 0]),
+      );
+      pass.setBindGroup(0, b.scanBindGroup!);
+      pass.setPipeline(scanPipeTile!);
+      pass.dispatchWorkgroups(numBlocks, 1, 1);
+      pass.setPipeline(scanPipeBlocks!);
+      pass.dispatchWorkgroups(1, 1, 1);
+      pass.setPipeline(scanPipeAdd!);
+      pass.dispatchWorkgroups(numBlocks, 1, 1);
+      b.scanDirty = false;
+    }
+    pass.end();
   }
 
   /**
@@ -1701,6 +2121,7 @@ export function buildHeapScene(
     const colorView = framebuffer.colors.tryFind(colorAttachmentName!)!;
     const depthView = framebuffer.depthStencil;
     const enc = device.createCommandEncoder({ label: "heapScene: encoder" });
+    encodeComputePrep(enc, token);
     const pass = enc.beginRenderPass({
       colorAttachments: [{
         view: colorView,
@@ -1725,8 +2146,29 @@ export function buildHeapScene(
     arena.indices.destroy();
     for (const b of buckets) {
       b.drawHeap.destroy();
+      b.drawTableBuf?.destroy();
+      b.blockSumsBuf?.destroy();
+      b.blockOffsetsBuf?.destroy();
+      b.indirectBuf?.destroy();
+      b.paramsBuf?.destroy();
     }
   }
 
-  return { frame, update, encodeIntoPass, addDraw, removeDraw, stats, dispose };
+  // Test-only escape hatch for inspecting megacall bucket state. Not
+  // part of the public API surface — keep cast at use-site.
+  const _debug = {
+    bucketsForTest(): readonly {
+      indirectBuf: GPUBuffer | undefined;
+      drawTableBuf: GPUBuffer | undefined;
+      recordCount: number;
+    }[] {
+      return buckets.map(b => ({
+        indirectBuf: b.indirectBuf,
+        drawTableBuf: b.drawTableBuf?.buffer,
+        recordCount: b.recordCount,
+      }));
+    },
+  };
+
+  return { frame, update, encodeIntoPass, encodeComputePrep, addDraw, removeDraw, stats, dispose, _debug } as HeapScene;
 }

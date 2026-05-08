@@ -8,6 +8,7 @@ import {
   AVal,
   AList,
   HashMap,
+  cset,
   cval,
   transact,
   type aval,
@@ -147,22 +148,20 @@ function trafoInvToM44f(t: Trafo3d): M44f {
 
 function makeUniforms(
   modelTrafo: Trafo3d,
-  viewProj: aval<Trafo3d>,
-  _viewT: aval<Trafo3d>,
+  viewProjM44: aval<M44f>,
+  lightLoc: aval<V3f>,
 ): HashMap<string, aval<unknown>> {
   // We provide what the trafo+lambert effect reads:
   //   ModelTrafo, ModelTrafoInv, ViewProjTrafo, LightLocation.
-  // The runtime UBO packer expects `_data`-bearing values; convert
-  // Trafo3d → M44f at the source. Same trick as wombat.dom's
-  // compile.ts:adaptForGpu.
+  // ViewProjTrafo and LightLocation are passed pre-shared so all ROs
+  // see the same aval identity → one arena allocation + one upload
+  // per frame instead of N.
   const m  = AVal.constant(trafoToM44f(modelTrafo));
   const mi = AVal.constant(trafoInvToM44f(modelTrafo));
-  const vp = viewProj.map(trafoToM44f);
-  const lightLoc = eye.map(e => new V3f(e.x as number, e.y as number, e.z as number));
   return HashMap.empty<string, aval<unknown>>()
     .add("ModelTrafo",     m)
     .add("ModelTrafoInv",  mi)
-    .add("ViewProjTrafo",  vp)
+    .add("ViewProjTrafo",  viewProjM44)
     .add("LightLocation",  lightLoc);
 }
 
@@ -185,7 +184,7 @@ const sharedPipelineState = PipelineState.constant({
   depth: { write: true, compare: "less" },
 });
 
-function makeRO(spec: RoSpec, viewProj: aval<Trafo3d>): RenderObject {
+function makeRO(spec: RoSpec, viewProjM44: aval<M44f>, lightLoc: aval<V3f>): RenderObject {
   return {
     effect: surface,
     pipelineState: sharedPipelineState,
@@ -193,7 +192,7 @@ function makeRO(spec: RoSpec, viewProj: aval<Trafo3d>): RenderObject {
       .add("Positions", spec.geo.positions)
       .add("Normals",   spec.geo.normals)
       .add("Colors",    asV4fBroadcast(spec.color)),
-    uniforms: makeUniforms(spec.modelTrafo, viewProj, view),
+    uniforms: makeUniforms(spec.modelTrafo, viewProjM44, lightLoc),
     textures: HashMap.empty<string, aval<ITexture>>(),
     samplers: HashMap.empty<string, aval<ISampler>>(),
     indices: spec.geo.indices,
@@ -468,7 +467,8 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   // through the legacy per-RO renderer — handy for A/B perf comparisons.
   const heapOnParam = new URLSearchParams(location.search).get("heap-on");
   const heapEnabled = cval(heapOnParam === null || heapOnParam === "1");
-  const runtime = new Runtime({ device, heapEnabled });
+  const megacall = new URLSearchParams(location.search).get("megacall") === "1";
+  const runtime = new Runtime({ device, heapEnabled, megacall });
 
   const bBox = bundleOf(rawBox);
   const bSph = bundleOf(rawSph);
@@ -484,6 +484,11 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     const projT  = projFor(aspect);
     return view.getValue(token).mul(projT);   // view first, then proj
   });
+  // Single shared M44f / lightLoc avals — every RO references the
+  // SAME aval objects so the runtime pool sees one identity → one
+  // arena allocation + one upload per frame instead of N.
+  const viewProjM44: aval<M44f> = viewProj.map(trafoToM44f);
+  const lightLoc: aval<V3f> = eye.map(e => new V3f(e.x as number, e.y as number, e.z as number));
 
   // Build N RO specs — same grid as the heap path so the visual
   // result is comparable. The Runtime path doesn't share buffers
@@ -496,7 +501,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
         geo: geos[i]!,
         modelTrafo: trafoOf(i, xPositions[i]!),
         color: colors[i]!,
-      }, viewProj));
+      }, viewProjM44, lightLoc));
     }
   } else {
     const side = Math.ceil(Math.sqrt(ROCount));
@@ -512,11 +517,20 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
         : geoIdx === 1
           ? Trafo3d.scaling(0.5, 0.5, 0.5).mul(Trafo3d.translation(new V3d(x, y, 0)))
           : Trafo3d.scaling(0.5, 0.5, 0.8).mul(Trafo3d.translation(new V3d(x, y, -0.4)));
-      ros.push(makeRO({ geo: bundle, modelTrafo: t, color: colors[k % 4]! }, viewProj));
+      ros.push(makeRO({ geo: bundle, modelTrafo: t, color: colors[k % 4]! }, viewProjM44, lightLoc));
     }
   }
 
-  const tree = RenderTree.ordered(...ros.map(o => RenderTree.leaf(o)));
+  // ?churn=N → wrap leaves in a cset and, each frame, remove N random
+  // entries + re-add the N removed on the previous frame. Exercises
+  // addDraw/removeDraw + the megacall GPU prefix-sum redispatch.
+  const churnParam = new URLSearchParams(location.search).get("churn");
+  const churn = churnParam !== null ? Math.max(0, parseInt(churnParam, 10) | 0) : 0;
+  const leaves = ros.map(o => RenderTree.leaf(o));
+  const sceneSet = churn > 0 ? cset<RenderTree>(leaves) : undefined;
+  const tree = sceneSet !== undefined
+    ? RenderTree.unorderedFromSet(sceneSet)
+    : RenderTree.ordered(...leaves);
   const clear: ClearValues = {
     colors: HashMap.empty<string, V4f>().add("outColor", new V4f(0.07, 0.07, 0.08, 1)),
     depth: 1.0,
@@ -532,16 +546,29 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   // continuously, use the heap path (which has the orbit-driven
   // continuous loop).
   const samples = new Float32Array(240);
+  const frameSamples = new Float32Array(240);
   let sampleI = 0, sampleN = 0, frames = 0, lastReport = performance.now();
-  const pct = (p: number): number => {
-    if (sampleN === 0) return 0;
-    const sorted = Array.from(samples.subarray(0, sampleN)).sort((a, b) => a - b);
-    return sorted[Math.min(sampleN - 1, Math.max(0, Math.floor(p * (sampleN - 1))))]!;
+  let frameSampleI = 0, frameSampleN = 0, lastRafNow = 0;
+  const pctOf = (buf: Float32Array, n: number, p: number): number => {
+    if (n === 0) return 0;
+    const sorted = Array.from(buf.subarray(0, n)).sort((a, b) => a - b);
+    return sorted[Math.min(n - 1, Math.max(0, Math.floor(p * (n - 1))))]!;
   };
+  const pct = (p: number): number => pctOf(samples, sampleN, p);
+  const fpct = (p: number): number => pctOf(frameSamples, frameSampleN, p);
   setStatus(`ready — per-RO path, ${ros.length} render objects (append ?heap=1 for heap path)`);
   const fbAval = attach.framebuffer as aval<import("@aardworx/wombat.rendering.experimental/core").IFramebuffer>;
   const startTime = performance.now();
+  let churnPool: RenderTree[] = [];
   runFrame(attach, (token) => {
+    const rafNow = performance.now();
+    if (lastRafNow !== 0) {
+      frameSamples[frameSampleI] = rafNow - lastRafNow;
+      frameSampleI = (frameSampleI + 1) % frameSamples.length;
+      if (frameSampleN < frameSamples.length) frameSampleN++;
+    }
+    lastRafNow = rafNow;
+
     const t0 = performance.now();
     task.run(fbAval.getValue(token), token);
     const dt = performance.now() - t0;
@@ -554,9 +581,12 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     if (shouldReport) {
       const elapsed = Math.max(1, now - lastReport);
       const fps = (frames * 1000 / elapsed).toFixed(0);
+      const tag = megacall ? "megacall" : (heapEnabled.value ? "heap" : "per-RO");
+      const churnTag = churn > 0 ? ` · churn=${churn}/frame` : "";
       setStatus(
-        `per-RO · ${ros.length} draws · ${frames} frames in ${elapsed.toFixed(0)} ms (~${fps} fps) · ` +
-        `encode ms p50=${pct(0.5).toFixed(2)} p99=${pct(0.99).toFixed(2)}`,
+        `${tag} · ${ros.length} draws${churnTag} · ${fps} fps · ` +
+        `encode p50=${pct(0.5).toFixed(2)} p99=${pct(0.99).toFixed(2)} · ` +
+        `frame p50=${fpct(0.5).toFixed(1)} p99=${fpct(0.99).toFixed(1)} ms`,
       );
       frames = 0;
       lastReport = now;
@@ -566,6 +596,21 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     // transact() so the mark cascades AFTER `outOfDate=false` reset,
     // reaching the wrapping aval's marking callback and scheduling
     // the next rAF. Without this, the loop idles after one frame.
-    onAfterFrame: () => { time.value = performance.now() - startTime; },
+    onAfterFrame: () => {
+      time.value = performance.now() - startTime;
+      if (sceneSet !== undefined && churn > 0) {
+        for (const r of churnPool) sceneSet.add(r);
+        const live = Array.from(sceneSet);
+        churnPool = [];
+        for (let i = 0; i < churn && live.length > 0; i++) {
+          const idx = (Math.random() * live.length) | 0;
+          const victim = live[idx]!;
+          live[idx] = live[live.length - 1]!;
+          live.pop();
+          sceneSet.remove(victim);
+          churnPool.push(victim);
+        }
+      }
+    },
   });
 })();

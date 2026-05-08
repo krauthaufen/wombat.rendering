@@ -10,6 +10,7 @@
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  define: { global: "globalThis" },
   test: {
     include: ["tests-browser/**/*.test.ts"],
     browser: {

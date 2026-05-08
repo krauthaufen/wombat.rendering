@@ -241,6 +241,14 @@ export interface BucketLayout {
   readonly textureBindings: readonly { readonly name: string; readonly wgslType: string; readonly binding: number }[];
   /** Sampler bindings, allocated after textures. */
   readonly samplerBindings: readonly { readonly name: string; readonly wgslType: string; readonly binding: number }[];
+  /**
+   * Megacall mode: one `pass.draw(totalEmit, 1, 0, 0)` per bucket.
+   * The shader binary-searches a per-bucket drawTable to figure out
+   * which slot a given vertex emit belongs to, then vertex-pulls the
+   * index. Adds two storage-buffer bindings (drawTable at 4,
+   * indexStorage at 5); textures shift to 6+.
+   */
+  readonly megacall: boolean;
 }
 
 /** First texture binding number; samplers come after the textures. */
@@ -249,10 +257,14 @@ export const HEAP_TEX_BINDING_START = 4;
 export function buildBucketLayout(
   schema: HeapEffectSchema,
   _hasTextures: boolean,
-  opts: { isInstanced?: boolean; perInstanceUniforms?: ReadonlySet<string> } = {},
+  opts: { isInstanced?: boolean; perInstanceUniforms?: ReadonlySet<string>; megacall?: boolean } = {},
 ): BucketLayout {
   const isInstanced = opts.isInstanced ?? false;
   const perInstanceUniforms = opts.perInstanceUniforms ?? new Set<string>();
+  const megacall = opts.megacall ?? false;
+  if (megacall && isInstanced) {
+    throw new Error("heapEffect: megacall + isInstanced not supported");
+  }
   const drawHeaderFields: DrawHeaderField[] = [];
 
   // Per-draw uniforms → u32 ref slots in the DrawHeader. The runtime
@@ -286,7 +298,7 @@ export function buildBucketLayout(
   // Allocate texture + sampler bindings starting at HEAP_TEX_BINDING_START.
   // Order: all textures, then all samplers — matches the prelude
   // layout below and the runtime's BGL/bind-group construction.
-  let nextBinding = HEAP_TEX_BINDING_START;
+  let nextBinding = megacall ? HEAP_TEX_BINDING_START + 2 : HEAP_TEX_BINDING_START;
   const textureBindings = schema.textures.map(t => ({
     name: t.name, wgslType: t.wgslType, binding: nextBinding++,
   }));
@@ -294,12 +306,13 @@ export function buildBucketLayout(
     name: s.name, wgslType: s.wgslType, binding: nextBinding++,
   }));
 
-  const preludeWgsl = generatePrelude(schema, textureBindings, samplerBindings);
+  const preludeWgsl = generatePrelude(schema, textureBindings, samplerBindings, megacall);
 
   return {
     drawHeaderFields, drawHeaderBytes, preludeWgsl, strideU32,
     isInstanced, perInstanceUniforms,
     textureBindings, samplerBindings,
+    megacall,
   };
 }
 
@@ -414,6 +427,7 @@ function generatePrelude(
   schema: HeapEffectSchema,
   textureBindings: readonly { name: string; wgslType: string; binding: number }[],
   samplerBindings: readonly { name: string; wgslType: string; binding: number }[],
+  megacall: boolean,
 ): string {
   // VsOut is generated from the schema's surviving VS outputs (post
   // link + DCE). No hardcoded fields — what the effect declared is
@@ -434,11 +448,15 @@ function generatePrelude(
     ? `\n${texDecls}${texDecls && smpDecls ? "\n" : ""}${smpDecls}\n`
     : "";
 
+  const megacallDecls = megacall
+    ? `\n@group(0) @binding(4) var<storage, read> drawTable:    array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage: array<u32>;`
+    : "";
+
   return /* wgsl */`
 @group(0) @binding(0) var<storage, read> heapU32:    array<u32>;
 @group(0) @binding(1) var<storage, read> headersU32: array<u32>;
 @group(0) @binding(2) var<storage, read> heapF32:    array<f32>;
-@group(0) @binding(3) var<storage, read> heapV4f:    array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> heapV4f:    array<vec4<f32>>;${megacallDecls}
 ${samplingBlock}
 struct VsOut {
 ${vsOutBody}
@@ -572,12 +590,19 @@ function rewriteVertex(
   //    keeps the `drawIdx = instance_index` (firstInstance trick) and
   //    leaves `iidx` undefined — the preamble only emits per-instance
   //    reads when the bucket has any.
-  const idxParam = layout.isInstanced ? "iidx" : "drawIdx";
-  const indexLet = layout.isInstanced ? "  let drawIdx = 0u;\n" : "";
-  s = s.replace(
-    fnHeader,
-    `@vertex\nfn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) ${idxParam}: u32) -> VsOut {\n${indexLet}${bindings.preamble}`,
-  );
+  if (layout.megacall) {
+    s = s.replace(
+      fnHeader,
+      `@vertex\nfn vs(@builtin(vertex_index) emitIdx: u32) -> VsOut {\n${megacallSearchPrelude()}${bindings.preamble}`,
+    );
+  } else {
+    const idxParam = layout.isInstanced ? "iidx" : "drawIdx";
+    const indexLet = layout.isInstanced ? "  let drawIdx = 0u;\n" : "";
+    s = s.replace(
+      fnHeader,
+      `@vertex\nfn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) ${idxParam}: u32) -> VsOut {\n${indexLet}${bindings.preamble}`,
+    );
+  }
 
   // 5. Drop input + output structs (we use the prelude's per-effect
   //    VsOut). Rename remaining references inside the body.
@@ -793,6 +818,17 @@ function rewriteFragment(
   // 6. Tidy.
   s = s.replace(/\n{3,}/g, "\n\n").trimStart();
   return s;
+}
+
+/**
+ * Megacall VS prelude: binary-search `drawTable` (one u32-quad per slot:
+ * firstEmit, drawIdx, indexStart, indexCount) for the slot owning the
+ * given `emitIdx`, then vertex-pull the index from `indexStorage`.
+ * Defines `drawIdx` + `vid` so the rest of the existing preamble works
+ * unchanged.
+ */
+export function megacallSearchPrelude(): string {
+  return `  var lo: u32 = 0u;\n  var hi: u32 = arrayLength(&drawTable) / 4u - 1u;\n  loop {\n    if (lo >= hi) { break; }\n    let _mid = (lo + hi + 1u) >> 1u;\n    if (drawTable[_mid * 4u] <= emitIdx) { lo = _mid; } else { hi = _mid - 1u; }\n  }\n  let _slot = lo;\n  let drawIdx = drawTable[_slot * 4u + 1u];\n  let _indexStart = drawTable[_slot * 4u + 2u];\n  let vid = indexStorage[_indexStart + (emitIdx - drawTable[_slot * 4u])];\n`;
 }
 
 function escapeRegExp(s: string): string {

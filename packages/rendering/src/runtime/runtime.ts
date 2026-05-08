@@ -24,6 +24,12 @@ export interface RuntimeOptions {
    * flips. Useful for A/B perf comparisons. Default: heap on.
    */
   readonly heapEnabled?: aval<boolean>;
+  /**
+   * Megacall mode for the heap path: one `pass.draw` per bucket via
+   * a per-bucket drawTable + binary-search VS. Static-only; throws on
+   * removal or instanced specs. Default: false.
+   */
+  readonly megacall?: boolean;
 }
 
 /**
@@ -58,6 +64,7 @@ export class Runtime {
         fragmentOutputLayout: layoutFromSignature(sig),
       })),
       ...(opts.heapEnabled !== undefined ? { heapEnabled: opts.heapEnabled } : {}),
+      ...(opts.megacall !== undefined ? { megacall: opts.megacall } : {}),
     };
     // `device.lost` is a real-WebGPU promise; mock devices may not
     // expose it. Treat as "never lost" in that case.
