@@ -103,7 +103,6 @@ function asV4fBroadcast(color: V4f): BufferView {
 // Camera
 // ---------------------------------------------------------------------------
 
-const eye    = new V3d(0, -16, 8);
 const target = new V3d(0,  0, 0);
 const up     = new V3d(0,  0, 1);
 
@@ -117,7 +116,18 @@ function buildView(eye: V3d, target: V3d, worldUp: V3d): Trafo3d {
   const upRe = right.cross(fwd).normalize();
   return Trafo3d.viewTrafoRH(eye, upRe, fwd);
 }
-const view = AVal.constant(buildView(eye, target, up));
+// Time-driven orbit camera. The cval is ticked in `runFrame`'s
+// post-render so the runtime's dirty-skip wakes up every rAF
+// (anything depending on `time` marks → the wrap aval re-evaluates).
+// Also lets the heap A/B comparison sample steady-state encode times
+// instead of one-frame numbers.
+const time = cval(0);
+function eyeAt(t: number): V3d {
+  const radius = 16;
+  return new V3d(Math.sin(t * 0.0005) * radius, -Math.cos(t * 0.0005) * radius, 8);
+}
+const eye: aval<V3d> = time.map(eyeAt);
+const view: aval<Trafo3d> = eye.map(e => buildView(e, target, up));
 function projFor(aspect: number, far = 100): Trafo3d {
   return Trafo3d.perspectiveProjectionRHFov(Math.PI / 3, aspect, 0.1, far);
 }
@@ -148,7 +158,7 @@ function makeUniforms(
   const m  = AVal.constant(trafoToM44f(modelTrafo));
   const mi = AVal.constant(trafoInvToM44f(modelTrafo));
   const vp = viewProj.map(trafoToM44f);
-  const lightLoc = AVal.constant(new V3f(eye.x as number, eye.y as number, eye.z as number));
+  const lightLoc = eye.map(e => new V3f(e.x as number, e.y as number, e.z as number));
   return HashMap.empty<string, aval<unknown>>()
     .add("ModelTrafo",     m)
     .add("ModelTrafoInv",  mi)
@@ -459,11 +469,14 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   const bCyl = bundleOf(rawCyl);
   const geos = [bBox, bSph, bCyl, bBox];
 
-  const viewProj: aval<Trafo3d> = attach.size.map(({ width, height }) => {
+  // viewProj depends on both size and view (= time-driven). Use a
+  // custom aval so a tick on either input recomputes; the runtime's
+  // adaptive system handles the cascade.
+  const viewProj: aval<Trafo3d> = AVal.custom(token => {
+    const { width, height } = attach.size.getValue(token);
     const aspect = Math.max(1e-3, width / Math.max(1, height));
     const projT  = projFor(aspect);
-    const viewT  = AVal.force(view);
-    return viewT.mul(projT);            // view first, then proj
+    return view.getValue(token).mul(projT);   // view first, then proj
   });
 
   // Build N RO specs — same grid as the heap path so the visual
@@ -521,6 +534,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   };
   setStatus(`ready — per-RO path, ${ros.length} render objects (append ?heap=1 for heap path)`);
   const fbAval = attach.framebuffer as aval<import("@aardworx/wombat.rendering.experimental/core").IFramebuffer>;
+  const startTime = performance.now();
   runFrame(attach, (token) => {
     const t0 = performance.now();
     task.run(fbAval.getValue(token), token);
@@ -530,9 +544,6 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     if (sampleN < samples.length) sampleN++;
     frames++;
     const now = performance.now();
-    // runFrame is dirty-skip: a static scene runs ~1 frame and idles.
-    // Report after the first frame so we still get the encode number;
-    // afterwards roll the 500ms window for live scenes.
     const shouldReport = sampleN === 1 || now - lastReport > 500;
     if (shouldReport) {
       const elapsed = Math.max(1, now - lastReport);
@@ -544,5 +555,11 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       frames = 0;
       lastReport = now;
     }
+  }, {
+    // Tick `time` after each frame's eval. runFrame wraps this in a
+    // transact() so the mark cascades AFTER `outOfDate=false` reset,
+    // reaching the wrapping aval's marking callback and scheduling
+    // the next rAF. Without this, the loop idles after one frame.
+    onAfterFrame: () => { time.value = performance.now() - startTime; },
   });
 })();
