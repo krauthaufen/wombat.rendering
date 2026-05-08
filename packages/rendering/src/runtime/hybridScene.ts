@@ -28,7 +28,7 @@
 // their internal amortization.
 
 import {
-  ASet, AdaptiveToken, type aset, type aval, type AdaptiveToken as _T,
+  ASet, AVal, AdaptiveToken, type aset, type aval, type AdaptiveToken as _T,
 } from "@aardworx/wombat.adaptive";
 import type { CompiledEffect, Effect } from "../core/shader.js";
 import type { FramebufferSignature } from "../core/framebufferSignature.js";
@@ -59,6 +59,21 @@ export interface CompileHybridSceneOptions {
    * legacy path; the heap path calls `compileHeapEffect` itself.
    */
   readonly compileEffect?: (e: Effect, sig: FramebufferSignature) => CompiledEffect;
+  /**
+   * Global on/off switch for the heap fast path. When `false`, every
+   * `RenderObject` routes through the legacy per-RO path regardless
+   * of its own eligibility — equivalent to forcing `isHeapEligible`
+   * to `false` for the whole scene. Reactive: flipping it migrates
+   * ROs between subsets via the existing `filterA` partition.
+   *
+   * Use cases:
+   *  - A/B perf comparisons (heap vs legacy on identical scenes).
+   *  - Quick fallback if a heap-path bug shows up on a specific
+   *    workload — flip the cval, ship.
+   *
+   * Default: `AVal.constant(true)` (heap path on for eligible ROs).
+   */
+  readonly heapEnabled?: aval<boolean>;
 }
 
 export interface HybridScene {
@@ -104,10 +119,17 @@ export function compileHybridScene(
   // Memoize the eligibility predicate per-RO so the two filterA calls
   // share one underlying observation. Without this, both calls would
   // build independent custom-avals with overlapping subscriptions.
+  // The per-RO eligibility is ANDed with the global `heapEnabled`
+  // toggle — flipping that off forces every RO to legacy.
+  const heapEnabled = opts.heapEnabled ?? AVal.constant(true);
   const eligCache = new WeakMap<RenderObject, aval<boolean>>();
   const elig = (ro: RenderObject): aval<boolean> => {
     let av = eligCache.get(ro);
-    if (av === undefined) { av = isHeapEligible(ro); eligCache.set(ro, av); }
+    if (av === undefined) {
+      const perRO = isHeapEligible(ro);
+      av = AVal.custom(t => heapEnabled.getValue(t) && perRO.getValue(t));
+      eligCache.set(ro, av);
+    }
     return av;
   };
 

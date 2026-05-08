@@ -37,6 +37,13 @@ export interface RuntimeContext {
    * `linkFragmentOutputs` pass uses it to re-pin and DCE outputs.
    */
   readonly compileEffect: (effect: Effect, signature: FramebufferSignature) => CompiledEffect;
+  /**
+   * Global heap on/off toggle propagated to every `HybridScene`
+   * compiled against this context. Flipping it causes every RO to
+   * migrate between the heap subset and the legacy subset.
+   * Useful for A/B perf comparisons.
+   */
+  readonly heapEnabled?: aval<boolean>;
 }
 
 class RenderTask implements IRenderTask {
@@ -128,6 +135,7 @@ class RenderTask implements IRenderTask {
     if (s === undefined) {
       s = compileHybridScene(this.ctx.device, this.signature, tree, {
         compileEffect: this.ctx.compileEffect,
+        ...(this.ctx.heapEnabled !== undefined ? { heapEnabled: this.ctx.heapEnabled } : {}),
       });
       this._scenes.set(cmd, s);
     }

@@ -3,7 +3,7 @@
 // (eventually) `renderTo(...)`.
 
 import type { Command, CompiledEffect, Effect, FramebufferSignature, IRenderTask, RenderTree } from "../core/index.js";
-import type { alist } from "@aardworx/wombat.adaptive";
+import type { alist, aval } from "@aardworx/wombat.adaptive";
 import { compileRenderTask, type RuntimeContext } from "./renderTask.js";
 import { renderTo, type RenderToOptions, type RenderToResult } from "./renderTo.js";
 
@@ -17,6 +17,13 @@ export interface RuntimeOptions {
    * …).
    */
   readonly compileEffect?: (effect: Effect, signature: FramebufferSignature) => CompiledEffect;
+  /**
+   * Global on/off toggle for the heap fast path. When `false`,
+   * every RO routes through the legacy per-RO renderer. Reactive:
+   * ROs migrate between heap and legacy subsets when the cval
+   * flips. Useful for A/B perf comparisons. Default: heap on.
+   */
+  readonly heapEnabled?: aval<boolean>;
 }
 
 /**
@@ -50,6 +57,7 @@ export class Runtime {
         target: "wgsl",
         fragmentOutputLayout: layoutFromSignature(sig),
       })),
+      ...(opts.heapEnabled !== undefined ? { heapEnabled: opts.heapEnabled } : {}),
     };
     // `device.lost` is a real-WebGPU promise; mock devices may not
     // expose it. Treat as "never lost" in that case.

@@ -447,8 +447,12 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     return;
   }
 
-  // ─── Per-RO baseline (Runtime + prepareRenderObject) ────────────────
-  const runtime = new Runtime({ device });
+  // ─── Per-RO baseline (Runtime → Hybrid task) ────────────────────────
+  // `?heap-on=0` flips the global heap toggle off so every RO routes
+  // through the legacy per-RO renderer — handy for A/B perf comparisons.
+  const heapOnParam = new URLSearchParams(location.search).get("heap-on");
+  const heapEnabled = cval(heapOnParam === null || heapOnParam === "1");
+  const runtime = new Runtime({ device, heapEnabled });
 
   const bBox = bundleOf(rawBox);
   const bSph = bundleOf(rawSph);
