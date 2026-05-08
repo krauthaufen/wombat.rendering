@@ -100,10 +100,10 @@ async function main() {
         1,
       );
     });
-    runtime.compile(AList.ofArray<Command>([
-      { kind: "Clear",  output: win.framebuffer, values: { colors: HashMap.empty<string, V4f>().add("outColor", clear.value) } },
-      { kind: "Render", output: win.framebuffer, tree: RenderTree.leaf(obj) },
-    ])).run(token);
+    runtime.compile(win.signature, AList.ofArray<Command>([
+      { kind: "Clear",  values: { colors: HashMap.empty<string, V4f>().add("outColor", clear.value) } },
+      { kind: "Render", tree: RenderTree.leaf(obj) },
+    ])).run(win.framebuffer.getValue(token), token);
 
     if (info.frame === 0) {
       status.textContent = "rendering on " + adapter.info.architecture + " (" + adapter.info.vendor + ")";

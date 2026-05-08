@@ -548,9 +548,9 @@ export function prepareRenderObject(
     // tight one-element buffer and asks every vertex/instance to read
     // it. WebGPU reads the same element when arrayStride is 0
     // (regardless of stepMode), so override the default tight stride
-    // here. Without this the second vertex would read past the end of
-    // the 16-byte buffer and pick up zeros — colorAval would tint
-    // only the first vertex of a draw.
+    // here. Without this the second vertex would read past the end
+    // of the 16-byte buffer and pick up zeros — colorAval would tint
+    // only the first vertex of each draw.
     const isBroadcast = view.singleValue !== undefined;
     const stride = isBroadcast ? 0 : BufferView.strideOf(view);
     const offset = BufferView.offsetOf(view);

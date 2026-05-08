@@ -30,7 +30,22 @@ export {
   type HeapDrawSpec,
   type HeapGeometry,
   type HeapTextureSet,
+  type HeapGroupShader,
   type BuildHeapSceneOptions,
 } from "./heapScene.js";
 
-export { compileHeapFragment } from "./heapShader.js";
+export {
+  compileHeapEffect,
+  type CompiledHeapEffect,
+  type FragmentOutputLayout,
+} from "./heapEffect.js";
+
+export { flattenRenderTree } from "./flattenTree.js";
+export { isHeapEligible } from "./heapEligibility.js";
+export { renderObjectToHeapSpec } from "./heapAdapter.js";
+
+export {
+  compileHybridScene,
+  type CompileHybridSceneOptions,
+  type HybridScene,
+} from "./hybridScene.js";

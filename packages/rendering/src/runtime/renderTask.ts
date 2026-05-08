@@ -26,7 +26,7 @@ import {
 import { beginPassDescriptor, clear } from "../commands/index.js";
 import { AdaptiveToken, type alist, type aval } from "@aardworx/wombat.adaptive";
 import { copy } from "./copy.js";
-import { ScenePass } from "./scenePass.js";
+import { compileHybridScene, type HybridScene } from "./hybridScene.js";
 
 export interface RuntimeContext {
   readonly device: GPUDevice;
@@ -41,42 +41,47 @@ export interface RuntimeContext {
 
 class RenderTask implements IRenderTask {
   /**
-   * Cache of `ScenePass`es keyed on the `Render` command itself.
-   * Holding ScenePass per command means the same `RenderTree`
-   * reused across frames keeps its incrementally-maintained
-   * walker state.
+   * Cache of `HybridScene`s keyed on the `Render` command itself.
+   * Each command compiles to a hybrid scene composing the heap-
+   * bucket fast path with the legacy per-RO path; reuse across
+   * frames preserves both backends' incremental state.
    */
-  private readonly _scenes = new Map<unknown, ScenePass>();
+  private readonly _scenes = new Map<unknown, HybridScene>();
   private _disposed = false;
 
   constructor(
     private readonly ctx: RuntimeContext,
+    readonly signature: FramebufferSignature,
     private readonly commands: alist<Command>,
   ) {}
 
-  run(token: AdaptiveToken): void {
+  run(framebuffer: IFramebuffer, token: AdaptiveToken): void {
     if (this._disposed) throw new Error("RenderTask: run after dispose");
     const enc = this.ctx.device.createCommandEncoder();
-    this.encode(enc, token);
+    this.encode(enc, framebuffer, token);
     this.ctx.device.queue.submit([enc.finish()]);
   }
 
-  encode(enc: GPUCommandEncoder, token: AdaptiveToken): void {
+  encode(enc: GPUCommandEncoder, framebuffer: IFramebuffer, token: AdaptiveToken): void {
     if (this._disposed) throw new Error("RenderTask: encode after dispose");
     RenderContext.withEncoder(enc, () => {
       const arr: Command[] = [];
       for (const c of this.commands.content.getValue(token)) arr.push(c);
       for (let i = 0; i < arr.length; i++) {
         const c = arr[i]!;
+        // Coalesce a Clear immediately followed by a Render: both
+        // share the run-arg framebuffer now (no per-cmd output to
+        // disambiguate), so the merge is unconditional when the
+        // pair is adjacent.
         if (c.kind === "Clear") {
           const next = arr[i + 1];
-          if (next !== undefined && next.kind === "Render" && next.output === c.output) {
-            this.encodeRenderCommand(enc, next, token, c.values);
+          if (next !== undefined && next.kind === "Render") {
+            this.encodeRenderCommand(enc, next, framebuffer, token, c.values);
             i++;
             continue;
           }
         }
-        this.encodeCommand(enc, c, token);
+        this.encodeCommand(enc, c, framebuffer, token);
       }
     });
   }
@@ -88,54 +93,56 @@ class RenderTask implements IRenderTask {
     this._disposed = true;
   }
 
-  private encodeCommand(enc: GPUCommandEncoder, c: Command, token: AdaptiveToken): void {
+  private encodeCommand(
+    enc: GPUCommandEncoder, c: Command, framebuffer: IFramebuffer, token: AdaptiveToken,
+  ): void {
     switch (c.kind) {
-      case "Clear":  clear(enc, c.output.getValue(token), c.values); return;
+      case "Clear":  clear(enc, framebuffer, c.values); return;
       case "Copy":   copy(enc, c.copy); return;
       case "Custom": c.encode(enc); return;
-      case "Render": this.encodeRenderCommand(enc, c, token); return;
+      case "Render": this.encodeRenderCommand(enc, c, framebuffer, token); return;
     }
   }
 
   private encodeRenderCommand(
     enc: GPUCommandEncoder,
     cmd: Extract<Command, { kind: "Render" }>,
+    framebuffer: IFramebuffer,
     token: AdaptiveToken,
     clearValues?: ClearValues,
   ): void {
-    const output = cmd.output.getValue(token);
-    const scene = this.sceneFor(cmd, output, cmd.tree);
-    const leaves = scene.resolve(token);
-    if (leaves.length === 0 && clearValues === undefined) return;
+    const scene = this.sceneFor(cmd, cmd.tree);
+    scene.update(token);
+    if (!scene.hasDraws() && clearValues === undefined) return;
     // Either we have draws or we need to clear — open a single pass.
-    const pass = enc.beginRenderPass(beginPassDescriptor(output, clearValues));
-    for (const leaf of leaves) leaf.record(pass, token);
+    const pass = enc.beginRenderPass(beginPassDescriptor(framebuffer, clearValues));
+    scene.encodeIntoPass(pass, token);
     pass.end();
   }
 
   private sceneFor(
     cmd: Extract<Command, { kind: "Render" }>,
-    output: IFramebuffer,
     tree: RenderTree,
-  ): ScenePass {
+  ): HybridScene {
     let s = this._scenes.get(cmd);
     if (s === undefined) {
-      s = new ScenePass(this.ctx.device, output.signature, tree, this.ctx.compileEffect);
+      s = compileHybridScene(this.ctx.device, this.signature, tree, {
+        compileEffect: this.ctx.compileEffect,
+      });
       this._scenes.set(cmd, s);
     }
     return s;
-    // Note: `output.signature` is read here only to seed the
-    // ScenePass; subsequent frames continue to use this signature
-    // even if the framebuffer aval emits a different sig. That
-    // matches the `(RenderObject, signature)` cache invariant —
-    // changing signature requires a fresh Render command.
   }
 }
 
-export function compileRenderTask(ctx: RuntimeContext, commands: alist<Command>): IRenderTask & {
-  encode(enc: GPUCommandEncoder, token: AdaptiveToken): void;
+export function compileRenderTask(
+  ctx: RuntimeContext,
+  signature: FramebufferSignature,
+  commands: alist<Command>,
+): IRenderTask & {
+  encode(enc: GPUCommandEncoder, framebuffer: IFramebuffer, token: AdaptiveToken): void;
 } {
-  return new RenderTask(ctx, commands);
+  return new RenderTask(ctx, signature, commands);
 }
 
 // `RenderTree` carries an `aval<RenderTree>` inside its `Adaptive`
