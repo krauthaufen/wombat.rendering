@@ -135,6 +135,16 @@ export function writeField(
     view.f32.set(value, offset >> 2);
     return;
   }
+  if (value instanceof Float64Array) {
+    // Downcast to f32 in-place. Aardvark's V/M types in the F#-on-JS
+    // path use Float64Array internally (V4d / M44d / Trafo3d) but
+    // GPU uniforms are always f32 — converting here saves every
+    // F# user from sprinkling V4f / V3f conversions across their
+    // Sg.Uniform values.
+    const dst = view.f32.subarray(offset >> 2, (offset >> 2) + value.length);
+    for (let i = 0; i < value.length; i++) dst[i] = value[i]!;
+    return;
+  }
   if (value instanceof Int32Array) {
     view.i32.set(value, offset >> 2);
     return;
@@ -146,6 +156,11 @@ export function writeField(
   if (value !== null && typeof value === "object" && "_data" in (value as object)) {
     const data = (value as { _data: unknown })._data;
     if (data instanceof Float32Array) { view.f32.set(data, offset >> 2); return; }
+    if (data instanceof Float64Array) {
+      const dst = view.f32.subarray(offset >> 2, (offset >> 2) + data.length);
+      for (let i = 0; i < data.length; i++) dst[i] = data[i]!;
+      return;
+    }
     if (data instanceof Int32Array)   { view.i32.set(data, offset >> 2); return; }
     if (data instanceof Uint32Array)  { view.u32.set(data, offset >> 2); return; }
   }
