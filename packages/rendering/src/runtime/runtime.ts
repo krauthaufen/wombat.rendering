@@ -88,10 +88,16 @@ export class Runtime {
   // cleanest path is to discard the old Runtime and construct a new
   // one from the same source `alist<Command>`.
 
-  /** Compile an `alist<Command>` into a runnable `IRenderTask`. */
-  compile(commands: alist<Command>): IRenderTask {
+  /**
+   * Compile an `alist<Command>` into a runnable `IRenderTask`. The
+   * `signature` is constant across the task's lifetime — pipelines
+   * specialise against it at compile time. Framebuffer instances are
+   * supplied at `task.run(framebuffer, token)`; their signatures
+   * must match.
+   */
+  compile(signature: FramebufferSignature, commands: alist<Command>): IRenderTask {
     if (this._disposed) throw new Error("Runtime: compile after disposeAll");
-    const task = compileRenderTask(this.ctx, commands);
+    const task = compileRenderTask(this.ctx, signature, commands);
     this._tasks.add(task);
     const origDispose = task.dispose.bind(task);
     task.dispose = () => { origDispose(); this._tasks.delete(task); };

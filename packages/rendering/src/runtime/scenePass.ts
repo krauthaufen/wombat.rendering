@@ -261,15 +261,50 @@ export class ScenePass {
   }
 
   /**
-   * Pull deltas from every dynamic subtree, splice the affected
-   * walkers, and produce the current ordered list of leaves.
-   * Idempotent on a clean adaptive graph (no readers fire).
+   * Pull deltas from every dynamic subtree and splice the affected
+   * walkers. CPU-only — no GPU work. After this returns, the leaf
+   * set is current and any per-leaf prepared resources have been
+   * brought up to date. Idempotent on a clean adaptive graph.
+   *
+   * Hybrid composition: call this BEFORE opening the render pass,
+   * alongside any other backend's `update`. Then open the pass and
+   * call `encodeIntoPass`.
    */
-  resolve(token: AdaptiveToken): PreparedRenderObject[] {
+  update(token: AdaptiveToken): void {
     this.root.update(token);
+  }
+
+  /**
+   * The current ordered list of leaves. Reads the walker tree's
+   * cached state — does not pull deltas. Call `update(token)` first
+   * if avals may have marked since last collect.
+   */
+  collect(): PreparedRenderObject[] {
     const out: PreparedRenderObject[] = [];
     this.root.emit(out);
     return out;
+  }
+
+  /**
+   * Encode each leaf's draw into an existing render pass. No
+   * begin/end; caller owns the pass. Hybrid renderers call this on
+   * the legacy path's pass alongside the heap path's `encodeIntoPass`.
+   *
+   * Must be preceded by `update(token)` in the same frame.
+   */
+  encodeIntoPass(passEnc: GPURenderPassEncoder, token: AdaptiveToken): void {
+    const leaves = this.collect();
+    for (const leaf of leaves) leaf.record(passEnc, token);
+  }
+
+  /**
+   * Convenience: `update` + `collect`. The legacy entry point.
+   * Pre-existing callers keep working; new code paths prefer the
+   * split methods.
+   */
+  resolve(token: AdaptiveToken): PreparedRenderObject[] {
+    this.update(token);
+    return this.collect();
   }
 
   dispose(): void {

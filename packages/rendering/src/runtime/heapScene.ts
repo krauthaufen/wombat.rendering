@@ -43,18 +43,37 @@
 // group's bind-group layout; the user's FS WGSL declares them.
 
 import { Trafo3d, V3d, V4f, type M44d } from "@aardworx/wombat.base";
-import { AVal, addMarkingCallback } from "@aardworx/wombat.adaptive";
-import type { aval, IDisposable } from "@aardworx/wombat.adaptive";
-import type { CanvasAttachment } from "../window/index.js";
+import { AVal, AdaptiveObject, AdaptiveToken } from "@aardworx/wombat.adaptive";
+import type { aval, aset, IAdaptiveObject, IDisposable, IHashSetReader } from "@aardworx/wombat.adaptive";
+import type { Effect } from "@aardworx/wombat.shader";
+import type { PipelineState } from "../core/pipelineState.js";
+import type { BufferView } from "../core/bufferView.js";
+import type { IBuffer, HostBufferSource } from "../core/buffer.js";
+import {
+  buildBucketLayout, compileHeapEffect, rewriteForLayout, stripTextureSamplerDecls,
+  type BucketLayout, type FragmentOutputLayout, type HeapEffectSchema,
+} from "./heapEffect.js";
 
 // ---------------------------------------------------------------------------
-// Layouts
+// Per-allocation arena layout
 // ---------------------------------------------------------------------------
 
-const GLOBALS_BYTES = 64 + 16;                                    // mat4 + vec4
-const GLOBALS_FLOATS = GLOBALS_BYTES / 4;
-const DRAW_HEADER_BYTES = 64 * 2 + 16 + 16;                       // 2 mat4 + vec4 + (u32 + 3*pad)
-const DRAW_HEADER_FLOATS = DRAW_HEADER_BYTES / 4;
+// Per-allocation header: (u32 typeId, u32 length). typeId is
+// (semantic << 16) | encoding. The data region follows the header
+// aligned up to 16 bytes (so positions/normals/etc. line up for
+// future vec4 reads).
+const ALLOC_HEADER_BYTES   = 8;
+const ALLOC_HEADER_PAD_TO  = 16;     // data starts header_offset + 16
+
+// Encoding-tag enum (low 16 bits of typeId).
+const ENC_V3F_TIGHT = 1;             // tightly-packed array of vec3<f32> (12 B/elt)
+
+// Semantic-tag enum (high 16 bits of typeId). Optional metadata —
+// the shader doesn't branch on this.
+const SEM_POSITIONS = 1;
+const SEM_NORMALS   = 2;
+
+const ALIGN16 = (n: number) => (n + 15) & ~15;
 
 function packMat44(m: M44d, dst: Float32Array, off: number): void {
   // M44d._data is the row-major Float64Array; not part of the public
@@ -64,99 +83,117 @@ function packMat44(m: M44d, dst: Float32Array, off: number): void {
   for (let i = 0; i < 16; i++) dst[off + i] = r[i]!;
 }
 
-function packGlobals(viewProj: Trafo3d, lightLocation: V3d, dst: Float32Array): void {
-  packMat44(viewProj.forward, dst, 0);
-  dst[16] = lightLocation.x as number;
-  dst[17] = lightLocation.y as number;
-  dst[18] = lightLocation.z as number;
-  dst[19] = 0;
+// ─── Layout-driven value packing ────────────────────────────────────
+//
+// Maps a schema uniform name + its value source to bytes in a staging
+// buffer. The bridge between the spec's named JS-side fields (e.g.
+// `spec.modelTrafo: Trafo3d`) and the schema's typed uniforms
+// ("ModelTrafo" mat4, "ModelTrafoInv" mat4, …). Step 5 generalises
+// this to a `spec.uniforms: { [name]: aval }` map; until then we
+// hardcode the shape here.
+
+// ─── Generic packer registry, keyed on WGSL type ────────────────────
+//
+// Each per-draw uniform comes from the spec as an aval whose JS value
+// type is determined by what the user passes. The packer for a given
+// WGSL type knows how to turn that JS value into bytes for the arena.
+// Step 5: this replaces the per-name `perDrawBinding` switch — the
+// spec just supplies `uniforms: { [name]: aval<...> }` and the
+// runtime asks the registry "how do I pack a `mat4x4<f32>`".
+
+/** A packer for one WGSL storage-buffer type. */
+interface WgslPacker {
+  /** Tightly-packed size in bytes of one value (mat4 = 64, vec3 = 12, …). */
+  readonly dataBytes: number;
+  readonly typeId: number;
+  /**
+   * Pack `val` (the aval's `.getValue(tok)` result) into `dst` at
+   * float offset `off`. The packer is responsible for handling the
+   * value type — Trafo3d, M44d, V4f, V3d, V3f, number — coercing as
+   * needed. Throws on unsupported value shapes.
+   */
+  readonly pack: (val: unknown, dst: Float32Array, off: number) => void;
 }
 
-function packDrawHeader(
-  modelTrafo: Trafo3d,
-  color: V4f,
-  vertexBase: number,
-  dst: Float32Array,
-  drawIndex: number,
-): void {
-  const off = drawIndex * DRAW_HEADER_FLOATS;
-  packMat44(modelTrafo.forward,  dst, off +  0);
-  packMat44(modelTrafo.backward, dst, off + 16);
-  dst[off + 32] = color.x; dst[off + 33] = color.y;
-  dst[off + 34] = color.z; dst[off + 35] = color.w;
-  new Uint32Array(dst.buffer, dst.byteOffset, dst.length)[off + 36] = vertexBase;
+const PACKER_MAT4: WgslPacker = {
+  dataBytes: 64, typeId: 0,
+  pack: (val, dst, off) => {
+    // Accept Trafo3d (uses .forward) or M44d directly.
+    const m = (val as { forward?: M44d }).forward !== undefined
+      ? (val as { forward: M44d }).forward
+      : (val as M44d);
+    packMat44(m, dst, off);
+  },
+};
+const PACKER_VEC4: WgslPacker = {
+  dataBytes: 16, typeId: 0,
+  pack: (val, dst, off) => {
+    const v = val as V4f;
+    dst[off + 0] = v.x; dst[off + 1] = v.y;
+    dst[off + 2] = v.z; dst[off + 3] = v.w;
+  },
+};
+const PACKER_VEC3: WgslPacker = {
+  dataBytes: 12, typeId: 0,
+  pack: (val, dst, off) => {
+    // V3f or V3d both expose .x/.y/.z; cast through a common shape.
+    const v = val as { x: number; y: number; z: number };
+    dst[off + 0] = v.x; dst[off + 1] = v.y; dst[off + 2] = v.z;
+  },
+};
+const PACKER_VEC2: WgslPacker = {
+  dataBytes: 8, typeId: 0,
+  pack: (val, dst, off) => {
+    const v = val as { x: number; y: number };
+    dst[off + 0] = v.x; dst[off + 1] = v.y;
+  },
+};
+const PACKER_F32: WgslPacker = {
+  dataBytes: 4, typeId: 0,
+  pack: (val, dst, off) => { dst[off] = val as number; },
+};
+
+function packerForWgslType(wgslType: string): WgslPacker {
+  switch (wgslType) {
+    case "mat4x4<f32>": return PACKER_MAT4;
+    case "vec4<f32>":   return PACKER_VEC4;
+    case "vec3<f32>":   return PACKER_VEC3;
+    case "vec2<f32>":   return PACKER_VEC2;
+    case "f32":         return PACKER_F32;
+    default:
+      throw new Error(`heapScene: no JS-side packer for WGSL type '${wgslType}'`);
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Shared WGSL prelude (struct + bindings + VS)
 // ---------------------------------------------------------------------------
 
-const SHADER_PRELUDE = /* wgsl */`
-struct Globals {
-  viewProj:      mat4x4<f32>,
-  lightLocation: vec4<f32>,
-};
-struct DrawHeader {
-  modelTrafo:    mat4x4<f32>,
-  modelTrafoInv: mat4x4<f32>,
-  color:         vec4<f32>,
-  vertexBase:    u32,
-  _pad0: u32, _pad1: u32, _pad2: u32,
-};
-@group(0) @binding(0) var<uniform>             globals:   Globals;
-@group(0) @binding(1) var<storage, read>       draws:     array<DrawHeader>;
-@group(0) @binding(2) var<storage, read>       positions: array<f32>;
-@group(0) @binding(3) var<storage, read>       normals:   array<f32>;
-
-struct VsOut {
-  @builtin(position) clipPos:  vec4<f32>,
-  @location(0)       worldPos: vec3<f32>,
-  @location(1)       normal:   vec3<f32>,
-  @location(2)       color:    vec4<f32>,
-  @location(3)       lightLoc: vec3<f32>,
-};
-
-fn fetchVec3(buf: ptr<storage, array<f32>, read>, base: u32) -> vec3<f32> {
-  return vec3<f32>((*buf)[base + 0u], (*buf)[base + 1u], (*buf)[base + 2u]);
-}
-
-@vertex
-fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) drawIdx: u32) -> VsOut {
-  let d = draws[drawIdx];
-  let base = (d.vertexBase + vid) * 3u;
-  let pos = fetchVec3(&positions, base);
-  let nor = fetchVec3(&normals,   base);
-  // wombat.shader convention: matrices uploaded row-major; WGSL reads
-  // them as col-major = transposed. v * M is the row-vec dual of
-  // M.mul(v) (= M*v math).
-  let wp = vec4<f32>(pos, 1.0) * d.modelTrafo;
-  let n  = (vec4<f32>(nor, 0.0) * d.modelTrafo).xyz;
-  var out: VsOut;
-  out.clipPos  = wp * globals.viewProj;
-  out.worldPos = wp.xyz;
-  out.normal   = n;
-  out.color    = d.color;
-  out.lightLoc = globals.lightLocation.xyz;
-  return out;
-}
-`;
+// Common decls — struct + bindings + helpers. Always concatenated
+// into every group's shader, before its custom VS+FS bodies.
+//
+// One arena GPUBuffer is bound through multiple typed views. Today
+// only `array<DrawHeader>` and `array<f32>` are wired; later we add
+// `array<u32>`, `array<vec2<f32>>`, `array<vec4<f32>>`, etc. (skip
+// `vec3` — its storage stride is 16, doesn't match tight packing).
+//
+// `attrRef` style: each attribute reference in DrawHeader is a byte
+// offset into the arena pointing at the allocation's header. The
+// header is `(u32 typeId, u32 length)`; data follows 16 bytes after
+// the ref. Today every attribute is V3F_TIGHT-encoded so the shader
+// reads 3 consecutive f32s from the f32 view; once we add more
+// encodings, `loadVec3Attr` grows a branch on `typeId & 0xFFFFu`.
+// (Per-bucket WGSL preludes are now generated by `buildBucketLayout`
+// in heapEffect.ts; this module just glues the bucket layout, the
+// shared arena, and the per-bucket DrawHeap together.)
 
 // ---------------------------------------------------------------------------
 // Geometry packing
 // ---------------------------------------------------------------------------
 
-interface PackedGeometry {
-  readonly positionsBuf: GPUBuffer;
-  readonly normalsBuf:   GPUBuffer;
-  readonly indexBuf:     GPUBuffer;
-  readonly entries:      ReadonlyArray<{ vertexBase: number; indexCount: number; firstIndex: number }>;
-  readonly bytes:        number;
-}
-
 /**
  * Geometry triple. Tightly-packed Float32 positions / normals (3
- * floats per vertex) plus Uint32 indices. The heap-scene packer
- * concatenates all draws' geometry into per-group slabs.
+ * floats per vertex) plus Uint32 indices.
  */
 export interface HeapGeometry {
   readonly positions: Float32Array;
@@ -164,45 +201,377 @@ export interface HeapGeometry {
   readonly indices:   Uint32Array;
 }
 
-function packGeometry(device: GPUDevice, geos: readonly HeapGeometry[], label: string): PackedGeometry {
-  let totalVerts = 0, totalIndices = 0;
-  for (const g of geos) {
-    totalVerts   += g.positions.length / 3;
-    totalIndices += g.indices.length;
+
+// ---------------------------------------------------------------------------
+// Resizable buffer (pow2 grow + GPU-side copy on resize)
+// ---------------------------------------------------------------------------
+
+const MIN_BUFFER_BYTES = 64 * 1024;
+const POW2 = (n: number): number => {
+  let p = 1; while (p < n) p <<= 1; return p;
+};
+
+/**
+ * A GPUBuffer that can grow to next power-of-two on demand. On grow,
+ * a fresh buffer is created at the new size, the live tail copied
+ * over via copyBufferToBuffer, and dependents (bind groups, mostly)
+ * are notified to rebuild via the `onResize` callback.
+ *
+ * `usedBytes` is the high-water mark — the runtime advances this as
+ * it allocates, and `ensureCapacity` grows when required. This
+ * separates allocation policy from grow policy.
+ */
+class GrowBuffer {
+  private buf: GPUBuffer;
+  private cap: number;
+  private used = 0;
+  private readonly listeners = new Set<() => void>();
+  constructor(
+    private readonly device: GPUDevice,
+    private readonly label: string,
+    private readonly usage: GPUBufferUsageFlags,
+    initialBytes: number,
+  ) {
+    this.cap = Math.max(MIN_BUFFER_BYTES, POW2(initialBytes));
+    this.buf = device.createBuffer({ size: this.cap, usage: usage | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, label });
   }
-  const positions = new Float32Array(totalVerts * 3);
-  const normals   = new Float32Array(totalVerts * 3);
-  const indices   = new Uint32Array(totalIndices);
-  const entries: { vertexBase: number; indexCount: number; firstIndex: number }[] = [];
-  let vOff = 0, iOff = 0;
-  for (const g of geos) {
-    const vCount = g.positions.length / 3;
-    positions.set(g.positions, vOff * 3);
-    normals.set(g.normals,     vOff * 3);
-    indices.set(g.indices, iOff);
-    entries.push({ vertexBase: vOff, indexCount: g.indices.length, firstIndex: iOff });
-    vOff += vCount;
-    iOff += g.indices.length;
+  get buffer(): GPUBuffer { return this.buf; }
+  get capacity(): number { return this.cap; }
+  get usedBytes(): number { return this.used; }
+  setUsed(n: number): void { this.used = n; }
+  onResize(cb: () => void): IDisposable {
+    this.listeners.add(cb);
+    return { dispose: () => { this.listeners.delete(cb); } };
   }
-  const mk = (data: ArrayBufferView, usage: GPUBufferUsageFlags, lbl: string): GPUBuffer => {
-    const buf = device.createBuffer({
-      size: alignUp(data.byteLength, 4),
-      usage: usage | GPUBufferUsage.COPY_DST,
-      label: lbl,
+  /** Ensure the buffer is at least `bytes` capacity. Grows by pow2 + copies live tail. */
+  ensureCapacity(bytes: number): void {
+    if (bytes <= this.cap) return;
+    const newCap = POW2(bytes);
+    const newBuf = this.device.createBuffer({
+      size: newCap, usage: this.usage | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, label: this.label,
     });
-    device.queue.writeBuffer(buf, 0, data.buffer, data.byteOffset, data.byteLength);
-    return buf;
-  };
-  return {
-    positionsBuf: mk(positions, GPUBufferUsage.STORAGE, `${label}/pos`),
-    normalsBuf:   mk(normals,   GPUBufferUsage.STORAGE, `${label}/nor`),
-    indexBuf:     mk(indices,   GPUBufferUsage.INDEX,   `${label}/idx`),
-    entries,
-    bytes: positions.byteLength + normals.byteLength + indices.byteLength,
-  };
+    if (this.used > 0) {
+      const enc = this.device.createCommandEncoder({ label: `${this.label}: grow-copy` });
+      enc.copyBufferToBuffer(this.buf, 0, newBuf, 0, ALIGN16(this.used));
+      this.device.queue.submit([enc.finish()]);
+    }
+    this.buf.destroy();
+    this.buf = newBuf;
+    this.cap = newCap;
+    for (const cb of this.listeners) cb();
+  }
+  destroy(): void { this.buf.destroy(); }
 }
 
-function alignUp(n: number, a: number): number { return (n + a - 1) & ~(a - 1); }
+// ---------------------------------------------------------------------------
+// UniformPool — aval-keyed refcounted allocations over the AttributeArena
+// ---------------------------------------------------------------------------
+
+interface PoolEntry {
+  /** Byte offset into the arena. Data starts at ref + ALLOC_HEADER_PAD_TO. */
+  readonly ref: number;
+  readonly dataBytes: number;
+  readonly typeId: number;
+  /** Packer used to refresh the data region on aval marks. */
+  readonly pack: (val: unknown, dst: Float32Array, off: number) => void;
+  refcount: number;
+}
+
+/**
+ * Aval-keyed pool of arena allocations. One allocation per unique
+ * aval (object identity). Two draws referencing the same aval share
+ * the allocation; their DrawHeaders carry the same u32 ref. Holds
+ * uniforms (fixed-size scalars/vectors/matrices) AND attribute arrays
+ * (variable-size). The caller decides `dataBytes` + `length` per
+ * acquisition — the pool just keys on aval identity and refcounts.
+ *
+ * Sharing emerges from aval identity — no separate "frequency"
+ * declaration needed. A `cval` shared by all draws → 1 alloc.
+ * A static positions array shared across instanced draws → 1 alloc.
+ * Same code path either way.
+ */
+class UniformPool {
+  private readonly byAval = new Map<aval<unknown>, PoolEntry>();
+
+  has(aval: aval<unknown>): boolean { return this.byAval.has(aval); }
+  entry(aval: aval<unknown>): PoolEntry | undefined { return this.byAval.get(aval); }
+
+  /**
+   * Acquire (or share) an allocation for `aval`. Caller passes the
+   * pre-read `value` (so the pool doesn't need a token) plus the
+   * (`dataBytes`, `typeId`, `length`, `pack`) describing how to lay
+   * it out. If a new allocation is made, the value is packed and
+   * uploaded immediately.
+   */
+  acquire(
+    device: GPUDevice,
+    arena: AttributeArena,
+    aval: aval<unknown>,
+    value: unknown,
+    dataBytes: number,
+    typeId: number,
+    length: number,
+    pack: (val: unknown, dst: Float32Array, off: number) => void,
+  ): number {
+    const existing = this.byAval.get(aval);
+    if (existing !== undefined) {
+      existing.refcount++;
+      return existing.ref;
+    }
+    const ref = arena.alloc(dataBytes);
+    const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
+    const buf = new ArrayBuffer(allocBytes);
+    const u32 = new Uint32Array(buf);
+    const f32 = new Float32Array(buf);
+    u32[0] = typeId;
+    u32[1] = length;
+    // stride_bytes (offset 8): bytes per element. Lets the VS decode
+    // pick V3- vs V4-tight load expressions for vec4 attributes
+    // (and is informative for everything else).
+    u32[2] = length > 0 ? Math.floor(dataBytes / length) : 0;
+    pack(value, f32, ALLOC_HEADER_PAD_TO / 4);
+    device.queue.writeBuffer(arena.buffer, ref, buf, 0, allocBytes);
+    this.byAval.set(aval, { ref, dataBytes, typeId, pack, refcount: 1 });
+    return ref;
+  }
+
+  /** Decrement refcount; if zero, free the arena allocation. */
+  release(arena: AttributeArena, aval: aval<unknown>): void {
+    const e = this.byAval.get(aval);
+    if (e === undefined) return;
+    e.refcount--;
+    if (e.refcount > 0) return;
+    arena.release(e.ref, ALIGN16(ALLOC_HEADER_PAD_TO + e.dataBytes));
+    this.byAval.delete(aval);
+  }
+
+  /** Re-pack and upload one entry's data region. Caller pre-reads `val`. */
+  repack(device: GPUDevice, arena: AttributeArena, aval: aval<unknown>, val: unknown): void {
+    const e = this.byAval.get(aval);
+    if (e === undefined) return;
+    const dst = new Float32Array(e.dataBytes / 4);
+    e.pack(val, dst, 0);
+    device.queue.writeBuffer(
+      arena.buffer, e.ref + ALLOC_HEADER_PAD_TO,
+      dst.buffer, dst.byteOffset, e.dataBytes,
+    );
+  }
+}
+
+/**
+ * Aval-keyed pool over the `IndexAllocator`. Two draws referencing
+ * the same `Uint32Array` (or aval thereof) share an index range —
+ * 19K instanced clones of the same mesh share one allocation, one
+ * upload. Index data is treated as immutable for the aval's
+ * lifetime: an aval mark won't repack (we'd have to free + re-alloc
+ * since size changes are likely). Use a fresh aval to swap meshes.
+ */
+class IndexPool {
+  private readonly byAval = new Map<aval<Uint32Array>, { firstIndex: number; count: number; refcount: number }>();
+
+  acquire(
+    device: GPUDevice,
+    indices: IndexAllocator,
+    aval: aval<Uint32Array>,
+    arr: Uint32Array,
+  ): { firstIndex: number; count: number } {
+    const existing = this.byAval.get(aval);
+    if (existing !== undefined) {
+      existing.refcount++;
+      return { firstIndex: existing.firstIndex, count: existing.count };
+    }
+    const firstIndex = indices.alloc(arr.length);
+    device.queue.writeBuffer(
+      indices.buffer, firstIndex * 4,
+      arr.buffer, arr.byteOffset, arr.byteLength,
+    );
+    this.byAval.set(aval, { firstIndex, count: arr.length, refcount: 1 });
+    return { firstIndex, count: arr.length };
+  }
+
+  release(indices: IndexAllocator, aval: aval<Uint32Array>): void {
+    const e = this.byAval.get(aval);
+    if (e === undefined) return;
+    e.refcount--;
+    if (e.refcount > 0) return;
+    indices.release(e.firstIndex, e.count);
+    this.byAval.delete(aval);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DrawHeap (slot-indexed) and AttributeArena (byte-bump) allocators
+// ---------------------------------------------------------------------------
+
+/**
+ * Slot-indexed allocator over a GrowBuffer. `slotBytes` is set per-
+ * instance — each bucket sizes its DrawHeader from its effect's
+ * schema, so a bucket whose layout is e.g. 96 B / slot uses a
+ * DrawHeap with `slotBytes=96`.
+ */
+class DrawHeap {
+  private free: number[] = [];
+  private nextSlot = 0;
+  constructor(private readonly buf: GrowBuffer, private readonly slotBytes: number) {}
+  get buffer(): GPUBuffer { return this.buf.buffer; }
+  /** Bytes per slot — caller multiplies by slot index for byte offsets. */
+  get bytesPerSlot(): number { return this.slotBytes; }
+  /** High-water mark in bytes (used to size bind-group entry on rebuild). */
+  get usedBytes(): number { return this.nextSlot * this.slotBytes; }
+  alloc(): number {
+    const slot = this.free.length > 0 ? this.free.pop()! : this.nextSlot++;
+    this.buf.ensureCapacity((slot + 1) * this.slotBytes);
+    this.buf.setUsed(Math.max(this.buf.usedBytes, (slot + 1) * this.slotBytes));
+    return slot;
+  }
+  release(slot: number): void { this.free.push(slot); }
+  onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
+  destroy(): void { this.buf.destroy(); }
+}
+
+/**
+ * Byte-bump allocator over a GrowBuffer for variable-size attribute
+ * allocations. Each allocation gets a 16-byte aligned start (8-byte
+ * (typeId, length) header at the start, data 16 bytes in). Frees go
+ * onto a list keyed by size for simple first-fit reuse later — for
+ * now `release` just records the gap and the bump cursor never
+ * shrinks.
+ */
+class AttributeArena {
+  private cursor = 0;
+  // (offset, size) free entries; first-fit reuse not yet implemented.
+  private freeList: { off: number; size: number }[] = [];
+  constructor(private readonly buf: GrowBuffer) {}
+  get buffer(): GPUBuffer { return this.buf.buffer; }
+  get capacity(): number { return this.buf.capacity; }
+  get usedBytes(): number { return this.cursor; }
+  /**
+   * Allocate space for one attribute. Returns the byte ref (offset
+   * to the header — data lives at ref + 16).
+   */
+  alloc(dataBytes: number): number {
+    const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
+    // First-fit reuse from free list.
+    for (let i = 0; i < this.freeList.length; i++) {
+      const f = this.freeList[i]!;
+      if (f.size >= allocBytes) {
+        const ref = f.off;
+        if (f.size === allocBytes) this.freeList.splice(i, 1);
+        else { f.off += allocBytes; f.size -= allocBytes; }
+        return ref;
+      }
+    }
+    const ref = this.cursor;
+    this.cursor += allocBytes;
+    this.buf.ensureCapacity(this.cursor);
+    this.buf.setUsed(this.cursor);
+    return ref;
+  }
+  release(ref: number, dataBytes: number): void {
+    const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
+    this.freeList.push({ off: ref, size: allocBytes });
+    // Coalesce adjacent free entries for cleanliness.
+    this.freeList.sort((a, b) => a.off - b.off);
+    for (let i = 0; i < this.freeList.length - 1; ) {
+      const a = this.freeList[i]!, b = this.freeList[i + 1]!;
+      if (a.off + a.size === b.off) { a.size += b.size; this.freeList.splice(i + 1, 1); }
+      else i++;
+    }
+  }
+  onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
+  destroy(): void { this.buf.destroy(); }
+}
+
+/**
+ * Element-bump allocator over an index GrowBuffer (units = u32). Each
+ * draw's index range is allocated as one block; on release the block
+ * is returned to a free list and can be reused first-fit.
+ */
+class IndexAllocator {
+  private cursor = 0;     // in u32s, not bytes
+  private freeList: { off: number; size: number }[] = [];
+  constructor(private readonly buf: GrowBuffer) {}
+  get buffer(): GPUBuffer { return this.buf.buffer; }
+  get usedElements(): number { return this.cursor; }
+  alloc(elements: number): number {
+    for (let i = 0; i < this.freeList.length; i++) {
+      const f = this.freeList[i]!;
+      if (f.size >= elements) {
+        const off = f.off;
+        if (f.size === elements) this.freeList.splice(i, 1);
+        else { f.off += elements; f.size -= elements; }
+        return off;
+      }
+    }
+    const off = this.cursor;
+    this.cursor += elements;
+    this.buf.ensureCapacity(this.cursor * 4);
+    this.buf.setUsed(this.cursor * 4);
+    return off;
+  }
+  release(off: number, elements: number): void {
+    this.freeList.push({ off, size: elements });
+    this.freeList.sort((a, b) => a.off - b.off);
+    for (let i = 0; i < this.freeList.length - 1; ) {
+      const a = this.freeList[i]!, b = this.freeList[i + 1]!;
+      if (a.off + a.size === b.off) { a.size += b.size; this.freeList.splice(i + 1, 1); }
+      else i++;
+    }
+  }
+  onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
+  destroy(): void { this.buf.destroy(); }
+}
+
+// ---------------------------------------------------------------------------
+// Static initial pack (uses the new allocators)
+// ---------------------------------------------------------------------------
+
+/**
+ * Global arena state: attribute / uniform data lives in `attrs`
+ * (multi-typed-view storage); indices live in `indices` (separate
+ * INDEX-usage buffer). Per-draw bookkeeping (which arena offsets
+ * are alive for which draw) now lives entirely in the bucket via
+ * the UniformPool's refcount + the bucket's per-local-slot arrays.
+ */
+interface ArenaState {
+  readonly attrs:    AttributeArena;
+  readonly indices:  IndexAllocator;
+}
+
+function buildArenaState(
+  device: GPUDevice,
+  attrBytesHint: number,
+  idxBytesHint: number,
+  label: string,
+): ArenaState {
+  const attrs = new AttributeArena(new GrowBuffer(
+    device, `${label}/attrs`, GPUBufferUsage.STORAGE,
+    attrBytesHint,
+  ));
+  const indices = new IndexAllocator(new GrowBuffer(
+    device, `${label}/idx`, GPUBufferUsage.INDEX,
+    idxBytesHint,
+  ));
+  return { attrs, indices };
+}
+
+function arenaBytes(arena: ArenaState): number {
+  return arena.attrs.usedBytes + arena.indices.usedElements * 4;
+}
+
+/** Upload a single attribute — header (typeId, length) + data — into the arena at byte offset `ref`. */
+function writeAttribute(
+  device: GPUDevice, buf: GPUBuffer, ref: number, typeId: number, length: number, data: Float32Array,
+): void {
+  const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + data.byteLength);
+  const staging = new ArrayBuffer(allocBytes);
+  const u32 = new Uint32Array(staging);
+  const f32 = new Float32Array(staging);
+  u32[0] = typeId;
+  u32[1] = length;
+  f32.set(data, ALLOC_HEADER_PAD_TO / 4);
+  device.queue.writeBuffer(buf, ref, staging, 0, allocBytes);
+}
 
 function asAval<T>(v: aval<T> | T): aval<T> {
   return (typeof v === "object" && v !== null && typeof (v as { getValue?: unknown }).getValue === "function")
@@ -210,132 +579,74 @@ function asAval<T>(v: aval<T> | T): aval<T> {
     : AVal.constant(v as T);
 }
 
-// ---------------------------------------------------------------------------
-// Per-group internal state
-// ---------------------------------------------------------------------------
-
-interface Group {
-  readonly key: string;
-  readonly pipeline: GPURenderPipeline;
-  readonly bindGroup: GPUBindGroup;
-  readonly globals: GPUBuffer;
-  readonly globalsStaging: Float32Array;
-  readonly drawHeap: GPUBuffer;
-  readonly drawStaging: Float32Array;
-  readonly packed: PackedGeometry;
-  readonly trafos: aval<Trafo3d>[];
-  readonly colors: aval<V4f>[];
-  readonly dirty: Set<number>;
-  readonly subs: IDisposable[];
+/** Heuristic predicate — BufferView has `buffer: aval<IBuffer>` + elementType. */
+function isBufferView(v: unknown): v is BufferView {
+  if (typeof v !== "object" || v === null) return false;
+  const o = v as { buffer?: unknown; elementType?: unknown };
+  return typeof o.buffer === "object" && o.buffer !== null
+      && typeof (o.buffer as { getValue?: unknown }).getValue === "function"
+      && typeof o.elementType === "object" && o.elementType !== null;
 }
 
-function buildGroup(
-  device: GPUDevice,
-  attach: CanvasAttachment,
-  key: string,
-  fragmentWgsl: string,
-  textureSet: HeapTextureSet | undefined,
-  draws: readonly { spec: HeapDrawSpec; sourceIndex: number }[],
-  modelTrafos: aval<Trafo3d>[],
-  colors: aval<V4f>[],
-): Group {
-  const sig = attach.signature;
-  const colorAttachmentName = sig.colorNames[0];
-  if (colorAttachmentName === undefined) {
-    throw new Error("buildHeapScene: framebuffer signature has no color attachment");
+/**
+ * Float32 view over a host-side buffer source. Used by the BufferView
+ * packer to hand the pool a typed array it can `set()` from.
+ */
+function asFloat32(data: HostBufferSource): Float32Array {
+  if (data instanceof Float32Array) return data;
+  if (ArrayBuffer.isView(data)) {
+    return new Float32Array(data.buffer, data.byteOffset, data.byteLength / 4);
   }
-  const colorFormat = sig.colors.tryFind(colorAttachmentName)!;
-  const depthFormat = sig.depthStencil?.format;
+  return new Float32Array(data); // ArrayBuffer
+}
 
-  const memberIndices = draws.map(d => d.sourceIndex);
-  const myTrafos = memberIndices.map(i => modelTrafos[i]!);
-  const myColors = memberIndices.map(i => colors[i]!);
+// ---------------------------------------------------------------------------
+// Internal state
+// ---------------------------------------------------------------------------
 
-  const packed = packGeometry(device, draws.map(d => d.spec.geo), `heapScene/${key}`);
+/**
+ * One pipeline-state bucket. Holds the pipeline + a list of global
+ * draw-slot indices to emit with it. The bind group it draws against
+ * is referenced by `bindGroup` (typically the shared no-textures one
+ * or one of the per-texture-set ones).
+ */
+interface Bucket {
+  readonly label: string;
+  readonly textures: HeapTextureSet | undefined;
+  readonly layout: BucketLayout;
+  readonly pipeline: GPURenderPipeline;
+  /** Repointed by `rebuildBindGroups` whenever any backing GrowBuffer reallocates. */
+  bindGroup: GPUBindGroup;
 
-  const globals = device.createBuffer({
-    size: alignUp(GLOBALS_BYTES, 16),
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    label: `heapScene/${key}/globals`,
-  });
-  const globalsStaging = new Float32Array(GLOBALS_FLOATS);
+  // Per-bucket buffers
+  readonly drawHeap: DrawHeap;
+  /** Float32 staging mirror of the drawHeap, sized to its current capacity. */
+  drawHeaderStaging: Float32Array;
 
-  const heapBytes = DRAW_HEADER_BYTES * draws.length;
-  const drawHeap = device.createBuffer({
-    size: alignUp(heapBytes, 16),
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    label: `heapScene/${key}/draws`,
-  });
-  const drawStaging = new Float32Array(DRAW_HEADER_FLOATS * draws.length);
-  for (let i = 0; i < draws.length; i++) {
-    packDrawHeader(
-      myTrafos[i]!.force(/* allow-force */),
-      myColors[i]!.force(/* allow-force */),
-      packed.entries[i]!.vertexBase, drawStaging, i,
-    );
-  }
-  device.queue.writeBuffer(drawHeap, 0, drawStaging.buffer, drawStaging.byteOffset, heapBytes);
+  // Per-local-slot state (sparse; index = local slot in this bucket).
+  readonly localPosRefs:  (number | undefined)[];
+  readonly localNorRefs:  (number | undefined)[];
+  readonly localEntries:  ({ indexCount: number; firstIndex: number; instanceCount: number } | undefined)[];
+  /** localSlot → global drawId, for cleanup paths. */
+  readonly localToDrawId: (number | undefined)[];
+  /**
+   * Per-draw uniform avals owned by this slot — used by removeDraw
+   * to release pool entries. Order doesn't matter; the pool is
+   * keyed by aval identity.
+   */
+  readonly localPerDrawAvals: (aval<unknown>[] | undefined)[];
+  /**
+   * Per-draw uniform refs (schema name → arena byte offset) for
+   * this slot. Stable during the slot's lifetime; used to re-pack
+   * the DrawHeader into a fresh staging mirror after the bucket's
+   * drawHeap GrowBuffer reallocates.
+   */
+  readonly localPerDrawRefs: (Map<string, number> | undefined)[];
 
-  const dirty = new Set<number>();
-  const subs: IDisposable[] = [];
-  for (let i = 0; i < draws.length; i++) {
-    subs.push(addMarkingCallback(myTrafos[i] as never, () => dirty.add(i)));
-    subs.push(addMarkingCallback(myColors[i] as never, () => dirty.add(i)));
-  }
-
-  const module = device.createShaderModule({
-    code: SHADER_PRELUDE + fragmentWgsl,
-    label: `heapScene/${key}/shader`,
-  });
-  const bindLayoutEntries: GPUBindGroupLayoutEntry[] = [
-    { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
-    { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-    { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-    { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-  ];
-  if (textureSet !== undefined) {
-    bindLayoutEntries.push(
-      { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
-      { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
-    );
-  }
-  const bindGroupLayout = device.createBindGroupLayout({
-    label: `heapScene/${key}/bgl`,
-    entries: bindLayoutEntries,
-  });
-  const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
-  const pipeline = device.createRenderPipeline({
-    label: `heapScene/${key}/pipeline`,
-    layout: pipelineLayout,
-    vertex:   { module, entryPoint: "vs", buffers: [] },
-    fragment: { module, entryPoint: "fs", targets: [{ format: colorFormat }] },
-    primitive: { topology: "triangle-list", cullMode: "back", frontFace: "ccw" },
-    ...(depthFormat !== undefined
-      ? { depthStencil: { format: depthFormat, depthWriteEnabled: true, depthCompare: "less" as GPUCompareFunction } }
-      : {}),
-  });
-  const bindEntries: GPUBindGroupEntry[] = [
-    { binding: 0, resource: { buffer: globals } },
-    { binding: 1, resource: { buffer: drawHeap } },
-    { binding: 2, resource: { buffer: packed.positionsBuf } },
-    { binding: 3, resource: { buffer: packed.normalsBuf } },
-  ];
-  if (textureSet !== undefined) {
-    bindEntries.push(
-      { binding: 4, resource: textureSet.textureView ?? textureSet.texture.createView() },
-      { binding: 5, resource: textureSet.sampler },
-    );
-  }
-  const bindGroup = device.createBindGroup({
-    label: `heapScene/${key}/bg`,
-    layout: bindGroupLayout,
-    entries: bindEntries,
-  });
-
-  return {
-    key, pipeline, bindGroup, globals, globalsStaging, drawHeap, drawStaging,
-    packed, trafos: myTrafos, colors: myColors, dirty, subs,
-  };
+  /** Live local slots (drives the render loop). */
+  readonly drawSlots: number[];
+  /** Local slots whose DrawHeader needs re-pack + writeBuffer next frame. */
+  readonly dirty: Set<number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -343,24 +654,110 @@ function buildGroup(
 // ---------------------------------------------------------------------------
 
 export interface HeapDrawSpec {
-  readonly geo: HeapGeometry;
-  readonly modelTrafo: aval<Trafo3d> | Trafo3d;
-  readonly color: aval<V4f> | V4f;
-  /** Group key — selects which pipeline-state group this draw joins. */
-  readonly groupKey: string;
+  /**
+   * The shader. Two draws with the same effect (matched by `effect.id`
+   * or by reference for raw-WGSL pairs) share a pipeline + bucket.
+   */
+  readonly effect: HeapGroupShader;
+  /**
+   * Per-name inputs covering both vertex attributes (e.g. `Positions`,
+   * `Normals`) and uniforms (e.g. `ModelTrafo`, `Color`, `ViewProjTrafo`)
+   * — whatever the effect's schema declares. The runtime walks the
+   * schema and pulls each by name.
+   *
+   * Sharing happens via aval identity: the same `cval` passed to
+   * many draws → one arena allocation + one upload per change.
+   * Same applies to attributes: instanced draws sharing a `Float32Array`
+   * for `Positions` share one arena allocation. Wrap raw values in
+   * `AVal.constant(...)` if you don't need to update them.
+   */
+  readonly inputs: { readonly [name: string]: aval<unknown> | unknown };
+  /**
+   * Index buffer for this draw. Indices live in their own `INDEX`-
+   * usage `GPUBuffer` (WebGPU forces this), separate from the arena.
+   */
+  readonly indices: aval<Uint32Array> | Uint32Array;
+  /**
+   * Optional texture set. When present, adds a `texture_2d<f32>` at
+   * binding 4 and a sampler at binding 5; the FS must declare them.
+   * Buckets with different `textures` (by reference) cannot share a
+   * bind group, so a distinct texture set wedges into the bucket key
+   * alongside the effect id.
+   */
+  readonly textures?: HeapTextureSet;
+  /**
+   * Optional pipeline state (rasterizer / depth / blend). Two specs
+   * sharing the SAME `PipelineState` object share a bucket; distinct
+   * objects get distinct buckets even if structurally equal — same
+   * identity convention as `effect`, `indices`, `textures`. The
+   * underlying avals are forced at addDraw time and baked into the
+   * pipeline; later marks on those avals are ignored. To change
+   * pipeline state, swap the `PipelineState` object (which forces
+   * a fresh bucket).
+   *
+   * Omitted ⇒ defaults: triangle-list / cull back / ccw / depth-less
+   * with depth write enabled. Matches the demo's existing visuals.
+   */
+  readonly pipelineState?: PipelineState;
+  /**
+   * Optional per-instance values (shape 2 — "I know this is one mesh
+   * with N transforms"). When present, `count` is the instance count
+   * and each entry of `values` overrides the same-named uniform from
+   * `inputs`: it's read once per instance via `instance_index` rather
+   * than once per draw. The pool stores it as a packed array
+   * (count × stride bytes) keyed on aval identity.
+   *
+   * The keys of `values` MUST be uniforms declared by the effect's
+   * schema; they shadow any same-named entry in `inputs`.
+   *
+   * Each instanced spec gets its own bucket (single slot). Non-
+   * instanced draws are unaffected.
+   */
+  readonly instances?: {
+    readonly count: aval<number> | number;
+    readonly values: { readonly [name: string]: aval<unknown> | unknown };
+  };
 }
 
 export interface HeapSceneStats {
   readonly groups: number;
-  readonly totalDraws: number;
-  readonly globalsBytes: number;
+  totalDraws: number;
   drawBytes: number;
-  readonly geometryBytes: number;
+  geometryBytes: number;
 }
 
 export interface HeapScene {
-  /** Render one frame against the given globals. */
-  frame(viewProj: Trafo3d, lightLocation: V3d): void;
+  /**
+   * Convenience: open a command encoder + render pass against
+   * `framebuffer`, run `update` + `encodeIntoPass`, end pass, submit.
+   * For hybrid composition (heap + legacy in one pass), use
+   * `update` + `encodeIntoPass` directly against a caller-managed
+   * `GPURenderPassEncoder` instead.
+   */
+  frame(framebuffer: import("../core/index.js").IFramebuffer, token: AdaptiveToken): void;
+  /**
+   * Pull pending aset deltas, drain pool / per-bucket dirty, and
+   * upload everything CPU-side that the next `encodeIntoPass` will
+   * read on the GPU. Idempotent within a frame; safe to call twice.
+   */
+  update(token: AdaptiveToken): void;
+  /**
+   * Encode all live bucket draws into an existing render pass. Caller
+   * owns `beginRenderPass` / `end` / `submit`. This is the building
+   * block for hybrid: a caller can interleave (in batches, never per-
+   * draw) heap encoding with legacy encoding into the same pass.
+   *
+   * Must be preceded by `update(token)` in the same frame; otherwise
+   * GPU state may lag behind CPU-side aval marks.
+   */
+  encodeIntoPass(passEnc: GPURenderPassEncoder): void;
+  /**
+   * Add a draw at runtime. Returns a stable slot handle that can be
+   * passed to `removeDraw` later. Allocators auto-grow as needed.
+   */
+  addDraw(spec: HeapDrawSpec): number;
+  /** Remove a draw previously returned by `addDraw` (or the initial-array index). */
+  removeDraw(slot: number): void;
   readonly stats: HeapSceneStats;
   dispose(): void;
 }
@@ -376,135 +773,861 @@ export interface HeapTextureSet {
   readonly sampler: GPUSampler;
 }
 
-export interface BuildHeapSceneOptions {
-  /** WGSL fragment-stage source per group key — must declare `fs(in: VsOut) -> @location(0) vec4<f32>`. */
-  readonly fragmentShaders: ReadonlyMap<string, string>;
-  /**
-   * Per-group texture set. When present, the group's bind-group
-   * layout adds a `texture_2d<f32>` at binding 4 and a sampler at
-   * binding 5. The user's FS WGSL must declare them.
-   */
-  readonly texturesByGroupKey?: ReadonlyMap<string, HeapTextureSet>;
+/**
+ * The shader contribution for a single group. Either a wombat.shader
+ * `Effect` (composed VS+FS via `effect(vsMarker, fsMarker)`), or a
+ * raw `{ vs, fs }` WGSL pair as an escape hatch for shaders that
+ * step outside the DSL surface (e.g. ones that bind extra
+ * texture-set resources at bindings 4/5).
+ *
+ * The strings (whether DSL-emitted or raw) must declare entry points
+ * named `vs` and `fs` matching the heap-scene prelude — see the
+ * module-level docs above.
+ */
+export type HeapGroupShader = Effect | { readonly vs: string; readonly fs: string };
+
+function isRawShaderPair(s: HeapGroupShader): s is { readonly vs: string; readonly fs: string } {
+  return typeof (s as { vs?: unknown }).vs === "string"
+      && typeof (s as { fs?: unknown }).fs === "string";
 }
 
 /**
- * Build a multi-group heap-backed scene renderer. Buckets `draws` by
- * `groupKey`, builds one pipeline + bind group + heap per bucket,
- * subscribes per-RO avals so dirty marks propagate to per-slot
+ * Build a heap-backed scene renderer from a flat list of draws.
+ *
+ * Bucketing is automatic: draws with the same effect (matched by
+ * `effect.id` for DSL effects, by reference for raw-WGSL pairs) and
+ * the same texture set (by reference) share a pipeline + bind group.
+ * Per-RO avals are subscribed so dirty marks propagate to per-slot
  * `writeBuffer`s on the next `frame()`.
  */
+export interface BuildHeapSceneOptions {
+  /**
+   * Maps each fragment-output name an effect emits to its framebuffer
+   * attachment location. Outputs not in the map get DCE'd by the
+   * `linkFragmentOutputs` pass — and any uniforms that only fed those
+   * outputs disappear from the schema too.
+   *
+   * Example: `{ locations: new Map([["outColor", 0]]) }` for a single-
+   * color framebuffer with effects that write to `outColor`.
+   *
+   * Omitted ⇒ no pruning; every output the effect declares survives.
+   */
+  readonly fragmentOutputLayout?: FragmentOutputLayout;
+}
+
 export function buildHeapScene(
   device: GPUDevice,
-  attach: CanvasAttachment,
-  draws: readonly HeapDrawSpec[],
-  opts: BuildHeapSceneOptions,
+  sig: import("../core/framebufferSignature.js").FramebufferSignature,
+  initialDraws: readonly HeapDrawSpec[] | aset<HeapDrawSpec>,
+  opts: BuildHeapSceneOptions = {},
 ): HeapScene {
-  const modelTrafos: aval<Trafo3d>[] = draws.map(d => asAval(d.modelTrafo));
-  const colors:      aval<V4f>[]    = draws.map(d => asAval(d.color));
-
-  // Bucket by group key.
-  const buckets = new Map<string, { spec: HeapDrawSpec; sourceIndex: number }[]>();
-  for (let i = 0; i < draws.length; i++) {
-    const d = draws[i]!;
-    let bucket = buckets.get(d.groupKey);
-    if (bucket === undefined) {
-      bucket = [];
-      buckets.set(d.groupKey, bucket);
-    }
-    bucket.push({ spec: d, sourceIndex: i });
+  const colorAttachmentName = sig.colorNames[0];
+  if (colorAttachmentName === undefined) {
+    throw new Error("buildHeapScene: framebuffer signature has no color attachment");
   }
-  const groups: Group[] = [];
-  for (const [key, members] of buckets) {
-    const fs = opts.fragmentShaders.get(key);
-    if (fs === undefined) {
-      throw new Error(`buildHeapScene: no fragment shader supplied for groupKey '${key}'`);
+  const colorFormat = sig.colors.tryFind(colorAttachmentName)!;
+  const depthFormat = sig.depthStencil?.format;
+
+  // ─── Global arena (uniform/attribute data + index buffer) ────────
+  // Initial capacities are just hints; both buffers pow2-grow on
+  // demand. Skip per-draw enumeration since aval-keyed sharing makes
+  // the actual allocated size hard to predict (10K instanced draws
+  // sharing the same Positions array → 1 alloc, not 10K).
+  const arena = buildArenaState(device, 64 * 1024, 16 * 1024, "heapScene");
+
+  // ─── Per-draw global bookkeeping (sparse, indexed by drawId) ──────
+  const drawIdToBucket:    (Bucket | undefined)[] = [];
+  const drawIdToLocalSlot: (number | undefined)[] = [];
+  /** Per-draw index aval — for `indexPool.release` on removeDraw. */
+  const drawIdToIndexAval: (aval<Uint32Array> | undefined)[] = [];
+  let nextDrawId = 0;
+
+  /** Unwrap an aval to its inner value, or pass through a plain value. */
+  function readPlain<T>(v: aval<T> | T): T {
+    if (typeof v === "object" && v !== null && typeof (v as { force?: unknown }).force === "function") {
+      return (v as aval<T>).force();
     }
-    const textureSet = opts.texturesByGroupKey?.get(key);
-    groups.push(buildGroup(device, attach, key, fs, textureSet, members, modelTrafos, colors));
+    return v as T;
   }
 
-  const stats: HeapSceneStats = {
-    groups: groups.length,
-    totalDraws: draws.length,
-    globalsBytes: GLOBALS_BYTES * groups.length,
-    drawBytes: 0,
-    geometryBytes: groups.reduce((acc, g) => acc + g.packed.bytes, 0),
+  /**
+   * Pick a pool placement (dataBytes/typeId/length/pack) for a
+   * schema-driven DrawHeader field given the JS value. Drives both
+   * fixed-size uniform reads (mat4, vec4, …) and variable-size
+   * attribute arrays — the latter measured from the value itself.
+   */
+  function poolPlacementFor(
+    f: { kind: "uniform-ref" | "attribute-ref"; uniformWgslType?: string; attributeWgslType?: string },
+    value: unknown,
+  ): { dataBytes: number; typeId: number; length: number; pack: (val: unknown, dst: Float32Array, off: number) => void } {
+    if (f.kind === "uniform-ref") {
+      const p = packerForWgslType(f.uniformWgslType ?? "");
+      return { dataBytes: p.dataBytes, typeId: p.typeId, length: 1, pack: p.pack };
+    }
+    // attribute-ref: variable-size array; we copy verbatim into the
+    // arena. The current encoding is V3F_TIGHT (3 f32s per element).
+    const arr = value as Float32Array;
+    const eltBytes =
+      f.attributeWgslType === "vec3<f32>" ? 12 :
+      f.attributeWgslType === "vec4<f32>" ? 12 /* v3 stored, v4 assembled in shader */ :
+      f.attributeWgslType === "vec2<f32>" ? 8  :
+      4;
+    const length = arr.byteLength / eltBytes;
+    return {
+      dataBytes: arr.byteLength,
+      typeId: ENC_V3F_TIGHT,
+      length,
+      pack: (val, dst, off) => { dst.set(val as Float32Array, off); },
+    };
+  }
+
+  /**
+   * Pool placement for a `BufferView`-backed attribute. The pool key
+   * is the BufferView's `aval<IBuffer>` (so `buffer`-identity drives
+   * sharing). The packer reads the `IBuffer`'s host data — native
+   * GPUBuffer-backed views are rejected (they belong on the legacy
+   * fallback path; see `isHeapEligible`).
+   *
+   * Validates: `stride === elementType.byteSize` (tight) and
+   * `offset === 0`. Both can be relaxed once the gather path
+   * supports strided/sub-range copies.
+   */
+  function bufferViewPlacement(
+    f: { attributeWgslType?: string },
+    bv: BufferView,
+  ): { dataBytes: number; typeId: number; length: number; pack: (val: unknown, dst: Float32Array, off: number) => void } {
+    const srcEltBytes = bv.elementType.byteSize;
+    const offset = bv.offset ?? 0;
+    if (offset !== 0) {
+      throw new Error(`heapScene: BufferView offset ${offset} > 0 not yet supported`);
+    }
+
+    // In-arena element bytes: the storage layout the shader will read
+    // from. vec4 is always 16 (read via `heapV4f[idx]`), vec3 is 12
+    // (read as 3 f32s), vec2 is 8, scalar is 4. V3f source for a vec4
+    // schema is expanded to V4f at upload with .w = 1.0 (Positions
+    // convention) — the shader reads heapV4f[idx] either way.
+    const outEltBytes =
+      f.attributeWgslType === "vec3<f32>" ? 12 :
+      f.attributeWgslType === "vec4<f32>" ? 16 :
+      f.attributeWgslType === "vec2<f32>" ? 8  :
+      4;
+    const allowedSrc: number[] =
+      f.attributeWgslType === "vec4<f32>"
+        ? [12, 16]   // V3f-with-w=1 expansion OR genuine V4f source
+        : [outEltBytes];
+    if (!allowedSrc.includes(srcEltBytes)) {
+      throw new Error(
+        `heapScene: BufferView elementType byteSize ${srcEltBytes} doesn't match ` +
+        `schema attribute ${f.attributeWgslType ?? "?"} (expected ${allowedSrc.join(" or ")})`,
+      );
+    }
+
+    // Stride convention:
+    //   stride == srcEltBytes (tight per-vertex)     → length = byteLength / srcEltBytes
+    //   stride == 0 OR singleValue !== undefined     → broadcast, length = 1
+    //   anything else (interleaved)                  → unsupported
+    // The shader uses cyclic addressing (`vid % length`), so a
+    // length-1 broadcast just maps every vertex to element 0.
+    const stride = bv.stride ?? srcEltBytes;
+    const isBroadcast = bv.singleValue !== undefined || stride === 0;
+    if (!isBroadcast && stride !== srcEltBytes) {
+      throw new Error(
+        `heapScene: BufferView stride ${stride} not tight (${srcEltBytes}) and not a broadcast`,
+      );
+    }
+
+    const ib = bv.buffer.force(/* allow-force */);
+    if (ib.kind !== "host") {
+      throw new Error(
+        `heapScene: BufferView wraps a native GPUBuffer (kind=${ib.kind}); ` +
+        `route this RO via the legacy path (see isHeapEligible).`,
+      );
+    }
+    // Store source-as-is; the alloc header's stride field tells the VS
+    // how many floats per element. No host-side expansion — the VS
+    // decode for vec4 uses `select` to fill `.w = 1.0` when the source
+    // is V3-tight.
+    const length = isBroadcast ? 1 : ib.sizeBytes / srcEltBytes;
+    const dataBytes = srcEltBytes * length;
+    void outEltBytes; // (not used: storage matches source exactly)
+    return {
+      dataBytes,
+      typeId: ENC_V3F_TIGHT,
+      length,
+      pack: (val, dst, off) => {
+        const ibuf = val as IBuffer;
+        if (ibuf.kind !== "host") {
+          throw new Error("heapScene: BufferView aval flipped to native GPUBuffer; not supported in heap path");
+        }
+        const src = asFloat32(ibuf.data);
+        const limitFloats = dataBytes / 4;
+        dst.set(src.subarray(0, limitFloats), off);
+      },
+    };
+  }
+
+  /**
+   * Pool placement for a per-instance uniform: the value is an array
+   * (length = `instanceCount`) of WGSL-typed elements packed tightly.
+   * The shader reads element `iidx` via `instanceLoadExpr`.
+   */
+  function perInstancePlacementFor(
+    f: { uniformWgslType?: string },
+    value: unknown,
+    instanceCount: number,
+  ): { dataBytes: number; typeId: number; length: number; pack: (val: unknown, dst: Float32Array, off: number) => void } {
+    const elt = packerForWgslType(f.uniformWgslType ?? "");
+    const dataBytes = elt.dataBytes * instanceCount;
+    const stride = elt.dataBytes / 4;
+    return {
+      dataBytes,
+      typeId: 0,
+      length: instanceCount,
+      pack: (val, dst, off) => {
+        const arr = val as readonly unknown[];
+        if (arr.length < instanceCount) {
+          throw new Error(
+            `heapScene: per-instance value has length ${arr.length} < instanceCount ${instanceCount}`,
+          );
+        }
+        for (let i = 0; i < instanceCount; i++) elt.pack(arr[i], dst, off + i * stride);
+      },
+    };
+  }
+
+  // ─── Pools — aval-keyed refcounted allocations ────────────────────
+  const pool = new UniformPool();
+  const indexPool = new IndexPool();
+
+  // ─── Adaptive routing: aval marks → repack the pool entry ─────────
+  // With pool-managed per-draw uniforms, value changes don't touch
+  // any DrawHeader (refs stay constant) — only the arena allocation's
+  // data needs re-uploading. inputChanged(o) routes to allocDirty
+  // when `o` is a known pool aval; the frame loop drains it.
+  const allocDirty = new Set<aval<unknown>>();
+  /**
+   * Per-draw bucket dirty (rare in steady state — only fires when
+   * something forces a header rewrite, e.g. a drawHeap GrowBuffer
+   * resize remarks every live local slot). Value-only changes go
+   * through `allocDirty` instead.
+   */
+  // (Bucket.dirty is on each bucket; this comment is a placeholder.)
+
+  class HeapSceneObj extends AdaptiveObject {
+    override inputChanged(_t: unknown, o: IAdaptiveObject): void {
+      // Pool avals are stored as `aval<unknown>`; the IAdaptiveObject
+      // identity matches.
+      if (pool.has(o as unknown as aval<unknown>)) {
+        allocDirty.add(o as unknown as aval<unknown>);
+      }
+    }
+  }
+  const sceneObj = new HeapSceneObj();
+
+  // ─── BGL + pipeline-layout cache (schema-driven) ──────────────────
+  //
+  // Bindings 0–3 are the four heap data views; 4..N are textures
+  // (one per surviving schema entry); N+1..M are samplers. Different
+  // (textureCount, samplerCount) pairs need different layouts; we
+  // build them lazily and cache.
+  interface BglEntry { bgl: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout }
+  const bglCache = new Map<string, BglEntry>();
+  function getBgl(layout: BucketLayout): BglEntry {
+    const key = `t${layout.textureBindings.length}|s${layout.samplerBindings.length}`;
+    let e = bglCache.get(key);
+    if (e !== undefined) return e;
+    // Heap data buffers are read by both stages: FS uniform-via-varying
+    // threading reads `heapF32` / `heapV4f` to decode uniforms inside
+    // the fragment shader. Visibility = VERTEX | FRAGMENT for all four.
+    const heapVis = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+    const entries: GPUBindGroupLayoutEntry[] = [
+      { binding: 0, visibility: heapVis, buffer: { type: "read-only-storage" } },
+      { binding: 1, visibility: heapVis, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: heapVis, buffer: { type: "read-only-storage" } },
+      { binding: 3, visibility: heapVis, buffer: { type: "read-only-storage" } },
+    ];
+    for (const t of layout.textureBindings) {
+      entries.push({
+        binding: t.binding, visibility: GPUShaderStage.FRAGMENT,
+        texture: { sampleType: "float" },
+      });
+    }
+    for (const s of layout.samplerBindings) {
+      entries.push({
+        binding: s.binding, visibility: GPUShaderStage.FRAGMENT,
+        sampler: { type: "filtering" },
+      });
+    }
+    const bgl = device.createBindGroupLayout({ label: `heapScene/bgl/${key}`, entries });
+    const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+    e = { bgl, pipelineLayout };
+    bglCache.set(key, e);
+    return e;
+  }
+
+  // ─── Buckets ──────────────────────────────────────────────────────
+  const buckets: Bucket[] = [];
+  const bucketByKey = new Map<string, Bucket>();
+
+  // ─── id-of helpers ────────────────────────────────────────────────
+  const rawIds = new WeakMap<object, string>();
+  let rawCounter = 0;
+  const idOf = (s: HeapGroupShader): string => {
+    if (isRawShaderPair(s)) {
+      let id = rawIds.get(s as object);
+      if (id === undefined) { id = `raw#${rawCounter++}`; rawIds.set(s as object, id); }
+      return id;
+    }
+    return `effect#${s.id}`;
+  };
+  const textureIds = new WeakMap<HeapTextureSet, string>();
+  let texCounter = 0;
+  const texIdOf = (t: HeapTextureSet | undefined): string => {
+    if (t === undefined) return "tex#none";
+    let id = textureIds.get(t);
+    if (id === undefined) { id = `tex#${texCounter++}`; textureIds.set(t, id); }
+    return id;
+  };
+  const psIds = new WeakMap<PipelineState, string>();
+  let psCounter = 0;
+  const psIdOf = (ps: PipelineState | undefined): string => {
+    if (ps === undefined) return "ps#default";
+    let id = psIds.get(ps);
+    if (id === undefined) { id = `ps#${psCounter++}`; psIds.set(ps, id); }
+    return id;
   };
 
-  function frame(viewProj: Trafo3d, lightLocation: V3d): void {
-    const fb = (attach.framebuffer as aval<import("../core/index.js").IFramebuffer>).force(/* allow-force */);
-    const colorAttachmentName = attach.signature.colorNames[0]!;
-    const colorView = fb.colors.tryFind(colorAttachmentName)!;
-    const depthFormat = attach.signature.depthStencil?.format;
-    const depthView = fb.depthStencil;
-
-    let totalDirtyBytes = 0;
-
-    const enc = device.createCommandEncoder({ label: "heapScene: encoder" });
-    let firstPass = true;
-    for (const g of groups) {
-      packGlobals(viewProj, lightLocation, g.globalsStaging);
-      device.queue.writeBuffer(g.globals, 0, g.globalsStaging.buffer, g.globalsStaging.byteOffset, GLOBALS_BYTES);
-
-      if (g.dirty.size > 0) {
-        for (const i of g.dirty) {
-          packDrawHeader(
-            g.trafos[i]!.force(/* allow-force */),
-            g.colors[i]!.force(/* allow-force */),
-            g.packed.entries[i]!.vertexBase, g.drawStaging, i,
-          );
-          const byteOff = i * DRAW_HEADER_BYTES;
-          device.queue.writeBuffer(
-            g.drawHeap, byteOff,
-            g.drawStaging.buffer, g.drawStaging.byteOffset + byteOff,
-            DRAW_HEADER_BYTES,
-          );
-          totalDirtyBytes += DRAW_HEADER_BYTES;
-        }
-        g.dirty.clear();
-      }
-
-      const pass = enc.beginRenderPass({
-        colorAttachments: [{
-          view: colorView,
-          clearValue: { r: 0.07, g: 0.07, b: 0.08, a: 1.0 },
-          loadOp: firstPass ? "clear" : "load",
-          storeOp: "store",
-        }],
-        ...(depthView !== undefined && depthFormat !== undefined ? {
-          depthStencilAttachment: {
-            view: depthView,
-            depthClearValue: 1.0,
-            depthLoadOp: firstPass ? "clear" : "load",
-            depthStoreOp: "store",
-          } satisfies GPURenderPassDepthStencilAttachment,
-        } : {}),
-      });
-      pass.setPipeline(g.pipeline);
-      pass.setBindGroup(0, g.bindGroup);
-      pass.setIndexBuffer(g.packed.indexBuf, "uint32");
-      for (let i = 0; i < g.packed.entries.length; i++) {
-        const e = g.packed.entries[i]!;
-        pass.drawIndexed(e.indexCount, 1, e.firstIndex, 0, i);
-      }
-      pass.end();
-      firstPass = false;
+  /** Resolved (forced) snapshot of the user's PipelineState. */
+  interface ResolvedPipelineState {
+    readonly topology:  GPUPrimitiveTopology;
+    readonly cullMode:  GPUCullMode;
+    readonly frontFace: GPUFrontFace;
+    readonly depth?: { readonly write: boolean; readonly compare: GPUCompareFunction };
+  }
+  function resolvePipelineState(ps: PipelineState | undefined): ResolvedPipelineState {
+    if (ps === undefined) {
+      return {
+        topology: "triangle-list", cullMode: "back", frontFace: "ccw",
+        depth: { write: true, compare: "less" },
+      };
     }
+    const r = ps.rasterizer;
+    const out: ResolvedPipelineState = {
+      topology:  r.topology.force(/* allow-force */),
+      cullMode:  r.cullMode.force(/* allow-force */),
+      frontFace: r.frontFace.force(/* allow-force */),
+      ...(ps.depth !== undefined ? {
+        depth: {
+          write:   ps.depth.write.force(/* allow-force */),
+          compare: ps.depth.compare.force(/* allow-force */),
+        },
+      } : {}),
+    };
+    return out;
+  }
 
+  // ─── Per-bucket bind-group construction ───────────────────────────
+  // The bind-group LAYOUT (binding types) is shared across all
+  // pipelines via noTexBgl/texBgl; the bind-group itself binds this
+  // bucket's drawHeap (binding 1) + its globals UBO (binding 0) +
+  // the global arena's heapF32 view (binding 2) + textures if any.
+  function buildBucketBindGroup(bucket: Bucket): GPUBindGroup {
+    // heapU32 / heapF32 / heapV4f are different typed views of the
+    // SAME global arena GPUBuffer (emscripten-style aliasing). The
+    // WGSL prelude declares one binding per view; the shader picks
+    // whichever matches its read.
+    const entries: GPUBindGroupEntry[] = [
+      { binding: 0, resource: { buffer: arena.attrs.buffer } },          // heapU32
+      { binding: 1, resource: { buffer: bucket.drawHeap.buffer } },      // headersU32
+      { binding: 2, resource: { buffer: arena.attrs.buffer } },          // heapF32
+      { binding: 3, resource: { buffer: arena.attrs.buffer } },          // heapV4f
+    ];
+    // Schema-driven texture + sampler entries. v1 user surface still
+    // accepts a single (texture, sampler) pair via HeapTextureSet —
+    // we map it onto the schema's discovered names by position. If
+    // the schema has more than one of either, the user must extend
+    // the spec (a future, multi-binding API).
+    const texLayout = bucket.layout.textureBindings;
+    const smpLayout = bucket.layout.samplerBindings;
+    if (texLayout.length > 0 || smpLayout.length > 0) {
+      if (bucket.textures === undefined) {
+        throw new Error(
+          `heapScene: bucket needs ${texLayout.length} texture(s) + ${smpLayout.length} sampler(s) ` +
+          `but spec.textures is undefined`,
+        );
+      }
+      if (texLayout.length > 1 || smpLayout.length > 1) {
+        throw new Error(
+          `heapScene: only single texture/sampler per bucket supported in v1 ` +
+          `(schema declares ${texLayout.length}/${smpLayout.length})`,
+        );
+      }
+      if (texLayout.length === 1) {
+        entries.push({
+          binding: texLayout[0]!.binding,
+          resource: bucket.textures.textureView ?? bucket.textures.texture.createView(),
+        });
+      }
+      if (smpLayout.length === 1) {
+        entries.push({
+          binding: smpLayout[0]!.binding,
+          resource: bucket.textures.sampler,
+        });
+      }
+    }
+    return device.createBindGroup({
+      label: `heapScene/${bucket.label}/bg`,
+      layout: getBgl(bucket.layout).bgl,
+      entries,
+    });
+  }
+
+  // When the global arena reallocates, every bucket's bind group
+  // needs rebuilding (its binding 2 buffer reference is stale).
+  arena.attrs.onResize(() => {
+    for (const b of buckets) b.bindGroup = buildBucketBindGroup(b);
+  });
+
+  // Default schema for the raw-WGSL escape hatch — covers what the
+  // demo's textured shader expects (positions, normals attribs +
+  // model/viewproj/light/color uniforms). Raw shaders that need a
+  // different binding shape have to surface a schema explicitly
+  // (future extension).
+  //
+  // The textured raw shader keeps its own hardcoded `checker` /
+  // `checkerSmp` decls at binding 4/5; we still surface them here so
+  // the bind-group layout / bind-group construction allocates slots.
+  const RAW_DEFAULT_SCHEMA: HeapEffectSchema = {
+    attributes: [
+      { name: "Positions", wgslType: "vec4<f32>", byteSize: 16, location: 0 },
+      { name: "Normals",   wgslType: "vec3<f32>", byteSize: 12, location: 1 },
+    ],
+    uniforms: [
+      { name: "ModelTrafo",    wgslType: "mat4x4<f32>", byteSize: 64 },
+      { name: "Color",         wgslType: "vec4<f32>",   byteSize: 16 },
+      { name: "ViewProjTrafo", wgslType: "mat4x4<f32>", byteSize: 64 },
+      { name: "LightLocation", wgslType: "vec3<f32>",   byteSize: 12 },
+    ],
+    varyings: [
+      { name: "clipPos",  wgslType: "vec4<f32>", builtin: "position" },
+      { name: "worldPos", wgslType: "vec3<f32>", location: 0 },
+      { name: "normal",   wgslType: "vec3<f32>", location: 1 },
+      { name: "color",    wgslType: "vec4<f32>", location: 2 },
+      { name: "lightLoc", wgslType: "vec3<f32>", location: 3 },
+    ],
+    fragmentOutputs: [{ name: "outColor", location: 0, wgslType: "vec4<f32>" }],
+    textures: [],
+    samplers: [],
+  };
+  /** Variant raw schema for the textured demo shader — adds the texture+sampler bindings. */
+  const RAW_TEXTURED_SCHEMA: HeapEffectSchema = {
+    ...RAW_DEFAULT_SCHEMA,
+    textures: [{ name: "checker", wgslType: "texture_2d<f32>" }],
+    samplers: [{ name: "checkerSmp", wgslType: "sampler" }],
+  };
+
+  // ─── findOrCreateBucket ───────────────────────────────────────────
+  let instancedBucketCounter = 0;
+  function findOrCreateBucket(
+    effect: HeapGroupShader,
+    textures: HeapTextureSet | undefined,
+    pipelineState: PipelineState | undefined,
+    instanceOpts: { isInstanced: boolean; perInstanceUniforms: ReadonlySet<string> },
+  ): Bucket {
+    const psKey = psIdOf(pipelineState);
+    const bk = instanceOpts.isInstanced
+      ? `${idOf(effect)}|${texIdOf(textures)}|${psKey}|inst#${instancedBucketCounter++}`
+      : `${idOf(effect)}|${texIdOf(textures)}|${psKey}`;
+    const existing = bucketByKey.get(bk);
+    if (existing !== undefined) return existing;
+    const ps = resolvePipelineState(pipelineState);
+
+    const layoutOpts = {
+      isInstanced: instanceOpts.isInstanced,
+      perInstanceUniforms: instanceOpts.perInstanceUniforms,
+    };
+    let layout: BucketLayout;
+    let vs: string, fs: string;
+    let preludeWgsl: string;
+    if (isRawShaderPair(effect)) {
+      // Pick the schema variant that matches the user's textures arg:
+      // textured raw shader uses the schema with checker/checkerSmp
+      // bindings; the plain default has no texture/sampler entries.
+      const rawSchema = textures !== undefined ? RAW_TEXTURED_SCHEMA : RAW_DEFAULT_SCHEMA;
+      layout = buildBucketLayout(rawSchema, textures !== undefined, layoutOpts);
+      // Strip any texture/sampler decls the raw shader may have hand-
+      // written — the prelude is now the single source of truth for
+      // those (matching where the BGL allocates slots). Raw shaders
+      // continue to reference texture/sampler identifiers by name in
+      // the body; those references survive.
+      vs = stripTextureSamplerDecls(effect.vs);
+      fs = stripTextureSamplerDecls(effect.fs);
+      preludeWgsl = layout.preludeWgsl;
+    } else {
+      const compiled = compileHeapEffect(effect, opts.fragmentOutputLayout);
+      layout = buildBucketLayout(compiled.schema, textures !== undefined, layoutOpts);
+      const rewritten = rewriteForLayout(compiled.rawVs, compiled.rawFs, layout);
+      vs = rewritten.vs; fs = rewritten.fs;
+      // Augmented prelude: VsOut grew flat-interpolated `_h_<name>Ref`
+      // varyings for every uniform the FS reads, so the FS preamble
+      // can pull them via `in._h_<name>Ref` instead of doing its own
+      // `headersU32` indirection per fragment.
+      preludeWgsl = rewritten.preludeWgsl;
+    }
+    const { pipelineLayout } = getBgl(layout);
+
+    const module = device.createShaderModule({
+      code: preludeWgsl + vs + fs,
+      label: `heapScene/${bk}/shader`,
+    });
+    const pipeline = device.createRenderPipeline({
+      label: `heapScene/${bk}/pipeline`,
+      layout: pipelineLayout,
+      vertex:   { module, entryPoint: "vs", buffers: [] },
+      fragment: { module, entryPoint: "fs", targets: [{ format: colorFormat }] },
+      primitive: { topology: ps.topology, cullMode: ps.cullMode, frontFace: ps.frontFace },
+      ...(depthFormat !== undefined && ps.depth !== undefined
+        ? { depthStencil: { format: depthFormat, depthWriteEnabled: ps.depth.write, depthCompare: ps.depth.compare } }
+        : depthFormat !== undefined
+          ? { depthStencil: { format: depthFormat, depthWriteEnabled: false, depthCompare: "always" as GPUCompareFunction } }
+          : {}),
+    });
+
+    // Per-bucket DrawHeader buffer (every uniform / attribute is a u32
+    // ref into the global arena; the per-bucket buffer just holds the
+    // refs).
+    const drawHeapBuf = new GrowBuffer(
+      device, `heapScene/${bk}/drawHeap`, GPUBufferUsage.STORAGE,
+      Math.max(layout.drawHeaderBytes, 64),
+    );
+    const drawHeap = new DrawHeap(drawHeapBuf, layout.drawHeaderBytes);
+
+    const bucket: Bucket = {
+      label: bk, textures, layout, pipeline,
+      bindGroup: null as unknown as GPUBindGroup,
+      drawHeap,
+      drawHeaderStaging: new Float32Array(drawHeapBuf.capacity / 4),
+      localPosRefs: [], localNorRefs: [],
+      localEntries: [], localToDrawId: [],
+      localPerDrawAvals: [], localPerDrawRefs: [],
+      drawSlots: [], dirty: new Set<number>(),
+    };
+    bucket.bindGroup = buildBucketBindGroup(bucket);
+    drawHeap.onResize(() => {
+      bucket.drawHeaderStaging = new Float32Array(drawHeapBuf.capacity / 4);
+      // GPU-side data was copied by the GrowBuffer's resize, but our
+      // CPU mirror is fresh — mark all live local slots dirty so
+      // their headers get re-packed and re-uploaded next frame.
+      for (const s of bucket.drawSlots) bucket.dirty.add(s);
+      bucket.bindGroup = buildBucketBindGroup(bucket);
+    });
+    buckets.push(bucket);
+    bucketByKey.set(bk, bucket);
+    return bucket;
+  }
+
+  // ─── Per-bucket header writer (refs only, post step 3) ────────────
+  // The DrawHeader is now a flat list of u32 refs into the arena —
+  // values themselves live in arena allocations the pool manages.
+  // This function packs the refs into the bucket's staging mirror;
+  // callers writeBuffer the result to the GPU.
+  function packBucketHeader(
+    bucket: Bucket, localSlot: number,
+    perDrawRefs: ReadonlyMap<string, number>,
+  ): void {
+    const dst = bucket.drawHeaderStaging;
+    const u32 = new Uint32Array(dst.buffer, dst.byteOffset, dst.length);
+    const baseFloat = (localSlot * bucket.layout.drawHeaderBytes) / 4;
+    for (const f of bucket.layout.drawHeaderFields) {
+      const fOff = baseFloat + f.byteOffset / 4;
+      const ref = perDrawRefs.get(f.name);
+      if (ref === undefined) {
+        throw new Error(`heapScene: missing ref for '${f.name}' (kind=${f.kind}) on local slot ${localSlot}`);
+      }
+      u32[fOff] = ref;
+    }
+  }
+
+  // ─── Stats (declared early so addDraw/removeDraw can mutate it) ───
+  const stats: HeapSceneStats = {
+    groups: 0,
+    totalDraws: 0,
+    drawBytes: 0,
+    geometryBytes: 0,
+  };
+  Object.defineProperty(stats, "groups", { get: () => buckets.length, configurable: true });
+
+  // ─── addDraw / removeDraw ─────────────────────────────────────────
+  function addDraw(spec: HeapDrawSpec): number {
+    const drawId = nextDrawId++;
+    const isInstanced = spec.instances !== undefined;
+    const perInstanceUniforms = isInstanced
+      ? new Set(Object.keys(spec.instances!.values))
+      : new Set<string>();
+    const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, {
+      isInstanced, perInstanceUniforms,
+    });
+
+    // Indices live in their own INDEX-usage buffer (WebGPU constraint).
+    // Aval-keyed: 19K instanced clones of the same mesh share one
+    // index allocation + one upload.
+    const indicesAval = asAval(spec.indices) as aval<Uint32Array>;
+    const indicesArr = readPlain(spec.indices) as Uint32Array;
+    const idxAlloc = indexPool.acquire(device, arena.indices, indicesAval, indicesArr);
+
+    const localSlot = bucket.drawHeap.alloc();
+    const instanceCount = isInstanced
+      ? readPlain(spec.instances!.count) as number
+      : 1;
+
+    // Walk the bucket's schema-driven DrawHeader fields. Per-instance
+    // uniforms (instanceOpts.perInstanceUniforms) pull from
+    // `spec.instances.values` and pack into an array allocation;
+    // everything else pulls from `spec.inputs` and packs as a single
+    // value. Both go through the same pool — sharing emerges from
+    // aval identity either way.
+    const perDrawAvals: aval<unknown>[] = [];
+    const perDrawRefs = new Map<string, number>();
+    sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
+      for (const f of bucket.layout.drawHeaderFields) {
+        const isPerInstanceField =
+          f.kind === "uniform-ref" && perInstanceUniforms.has(f.name);
+        const provided = isPerInstanceField
+          ? spec.instances!.values[f.name]
+          : spec.inputs[f.name];
+        if (provided === undefined) {
+          const where = isPerInstanceField ? "spec.instances.values" : "spec.inputs";
+          throw new Error(
+            `heapScene: ${where} missing required entry '${f.name}' ` +
+            `(effect declares ${f.kind === "uniform-ref"
+              ? `uniform ${f.uniformWgslType ?? "unknown"}`
+              : `attribute ${f.attributeWgslType ?? "unknown"}`})`,
+          );
+        }
+
+        // Attribute-ref + BufferView: pivot the pool key onto the
+        // BufferView's `aval<IBuffer>` so identity-based sharing works
+        // naturally across draws (two ROs with the same `buffer` aval
+        // share the arena allocation). The packer extracts host data.
+        let av: aval<unknown>;
+        let value: unknown;
+        let placement: ReturnType<typeof poolPlacementFor>;
+        if (f.kind === "attribute-ref" && !isPerInstanceField && isBufferView(provided)) {
+          const bv = provided;
+          placement = bufferViewPlacement(f, bv);
+          av = bv.buffer as aval<unknown>;
+          value = bv.buffer.getValue(tok);
+        } else {
+          av = asAval(provided as aval<unknown> | unknown);
+          value = av.getValue(tok);
+          placement = isPerInstanceField
+            ? perInstancePlacementFor(f, value, instanceCount)
+            : poolPlacementFor(f, value);
+        }
+        const ref = pool.acquire(
+          device, arena.attrs, av, value,
+          placement.dataBytes, placement.typeId, placement.length, placement.pack,
+        );
+        perDrawRefs.set(f.name, ref);
+        perDrawAvals.push(av);
+      }
+    });
+
+    bucket.localPosRefs[localSlot] = perDrawRefs.get("Positions");
+    bucket.localNorRefs[localSlot] = perDrawRefs.get("Normals");
+    bucket.localEntries[localSlot] = {
+      indexCount: idxAlloc.count, firstIndex: idxAlloc.firstIndex, instanceCount,
+    };
+    bucket.localToDrawId[localSlot] = drawId;
+    bucket.drawSlots.push(localSlot);
+    bucket.localPerDrawAvals[localSlot] = perDrawAvals;
+    bucket.localPerDrawRefs[localSlot]  = perDrawRefs;
+
+    packBucketHeader(bucket, localSlot, perDrawRefs);
+    const byteOff = localSlot * bucket.layout.drawHeaderBytes;
+    device.queue.writeBuffer(
+      bucket.drawHeap.buffer, byteOff,
+      bucket.drawHeaderStaging.buffer, bucket.drawHeaderStaging.byteOffset + byteOff,
+      bucket.layout.drawHeaderBytes,
+    );
+
+    drawIdToBucket[drawId]    = bucket;
+    drawIdToLocalSlot[drawId] = localSlot;
+    drawIdToIndexAval[drawId] = indicesAval;
+    stats.totalDraws++;
+    stats.geometryBytes = arenaBytes(arena);
+    return drawId;
+  }
+
+  function removeDraw(drawId: number): void {
+    const bucket    = drawIdToBucket[drawId];
+    const localSlot = drawIdToLocalSlot[drawId];
+    if (bucket === undefined || localSlot === undefined) return;
+
+    // Release pool entries — refcount drops; if zero, allocation freed.
+    const avals = bucket.localPerDrawAvals[localSlot];
+    if (avals !== undefined) for (const av of avals) pool.release(arena.attrs, av);
+    const idxAval = drawIdToIndexAval[drawId];
+    if (idxAval !== undefined) indexPool.release(arena.indices, idxAval);
+
+    bucket.localPerDrawAvals[localSlot] = undefined;
+    bucket.localPerDrawRefs[localSlot]  = undefined;
+    bucket.localPosRefs[localSlot]  = undefined;
+    bucket.localNorRefs[localSlot]  = undefined;
+    bucket.localEntries[localSlot]  = undefined;
+    bucket.localToDrawId[localSlot] = undefined;
+    const idx = bucket.drawSlots.indexOf(localSlot);
+    if (idx >= 0) bucket.drawSlots.splice(idx, 1);
+    bucket.dirty.delete(localSlot);
+    bucket.drawHeap.release(localSlot);
+
+    drawIdToBucket[drawId]    = undefined;
+    drawIdToLocalSlot[drawId] = undefined;
+    drawIdToIndexAval[drawId] = undefined;
+
+    stats.totalDraws--;
+    stats.geometryBytes = arenaBytes(arena);
+  }
+
+  // ─── Aset reader (pull-driven on each frame) ──────────────────────
+  let asetReader: IHashSetReader<HeapDrawSpec> | undefined;
+  const specToDrawId = new Map<HeapDrawSpec, number>();
+  function drainAsetWith(tok: AdaptiveToken): void {
+    if (asetReader === undefined) return;
+    const delta = asetReader.getChanges(tok);
+    delta.iter((op: { value: HeapDrawSpec; count: number }) => {
+      if (op.count > 0) {
+        const id = addDraw(op.value);
+        specToDrawId.set(op.value, id);
+      } else {
+        const id = specToDrawId.get(op.value);
+        if (id !== undefined) {
+          removeDraw(id);
+          specToDrawId.delete(op.value);
+        }
+      }
+    });
+  }
+
+  // ─── Initial population ───────────────────────────────────────────
+  if (Array.isArray(initialDraws)) {
+    for (const d of initialDraws as readonly HeapDrawSpec[]) addDraw(d);
+  } else {
+    asetReader = (initialDraws as aset<HeapDrawSpec>).getReader();
+    sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => drainAsetWith(tok));
+  }
+
+  // ─── update / encodeIntoPass / frame / dispose ───────────────────
+  /**
+   * CPU-side data refresh: drain pending aset deltas, repack any
+   * pool-tracked aval that marked since last frame, re-write any
+   * bucket headers that the drawHeap grew under. After this returns,
+   * the GPU state mirrors the current adaptive snapshot — caller is
+   * free to encode draws.
+   */
+  function update(token: AdaptiveToken): void {
+    let totalDirtyBytes = 0;
+    sceneObj.evaluateAlways(token, (tok) => {
+      drainAsetWith(tok);
+
+      // 1. Pool: re-pack any aval whose value changed since last frame.
+      //    One writeBuffer per dirty aval, regardless of how many draws
+      //    reference it — sharing pays off here.
+      if (allocDirty.size > 0) {
+        for (const av of allocDirty) {
+          pool.repack(device, arena.attrs, av, av.getValue(tok));
+          const e = pool.entry(av);
+          if (e !== undefined) totalDirtyBytes += e.dataBytes;
+        }
+        allocDirty.clear();
+      }
+
+      // 2. Per-bucket: (rare) header re-pack — only fires when the
+      //    bucket's drawHeap GrowBuffer reallocated and we need to
+      //    re-write all live slots into the new staging mirror.
+      for (const bucket of buckets) {
+        if (bucket.dirty.size === 0) continue;
+        for (const localSlot of bucket.dirty) {
+          const refs = bucket.localPerDrawRefs[localSlot];
+          if (refs === undefined) continue;
+          packBucketHeader(bucket, localSlot, refs);
+          const byteOff = localSlot * bucket.layout.drawHeaderBytes;
+          device.queue.writeBuffer(
+            bucket.drawHeap.buffer, byteOff,
+            bucket.drawHeaderStaging.buffer, bucket.drawHeaderStaging.byteOffset + byteOff,
+            bucket.layout.drawHeaderBytes,
+          );
+          totalDirtyBytes += bucket.layout.drawHeaderBytes;
+        }
+        bucket.dirty.clear();
+      }
+    });
     stats.drawBytes = totalDirtyBytes;
+  }
+
+  /**
+   * Encode all live bucket draws into an existing render pass. No
+   * begin/end — caller owns the pass. Used by both the convenience
+   * `frame()` below and (eventually) the hybrid render task.
+   */
+  function encodeIntoPass(pass: GPURenderPassEncoder): void {
+    pass.setIndexBuffer(arena.indices.buffer, "uint32");
+    let curBg: GPUBindGroup | null = null;
+    for (const b of buckets) {
+      if (b.bindGroup !== curBg) { pass.setBindGroup(0, b.bindGroup); curBg = b.bindGroup; }
+      pass.setPipeline(b.pipeline);
+      for (const localSlot of b.drawSlots) {
+        const e = b.localEntries[localSlot]!;
+        // Instanced buckets force `drawIdx = 0u` in WGSL (single slot),
+        // so firstInstance must be 0 too — `instance_index` then runs
+        // 0..instanceCount-1 and is read as `iidx`. Non-instanced
+        // buckets keep the firstInstance=slot trick.
+        const firstInstance = b.layout.isInstanced ? 0 : localSlot;
+        pass.drawIndexed(e.indexCount, e.instanceCount, e.firstIndex, 0, firstInstance);
+      }
+    }
+  }
+
+  /**
+   * Convenience: open a command encoder + render pass against
+   * `framebuffer`, drive update + encodeIntoPass, end pass, submit.
+   * For hybrid composition use `update` + `encodeIntoPass` directly.
+   */
+  function frame(
+    framebuffer: import("../core/index.js").IFramebuffer,
+    token: AdaptiveToken,
+  ): void {
+    update(token);
+    const colorView = framebuffer.colors.tryFind(colorAttachmentName!)!;
+    const depthView = framebuffer.depthStencil;
+    const enc = device.createCommandEncoder({ label: "heapScene: encoder" });
+    const pass = enc.beginRenderPass({
+      colorAttachments: [{
+        view: colorView,
+        clearValue: { r: 0.07, g: 0.07, b: 0.08, a: 1.0 },
+        loadOp: "clear", storeOp: "store",
+      }],
+      ...(depthView !== undefined && depthFormat !== undefined ? {
+        depthStencilAttachment: {
+          view: depthView,
+          depthClearValue: 1.0,
+          depthLoadOp: "clear", depthStoreOp: "store",
+        } satisfies GPURenderPassDepthStencilAttachment,
+      } : {}),
+    });
+    encodeIntoPass(pass);
+    pass.end();
     device.queue.submit([enc.finish()]);
   }
 
   function dispose(): void {
-    for (const g of groups) {
-      for (const s of g.subs) s.dispose();
-      g.globals.destroy();
-      g.drawHeap.destroy();
-      g.packed.positionsBuf.destroy();
-      g.packed.normalsBuf.destroy();
-      g.packed.indexBuf.destroy();
+    arena.attrs.destroy();
+    arena.indices.destroy();
+    for (const b of buckets) {
+      b.drawHeap.destroy();
     }
   }
 
-  return { frame, stats, dispose };
+  return { frame, update, encodeIntoPass, addDraw, removeDraw, stats, dispose };
 }

@@ -32,7 +32,7 @@ import { Runtime } from "@aardworx/wombat.rendering.experimental/runtime";
 import { attachCanvas, runFrame } from "@aardworx/wombat.rendering.experimental/window";
 import { surface } from "./effects.js";
 import { buildBox, buildSphere, buildCylinder, type GeometryData } from "./geometry.js";
-import { buildHeapRenderer, type HeapDrawSpec } from "./heap.js";
+import { buildHeapRenderer, type HeapDrawSpec, type HeapInstancedSpec } from "./heap.js";
 
 // `?heap=1` selects the experimental heap-backed render path, which
 // bypasses Runtime/prepareRenderObject and drives WebGPU directly.
@@ -291,11 +291,14 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
 
   function buildDraws(count: number): HeapDrawSpec[] {
     if (count <= 4) {
-      // 4-RO classic layout: slot 0 lambert (live colour), slot 1
-      // flat, slot 2 lambert (live trafo), slot 3 textured. Forces
-      // 3 distinct groups to demonstrate per-group bind layouts.
-      const kindFor = (i: number): "lambert" | "flat" | "textured" =>
-        i === 0 ? "lambert" : i === 1 ? "flat" : i === 2 ? "lambert" : "textured";
+      // 4-RO classic layout — one RO per group kind:
+      //   slot 0 lambert (live colour), slot 1 wave (custom VS),
+      //   slot 2 flat, slot 3 textured.
+      // Each group-key gets its own pipeline; "lambert" round-trips
+      // through compileHeapVertex with the default VS body, "wave"
+      // routes through compileHeapVertex with a sin(x) displacement.
+      const kindFor = (i: number): "lambert" | "flat" | "textured" | "wave" =>
+        i === 0 ? "lambert" : i === 1 ? "wave" : i === 2 ? "flat" : "textured";
       return xPositions.slice(0, count).map((x, i) => ({
         geo: rawGeos[i]!,
         modelTrafo: i === 2 ? cylTrafo : trafoOf(i, x),
@@ -323,7 +326,8 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
             : Trafo3d.scaling(0.5, 0.5, 0.8).mul(Trafo3d.translation(new V3d(x, y, -0.4)));
       // Cycle 3 group kinds so the grid mixes lambert / flat /
       // textured in roughly equal proportions.
-      const kind = (k % 3 === 0 ? "lambert" : k % 3 === 1 ? "flat" : "textured") as const;
+      const kind: "lambert" | "flat" | "textured" =
+        k % 3 === 0 ? "lambert" : k % 3 === 1 ? "flat" : "textured";
       out.push({
         geo,
         modelTrafo: k === 2 && count >= 3 ? cylTrafo : offsetTrafo,
@@ -335,8 +339,36 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   }
 
   if (useHeap) {
-    const draws: HeapDrawSpec[] = buildDraws(ROCount);
-    const renderer = buildHeapRenderer(device, attach, draws);
+    // ?inst=1 → submit ROCount as ONE instanced render-object (shape 2)
+    // instead of N independent ROs. One drawIndexed(_, N, …) call,
+    // ModelTrafo packed as a per-instance array.
+    const useInstanced = new URLSearchParams(location.search).get("inst") === "1";
+    let draws: HeapDrawSpec[];
+    let instanced: HeapInstancedSpec[] | undefined;
+    if (useInstanced) {
+      draws = [];                                              // skip independent draws
+      const side    = Math.ceil(Math.sqrt(ROCount));
+      const spacing = 2.4;
+      const center  = (side - 1) * 0.5;
+      const transforms: Trafo3d[] = [];
+      for (let k = 0; k < ROCount; k++) {
+        const ix = k % side, iy = Math.floor(k / side);
+        const x = (ix - center) * spacing, y = (iy - center) * spacing;
+        transforms.push(
+          Trafo3d.scaling(0.5, 0.5, 0.5).mul(Trafo3d.translation(new V3d(x, y, 0))),
+        );
+      }
+      instanced = [{
+        geo: rawSph,
+        transforms,
+        count: ROCount,
+        color: colors[1]!,
+        kind: "lambert",
+      }];
+    } else {
+      draws = buildDraws(ROCount);
+    }
+    const renderer = buildHeapRenderer(device, attach, draws, instanced);
 
     // Animate camera in a slow orbit around origin so we drive the
     // globals-upload path every frame while the per-draw heap stays
@@ -403,7 +435,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
         setStatus(
           `heap · ${renderer.stats.totalDraws} draws / ${renderer.stats.groups} grp · ${fps} fps ` +
           `· encode ms p50=${p50} p99=${p99} · ` +
-          `globals: ${renderer.stats.globalsBytes} B · per-draw: ${renderer.stats.drawBytes} B · ` +
+          `per-draw: ${renderer.stats.drawBytes} B · ` +
           `geometry: ${geoKb.toFixed(1)} KiB`,
         );
         frames = 0;
@@ -467,10 +499,10 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     depth: 1.0,
   };
   const cmds = AList.ofArray<Command>([
-    { kind: "Clear", output: attach.framebuffer, values: clear },
-    { kind: "Render", output: attach.framebuffer, tree },
+    { kind: "Clear", values: clear },
+    { kind: "Render", tree },
   ]);
-  const task = runtime.compile(cmds);
+  const task = runtime.compile(attach.signature, cmds);
   // Frame-time samples (same shape as heap path). Note the per-RO
   // baseline is dirty-skip via runFrame, so for static scenes only
   // the first frame fires and stats won't tick. To stress-time it
@@ -484,9 +516,10 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     return sorted[Math.min(sampleN - 1, Math.max(0, Math.floor(p * (sampleN - 1))))]!;
   };
   setStatus(`ready — per-RO path, ${ros.length} render objects (append ?heap=1 for heap path)`);
+  const fbAval = attach.framebuffer as aval<import("@aardworx/wombat.rendering.experimental/core").IFramebuffer>;
   runFrame(attach, (token) => {
     const t0 = performance.now();
-    task.run(token);
+    task.run(fbAval.getValue(token), token);
     const dt = performance.now() - t0;
     samples[sampleI] = dt;
     sampleI = (sampleI + 1) % samples.length;
