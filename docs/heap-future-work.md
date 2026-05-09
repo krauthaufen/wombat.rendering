@@ -243,6 +243,75 @@ This is a small focused change — ~50 LOC per pool plus a shared
 hash utility. Pairs naturally with the AtlasPool aval-reactivity
 work (item 0 of textures plan, also pending).
 
+## 5c. memoMap — pure-function dedup at the aval layer
+
+(Lives in `wombat.adaptive`, not the rendering package — but in
+the same architectural thread as §5b. Listed here because the
+heap path is the loudest victim of the identity gotcha it fixes.)
+
+§5b dedupes constant avals by value. The remaining identity
+gotcha is **reactive avals derived via `.map(f)`** where `f` is
+pure but called fresh per call site:
+
+```ts
+// Per RO:
+const vp = viewProj.map(trafoToM44f);  // fresh derived aval each call
+makeRO({ uniforms: { ViewProj: vp }, ... });
+```
+
+50K ROs → 50K distinct `vp` avals computing the same trafo. Pool
+sees 50K identities, allocates 50K entries. The original viewProj
+.map fix was to hoist `viewProjM44 = viewProj.map(trafoToM44f)`
+out of the loop — manual identity sharing. Same shape as the
+constant-aval issue; same systemic fix wanted.
+
+**The trick: function identity is a free key (== is reference
+equal in JS), but only safe to dedupe when `f` is pure / has no
+captured state.**
+
+JS doesn't expose purity statically. Three cases:
+1. Module-level pure function (`trafoToM44f`): same ref
+   everywhere. Dedup correct and useful.
+2. Closure capturing variable: different ref per call, different
+   behavior. Dedup would be incorrect.
+3. Inline-pure lambda: pure but fresh ref. Same behavior as 1,
+   but not identity-equal — can't be deduped without a content
+   hash, and `.toString()` hashing isn't safe (closures'
+   captured variables don't appear in source).
+
+**Solution: opt-in via `memoMap`:**
+
+```ts
+aval.memoMap(f)   // user asserts f is pure + reference-stable
+```
+
+Internally: `WeakMap<aval, WeakMap<Function, aval>>`. First call
+with `(av, f)` creates and caches; subsequent calls return the
+same reference. Both keys weakly held; cache entries die with
+their sources.
+
+User opt-in is fine — same shape as React's `useMemo` (caller
+asserts dependency-correctness) or Reactor's `cache`. One-line
+API note: "use memoMap for pure module-level functions; plain
+map for closures with captured state."
+
+**Combined with §5b, the identity-footgun surface closes:**
+
+| Aval shape | Today | With §5b + §5c |
+|---|---|---|
+| `AVal.constant(value)` per call, same value | N entries | 1 entry (5b) |
+| Reactive aval `.map(pureFn)` per call | N entries | 1 entry (5c) |
+| Reactive aval `.map(closure)` per call | N entries | N entries (correct — different behavior) |
+
+Users stop having to think about identity in the
+common-pure cases. Reactive-with-captured-state remains explicit,
+which is the right level — reading code with a closure should
+prompt the question "what does this capture."
+
+Implementation cost: ~30 LOC in `wombat.adaptive`. Zero changes
+in rendering layer; the existing identity-keyed pools just see
+fewer distinct avals.
+
 ## 6. Uber-shader families with shared header pool
 
 Currently the bucket key is `(effect, pipelineState, textures)` — two
