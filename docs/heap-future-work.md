@@ -598,7 +598,7 @@ schemas at all. Each effect keeps its native drawHeader layout. The
 machinery that gets shared is the storage and the dispatch, not the
 data format.
 
-### v1 PoC scope (agreed 2026-05-09)
+### v1 PoC scope (agreed 2026-05-09) ✅ SHIPPED
 
 The proof-of-concept implements the strong form: **bucket key
 reduces to `(familyId, pipelineState)`**. `effect`, `textureSet`,

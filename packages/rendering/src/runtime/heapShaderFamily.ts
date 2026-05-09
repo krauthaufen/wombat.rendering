@@ -84,10 +84,23 @@ export interface ShaderFamilySchema {
  * The error message identifies both effects + the offending field so
  * the user can disambiguate via `effect.rename({varyings: ...})`.
  */
+export interface BuildShaderFamilyOptions {
+  /**
+   * Route every texture binding declared by any member effect through
+   * the atlas drawHeader path (pageRef / formatBits / origin / size
+   * inline fields) instead of standalone texture bindings. Set by
+   * heapScene's family-merge path so the union bucket has uniform
+   * texture-binding shape regardless of which member effects are
+   * textured. Defaults to false (analysis-only callers don't need it).
+   */
+  readonly atlasizeAllTextures?: boolean;
+}
+
 export function buildShaderFamily(
   effects: readonly Effect[],
   fragmentOutputLayout?: FragmentOutputLayout,
   slotAssigner?: FamilySlotAssigner,
+  options: BuildShaderFamilyOptions = {},
 ): ShaderFamilySchema {
   // 1. Deterministic ordering. Sort by `effect.id` (lexicographic).
   //    `Array.prototype.sort` is mutating, so copy first.
@@ -130,7 +143,9 @@ export function buildShaderFamily(
   }
 
   // 6. drawHeader union across all effects, then append layoutId.
-  const drawHeaderUnion = unionDrawHeaders(sortedEffects, perEffectSchema);
+  const drawHeaderUnion = unionDrawHeaders(
+    sortedEffects, perEffectSchema, options.atlasizeAllTextures === true,
+  );
 
   return {
     id,
@@ -240,6 +255,7 @@ function packVaryings(
 function unionDrawHeaders(
   sortedEffects: readonly Effect[],
   perEffectSchema: ReadonlyMap<Effect, HeapEffectSchema>,
+  atlasizeAllTextures: boolean,
 ): BucketLayout {
   // Build each effect's BucketLayout with default opts. The v1 PoC's
   // family-build call site (a future slice) will pass the real
@@ -248,7 +264,12 @@ function unionDrawHeaders(
   const perEffectLayout = new Map<Effect, BucketLayout>();
   for (const e of sortedEffects) {
     const schema = perEffectSchema.get(e)!;
-    perEffectLayout.set(e, buildBucketLayout(schema, false, {}));
+    const atlasNames = atlasizeAllTextures
+      ? new Set(schema.textures.map(t => t.name))
+      : new Set<string>();
+    perEffectLayout.set(e, buildBucketLayout(schema, false, {
+      atlasTextureBindings: atlasNames,
+    }));
   }
 
   // Union drawHeaderFields by name. First-seen layout wins for the
@@ -508,15 +529,35 @@ export function compileShaderFamily(
   const perEffectFs: string[] = [];
   for (const e of family.effects) {
     const k = family.layoutIdOf.get(e)!;
-    const vsHelper = `family_vs_${k}`;
-    const fsHelper = `family_fs_${k}`;
-    const renamed = e.rename({
-      entries: new Map([
-        ...findStageEntryNames(e, "vertex").map(n => [n, vsHelper] as [string, string]),
-        ...findStageEntryNames(e, "fragment").map(n => [n, fsHelper] as [string, string]),
-      ]),
-    });
+    // Composed effects (multiple same-stage Entries that compose into
+    // one fused entry) need each source Entry renamed to a UNIQUE
+    // target — `renameEntries` rejects collisions, and `composeStages`
+    // joins source names into the fused entry's name. After IR compile
+    // we read the actual emitted @vertex / @fragment name from the
+    // WGSL and use that as the helper name.
+    const vsEntries = findStageEntryNames(e, "vertex");
+    const fsEntries = findStageEntryNames(e, "fragment");
+    const vsPrefix = `family_vs_${k}`;
+    const fsPrefix = `family_fs_${k}`;
+    const entryMap = new Map<string, string>();
+    if (vsEntries.length === 1) {
+      entryMap.set(vsEntries[0]!, vsPrefix);
+    } else {
+      for (let i = 0; i < vsEntries.length; i++) {
+        entryMap.set(vsEntries[i]!, `${vsPrefix}_p${i}`);
+      }
+    }
+    if (fsEntries.length === 1) {
+      entryMap.set(fsEntries[0]!, fsPrefix);
+    } else {
+      for (let i = 0; i < fsEntries.length; i++) {
+        entryMap.set(fsEntries[i]!, `${fsPrefix}_p${i}`);
+      }
+    }
+    const renamed = e.rename({ entries: entryMap });
     const ir = compileHeapEffectIR(renamed, family.drawHeaderUnion, opts, "family-member");
+    const vsHelper = readEntryName(ir.vs, "vertex") ?? vsPrefix;
+    const fsHelper = readEntryName(ir.fs, "fragment") ?? fsPrefix;
     // Auto-generated struct names = `${capitalise(entryName)}Output` /
     // `${capitalise(entryName)}Input` (see wombat.shader/wgsl/emit).
     const outStruct = capitalise(vsHelper) + "Output";
@@ -561,6 +602,16 @@ export function compileShaderFamily(
 
 function capitalise(s: string): string {
   return s.length === 0 ? s : s[0]!.toUpperCase() + s.slice(1);
+}
+
+/**
+ * Find the name of the `@vertex` / `@fragment` fn in a WGSL source.
+ * Returns undefined when no such decl is present.
+ */
+function readEntryName(src: string, stage: "vertex" | "fragment"): string | undefined {
+  const re = new RegExp(`@${stage}\\s+fn\\s+(\\w+)\\b`);
+  const m = re.exec(src);
+  return m === null ? undefined : m[1];
 }
 
 /**
@@ -899,6 +950,12 @@ function synthesizeFamilyFs(
   const slots = family.varyingSlots;
   const layoutIdLoc = slots;
   const lines: string[] = [];
+  // Suppress Tint's conservative derivative-uniformity analysis: layoutIdIn is
+  // @interpolate(flat) and uniform per primitive in practice, but Tint treats
+  // fragment-in params as non-uniform, rejecting dpdx/dpdy reachable from the
+  // switch. v1 concession; v2 may hoist derivatives via parameter-threading.
+  lines.push("diagnostic(off, derivative_uniformity);");
+  lines.push("");
   lines.push("// Family-merged fragment shader (slice 3b synthesis).");
   for (const d of dedupedDecls) {
     lines.push(d);

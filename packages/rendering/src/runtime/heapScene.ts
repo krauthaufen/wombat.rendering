@@ -54,8 +54,13 @@ import type { IBuffer, HostBufferSource } from "../core/buffer.js";
 import {
   buildBucketLayout, compileHeapEffect,
   type BucketLayout, type FragmentOutputLayout,
+  type HeapEffectSchema,
 } from "./heapEffect.js";
 import { compileHeapEffectIR } from "./heapEffectIR.js";
+import {
+  buildShaderFamily, compileShaderFamily,
+  type ShaderFamilySchema,
+} from "./heapShaderFamily.js";
 import {
   ATLAS_PAGE_FORMATS, atlasFormatIndex,
   type AtlasPage, type AtlasPageFormat, type AtlasPool,
@@ -950,6 +955,12 @@ interface Bucket {
    * drawHeap GrowBuffer reallocates.
    */
   readonly localPerDrawRefs: (Map<string, number> | undefined)[];
+  /**
+   * Per-local-slot layoutId for the §6 family-merge selector. Stable
+   * during the slot's lifetime; written into the drawHeader's
+   * `__layoutId` field by `packBucketHeader`.
+   */
+  readonly localLayoutIds: (number | undefined)[];
 
   /** Live local slots (drives the render loop). */
   readonly drawSlots: number[];
@@ -1638,6 +1649,69 @@ export function buildHeapScene(
   const buckets: Bucket[] = [];
   const bucketByKey = new Map<string, Bucket>();
 
+  // ─── Family state (§6 family-merge, slice 3c) ─────────────────────
+  // Built lazily on the first addDraw batch from the union of all
+  // effects in that batch, then frozen. Subsequent addDraws with an
+  // unknown effect throw — reactive family rebuild is a v2 punt.
+  //
+  // Bucket key collapses to (familyId, pipelineState): every effect
+  // in the family shares one bucket per pipelineState. The family
+  // VS/FS dispatches to per-effect helpers via `layoutId`.
+  let family: ShaderFamilySchema | undefined;
+  let familyVsModule: GPUShaderModule | undefined;
+  let familyFsModule: GPUShaderModule | undefined;
+  /** Per-effect schemas, indexed by Effect identity for fast lookup in addDraw. */
+  let familyPerEffectSchema: ReadonlyMap<Effect, HeapEffectSchema> | undefined;
+  /** Cached "field name → membership" sets per effect (drawHeader fields the
+   * effect actually populates; everything else stays 0). */
+  let familyFieldsForEffect: Map<Effect, Set<string>> | undefined;
+
+  function buildFamilyFromEffects(effects: readonly Effect[]): void {
+    if (family !== undefined) return;
+    if (effects.length === 0) {
+      throw new Error("heapScene: cannot build shader family from an empty effect set");
+    }
+    // Deduplicate by Effect identity preserving order.
+    const seen = new Set<Effect>();
+    const unique: Effect[] = [];
+    for (const e of effects) {
+      if (!seen.has(e)) { seen.add(e); unique.push(e); }
+    }
+    family = buildShaderFamily(
+      unique, opts.fragmentOutputLayout, undefined,
+      // Atlas-route every textured effect's bindings when an atlas pool
+      // is in scope (§6 v1 spec point 4). Without a pool, fall back to
+      // standalone texture bindings — the per-effect rare path.
+      { atlasizeAllTextures: atlasPool !== undefined },
+    );
+    const compiled = compileShaderFamily(family, opts.fragmentOutputLayout);
+    familyVsModule = device.createShaderModule({ code: compiled.vs, label: `heapScene/family/${family.id}/vs` });
+    familyFsModule = device.createShaderModule({ code: compiled.fs, label: `heapScene/family/${family.id}/fs` });
+    familyPerEffectSchema = family.perEffectSchema;
+    familyFieldsForEffect = new Map();
+    for (const e of family.effects) {
+      const s = family.perEffectSchema.get(e)!;
+      const fields = new Set<string>();
+      for (const a of s.attributes) fields.add(a.name);
+      for (const u of s.uniforms)   fields.add(u.name);
+      for (const t of s.textures)   fields.add(t.name);
+      familyFieldsForEffect.set(e, fields);
+    }
+  }
+
+  function ensureFamilyKnowsEffect(effect: Effect): void {
+    if (family === undefined) {
+      throw new Error("heapScene: ensureFamilyKnowsEffect called before family build");
+    }
+    if (!family.layoutIdOf.has(effect)) {
+      const known = [...family.effects].map(e => e.id).join(",");
+      throw new Error(
+        `heapScene: family is frozen; effect ${effect.id} not in {${known}}; ` +
+        `reactive family rebuild is v2`,
+      );
+    }
+  }
+
   // ─── id-of helpers ────────────────────────────────────────────────
   const idOf = (s: Effect): string => `effect#${s.id}`;
   const textureIds = new WeakMap<HeapTextureSet, string>();
@@ -1838,58 +1912,32 @@ export function buildHeapScene(
   }
 
   // ─── findOrCreateBucket ───────────────────────────────────────────
-  // Atlas-variant ROs share buckets by (effect, pipelineState) regardless
-  // of which atlas pages they happen to land on — the bucket extends its
-  // page set lazily as new ROs join. Standalone-variant ROs keep the
-  // texture-identity wedge in the key (today's behavior).
-  function bucketTextureKey(textures: HeapTextureSet | undefined): string {
-    if (textures === undefined) return "tex#none";
-    if (textures.kind === "atlas") return "tex#atlas";
-    return texIdOf(textures);
-  }
+  // Slice 3c: the bucket key collapses to (familyId, pipelineState).
+  // Every member effect in the family shares one bucket per
+  // pipelineState; layoutId dispatch in the family VS/FS picks the
+  // right per-effect helper at draw time. Atlas-binding shape follows
+  // from `family.drawHeaderUnion.atlasTextureBindings.size > 0`.
+  void texIdOf; // retained for future per-bucket diagnostics
   function findOrCreateBucket(
-    effect: Effect,
-    textures: HeapTextureSet | undefined,
+    _effect: Effect,
+    _textures: HeapTextureSet | undefined,
     pipelineState: PipelineState | undefined,
-    instanceOpts: {
-      perInstanceUniforms: ReadonlySet<string>;
-      perInstanceAttributes: ReadonlySet<string>;
-    },
   ): Bucket {
+    if (family === undefined || familyVsModule === undefined || familyFsModule === undefined) {
+      throw new Error("heapScene: findOrCreateBucket called before family build");
+    }
     const psKey = psIdOf(pipelineState);
-    const texKey = bucketTextureKey(textures);
-    // Per-instance-attribute sets affect the emitted shader (per-instance
-    // attribute reads index by iidx not vid), so they wedge into the
-    // bucket key.
-    const piaKey = instanceOpts.perInstanceAttributes.size === 0
-      ? ""
-      : `|pia#${[...instanceOpts.perInstanceAttributes].sort().join(",")}`;
-    const bk = `${idOf(effect)}|${texKey}|${psKey}${piaKey}`;
+    const bk = `family#${family.id}|${psKey}`;
     const existing = bucketByKey.get(bk);
     if (existing !== undefined) return existing;
     const ps = resolvePipelineState(pipelineState);
 
-    const isAtlasBucket = textures !== undefined && textures.kind === "atlas";
-    const baseLayoutOpts = {
-      perInstanceUniforms: instanceOpts.perInstanceUniforms,
-      perInstanceAttributes: instanceOpts.perInstanceAttributes,
-    };
-    const compiled = compileHeapEffect(effect, opts.fragmentOutputLayout);
-    const atlasNames = isAtlasBucket
-      ? new Set(compiled.schema.textures.map(t => t.name))
-      : new Set<string>();
-    const layout: BucketLayout = buildBucketLayout(
-      compiled.schema, textures !== undefined,
-      { ...baseLayoutOpts, atlasTextureBindings: atlasNames },
-    );
-    const ir = compileHeapEffectIR(effect, layout, {
-      target: "wgsl",
-      ...(opts.fragmentOutputLayout !== undefined ? { fragmentOutputLayout: opts.fragmentOutputLayout } : {}),
-    });
-    const vsModule = device.createShaderModule({ code: ir.vs, label: `heapScene/${bk}/vs` });
-    const fsModule = device.createShaderModule({ code: ir.fs, label: `heapScene/${bk}/fs` });
-    const vsEntry = ir.vsEntry;
-    const fsEntry = ir.fsEntry;
+    const layout: BucketLayout = family.drawHeaderUnion;
+    const isAtlasBucket = layout.atlasTextureBindings.size > 0;
+    const vsModule = familyVsModule;
+    const fsModule = familyFsModule;
+    const vsEntry = "family_vs_main";
+    const fsEntry = "family_fs_main";
     const { pipelineLayout } = getBgl(layout, isAtlasBucket);
 
     const pipeline = device.createRenderPipeline({
@@ -1915,14 +1963,19 @@ export function buildHeapScene(
     const drawHeap = new DrawHeap(drawHeapBuf, layout.drawHeaderBytes);
 
     const bucket: Bucket = {
-      label: bk, textures, layout, pipeline,
+      // §6 family-merge: family buckets aren't keyed on a specific
+      // texture set — atlas placements are addressed per-RO via
+      // drawHeader fields (`pageRef` + `formatBits` + `origin` +
+      // `size`), and the bucket's atlas-binding ladder is driven by
+      // `atlasPool.pagesFor(format)`. Leave `textures` undefined.
+      label: bk, textures: undefined, layout, pipeline,
       bindGroup: null as unknown as GPUBindGroup,
       drawHeap,
       drawHeaderStaging: new Float32Array(drawHeapBuf.capacity / 4),
       headerDirtyMin: Infinity, headerDirtyMax: 0,
       localPosRefs: [], localNorRefs: [],
       localEntries: [], localToDrawId: [],
-      localPerDrawAvals: [], localPerDrawRefs: [],
+      localPerDrawAvals: [], localPerDrawRefs: [], localLayoutIds: [],
       drawSlots: [], dirty: new Set<number>(),
       drawTableDirtyMin: Infinity, drawTableDirtyMax: 0,
       recordCount: 0, slotToRecord: [], recordToSlot: [],
@@ -2021,6 +2074,7 @@ export function buildHeapScene(
   function packBucketHeader(
     bucket: Bucket, localSlot: number,
     perDrawRefs: ReadonlyMap<string, number>,
+    layoutId: number,
   ): void {
     const dst = bucket.drawHeaderStaging;
     const u32 = new Uint32Array(dst.buffer, dst.byteOffset, dst.length);
@@ -2030,9 +2084,21 @@ export function buildHeapScene(
       // origin/size as vec2<f32>) and are filled by packAtlasTextureFields.
       if (f.kind === "texture-ref") continue;
       const fOff = baseFloat + f.byteOffset / 4;
+      // §6 family-merge slice 3c: write the layoutId selector inline.
+      // Field kind stays `uniform-ref` so the IR's load expression
+      // (`headersU32[base + offset]`) reads it as a u32 directly,
+      // exactly matching the inline integer we store here.
+      if (f.name === "__layoutId") {
+        u32[fOff] = layoutId >>> 0;
+        continue;
+      }
       const ref = perDrawRefs.get(f.name);
       if (ref === undefined) {
-        throw new Error(`heapScene: missing ref for '${f.name}' (kind=${f.kind}) on local slot ${localSlot}`);
+        // Family-merge: a slot's effect doesn't populate every field of
+        // the union; leave the unused slots zero — the layoutId switch
+        // ensures they're never read by the wrong effect's helper.
+        u32[fOff] = 0;
+        continue;
       }
       u32[fOff] = ref;
     }
@@ -2132,15 +2198,21 @@ export function buildHeapScene(
   // ─── addDraw / removeDraw ─────────────────────────────────────────
   function addDraw(spec: HeapDrawSpec): number {
     const drawId = nextDrawId++;
+    // Family-merge (slice 3c): build the family lazily from this
+    // single spec when no batched lazy-build occurred earlier (e.g.
+    // direct addDraw at runtime). The aset / array initial-population
+    // paths build from the full effect set up front.
+    if (family === undefined) {
+      buildFamilyFromEffects([spec.effect]);
+    } else {
+      ensureFamilyKnowsEffect(spec.effect);
+    }
     const perInstanceUniforms = new Set<string>();
-    // Per-RO instancing: each entry in `instanceAttributes` is read by
-    // the shader at index `iidx` (= instance_index in the megacall path).
     const perInstanceAttributes = spec.instanceAttributes !== undefined
       ? new Set(Object.keys(spec.instanceAttributes))
       : new Set<string>();
-    const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, {
-      perInstanceUniforms, perInstanceAttributes,
-    });
+    const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState);
+    const effectFields = familyFieldsForEffect!.get(spec.effect)!;
 
     // Indices live in their own INDEX-usage buffer (WebGPU constraint).
     // Aval-keyed: 19K instanced clones of the same mesh share one
@@ -2167,6 +2239,11 @@ export function buildHeapScene(
         // Atlas-variant texture bindings carry inline values rather than
         // pool refs; packAtlasTextureFields fills them after this loop.
         if (f.kind === "texture-ref") continue;
+        // Family-merge: the union drawHeader includes fields from every
+        // member effect. Skip fields this effect doesn't declare — its
+        // layoutId branch never reads them, so the slot stays zero.
+        if (f.name === "__layoutId") continue;
+        if (!effectFields.has(f.name)) continue;
         const isPerInstanceUniformField =
           f.kind === "uniform-ref" && perInstanceUniforms.has(f.name);
         const isPerInstanceAttrField =
@@ -2226,8 +2303,10 @@ export function buildHeapScene(
     bucket.drawSlots.push(localSlot);
     bucket.localPerDrawAvals[localSlot] = perDrawAvals;
     bucket.localPerDrawRefs[localSlot]  = perDrawRefs;
+    const layoutId = family!.layoutIdOf.get(spec.effect)!;
+    bucket.localLayoutIds[localSlot] = layoutId;
 
-    packBucketHeader(bucket, localSlot, perDrawRefs);
+    packBucketHeader(bucket, localSlot, perDrawRefs, layoutId);
     if (bucket.isAtlasBucket && spec.textures !== undefined && spec.textures.kind === "atlas") {
       packAtlasTextureFields(bucket, localSlot, spec.textures);
       bucket.localAtlasReleases[localSlot] = spec.textures.release;
@@ -2363,6 +2442,7 @@ export function buildHeapScene(
 
     bucket.localPerDrawAvals[localSlot] = undefined;
     bucket.localPerDrawRefs[localSlot]  = undefined;
+    bucket.localLayoutIds[localSlot]    = undefined;
     bucket.localPosRefs[localSlot]  = undefined;
     bucket.localNorRefs[localSlot]  = undefined;
     bucket.localEntries[localSlot]  = undefined;
@@ -2402,10 +2482,45 @@ export function buildHeapScene(
 
   // ─── Initial population ───────────────────────────────────────────
   if (Array.isArray(initialDraws)) {
-    for (const d of initialDraws as readonly HeapDrawSpec[]) addDraw(d);
+    // Pre-build the family from all initial effects so the first
+    // bucket is built against the union right away. Skipped when the
+    // array is empty (family will build lazily when an addDraw fires).
+    const arr = initialDraws as readonly HeapDrawSpec[];
+    if (arr.length > 0) buildFamilyFromEffects(arr.map(d => d.effect));
+    for (const d of arr) addDraw(d);
   } else {
     asetReader = (initialDraws as aset<HeapDrawSpec>).getReader();
-    sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => drainAsetWith(tok));
+    sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
+      // First drain: snapshot all add-ops, build the family from their
+      // effects up front, then run addDraw. Subsequent drains either
+      // reuse the frozen family (matching effects) or throw on a new
+      // unseen effect (per the v1 frozen-family contract).
+      if (family === undefined) {
+        const reader = asetReader!;
+        const delta = reader.getChanges(tok);
+        const adds: HeapDrawSpec[] = [];
+        const remaining: { value: HeapDrawSpec; count: number }[] = [];
+        delta.iter((op) => {
+          remaining.push(op);
+          if (op.count > 0) adds.push(op.value);
+        });
+        if (adds.length > 0) buildFamilyFromEffects(adds.map(s => s.effect));
+        for (const op of remaining) {
+          if (op.count > 0) {
+            const id = addDraw(op.value);
+            specToDrawId.set(op.value, id);
+          } else {
+            const id = specToDrawId.get(op.value);
+            if (id !== undefined) {
+              removeDraw(id);
+              specToDrawId.delete(op.value);
+            }
+          }
+        }
+      } else {
+        drainAsetWith(tok);
+      }
+    });
   }
 
   // ─── update / encodeIntoPass / frame / dispose ───────────────────
@@ -2482,7 +2597,7 @@ export function buildHeapScene(
         for (const localSlot of bucket.dirty) {
           const refs = bucket.localPerDrawRefs[localSlot];
           if (refs === undefined) continue;
-          packBucketHeader(bucket, localSlot, refs);
+          packBucketHeader(bucket, localSlot, refs, bucket.localLayoutIds[localSlot] ?? 0);
           if (bucket.isAtlasBucket) {
             const ts = bucket.localAtlasTextures[localSlot];
             if (ts !== undefined) packAtlasTextureFields(bucket, localSlot, ts);
