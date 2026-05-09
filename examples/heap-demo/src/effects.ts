@@ -130,9 +130,24 @@ export const lambertTexturedFS = fragment((v: {
 
 export const texturedSurface = effect(trafoTexturedVS, lambertTexturedFS);
 
-// ─── Instanced variant ────────────────────────────────────────────────
+// Tiny passthrough stage that declares `Uvs` as both a vertex input
+// and an inter-stage carrier. Composed-VS chains pick it up and
+// surface Uvs in the merged outputs; the textured FS reads it. No
+// math — the optimizer DCEs it down to a wire when present, and
+// drops it entirely when no FS consumes Uvs.
+export const uvsVS = vertex((v: { Uvs: V2f }) => ({ Uvs: v.Uvs }));
+
+// ─── Instanced variants ───────────────────────────────────────────────
 // Proper composition: model → instanceOffset → clip → lambert. No
-// duplication; `composeStages` fuses the three VS stages via
+// duplication; `composeStages` fuses the VS stages via
 // `extractFusedEntry`, and the per-stage emit's `pruneToStage` keeps
 // the FS module free of VS-only helper bodies.
+
 export const instancedSurface = effect(modelVS, instanceOffsetVS, clipVS, lambertFS);
+
+// Textured instanced variant — same VS chain plus a `uvsVS` stage
+// that surfaces the per-vertex Uvs into the inter-stage carrier so
+// `lambertTexturedFS` can sample the atlas.
+export const instancedTexturedSurface = effect(
+  modelVS, uvsVS, instanceOffsetVS, clipVS, lambertTexturedFS,
+);

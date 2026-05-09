@@ -31,7 +31,10 @@ import {
 } from "@aardworx/wombat.rendering.experimental/core";
 import { Runtime } from "@aardworx/wombat.rendering.experimental/runtime";
 import { attachCanvas, runFrame } from "@aardworx/wombat.rendering.experimental/window";
-import { surface, texturedSurface, instancedSurface } from "./effects.js";
+import {
+  surface, texturedSurface,
+  instancedSurface, instancedTexturedSurface,
+} from "./effects.js";
 import { buildBox, buildSphere, buildCylinder, type GeometryData } from "./geometry.js";
 
 const countParam = new URLSearchParams(location.search).get("count");
@@ -230,12 +233,20 @@ function makeInstancedTowerRO(
   const offsets = new Float32Array(count * 3);
   for (let i = 0; i < count; i++) offsets[i * 3 + 2] = i * dz;
   const offsetView = BufferView.ofArray(offsets, { elementType: ElementType.V3f });
-  const baseAttribs = HashMap.empty<string, BufferView>()
+  const textured = spec.texture !== undefined && spec.sampler !== undefined;
+  let vertexAttribs = HashMap.empty<string, BufferView>()
     .add("Positions", spec.geo.positions)
     .add("Normals",   spec.geo.normals)
     .add("Colors",    asV4fBroadcast(spec.color));
+  if (textured) vertexAttribs = vertexAttribs.add("Uvs", spec.geo.uvs);
   const instAttribs = HashMap.empty<string, BufferView>()
     .add("InstanceOffset", offsetView);
+  const textures = textured
+    ? HashMap.empty<string, aval<ITexture>>().add("albedo", spec.texture!)
+    : HashMap.empty<string, aval<ITexture>>();
+  const samplers = textured
+    ? HashMap.empty<string, aval<ISampler>>().add("albedo", spec.sampler!)
+    : HashMap.empty<string, aval<ISampler>>();
   // Original drawCall is `instanceCount: 1`. Patch it to `count`.
   const dc: aval<DrawCall> = AVal.constant<DrawCall>({
     kind: "indexed",
@@ -248,13 +259,13 @@ function makeInstancedTowerRO(
     firstInstance: 0,
   });
   return {
-    effect: instancedSurface,
+    effect: textured ? instancedTexturedSurface : instancedSurface,
     pipelineState: sharedPipelineState,
-    vertexAttributes: baseAttribs,
+    vertexAttributes: vertexAttribs,
     instanceAttributes: instAttribs,
     uniforms: makeUniforms(spec.modelTrafo, viewProj, eye),
-    textures: HashMap.empty<string, aval<ITexture>>(),
-    samplers: HashMap.empty<string, aval<ISampler>>(),
+    textures,
+    samplers,
     indices: spec.geo.indices,
     drawCall: dc,
   };
@@ -476,9 +487,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       const towerHere = instCount > 1 && (k % instStride) === 0;
       const spec: RoSpec = {
         geo: bundle, modelTrafo: t, color: colors[k % 4]!,
-        // Towers can't share atlas textures with the regular grid —
-        // they use the non-textured `instancedSurface` effect.
-        ...(atlasMode && !towerHere ? { texture: pickTex(k)!, sampler: sharedSampler! } : {}),
+        ...(atlasMode ? { texture: pickTex(k)!, sampler: sharedSampler! } : {}),
       };
       if (towerHere) {
         ros.push(makeInstancedTowerRO(spec, viewProj, eye, instCount, 1.0));
