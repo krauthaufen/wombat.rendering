@@ -41,6 +41,38 @@ acceptable on mobile, and a real concern even on desktop.
 
 ## Tiering
 
+### Tier 0 — escalates to legacy
+
+Some ROs never enter the heap subset at all. `isHeapEligible` rejects
+them up front and `HybridScene` routes them to `ScenePass` (the
+per-RO legacy renderer with full user control). This is *before* the
+Tier-S/M/L decision below — Tier 0 ROs are simply not classified.
+
+Escalation rules (any one is sufficient):
+
+- **`ITexture.kind === "gpu"`.** The user is managing a backend
+  resource themselves — render target, video frame, environment
+  probe, streaming photogrammetry tile. Heap-side handling
+  (atlas-packing, rebadging, bucket-key folding) doesn't apply.
+- **Texture extent > `LEGACY_MAX_DIM` on either side**
+  (`LEGACY_MAX_DIM = 4096`). Above this threshold, even the heap's
+  Tier-L "standalone" path stops being a win: better to give the RO
+  its own dedicated GPUTexture in legacy than to host-upload a ~16M
+  pixel image into heap-managed memory and risk bumping
+  `maxTextureDimension2D`.
+- **Texture is not 2D / has more than one array layer.** Cubemaps,
+  2D arrays, 3D volumes. Heap shaders are 2D-only. (For
+  `kind: "gpu"` this is read off the underlying `GPUTexture`'s
+  `dimension` / `depthOrArrayLayers`. For `kind: "host"` the
+  source descriptors are 2D-by-construction; the rule still
+  defensively rejects raw sources with `depthOrArrayLayers > 1`.)
+
+Note: rule 1 already covers most rule-3 cases — non-2D / arrayed
+textures essentially only exist via user-supplied `fromGPU`. Rule 3
+is belt-and-suspenders for any future host-side variant.
+
+The remaining heap-eligible ROs feed into Tier S/M/L below.
+
 Three tiers, decided at addDraw time from the source texture's
 descriptor:
 

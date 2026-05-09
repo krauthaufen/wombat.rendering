@@ -10,9 +10,16 @@
 //      Read once from the drawCall snapshot.
 //   3. REACTIVE — every `aval<IBuffer>` (vertex attribs + indices)
 //      must currently resolve to `kind: "host"`. Every `aval<ITexture>`
-//      to `kind: "gpu"` (heap path doesn't run host-texture upload),
-//      every `aval<ISampler>` to `kind: "gpu"`. When any of these
-//      mark and flip, the result aval marks → hybrid task repartitions.
+//      must be heap-servable: `kind: "host"` (atlasable / Tier-L
+//      host upload), 2D dimension, single array layer, and within
+//      `LEGACY_MAX_DIM` on each side. Anything failing those rules
+//      escalates to the legacy ScenePass — the user is managing a
+//      backend resource (render-target, video, environment probe,
+//      streaming tile) or asking for a cubemap/array/volume that
+//      the heap shaders don't support, or a texture too large for
+//      heap-side handling to be a win. Every `aval<ISampler>` must
+//      resolve to `kind: "gpu"`. When any of these mark and flip,
+//      the result aval marks → hybrid task repartitions.
 //
 // Out-of-scope blockers (return false unconditionally if present):
 //   - `instanceAttributes`     — heap path doesn't ingest these yet.
@@ -30,9 +37,64 @@ import type { ITexture } from "../core/texture.js";
 import type { ISampler } from "../core/sampler.js";
 import type { RenderObject } from "../core/renderObject.js";
 
+/**
+ * Maximum texture extent (per side) the heap path is willing to
+ * ingest. Anything wider/taller escalates to the legacy renderer
+ * which gives each RO its own dedicated GPUTexture — that's a
+ * better fit than wasting an atlas page on a single ~4K image
+ * (and it sidesteps device-limit risk near `maxTextureDimension2D`).
+ */
+const LEGACY_MAX_DIM = 4096;
+
 const isHostBuffer = (b: IBuffer): boolean => b.kind === "host";
-const isGpuTexture = (t: ITexture): boolean => t.kind === "gpu";
 const isGpuSampler = (s: ISampler): boolean => s.kind === "gpu";
+
+/**
+ * Heap-servability check for a single texture value. Returns `true`
+ * when the texture fits the heap path's ingest envelope:
+ *   - `kind === "host"` (the user isn't managing a backend
+ *     resource — those go to legacy untouched).
+ *   - 2D, single array layer (heap shaders are 2D-only).
+ *   - Both extents `<= LEGACY_MAX_DIM`.
+ *
+ * For `kind: "gpu"` we currently always reject (rule 1) — even a
+ * plain 2D rgba8unorm GPUTexture goes legacy, on the assumption
+ * that the user attached a `GPUTexture` for a reason (render target,
+ * external import, streamed tile) and shouldn't be silently
+ * rebadged. The dimension/layer/size checks are still implemented
+ * for `kind: "gpu"` for clarity / future use if we relax rule 1.
+ *
+ * For `kind: "host"`, by construction `RawTextureSource` and
+ * `ExternalTextureSource` are 2D single-layer — but we read
+ * `depthOrArrayLayers` from raw sources defensively (it's optional
+ * on the descriptor and could in principle be set).
+ */
+function isHeapServableTexture(t: ITexture): boolean {
+  if (t.kind === "gpu") return false;
+  const src = t.source;
+  if (src.kind === "raw") {
+    if ((src.depthOrArrayLayers ?? 1) !== 1) return false;
+    if (src.width > LEGACY_MAX_DIM || src.height > LEGACY_MAX_DIM) return false;
+    return true;
+  }
+  // external — read width/height off the source. Most types have
+  // it; HTMLVideoElement uses videoWidth/videoHeight. Sources
+  // without measurable dimensions are deferred (eligible until
+  // they resolve — heapAdapter handles undimensioned gracefully).
+  const ext = src.source as unknown;
+  let w = 0, h = 0;
+  if (typeof HTMLVideoElement !== "undefined" && ext instanceof HTMLVideoElement) {
+    w = ext.videoWidth; h = ext.videoHeight;
+  } else if (typeof ImageData !== "undefined" && ext instanceof ImageData) {
+    w = ext.width; h = ext.height;
+  } else {
+    const any = ext as { width?: number; height?: number };
+    w = any.width ?? 0;
+    h = any.height ?? 0;
+  }
+  if (w > LEGACY_MAX_DIM || h > LEGACY_MAX_DIM) return false;
+  return true;
+}
 
 function bufferAvals(ro: RenderObject): aval<IBuffer>[] {
   const out: aval<IBuffer>[] = [];
@@ -97,9 +159,9 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
   // can flip; if they violate heap constraints the RO routes to the
   // legacy path that frame).
   return AVal.custom(token => {
-    for (const av of buffers)  if (!isHostBuffer(av.getValue(token)))  return false;
-    for (const av of textures) if (!isGpuTexture(av.getValue(token)))  return false;
-    for (const av of samplers) if (!isGpuSampler(av.getValue(token)))  return false;
+    for (const av of buffers)  if (!isHostBuffer(av.getValue(token)))         return false;
+    for (const av of textures) if (!isHeapServableTexture(av.getValue(token))) return false;
+    for (const av of samplers) if (!isGpuSampler(av.getValue(token)))          return false;
     const dc = ro.drawCall.getValue(token);
     if (dc.kind !== "indexed") return false;
     if (dc.instanceCount !== 1) return false;
