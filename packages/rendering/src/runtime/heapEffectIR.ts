@@ -385,6 +385,111 @@ function wgslTypeFromHeapField(wgslType: string): Type {
 }
 
 /**
+ * Family-member FS uniform rewrite (direct heap reads).
+ *
+ * The wrapper module threads `heap_drawIdx` and `instId` as plain u32
+ * flat varyings into the FS, then passes them to each per-effect FS
+ * helper. Inside the helper, every `ReadInput("Uniform", X)` is
+ * substituted with `loadUniformByRef(loadHeaderRef(heap_drawIdx, …), …)`
+ * (or `loadInstanceByRef(refExpr, instId, …)` for per-instance
+ * uniforms). No VS-side WriteOutput stmts and no `_h_*Ref` varyings —
+ * the carrier is the single `heap_drawIdx` u32.
+ *
+ * `heap_drawIdx` and `instId` are referenced as `Var` exprs; the post-
+ * emit `applyFamilyMemberFsShape` rewires the FS entry signature to
+ * surface them as plain u32 fn parameters.
+ */
+function rewriteFsUniformsDirect(m: Module, layout: BucketLayout): Module {
+  const used = new Set<string>();
+  for (const v of m.values) {
+    if (v.kind !== "Entry" || v.entry.stage !== "fragment") continue;
+    for (const sn of readInputs(v.entry.body).values()) {
+      if (sn.scope === "Uniform") used.add(sn.name);
+    }
+  }
+  if (used.size === 0) return m;
+
+  const fieldByName = new Map(layout.drawHeaderFields.map(f => [f.name, f]));
+  const drawIdxExpr: Expr = { kind: "Var", var: { name: "heap_drawIdx", type: Tu32, mutable: false } } as Expr;
+  const instIdExpr:  Expr = { kind: "Var", var: { name: "instId",       type: Tu32, mutable: false } } as Expr;
+  const fsSubst = new Map<string, Expr>();
+  for (const name of used) {
+    const f = fieldByName.get(name);
+    if (f === undefined || f.kind !== "uniform-ref") continue;
+    const refExpr = loadHeaderRef(drawIdxExpr, f.byteOffset, layout.strideU32);
+    const value = layout.perInstanceUniforms.has(name)
+      ? loadInstanceByRef(refExpr, instIdExpr, f.uniformWgslType ?? "")
+      : loadUniformByRef(refExpr, f.uniformWgslType ?? "");
+    fsSubst.set(name, value);
+  }
+  return substituteInputsInStage(m, "fragment", "Uniform", n => fsSubst.get(n));
+}
+
+/**
+ * Family-member FS atlas rewrite (direct heap reads).
+ *
+ * Like `rewriteFsAtlasTextures` but instead of threading
+ * `_h_<name>{PageRef,FormatBits,Origin,Size}` flat varyings from VS,
+ * the substituted `atlasSample(pageRef, formatBits, origin, size, uv)`
+ * call reads each header field inline from `headersU32` via
+ * `heap_drawIdx`. The wrapper-supplied `heap_drawIdx` u32 fn parameter
+ * carries the per-draw header index.
+ */
+function rewriteFsAtlasTexturesDirect(m: Module, layout: BucketLayout): Module {
+  if (layout.atlasTextureBindings.size === 0) return m;
+  const used = new Set<string>();
+  for (const v of m.values) {
+    if (v.kind !== "Entry" || v.entry.stage !== "fragment") continue;
+    visitStmtExprs(v.entry.body, e => {
+      const hit = isAtlasSampleCall(e, layout.atlasTextureBindings);
+      if (hit !== null) used.add(hit.name);
+    });
+  }
+  if (used.size === 0) return m;
+
+  const fieldByAtlas = new Map<string, Map<string, ReturnType<typeof byteOffsetOf>>>();
+  for (const f of layout.drawHeaderFields) {
+    if (f.kind !== "texture-ref" || f.textureBindingName === undefined) continue;
+    const sub = f.textureSub!;
+    let inner = fieldByAtlas.get(f.textureBindingName);
+    if (inner === undefined) { inner = new Map(); fieldByAtlas.set(f.textureBindingName, inner); }
+    inner.set(sub, byteOffsetOf(f.byteOffset));
+  }
+
+  const drawIdxExpr: Expr = { kind: "Var", var: { name: "heap_drawIdx", type: Tu32, mutable: false } } as Expr;
+  const stride = layout.strideU32;
+  const headerU32At = (offU32: number): Expr =>
+    item(headersU32, add(mul(drawIdxExpr, constU32(stride), Tu32), constU32(offU32), Tu32), Tu32);
+  const headerF32At = (offU32: number): Expr => ({
+    kind: "CallIntrinsic",
+    op: { name: "bitcast<f32>", returnTypeOf: () => Tf32, pure: true,
+          emit: { glsl: "intBitsToFloat", wgsl: "bitcast<f32>" } } as IntrinsicRef,
+    args: [headerU32At(offU32)],
+    type: Tf32,
+  });
+
+  return mapStageEntryBodies(m, "fragment", body => mapStmt(body, {
+    expr: e => mapExpr(e, sub => {
+      const hit = isAtlasSampleCall(sub, layout.atlasTextureBindings);
+      if (hit === null) return sub;
+      const fields = fieldByAtlas.get(hit.name)!;
+      const pageRefOff    = fields.get("pageRef")!.u32;
+      const formatBitsOff = fields.get("formatBits")!.u32;
+      const originOff     = fields.get("origin")!.u32;
+      const sizeOff       = fields.get("size")!.u32;
+      const args: Expr[] = [
+        headerU32At(pageRefOff),
+        headerU32At(formatBitsOff),
+        newVec([headerF32At(originOff),     headerF32At(originOff + 1)],     Tvec2),
+        newVec([headerF32At(sizeOff),       headerF32At(sizeOff + 1)],       Tvec2),
+        hit.uv,
+      ];
+      return { kind: "CallIntrinsic", op: ATLAS_SAMPLE_INTRINSIC, args, type: Tvec4 };
+    }),
+  }));
+}
+
+/**
  * FS uniform threading: thread `_h_<name>Ref` (and `_iidx`, when
  * needed) varyings from VS to FS, and rewrite FS `ReadInput("Uniform",
  * X)` into a heap-load through the threaded ref.
@@ -729,8 +834,16 @@ export function compileHeapEffectIR(
   // add interstage params and VS WriteOutput stmts; their write sets
   // are disjoint, so the order is interchangeable in practice. Keep
   // the original order for byte-for-byte equivalence.
-  combined = rewriteFsAtlasTextures(combined, layout);
-  combined = rewriteFsUniforms(combined, layout);
+  if (mode === "family-member") {
+    // Direct heap-read FS path: substitute uniforms / atlas samples
+    // directly using the wrapper-supplied `heap_drawIdx` / `instId`
+    // u32 fn parameters. No VS→FS varying threading on the heap side.
+    combined = rewriteFsAtlasTexturesDirect(combined, layout);
+    combined = rewriteFsUniformsDirect(combined, layout);
+  } else {
+    combined = rewriteFsAtlasTextures(combined, layout);
+    combined = rewriteFsUniforms(combined, layout);
+  }
   // Add heap storage buffers as bindings.
   combined = { ...combined, values: [...heapStorageBufferDecls(), ...combined.values] };
 
@@ -748,6 +861,9 @@ export function compileHeapEffectIR(
     vsSrc = mode === "family-member"
       ? applyFamilyMemberShape(vsSrc)
       : applyMegacallToEmittedVs(vsSrc);
+  }
+  if (mode === "family-member" && fsSrc.length > 0) {
+    fsSrc = applyFamilyMemberFsShape(fsSrc);
   }
   if (layout.atlasTextureBindings.size > 0) {
     // Strip user-emitted texture/sampler binding decls for atlas-routed
@@ -983,6 +1099,47 @@ function applyFamilyMemberShape(vs: string): string {
     `  let instance_index: u32 = instId;\n` +
     `  let vertex_index: u32 = vid;\n`;
   const newHeader = `@vertex fn ${fnName}(${newParamList}) -> ${retType} {\n${bodyAliases}`;
+  s = s.slice(0, headerStart) + newHeader + s.slice(headerEnd);
+  s = threadMegacallParamsThroughHelpers(s);
+  return s;
+}
+
+/**
+ * Family-member FS shape: rewrite the emitted `@fragment fn` signature
+ * to take `heap_drawIdx: u32, instId: u32` as additional plain u32 fn
+ * parameters (after the existing FsIn struct param). The body uses
+ * `heap_drawIdx` / `instId` as `Var` reads — the wrapper passes them
+ * in from flat-interpolated u32 inputs on the family FsIn.
+ *
+ * `threadMegacallParamsThroughHelpers` is run as well in case any FS
+ * helper fn extracted by composeStages references those identifiers.
+ */
+function applyFamilyMemberFsShape(fs: string): string {
+  let s = fs;
+  const startRe = /@fragment\s+fn\s+(\w+)\s*\(/;
+  const startMatch = s.match(startRe);
+  if (startMatch === null) return s;
+  const fnName = startMatch[1]!;
+  const paramOpen = startMatch.index! + startMatch[0]!.length;
+  let depth = 1;
+  let i = paramOpen;
+  for (; i < s.length && depth > 0; i++) {
+    const c = s[i];
+    if (c === "(") depth++;
+    else if (c === ")") depth--;
+  }
+  if (depth !== 0) return s;
+  const paramList = s.slice(paramOpen, i - 1);
+  const tailRe = /\s*->\s*([\w<>,\s]+?)\s*\{/y;
+  tailRe.lastIndex = i;
+  const tailMatch = tailRe.exec(s);
+  if (tailMatch === null) return s;
+  const retType = tailMatch[1]!.trim();
+  const headerEnd = tailRe.lastIndex;
+  const headerStart = startMatch.index!;
+  const existing = paramList.split(",").map(p => p.trim()).filter(p => p.length > 0);
+  const newParamList = [...existing, "heap_drawIdx: u32", "instId: u32"].join(", ");
+  const newHeader = `@fragment fn ${fnName}(${newParamList}) -> ${retType} {\n`;
   s = s.slice(0, headerStart) + newHeader + s.slice(headerEnd);
   s = threadMegacallParamsThroughHelpers(s);
   return s;

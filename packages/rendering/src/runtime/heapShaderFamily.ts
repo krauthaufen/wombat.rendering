@@ -651,29 +651,15 @@ export function compileShaderFamily(
   }
   const layoutIdOffsetU32 = layoutIdField.byteOffset / 4;
 
-  // 4b. Discover heap-injected (`_h_...`) threading fields per effect by
-  //     parsing each per-effect VS output struct, then pack them into
-  //     family-wide `vec4<u32>` slots (separate pool from the user
-  //     `vec4<f32>` varyings). Mutates the schema in place — callers
-  //     that need the slot map can read it back after compile.
-  const perEffectHeapSlotMap = new Map<Effect, ReadonlyMap<string, HeapFamilySlot>>();
-  let heapVaryingSlots = 0;
-  for (const p of perEffectVs) {
-    const e = family.effects[p.layoutId]!;
-    const heapFields = extractHeapInjectedOutputs(p.vs, p.outStruct);
-    const slotMap = packHeapSlots(heapFields);
-    perEffectHeapSlotMap.set(e, slotMap);
-    let maxSlot = 0;
-    for (const s of slotMap.values()) {
-      if (s.slot + 1 > maxSlot) maxSlot = s.slot + 1;
-    }
-    if (maxSlot > heapVaryingSlots) heapVaryingSlots = maxSlot;
-  }
-  // Mutate the schema with the freshly computed maps. The schema is
-  // declared `readonly` for the consumer-visible API; this assignment
-  // is the one allowed in-package edge for the compile pipeline.
-  (family as { -readonly [K in keyof ShaderFamilySchema]: ShaderFamilySchema[K] }).heapVaryingSlots = heapVaryingSlots;
-  (family as { -readonly [K in keyof ShaderFamilySchema]: ShaderFamilySchema[K] }).perEffectHeapSlotMap = perEffectHeapSlotMap;
+  // 4b. Family-merge direct-heap-read path: per-effect FS reads the heap
+  //     headers directly using the wrapper-supplied `heap_drawIdx` /
+  //     `instId` u32 fn parameters. The carrier on the cross-stage
+  //     boundary is a single `heap_drawIdx_out: u32` (and
+  //     `instId_out: u32`) flat varying — no per-uniform `_h_*Ref`
+  //     varyings, no `vec4<u32>` packing. Keep the schema fields
+  //     populated for backward compatibility (zero / empty).
+  (family as { -readonly [K in keyof ShaderFamilySchema]: ShaderFamilySchema[K] }).heapVaryingSlots = 0;
+  (family as { -readonly [K in keyof ShaderFamilySchema]: ShaderFamilySchema[K] }).perEffectHeapSlotMap = new Map();
 
   // 5. Synthesize the wrapper VS and FS.
   const vs = synthesizeFamilyVs(family, perEffectVs, vsDecls, familyStrideU32, layoutIdOffsetU32);
@@ -684,152 +670,6 @@ export function compileShaderFamily(
     fs,
     fragmentOutputLayout,
   };
-}
-
-// ─── Heap-injected slot discovery + packing (slice 3b followup) ─────
-//
-// Heap-injected threading fields (names beginning with `_h_`, types
-// `u32` or `vec2<f32>`) are added to per-effect VS output / FS input
-// structs by `compileHeapEffectIR`'s `rewriteFsUniforms` /
-// `rewriteFsAtlasTextures` passes. They carry per-draw refs (uniform
-// pool refs + atlas pageRef/formatBits/origin/size) from VS to FS so
-// the FS can load uniforms / sample atlas textures without a per-
-// fragment storage read of the draw header.
-//
-// In standalone-mode emit these fields land on `@location(N)` of the
-// auto-generated VsOut / FsIn struct, where wombat.shader's auto-link
-// allocates locations starting after the user varyings. In family
-// mode the family wrapper owns the cross-stage carrier, so those
-// per-effect locations are unused — instead the wrapper packs each
-// effect's heap-injected fields into anonymous `vec4<u32>` slots
-// (`HeapVarying<k>`) sitting between the user `Varying<k>: vec4<f32>`
-// slots and the trailing `layoutIdOut: u32`. The packing is per-
-// effect (each effect packs starting at slot 0) and the family-wide
-// slot count is the max across effects.
-//
-// Storage is uniformly `vec4<u32>`; f32 fields (vec2<f32>) are
-// bitcast through u32 components on pack and back on unpack.
-
-interface HeapInjectedField {
-  readonly name: string;
-  readonly wgslType: string;
-  /** Component count in u32 storage units: u32→1, vec2<f32>→2, etc. */
-  readonly size: number;
-}
-
-/**
- * Parse `struct <structName> { ... };` out of a per-effect VS source
- * and return all `_h_...` fields with their WGSL types. Builtins and
- * named user varyings (which the family schema's `varyings` list
- * already covers) are skipped.
- */
-function extractHeapInjectedOutputs(vsSrc: string, structName: string): readonly HeapInjectedField[] {
-  // Locate the struct body.
-  const structRe = new RegExp(`struct\\s+${structName}\\s*\\{([\\s\\S]*?)\\}`, "m");
-  const m = structRe.exec(vsSrc);
-  if (m === null) return [];
-  const body = m[1]!;
-  const fields: HeapInjectedField[] = [];
-  // Match each field decl: optional `@…` decorations, then `name: type,`.
-  // Field type must not contain `,` at top level (vector/matrix args
-  // are inside `<...>`), so we slice by the trailing comma.
-  const fieldRe = /(?:@[\w()<>,.\s]+\s+)*(\w+)\s*:\s*([\w<>]+)\s*,/g;
-  let fm: RegExpExecArray | null;
-  while ((fm = fieldRe.exec(body)) !== null) {
-    const name = fm[1]!;
-    const type = fm[2]!;
-    if (!name.startsWith("_h_") && name !== "_iidx") continue;
-    const size = wgslU32ComponentCount(type);
-    fields.push({ name, wgslType: type, size });
-  }
-  return fields;
-}
-
-/**
- * u32-component count for a heap-injected field's WGSL type. Each
- * component lands in one `vec4<u32>` lane; f32-typed fields use
- * `bitcast<u32>` to encode and `bitcast<f32>` to decode.
- */
-function wgslU32ComponentCount(wgslType: string): number {
-  if (wgslType === "u32" || wgslType === "i32" || wgslType === "f32") return 1;
-  const m = /^vec([234])<\s*[fui]32\s*>$/.exec(wgslType);
-  if (m !== null) return Number(m[1]);
-  throw new Error(`compileShaderFamily: cannot pack heap-injected field of type '${wgslType}' into vec4<u32> slots`);
-}
-
-/** Greedy first-fit pack of heap-injected fields into vec4<u32> slots. */
-function packHeapSlots(fields: readonly HeapInjectedField[]): ReadonlyMap<string, HeapFamilySlot> {
-  const result = new Map<string, HeapFamilySlot>();
-  const slotFill: number[] = [];
-  for (const f of fields) {
-    let placed = false;
-    for (let i = 0; i < slotFill.length; i++) {
-      const used = slotFill[i]!;
-      if (used + f.size <= 4) {
-        result.set(f.name, { slot: i, offset: used, size: f.size, wgslType: f.wgslType });
-        slotFill[i] = used + f.size;
-        placed = true;
-        break;
-      }
-    }
-    if (!placed) {
-      const slot = slotFill.length;
-      slotFill.push(f.size);
-      result.set(f.name, { slot, offset: 0, size: f.size, wgslType: f.wgslType });
-    }
-  }
-  return result;
-}
-
-/**
- * Build the value expression for unpacking a heap-injected field
- * out of a `vec4<u32>` slot. `slotName` is the FsIn slot variable
- * (e.g. `in.HeapVarying2`). Result has the field's original WGSL
- * type — bitcast back to f32 / vec2<f32> as needed.
- */
-function unpackHeapValue(slotName: string, slot: HeapFamilySlot): string {
-  const swiz = ["x", "y", "z", "w"];
-  const lanes: string[] = [];
-  for (let i = 0; i < slot.size; i++) {
-    lanes.push(`${slotName}.${swiz[slot.offset + i]!}`);
-  }
-  // Dispatch by field type. For scalars (size 1) we have one lane;
-  // for vec2/3/4<f32> we wrap each lane in `bitcast<f32>` and build
-  // the vector. For u32-typed vector fields the lanes are already u32
-  // so just build a vec<u32>.
-  if (slot.size === 1) {
-    return wrapScalarFromU32(lanes[0]!, slot.wgslType);
-  }
-  const m = /^vec([234])<\s*([fui])32\s*>$/.exec(slot.wgslType);
-  if (m === null) {
-    throw new Error(`compileShaderFamily: unpackHeapValue unsupported type '${slot.wgslType}'`);
-  }
-  const elem = m[2]!;
-  if (elem === "f") {
-    const args = lanes.map(l => `bitcast<f32>(${l})`).join(", ");
-    return `vec${slot.size}<f32>(${args})`;
-  }
-  return `vec${slot.size}<${elem}32>(${lanes.join(", ")})`;
-}
-
-function wrapScalarFromU32(expr: string, wgslType: string): string {
-  if (wgslType === "u32" || wgslType === "i32") return expr;
-  if (wgslType === "f32") return `bitcast<f32>(${expr})`;
-  throw new Error(`compileShaderFamily: wrapScalarFromU32 on unsupported type '${wgslType}'`);
-}
-
-/** Encode a single component (or whole vector) as u32 — bitcast for f32. */
-function wrapAsU32(expr: string, wgslType: string): string {
-  // Per-component invocation, so wgslType is the *whole-field* type.
-  // For scalar fields the per-component is the value itself; for
-  // vec2<f32> the per-component (already swizzled out by caller) is f32.
-  if (wgslType === "u32" || wgslType === "i32") return expr;
-  if (wgslType === "f32") return `bitcast<u32>(${expr})`;
-  // vec2/3/4<f32>: the caller has already swizzled to a single .x/.y
-  // f32 component, so bitcast that.
-  if (/^vec[234]<\s*f32\s*>$/.test(wgslType)) return `bitcast<u32>(${expr})`;
-  if (/^vec[234]<\s*[ui]32\s*>$/.test(wgslType)) return expr;
-  throw new Error(`compileShaderFamily: wrapAsU32 on unsupported type '${wgslType}'`);
 }
 
 // ─── Helpers (slice 3b) ─────────────────────────────────────────────
@@ -984,34 +824,34 @@ function dedupModuleDecls(decls: readonly string[], stageLabel: string): string[
 
 /**
  * Build the family `FamilyVsOut` struct text. One `vec4<f32>` per
- * user-varying slot, then one flat-interpolated `vec4<u32>` per
- * heap-injected slot, then a flat-interpolated `layoutIdOut: u32`.
+ * user-varying slot, then three flat-interpolated u32 carriers:
+ * `heap_drawIdx_out`, `instId_out`, and `layoutIdOut`. The FS reads
+ * the heap headers directly via these u32 indices — no per-uniform
+ * ref varyings.
  */
-function familyVsOutStruct(slots: number, heapSlots: number, layoutIdLoc: number): string {
+function familyVsOutStruct(slots: number): string {
   const lines: string[] = [];
   lines.push("struct FamilyVsOut {");
   lines.push("  @builtin(position) gl_Position: vec4<f32>,");
   for (let i = 0; i < slots; i++) {
     lines.push(`  @location(${i}) Varying${i}: vec4<f32>,`);
   }
-  for (let i = 0; i < heapSlots; i++) {
-    lines.push(`  @interpolate(flat) @location(${slots + i}) HeapVarying${i}: vec4<u32>,`);
-  }
-  lines.push(`  @interpolate(flat) @location(${layoutIdLoc}) layoutIdOut: u32,`);
+  lines.push(`  @interpolate(flat) @location(${slots})     heap_drawIdx_out: u32,`);
+  lines.push(`  @interpolate(flat) @location(${slots + 1}) instId_out: u32,`);
+  lines.push(`  @interpolate(flat) @location(${slots + 2}) layoutIdOut: u32,`);
   lines.push("};");
   return lines.join("\n");
 }
 
-function familyFsInStruct(slots: number, heapSlots: number, layoutIdLoc: number): string {
+function familyFsInStruct(slots: number): string {
   const lines: string[] = [];
   lines.push("struct FamilyFsIn {");
   for (let i = 0; i < slots; i++) {
     lines.push(`  @location(${i}) Varying${i}: vec4<f32>,`);
   }
-  for (let i = 0; i < heapSlots; i++) {
-    lines.push(`  @interpolate(flat) @location(${slots + i}) HeapVarying${i}: vec4<u32>,`);
-  }
-  lines.push(`  @interpolate(flat) @location(${layoutIdLoc}) layoutIdIn: u32,`);
+  lines.push(`  @interpolate(flat) @location(${slots})     heap_drawIdx_in: u32,`);
+  lines.push(`  @interpolate(flat) @location(${slots + 1}) instId_in: u32,`);
+  lines.push(`  @interpolate(flat) @location(${slots + 2}) layoutIdIn: u32,`);
   lines.push("};");
   return lines.join("\n");
 }
@@ -1067,38 +907,6 @@ function buildVsCase(
     const slotName = `out.Varying${slot.slot}`;
     lines.push(`      ${slotName} = ${packVec4Components(`r.${v.name}`, slot.offset, slot.size)};`);
   }
-  // Heap-injected refs (flat-interpolated, vec4<u32> slots). Each slot
-  // is built from up to four lanes drawn from one or more `_h_*` /
-  // `_iidx` fields on the per-effect helper's output struct, with
-  // bitcast<u32> for f32 sources. Group field placements by target
-  // slot so we emit ONE `out.HeapVarying<k> = vec4<u32>(...)` per slot
-  // (covering every contributing field's lanes in one literal).
-  const heapSlotMap = family.perEffectHeapSlotMap.get(effect);
-  if (heapSlotMap !== undefined && heapSlotMap.size > 0) {
-    type SlotPlan = { lanes: string[] };
-    const plans = new Map<number, SlotPlan>();
-    for (const [name, hs] of heapSlotMap) {
-      let plan = plans.get(hs.slot);
-      if (plan === undefined) {
-        plan = { lanes: ["0u", "0u", "0u", "0u"] };
-        plans.set(hs.slot, plan);
-      }
-      const swiz = ["x", "y", "z", "w"];
-      for (let i = 0; i < hs.size; i++) {
-        const lane = hs.offset + i;
-        const compExpr = hs.size === 1
-          ? `r.${name}`
-          : `r.${name}.${swiz[i]!}`;
-        plan.lanes[lane] = wrapAsU32(compExpr, hs.wgslType);
-      }
-    }
-    // Emit in slot-index order for deterministic output.
-    const sortedSlots = [...plans.keys()].sort((a, b) => a - b);
-    for (const k of sortedSlots) {
-      const plan = plans.get(k)!;
-      lines.push(`      out.HeapVarying${k} = vec4<u32>(${plan.lanes.join(", ")});`);
-    }
-  }
   lines.push(`    }`);
   return lines.join("\n");
 }
@@ -1139,17 +947,7 @@ function buildFsCase(
     const rhs = slotComponentExpr(slotName, slot.offset, slot.size);
     lines.push(`      fin.${v.name} = ${rhs};`);
   }
-  // Heap-injected refs: unpack from vec4<u32> slots, bitcast back to
-  // f32 / vec2<f32> as needed.
-  const heapSlotMap = family.perEffectHeapSlotMap.get(effect);
-  if (heapSlotMap !== undefined) {
-    for (const [name, hs] of heapSlotMap) {
-      const slotName = `in.HeapVarying${hs.slot}`;
-      const rhs = unpackHeapValue(slotName, hs);
-      lines.push(`      fin.${name} = ${rhs};`);
-    }
-  }
-  lines.push(`      let r: ${fsOutStruct} = ${fsHelperName}(fin);`);
+  lines.push(`      let r: ${fsOutStruct} = ${fsHelperName}(fin, heap_drawIdx, instId);`);
   // Copy r's fields into the family FsOut. v1 assumes per-effect FS
   // output structs all carry the same fields (driven by
   // `fragmentOutputLayout`); we just map by name. Fragment outputs
@@ -1198,11 +996,9 @@ function synthesizeFamilyVs(
   layoutIdOffsetU32: number,
 ): string {
   const slots = family.varyingSlots;
-  const heapSlots = family.heapVaryingSlots;
-  const layoutIdLoc = slots + heapSlots; // after the N vec4<f32> + M vec4<u32> slots
 
   const lines: string[] = [];
-  lines.push("// Family-merged vertex shader (slice 3b synthesis).");
+  lines.push("// Family-merged vertex shader (direct-heap-read FS path).");
   // Megacall storage-buffer bindings (same shape as standalone path).
   lines.push("@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;");
   lines.push("@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;");
@@ -1215,7 +1011,7 @@ function synthesizeFamilyVs(
     lines.push("");
   }
   // Family VsOut struct.
-  lines.push(familyVsOutStruct(slots, heapSlots, layoutIdLoc));
+  lines.push(familyVsOutStruct(slots));
   lines.push("");
   // Wrapper @vertex.
   lines.push("@vertex fn family_vs_main(@builtin(vertex_index) emitIdx: u32) -> FamilyVsOut {");
@@ -1231,9 +1027,8 @@ function synthesizeFamilyVs(
   for (let i = 0; i < slots; i++) {
     lines.push(`  out.Varying${i} = vec4<f32>(0.0);`);
   }
-  for (let i = 0; i < heapSlots; i++) {
-    lines.push(`  out.HeapVarying${i} = vec4<u32>(0u);`);
-  }
+  lines.push("  out.heap_drawIdx_out = heap_drawIdx;");
+  lines.push("  out.instId_out = instId;");
   lines.push("  out.layoutIdOut = layoutId;");
   lines.push("  switch (layoutId) {");
   for (const p of perEffect) {
@@ -1253,8 +1048,6 @@ function synthesizeFamilyFs(
   dedupedDecls: readonly string[],
 ): string {
   const slots = family.varyingSlots;
-  const heapSlots = family.heapVaryingSlots;
-  const layoutIdLoc = slots + heapSlots;
   const lines: string[] = [];
   // Suppress Tint's conservative derivative-uniformity analysis: layoutIdIn is
   // @interpolate(flat) and uniform per primitive in practice, but Tint treats
@@ -1262,17 +1055,21 @@ function synthesizeFamilyFs(
   // switch. v1 concession; v2 may hoist derivatives via parameter-threading.
   lines.push("diagnostic(off, derivative_uniformity);");
   lines.push("");
-  lines.push("// Family-merged fragment shader (slice 3b synthesis).");
+  lines.push("// Family-merged fragment shader (direct-heap-read FS path).");
   for (const d of dedupedDecls) {
     lines.push(d);
     lines.push("");
   }
-  lines.push(familyFsInStruct(slots, heapSlots, layoutIdLoc));
+  lines.push(familyFsInStruct(slots));
   lines.push("");
   lines.push(familyFsOutStruct(family));
   lines.push("");
   lines.push("@fragment fn family_fs_main(in: FamilyFsIn) -> FamilyFsOut {");
   lines.push("  var fout: FamilyFsOut;");
+  // Hoist heap_drawIdx / instId out of the FsIn carrier into locals so
+  // each per-effect dispatch case can pass them by name to the helper.
+  lines.push("  let heap_drawIdx: u32 = in.heap_drawIdx_in;");
+  lines.push("  let instId: u32 = in.instId_in;");
   lines.push("  switch (in.layoutIdIn) {");
   for (const p of perEffect) {
     const e = family.effects[p.layoutId]!;

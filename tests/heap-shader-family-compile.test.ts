@@ -233,7 +233,7 @@ describe("compileShaderFamily", () => {
     expect(out.vs).toMatch(re);
   });
 
-  it("FamilyVsOut has one Varying<i> location per slot plus flat HeapVarying<k> + layoutIdOut", () => {
+  it("FamilyVsOut has one Varying<i> location per slot plus flat heap_drawIdx / instId / layoutIdOut", () => {
     const family = buildShaderFamily([makeSurfaceEffect(), makeTexturedEffect()]);
     const out = compileShaderFamily(family);
     for (let i = 0; i < family.varyingSlots; i++) {
@@ -241,20 +241,23 @@ describe("compileShaderFamily", () => {
       expect(out.vs).toMatch(re);
       expect(out.fs).toMatch(re);
     }
-    // Heap-injected slots (vec4<u32>, flat) sit immediately after the
-    // user vec4<f32> slots. For these fixtures (no FS uniform reads /
-    // no atlas) the count is 0; if the IR rewrite adds threading, the
-    // count grows and this loop catches it.
-    for (let i = 0; i < family.heapVaryingSlots; i++) {
-      const loc = family.varyingSlots + i;
-      const re = new RegExp(`@interpolate\\(flat\\)\\s+@location\\(${loc}\\)\\s+HeapVarying${i}\\s*:\\s*vec4<u32>`);
-      expect(out.vs).toMatch(re);
-      expect(out.fs).toMatch(re);
-    }
-    // layoutIdOut sits at @location(N + M) flat-interpolated.
-    const N = family.varyingSlots + family.heapVaryingSlots;
-    expect(out.vs).toMatch(new RegExp(`@interpolate\\(flat\\)\\s+@location\\(${N}\\)\\s+layoutIdOut\\s*:\\s*u32`));
-    expect(out.fs).toMatch(new RegExp(`@interpolate\\(flat\\)\\s+@location\\(${N}\\)\\s+layoutIdIn\\s*:\\s*u32`));
+    // No more `HeapVarying<k>: vec4<u32>` slots — the FS reads heap
+    // headers directly via the wrapper-supplied `heap_drawIdx` / `instId`
+    // u32 carriers.
+    expect(out.vs).not.toMatch(/HeapVarying\d+\s*:\s*vec4<u32>/);
+    expect(out.fs).not.toMatch(/HeapVarying\d+\s*:\s*vec4<u32>/);
+    // Direct-heap-read carriers sit immediately after the user
+    // varyings: `heap_drawIdx_out` at @location(N), `instId_out` at
+    // @location(N+1), `layoutIdOut` at @location(N+2).
+    const N = family.varyingSlots;
+    expect(out.vs).toMatch(new RegExp(`@interpolate\\(flat\\)\\s+@location\\(${N}\\)\\s+heap_drawIdx_out\\s*:\\s*u32`));
+    expect(out.vs).toMatch(new RegExp(`@interpolate\\(flat\\)\\s+@location\\(${N + 1}\\)\\s+instId_out\\s*:\\s*u32`));
+    expect(out.vs).toMatch(new RegExp(`@interpolate\\(flat\\)\\s+@location\\(${N + 2}\\)\\s+layoutIdOut\\s*:\\s*u32`));
+    expect(out.fs).toMatch(new RegExp(`@interpolate\\(flat\\)\\s+@location\\(${N}\\)\\s+heap_drawIdx_in\\s*:\\s*u32`));
+    expect(out.fs).toMatch(new RegExp(`@interpolate\\(flat\\)\\s+@location\\(${N + 1}\\)\\s+instId_in\\s*:\\s*u32`));
+    expect(out.fs).toMatch(new RegExp(`@interpolate\\(flat\\)\\s+@location\\(${N + 2}\\)\\s+layoutIdIn\\s*:\\s*u32`));
+    // Schema's heapVaryingSlots stays at 0 in the direct-read path.
+    expect(family.heapVaryingSlots).toBe(0);
   });
 
   it("idempotent — same family schema produces same merged output", () => {
