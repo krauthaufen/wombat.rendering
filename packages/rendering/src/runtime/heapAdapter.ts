@@ -55,6 +55,20 @@ function asUint32(data: HostBufferSource): Uint32Array {
 // spheres each allocating their own copy of the 6144-index buffer
 // → 270 MB).
 const indicesAvalCache = new WeakMap<aval<IBuffer>, aval<Uint32Array>>();
+
+// Per-aval shared "current pool ref" cell. ROs that share an
+// `aval<ITexture>` (and therefore one AtlasPool entry) all read
+// through the same cell; `repack` updates `cell.ref` so every
+// `release` closure frees the latest sub-rect after a swap.
+const currentRefCellCache = new WeakMap<aval<ITexture>, { ref: number }>();
+function currentRefCellFor(av: aval<ITexture>, initial: number): { ref: number } {
+  let c = currentRefCellCache.get(av);
+  if (c === undefined) {
+    c = { ref: initial };
+    currentRefCellCache.set(av, c);
+  }
+  return c;
+}
 function indicesAvalFor(ibAval: aval<IBuffer>): aval<Uint32Array> {
   let av = indicesAvalCache.get(ibAval);
   if (av === undefined) {
@@ -217,6 +231,12 @@ export function renderObjectToHeapSpec(
           ...(dims.host !== undefined ? { source: { width: dims.width, height: dims.height, host: dims.host } } : {}),
         },
       );
+      const texAvalTyped = texAval as aval<ITexture>;
+      // Per-aval shared current-ref cell so all ROs sharing a single
+      // `aval<ITexture>` see the same "live" pool ref. After a repack
+      // every release closure reads the cell and frees the LATEST
+      // sub-rect — no leaks even when multiple ROs are bucket-shared.
+      const cell = currentRefCellFor(texAvalTyped, acq.ref);
       textures = {
         kind: "atlas",
         format: atlasFormat,
@@ -227,15 +247,20 @@ export function renderObjectToHeapSpec(
         sampler: samplerVal,
         page: acq.page,
         poolRef: acq.ref,
-        release: () => pool.release(acq.ref),
+        release: () => pool.release(cell.ref),
+        // Reactivity hooks: heapScene subscribes to `sourceAval`; on
+        // mark, drains via `repack(newTex)` — the pool frees the old
+        // sub-rect, acquires a new one, and the heap path rewrites
+        // the drawHeader fields. Mirrors UniformPool.repack(av, val).
+        sourceAval: texAvalTyped,
+        repack: (newTex: ITexture) => {
+          const next = pool.repack(texAvalTyped, newTex, {
+            wantsMips: dims.mipLevelCount > 1,
+          });
+          cell.ref = next.ref;
+          return next;
+        },
       };
-      // FUTURE: texture-aval reactivity. The pool keys on `texAval`
-      // identity once at addDraw; if the source aval flips to a new
-      // ITexture, the heap path won't re-acquire. Mirror UniformPool's
-      // repack(av, newValue) shape — track a dirty atlas-aval set,
-      // release the old sub-rect + acquire a new one + update the
-      // drawHeader fields in `update(token)`. Single-PR scope here is
-      // the BGL/bind-group/drawHeader plumbing for the static case.
     } else {
       // Tier-L fallback: keep the existing standalone path, which
       // requires a resolved GPUTexture/GPUSampler.

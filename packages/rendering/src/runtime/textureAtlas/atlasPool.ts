@@ -158,6 +158,49 @@ export const mipOffsetInPyramid = (
 };
 
 /**
+ * Pull `(format, width, height, mipLevelCount, host?)` out of an
+ * ITexture for atlas eligibility. Mirrors `heapAdapter.describeTexture`
+ * — kept local so `repack` can validate without importing the adapter.
+ * Returns `null` for sources we can't measure.
+ */
+function describeAtlasTexture(t: ITexture): {
+  format: GPUTextureFormat; width: number; height: number;
+  mipLevelCount: number; host?: HostTextureSource;
+} | null {
+  if (t.kind === "gpu") {
+    const tex = t.texture;
+    return {
+      format: tex.format, width: tex.width, height: tex.height,
+      mipLevelCount: tex.mipLevelCount,
+    };
+  }
+  const src = t.source;
+  if (src.kind === "raw") {
+    return {
+      format: src.format, width: src.width, height: src.height,
+      mipLevelCount: src.mipLevelCount ?? 1, host: src,
+    };
+  }
+  const ext = src.source as unknown;
+  let w = 0, h = 0;
+  if (typeof HTMLVideoElement !== "undefined" && ext instanceof HTMLVideoElement) {
+    w = ext.videoWidth; h = ext.videoHeight;
+  } else if (typeof ImageData !== "undefined" && ext instanceof ImageData) {
+    w = ext.width; h = ext.height;
+  } else {
+    const any = ext as { width?: number; height?: number };
+    w = any.width ?? 0; h = any.height ?? 0;
+  }
+  if (w <= 0 || h <= 0) return null;
+  return {
+    format: src.format ?? "rgba8unorm",
+    width: w, height: h,
+    mipLevelCount: src.generateMips ? Math.floor(Math.log2(Math.max(w, h))) + 1 : 1,
+    host: src,
+  };
+}
+
+/**
  * Aval-identity keyed pool over the per-format page sets. Multiple
  * acquisitions of the same `aval<ITexture>` share one sub-rect; the
  * refcount drives release.
@@ -288,6 +331,83 @@ export class AtlasPool {
     pages.push(page);
     for (const cb of this.pageAddedListeners.get(format)!) cb(pageId);
     return this.finalize(sourceAval, format, pageId, page, opts.source, width, height, numMips);
+  }
+
+  /**
+   * Look up the existing acquisition for a source aval, or `undefined`
+   * if the aval is not currently held in the pool. Mirrors
+   * `UniformPool.entry` — used by the heap path's reactivity loop to
+   * detect "this aval has live refs and just marked".
+   */
+  entry(sourceAval: aval<ITexture>): AtlasAcquisition | undefined {
+    const e = this.entriesByAval.get(sourceAval);
+    return e === undefined ? undefined : this.makeResult(e);
+  }
+
+  /**
+   * Re-pack an aval's atlas placement against a new ITexture value.
+   * Mirrors `UniformPool.repack(av, newValue)` — used when an atlas-
+   * routed `aval<ITexture>` source swaps. Frees the old sub-rect (and
+   * the page slot in the packer) and acquires a fresh one for the new
+   * texture; the returned `AtlasAcquisition` carries the (potentially
+   * different) `pageId`/`origin`/`size`/`numMips`/`ref`. Refcount is
+   * preserved across the swap so multi-RO sharing keeps working.
+   *
+   * Throws if the new texture isn't Tier-S eligible (different format
+   * outside rgba8unorm/srgb, or larger than the cap). Callers should
+   * rely on the heap eligibility classifier, but this is a safety net.
+   */
+  repack(
+    sourceAval: aval<ITexture>,
+    newTexture: ITexture,
+    opts: AtlasAcquireOptions = {},
+  ): AtlasAcquisition {
+    const old = this.entriesByAval.get(sourceAval);
+    if (old === undefined) {
+      throw new Error("AtlasPool.repack: source aval has no live entry");
+    }
+    // Resolve the new texture's eligibility + dimensions.
+    const desc = describeAtlasTexture(newTexture);
+    if (desc === null) {
+      throw new Error("AtlasPool.repack: new ITexture has no measurable dimensions");
+    }
+    const fmt = AtlasPool.eligibleFormat(desc.format);
+    if (fmt === null) {
+      throw new Error(
+        `AtlasPool.repack: new texture format ${desc.format} is not Tier-S eligible`,
+      );
+    }
+    if (!AtlasPool.eligibleSize(desc.width, desc.height)) {
+      throw new Error(
+        `AtlasPool.repack: new texture ${desc.width}×${desc.height} exceeds Tier-S cap`,
+      );
+    }
+
+    // 1. Free the old rect from its page's packer + drop the maps.
+    const savedRefcount = old.refcount;
+    const oldPages = this.pagesByFormat.get(old.format)!;
+    const oldPage = oldPages[old.pageId];
+    if (oldPage !== undefined) {
+      oldPage.packing = oldPage.packing.remove(old.ref);
+    }
+    this.entriesByRef.delete(old.ref);
+    this.entriesByAval.delete(sourceAval);
+
+    // 2. Acquire a fresh placement for the new texture. Reuse the
+    //    `acquire` algorithm — entriesByAval no longer has us, so it
+    //    picks the existing-pages-first path naturally.
+    const acqOpts: AtlasAcquireOptions = {
+      ...opts,
+      ...(opts.source === undefined && desc.host !== undefined
+        ? { source: { width: desc.width, height: desc.height, host: desc.host } }
+        : {}),
+    };
+    const acq = this.acquire(fmt, sourceAval, desc.width, desc.height, acqOpts);
+
+    // 3. Restore the original refcount (acquire set it to 1).
+    const newEntry = this.entriesByRef.get(acq.ref);
+    if (newEntry !== undefined) newEntry.refcount = savedRefcount;
+    return acq;
   }
 
   /** Decrement the refcount; on zero, free the sub-rect. */

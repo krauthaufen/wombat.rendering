@@ -1111,6 +1111,25 @@ export type HeapTextureSet =
        * pool handle.
        */
       readonly release: () => void;
+      /**
+       * The original `aval<ITexture>` source. When present, heapScene
+       * subscribes to it; an aval mark routes through the per-frame
+       * `update` loop into `AtlasPool.repack(av, newValue)`, with the
+       * resulting drawHeader fields rewritten in place. Absent ⇒ static
+       * texture path (no reactivity, current behaviour).
+       *
+       * The pool-level `repack` callback rewires this RO's atlas slot
+       * to the new placement; heapScene reads it from `bucket.localAtlasReleases`'
+       * sibling slot (`localAtlasRepacks`) to avoid a global pool handle.
+       */
+      readonly sourceAval?: aval<ITexture>;
+      /**
+       * Bound `(newTex) → AtlasAcquisition` closure backed by the
+       * pool's `repack`. Adapter-supplied so heapScene can swap the
+       * placement for `sourceAval` without holding a direct pool
+       * reference.
+       */
+      readonly repack?: (newTex: ITexture) => import("./textureAtlas/atlasPool.js").AtlasAcquisition;
     };
 
 /**
@@ -1349,6 +1368,23 @@ export function buildHeapScene(
   // data needs re-uploading. inputChanged(o) routes to allocDirty
   // when `o` is a known pool aval; the frame loop drains it.
   const allocDirty = new Set<aval<unknown>>();
+
+  // Atlas texture-aval reactivity. When a `cval<ITexture>` driving an
+  // atlas-routed RO swaps its inner ITexture, the heap path needs to
+  // (a) release the old sub-rect, (b) acquire a new one, and
+  // (c) rewrite the drawHeader fields of every RO referencing the aval.
+  // Mirrors `allocDirty` shape but for atlas placements rather than
+  // arena uniforms. Each aval can be referenced by multiple ROs (across
+  // buckets) — `atlasAvalRefs` tracks all (bucket, localSlot) pairs so
+  // one swap rewrites N drawHeaders in one drain.
+  const atlasAvalDirty = new Set<aval<ITexture>>();
+  interface AtlasAvalRef {
+    readonly bucket: Bucket;
+    readonly localSlot: number;
+    readonly repack: (newTex: ITexture) => import("./textureAtlas/atlasPool.js").AtlasAcquisition;
+    readonly sampler: ISampler;
+  }
+  const atlasAvalRefs = new Map<aval<ITexture>, AtlasAvalRef[]>();
   /**
    * Per-draw bucket dirty (rare in steady state — only fires when
    * something forces a header rewrite, e.g. a drawHeap GrowBuffer
@@ -1363,6 +1399,11 @@ export function buildHeapScene(
       // identity matches.
       if (pool.has(o as unknown as aval<unknown>)) {
         allocDirty.add(o as unknown as aval<unknown>);
+        return;
+      }
+      const av = o as unknown as aval<ITexture>;
+      if (atlasAvalRefs.has(av)) {
+        atlasAvalDirty.add(av);
       }
     }
   }
@@ -2122,6 +2163,22 @@ export function buildHeapScene(
       packAtlasTextureFields(bucket, localSlot, spec.textures);
       bucket.localAtlasReleases[localSlot] = spec.textures.release;
       bucket.localAtlasTextures[localSlot] = spec.textures;
+      // Reactivity wire-up: subscribe to `sourceAval` (so sceneObj.inputChanged
+      // sees marks) and record the (bucket, slot) pair for the drain loop.
+      const sourceAval = spec.textures.sourceAval;
+      const repackFn = spec.textures.repack;
+      if (sourceAval !== undefined && repackFn !== undefined) {
+        sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
+          // touch — registers sceneObj as an output of sourceAval.
+          sourceAval.getValue(tok);
+        });
+        let arr = atlasAvalRefs.get(sourceAval);
+        if (arr === undefined) {
+          arr = [];
+          atlasAvalRefs.set(sourceAval, arr);
+        }
+        arr.push({ bucket, localSlot, repack: repackFn, sampler: spec.textures.sampler });
+      }
     }
     const byteOff = localSlot * bucket.layout.drawHeaderBytes;
     if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
@@ -2209,6 +2266,24 @@ export function buildHeapScene(
     if (idxAval !== undefined) indexPool.release(arena.indices, idxAval);
     const atlasRel = bucket.localAtlasReleases[localSlot];
     if (atlasRel !== undefined) atlasRel();
+    // Drop atlas-aval ref (if any). When the last ref is dropped we
+    // also remove the aval from the dirty set — a marking after the
+    // last RO is gone is a no-op.
+    const atlasTex = bucket.localAtlasTextures[localSlot];
+    if (atlasTex !== undefined) {
+      const sourceAval = atlasTex.sourceAval;
+      if (sourceAval !== undefined) {
+        const arr = atlasAvalRefs.get(sourceAval);
+        if (arr !== undefined) {
+          const i = arr.findIndex(r => r.bucket === bucket && r.localSlot === localSlot);
+          if (i >= 0) arr.splice(i, 1);
+          if (arr.length === 0) {
+            atlasAvalRefs.delete(sourceAval);
+            atlasAvalDirty.delete(sourceAval);
+          }
+        }
+      }
+    }
     bucket.localAtlasReleases[localSlot] = undefined;
     bucket.localAtlasTextures[localSlot] = undefined;
 
@@ -2282,6 +2357,47 @@ export function buildHeapScene(
           if (e !== undefined) totalDirtyBytes += e.dataBytes;
         }
         allocDirty.clear();
+      }
+
+      // 1b. Atlas-texture aval reactivity: an `aval<ITexture>` that
+      //     drives an atlas placement was marked. Repack the pool entry
+      //     and rewrite the drawHeader fields of every (bucket, slot)
+      //     referencing this aval. The replaced HeapTextureSet's
+      //     `release` closure points at the OLD pool ref — that's
+      //     fine, it still resolves correctly under the pool's
+      //     ref-by-id lookup; we replace it with a closure over the
+      //     new ref so removeDraw frees the right one.
+      if (atlasAvalDirty.size > 0) {
+        for (const av of atlasAvalDirty) {
+          const refs = atlasAvalRefs.get(av);
+          if (refs === undefined || refs.length === 0) continue;
+          const newTex = av.getValue(tok);
+          const acq = refs[0]!.repack(newTex);
+          for (const r of refs) {
+            const newTextures: HeapTextureSet & { kind: "atlas" } = {
+              kind: "atlas",
+              format: acq.page.format,
+              pageId: acq.pageId,
+              origin: acq.origin,
+              size: acq.size,
+              numMips: acq.numMips,
+              sampler: r.sampler,
+              page: acq.page,
+              poolRef: acq.ref,
+              release: r.bucket.localAtlasTextures[r.localSlot]!.release,
+              sourceAval: av,
+              repack: r.repack,
+            };
+            r.bucket.localAtlasTextures[r.localSlot] = newTextures;
+            packAtlasTextureFields(r.bucket, r.localSlot, newTextures);
+            const byteOff = r.localSlot * r.bucket.layout.drawHeaderBytes;
+            if (byteOff < r.bucket.headerDirtyMin) r.bucket.headerDirtyMin = byteOff;
+            const end = byteOff + r.bucket.layout.drawHeaderBytes;
+            if (end > r.bucket.headerDirtyMax) r.bucket.headerDirtyMax = end;
+            totalDirtyBytes += r.bucket.layout.drawHeaderBytes;
+          }
+        }
+        atlasAvalDirty.clear();
       }
 
       // 2. Per-bucket: (rare) header re-pack — only fires when the
