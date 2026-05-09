@@ -23,9 +23,11 @@ In a typical scientific-viz workload:
   gizmos, brushes, axis indicators, vehicle props, hover
   affordances, GIS feature symbols, point/line clouds below some
   threshold, any RO whose total payload fits comfortably (see §2).
-  Mixed effects, mixed trafos, mixed textures (with §6 + §9).
-  Hundreds to tens of thousands of these, all collapsing to ~3
-  drawIndirect calls.
+  Mixed effects, mixed trafos, mixed textures (with §6 + §9),
+  per-RO instancing (with §10) — a 1000-tree forest with a shared
+  mesh + 1000 distinct transforms collapses to one bucket and one
+  drawIndirect. Hundreds to tens of thousands of these, all
+  collapsing to ~3 drawIndirect calls.
 
 The success metric isn't "render a billion points faster than your
 hand-rolled C++." It's "make the tail effectively free so users
@@ -970,3 +972,78 @@ This is the right escape hatch *today* AND a clean migration path
 to the eventual bindless future. Spirit-aligned with the rest of
 the architecture: pay the price in management complexity at the
 periphery, gain unconditional uniformity in the hot path.
+
+## 10. Per-RO instancing ✅ SHIPPED
+
+The heap path used to hard-reject ROs with `instanceAttributes` and
+soft-reject `instanceCount > 1` — both went via the legacy per-RO
+renderer. Today: an RO with a shared mesh + N per-instance
+attribute buffers + `instanceCount = N` (e.g. a 1000-tree forest)
+collapses to **one bucket, one record, one drawIndirect** in
+megacall mode. Total emit per record: `indexCount * instanceCount`.
+
+**What changed:**
+
+- **Eligibility** (`heapEligibility.ts`): `instanceAttributes` are
+  now accepted as long as every entry passes the same tight-stride
+  / stride-0-broadcast rule applied to `vertexAttributes`.
+  `instanceCount` may be any positive value. `firstInstance != 0`
+  remains rejected.
+- **DrawHeader schema** (`heapEffect.ts`): per-instance attributes
+  share the existing attribute arena (no new arena introduced)
+  and emit one `(refIntoArena, stride)` u32 ref per attribute,
+  parallel to per-vertex attribute fields. `BucketLayout`
+  records `perInstanceAttributes: ReadonlySet<string>` so the IR
+  rewriter picks the per-instance index for those reads.
+- **DrawTable record** grew by 4 bytes: now `(firstEmit, drawIdx,
+  indexStart, indexCount, instanceCount)` = 20 bytes / 5 u32. The
+  GPU prefix-sum reads `indexCount * instanceCount` per record
+  instead of just `indexCount`.
+- **VS prelude** splits the per-record local offset into
+  `instId = local / indexCount`, `vid = indices[indexStart + local
+  % indexCount]`. The header-selector identifier is `heap_drawIdx`
+  so the user-facing `instance_index` builtin carries the in-RO
+  instance index (= instId), not the per-RO selector.
+
+Megacall is now the only path. The earlier non-megacall mode (one
+`drawIndexed` per slot with bit-split `firstInstance` encoding) was
+removed — its only advantage was avoiding the prefix-sum compute
+pass, but it capped per-RO instances at `2^20 - 1` and hard-broke at
+`localSlot >= 4096`. Megacall scales to billions of emits per bucket
+(VRAM is the bound long before any u32 ceiling).
+
+**Backward compat:** an RO with `instanceCount = 1` and no
+per-instance attributes evaluates `instId = 0` and reads the same
+header entries as before. Existing 93 rendering tests stay green.
+
+**Why arena reuse over a new "instance arena":** per-instance
+buffers don't have an access pattern WGSL distinguishes from
+per-vertex — both are random-indexed reads via a `(refIntoArena,
+length)` pair. The pool's aval-keyed sharing already handles the
+"1000 ROs share one positions buffer" case for vertex attributes;
+instance attributes flow through the same code path with no
+duplication. Per-RO instance counts up to ~10⁶ fit comfortably
+within today's arena growth.
+
+**MDI migration path:** WebGPU's eventual `multi-draw-indirect`
+extension replaces the binary-search-fold trick (one drawIndirect
+that internally iterates `numRecords` parameter sets) with one
+native MDI call. The arena layout, drawHeader schema, and
+prefix-sum kernel don't change — only the encode-side switches
+from "compute scan to one indirect call covering totalEmit
+vertices" to "skip the scan and issue MDI". The IR's per-instance
+attribute reads survive unchanged because `__heap_drawIdx` and
+`instId` map directly to MDI's per-draw `drawId` builtin and the
+hardware's instance-index, respectively.
+
+**v1 limitations** worth surfacing for future tightening:
+
+- `spec.instanceCount` is read once at addDraw time. Reactive
+  updates to instance count require a re-add (CPU side) — the
+  drawTable record's `instanceCount` field is wired up to be GPU-
+  visible reactive, but the CPU diff path doesn't yet listen.
+- The effect's IR-level attribute step-mode is inferred from the
+  user's `instanceAttributes` map at adapter time; the schema
+  itself is step-mode-agnostic. Two ROs with the same effect but
+  one routes an attribute as per-vertex and the other as per-
+  instance produce distinct buckets (different shaders).

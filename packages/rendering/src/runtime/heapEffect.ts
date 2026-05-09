@@ -236,33 +236,26 @@ export interface BucketLayout {
   /** DrawHeader stride in u32 elements (drawHeaderBytes / 4). */
   readonly strideU32: number;
   /**
-   * True if this bucket holds an instanced draw (shape 2). The bucket has
-   * a single slot (slot=0); WGSL reads `iidx = instance_index` and uses
-   * `instanceLoadExpr` for any uniform listed in `perInstanceUniforms`.
-   */
-  readonly isInstanced: boolean;
-  /**
    * Names (schema-side) of uniforms that vary per instance. Populated
    * from `spec.instances.values` at addDraw time; the rewriter pulls
    * these via `instanceLoadExpr` instead of `uniformLoadExpr`.
    */
   readonly perInstanceUniforms: ReadonlySet<string>;
   /**
+   * Names (schema-side) of attributes that vary per instance. Populated
+   * from `spec.instanceAttributes` at addDraw time. The rewriter
+   * indexes per-instance attribute reads by `iidx` (= `instance_index`
+   * the megacall path) instead of `vid`.
+   */
+  readonly perInstanceAttributes: ReadonlySet<string>;
+  /**
    * Texture bindings: name + WGSL type + bind-group binding number
    * (allocated starting at TEX_BINDING_START, after the four heap-
-   * data bindings 0–3).
+   * data bindings 0–3 and the three megacall bindings 4–6).
    */
   readonly textureBindings: readonly { readonly name: string; readonly wgslType: string; readonly binding: number }[];
   /** Sampler bindings, allocated after textures. */
   readonly samplerBindings: readonly { readonly name: string; readonly wgslType: string; readonly binding: number }[];
-  /**
-   * Megacall mode: one `pass.draw(totalEmit, 1, 0, 0)` per bucket.
-   * The shader binary-searches a per-bucket drawTable to figure out
-   * which slot a given vertex emit belongs to, then vertex-pulls the
-   * index. Adds two storage-buffer bindings (drawTable at 4,
-   * indexStorage at 5); textures shift to 6+.
-   */
-  readonly megacall: boolean;
   /**
    * Atlas-routed texture binding names, exposed for the FS rewriter so
    * it can substitute `textureSample(name, smp, uv)` with the heap
@@ -271,8 +264,12 @@ export interface BucketLayout {
   readonly atlasTextureBindings: ReadonlySet<string>;
 }
 
-/** First texture binding number; samplers come after the textures. */
-export const HEAP_TEX_BINDING_START = 4;
+/**
+ * First texture binding number; samplers come after the textures.
+ * Bindings 0–3 are the four heap arena views, 4–6 are megacall
+ * (drawTable, indexStorage, firstDrawInTile).
+ */
+export const HEAP_TEX_BINDING_START = 7;
 
 /**
  * Number of independent pages per format. Drives both the BGL slot
@@ -293,9 +290,8 @@ export function buildBucketLayout(
   schema: HeapEffectSchema,
   _hasTextures: boolean,
   opts: {
-    isInstanced?: boolean;
     perInstanceUniforms?: ReadonlySet<string>;
-    megacall?: boolean;
+    perInstanceAttributes?: ReadonlySet<string>;
     /**
      * Names of schema texture bindings routed via the atlas binding-array
      * path. Each such binding is dropped from `textureBindings` /
@@ -306,13 +302,9 @@ export function buildBucketLayout(
     atlasTextureBindings?: ReadonlySet<string>;
   } = {},
 ): BucketLayout {
-  const isInstanced = opts.isInstanced ?? false;
   const perInstanceUniforms = opts.perInstanceUniforms ?? new Set<string>();
-  const megacall = opts.megacall ?? false;
+  const perInstanceAttributes = opts.perInstanceAttributes ?? new Set<string>();
   const atlasTextureBindings = opts.atlasTextureBindings ?? new Set<string>();
-  if (megacall && isInstanced) {
-    throw new Error("heapEffect: megacall + isInstanced not supported");
-  }
   const drawHeaderFields: DrawHeaderField[] = [];
 
   // Per-draw uniforms → u32 ref slots in the DrawHeader. The runtime
@@ -383,7 +375,7 @@ export function buildBucketLayout(
   // layout below and the runtime's BGL/bind-group construction.
   // Atlas-routed bindings drop out — their data flows through the
   // drawHeader instead of through individual texture/sampler slots.
-  let nextBinding = megacall ? HEAP_TEX_BINDING_START + 2 : HEAP_TEX_BINDING_START;
+  let nextBinding = HEAP_TEX_BINDING_START;
   const textureBindings = schema.textures
     .filter(t => !atlasTextureBindings.has(t.name))
     .map(t => ({ name: t.name, wgslType: t.wgslType, binding: nextBinding++ }));
@@ -413,15 +405,15 @@ export function buildBucketLayout(
     ? extendSchemaWithAtlasVaryings(schema, atlasTextureBindings)
     : schema;
   const preludeWgsl = generatePrelude(
-    schemaForPrelude, textureBindings, samplerBindings, megacall,
+    schemaForPrelude, textureBindings, samplerBindings,
     isAtlasBucket,
   );
 
   return {
     drawHeaderFields, drawHeaderBytes, preludeWgsl, strideU32,
-    isInstanced, perInstanceUniforms,
+    perInstanceUniforms,
+    perInstanceAttributes,
     textureBindings, samplerBindings,
-    megacall,
     atlasTextureBindings,
   };
 }
@@ -464,7 +456,6 @@ function generatePrelude(
   schema: HeapEffectSchema,
   textureBindings: readonly { name: string; wgslType: string; binding: number }[],
   samplerBindings: readonly { name: string; wgslType: string; binding: number }[],
-  megacall: boolean,
   isAtlasBucket: boolean,
 ): string {
   // VsOut is generated from the schema's surviving VS outputs (post
@@ -486,9 +477,7 @@ function generatePrelude(
     ? `\n${texDecls}${texDecls && smpDecls ? "\n" : ""}${smpDecls}\n`
     : "";
 
-  const megacallDecls = megacall
-    ? `\n@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;\n@group(0) @binding(6) var<storage, read> firstDrawInTile: array<u32>;`
-    : "";
+  const megacallDecls = `\n@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;\n@group(0) @binding(6) var<storage, read> firstDrawInTile: array<u32>;`;
 
   const atlasBlock = isAtlasBucket ? generateAtlasPrelude() : "";
 
@@ -652,12 +641,19 @@ export function atlasVaryingNames(name: string): {
 
 
 /**
- * Megacall VS prelude: binary-search `drawTable` (one u32-quad per slot:
- * firstEmit, drawIdx, indexStart, indexCount) for the slot owning the
- * given `emitIdx`, then vertex-pull the index from `indexStorage`.
- * Defines `drawIdx` + `vid` so the rest of the existing preamble works
- * unchanged.
+ * Megacall VS prelude: binary-search `drawTable` (one record per slot,
+ * 5 u32s: firstEmit, drawIdx, indexStart, indexCount, instanceCount)
+ * for the slot owning the given `emitIdx`, then split the in-record
+ * offset into `(instId, vid)` so per-RO instancing collapses to one
+ * record + one drawIndirect. Defines:
+ *   - `heap_drawIdx` — per-RO selector for header reads.
+ *   - `instId`         — instance index in [0, instanceCount-1].
+ *   - `vid`            — vertex index pulled from indexStorage.
+ *
+ * Layout: each record emits `indexCount * instanceCount` vertices.
+ * `local = emitIdx - firstEmit`, `instId = local / indexCount`,
+ * `vid = indices[indexStart + local % indexCount]`.
  */
 export function megacallSearchPrelude(): string {
-  return `  let _tileIdx = emitIdx >> 6u;\n  var lo: u32 = firstDrawInTile[_tileIdx];\n  var hi: u32 = firstDrawInTile[_tileIdx + 1u];\n  loop {\n    if (lo >= hi) { break; }\n    let _mid = (lo + hi + 1u) >> 1u;\n    if (drawTable[_mid * 4u] <= emitIdx) { lo = _mid; } else { hi = _mid - 1u; }\n  }\n  let _slot = lo;\n  let drawIdx = drawTable[_slot * 4u + 1u];\n  let _indexStart = drawTable[_slot * 4u + 2u];\n  let vid = indexStorage[_indexStart + (emitIdx - drawTable[_slot * 4u])];\n`;
+  return `  let _tileIdx = emitIdx >> 6u;\n  var lo: u32 = firstDrawInTile[_tileIdx];\n  var hi: u32 = firstDrawInTile[_tileIdx + 1u];\n  loop {\n    if (lo >= hi) { break; }\n    let _mid = (lo + hi + 1u) >> 1u;\n    if (drawTable[_mid * 5u] <= emitIdx) { lo = _mid; } else { hi = _mid - 1u; }\n  }\n  let _slot = lo;\n  let _firstEmit  = drawTable[_slot * 5u + 0u];\n  let heap_drawIdx = drawTable[_slot * 5u + 1u];\n  let _indexStart = drawTable[_slot * 5u + 2u];\n  let _indexCount = drawTable[_slot * 5u + 3u];\n  let _local      = emitIdx - _firstEmit;\n  let instId      = _local / _indexCount;\n  let vid         = indexStorage[_indexStart + (_local % _indexCount)];\n`;
 }

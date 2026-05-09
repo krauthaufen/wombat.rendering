@@ -95,3 +95,29 @@ export const lambertTexturedFS = fragment((v: {
 });
 
 export const texturedSurface = effect(trafoTexturedVS, lambertTexturedFS);
+
+// ─── Instanced variant ────────────────────────────────────────────────
+// Adds an `InstanceOffset: V3f` attribute to the vertex input. The
+// runtime decides per-vertex vs per-instance step-mode based on
+// whether the RO binds the attribute via `vertexAttributes` or
+// `instanceAttributes` — the effect itself doesn't care. We use
+// this in main.ts to spawn instanced "towers" stacked along +Z.
+
+export const trafoInstancedVS = vertex((v: {
+  Positions:      V4f;
+  Normals:        V3f;
+  Colors:         V4f;
+  InstanceOffset: V3f;
+}) => {
+  const wp0 = uniform.ModelTrafo.mul(v.Positions);
+  const wp  = new V4f(wp0.xyz.add(v.InstanceOffset), wp0.w);
+  const n4  = new V4f(v.Normals.xyz, 0.0);
+  return {
+    gl_Position:    uniform.ViewProjTrafo.mul(wp),
+    WorldPositions: wp,
+    Normals:        n4.xyz,
+    Colors:         v.Colors,
+  };
+});
+
+export const instancedSurface = effect(trafoInstancedVS, lambertFS);

@@ -78,6 +78,9 @@ export class MockGPU {
   writeTextureCalls: WriteTextureCall[] = [];
   copyExternalCalls: CopyExternalCall[] = [];
   renderPasses: MockRenderPass[] = [];
+  computePipelines: GPUComputePipelineDescriptor[] = [];
+  computePasses: { setPipelineCalls: GPUComputePipeline[]; dispatches: { x: number; y: number; z: number }[] }[] = [];
+  drawIndirectCalls: { buffer: GPUBuffer; offset: number }[] = [];
   pipelines: GPURenderPipelineDescriptor[] = [];
   pipelineLayouts: GPUPipelineLayoutDescriptor[] = [];
   bindGroupLayouts: GPUBindGroupLayoutDescriptor[] = [];
@@ -155,6 +158,10 @@ export class MockGPU {
         self.pipelines.push(desc);
         return { __mockPipeline: desc } as unknown as GPURenderPipeline;
       },
+      createComputePipeline(desc: GPUComputePipelineDescriptor): GPUComputePipeline {
+        self.computePipelines.push(desc);
+        return { __mockComputePipeline: desc } as unknown as GPUComputePipeline;
+      },
       createBindGroup(desc: GPUBindGroupDescriptor): GPUBindGroup {
         self.bindGroups.push(desc);
         return { __mockBG: desc } as unknown as GPUBindGroup;
@@ -229,7 +236,23 @@ export class MockGPU {
           drawIndexed(indexCount: number, instanceCount?: number, firstIndex?: number, baseVertex?: number, firstInstance?: number) {
             recorder.drawIndexedCalls.push({ indexCount, instanceCount, firstIndex, baseVertex, firstInstance });
           },
+          drawIndirect(buffer: GPUBuffer, offset: number) {
+            self.drawIndirectCalls.push({ buffer, offset });
+          },
+          drawIndexedIndirect(buffer: GPUBuffer, offset: number) {
+            self.drawIndirectCalls.push({ buffer, offset });
+          },
         } as unknown as GPURenderPassEncoder;
+      },
+      beginComputePass(_desc?: GPUComputePassDescriptor): GPUComputePassEncoder {
+        const recorder = { setPipelineCalls: [] as GPUComputePipeline[], dispatches: [] as { x: number; y: number; z: number }[] };
+        self.computePasses.push(recorder);
+        return {
+          end() {},
+          setPipeline(p: GPUComputePipeline) { recorder.setPipelineCalls.push(p); },
+          setBindGroup() {},
+          dispatchWorkgroups(x: number, y = 1, z = 1) { recorder.dispatches.push({ x, y, z }); },
+        } as unknown as GPUComputePassEncoder;
       },
       copyBufferToBuffer(src: GPUBuffer, srcOffset: number, dst: GPUBuffer, dstOffset: number, size: number) {
         self.copyBufferCalls.push({ src, srcOffset, dst, dstOffset, size });

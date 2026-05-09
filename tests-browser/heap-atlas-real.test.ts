@@ -146,7 +146,6 @@ describe("heap-atlas real-GPU integration", () => {
 
       const scene = buildHeapScene(device, sig, draws, {
         fragmentOutputLayout: { locations: new Map([["outColor", 0]]) },
-        megacall: false,
         atlasPool: pool,
       });
 

@@ -132,3 +132,56 @@ describe("isHeapEligible — texture escalation rules", () => {
     expect(isHeapEligible(withTexSampler(tex)).getValue(AdaptiveToken.top)).toBe(false);
   });
 });
+
+describe("isHeapEligible — per-RO instancing", () => {
+  it("RO with tight-stride instance attributes is eligible", () => {
+    const ibuf = cval<IBuffer>(IBuffer.fromHost(new ArrayBuffer(48)));
+    const view: BufferView = {
+      buffer: ibuf, offset: 0, stride: 12, elementType: ElementType.V3f,
+    };
+    const ro = baseRO({
+      instanceAttributes: HashMap.empty<string, BufferView>().add("offset", view),
+      drawCall: cval<DrawCall>({
+        kind: "indexed", indexCount: 3, instanceCount: 4,
+        firstIndex: 0, baseVertex: 0, firstInstance: 0,
+      }),
+    });
+    expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(true);
+  });
+
+  it("RO with high instanceCount and no per-instance attrs is eligible", () => {
+    const ro = baseRO({
+      drawCall: cval<DrawCall>({
+        kind: "indexed", indexCount: 3, instanceCount: 1000,
+        firstIndex: 0, baseVertex: 0, firstInstance: 0,
+      }),
+    });
+    expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(true);
+  });
+
+  it("RO with non-tight stride on instance attribute is ineligible", () => {
+    const ibuf = cval<IBuffer>(IBuffer.fromHost(new ArrayBuffer(64)));
+    const view: BufferView = {
+      // V3f source (12B) but stride 16 — interleaved, not tight, not broadcast.
+      buffer: ibuf, offset: 0, stride: 16, elementType: ElementType.V3f,
+    };
+    const ro = baseRO({
+      instanceAttributes: HashMap.empty<string, BufferView>().add("offset", view),
+      drawCall: cval<DrawCall>({
+        kind: "indexed", indexCount: 3, instanceCount: 4,
+        firstIndex: 0, baseVertex: 0, firstInstance: 0,
+      }),
+    });
+    expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(false);
+  });
+
+  it("RO with firstInstance != 0 is ineligible (still rejected)", () => {
+    const ro = baseRO({
+      drawCall: cval<DrawCall>({
+        kind: "indexed", indexCount: 3, instanceCount: 4,
+        firstIndex: 0, baseVertex: 0, firstInstance: 1,
+      }),
+    });
+    expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(false);
+  });
+});

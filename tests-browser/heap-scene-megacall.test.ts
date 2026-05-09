@@ -86,7 +86,6 @@ describe("heap-scene megacall integration", () => {
 
       const scene = buildHeapScene(device, sig, draws, {
         fragmentOutputLayout: { locations: new Map([["outColor", 0]]) },
-        megacall: true,
       });
 
       // Drive update + encodeComputePrep + submit.
@@ -205,7 +204,6 @@ describe("heap-scene megacall integration", () => {
 
       const scene = buildHeapScene(device, sig, draws, {
         fragmentOutputLayout: { locations: new Map([["outColor", 0]]) },
-        megacall: true,
       });
 
       scene.update(AdaptiveToken.top);
@@ -340,7 +338,6 @@ describe("heap-scene megacall integration", () => {
 
       const scene = buildHeapScene(device, sig, draws, {
         fragmentOutputLayout: { locations: new Map([["outColor", 0]]) },
-        megacall: true,
       });
 
       scene.update(AdaptiveToken.top);

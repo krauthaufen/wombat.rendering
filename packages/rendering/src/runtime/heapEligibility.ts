@@ -22,9 +22,13 @@
 //      the result aval marks → hybrid task repartitions.
 //
 // Out-of-scope blockers (return false unconditionally if present):
-//   - `instanceAttributes`     — heap path doesn't ingest these yet.
 //   - `storageBuffers`         — same.
 //   - >1 texture or sampler    — multi-binding API not in v1.
+//
+// Per-RO instancing IS supported: `instanceAttributes` are accepted as
+// long as every entry passes the same tight-stride / stride-0-broadcast
+// rule used for `vertexAttributes`, and `dc.instanceCount` may be any
+// positive value (with `firstInstance === 0`).
 //
 // These are conservative wedges, not permanent: as the heap path
 // grows feature support each becomes a per-buffer eligibility
@@ -106,6 +110,9 @@ function isHeapServableTexture(t: ITexture): boolean {
 function bufferAvals(ro: RenderObject): aval<IBuffer>[] {
   const out: aval<IBuffer>[] = [];
   ro.vertexAttributes.iter((_k, v: BufferView) => { out.push(v.buffer); });
+  if (ro.instanceAttributes !== undefined) {
+    ro.instanceAttributes.iter((_k, v: BufferView) => { out.push(v.buffer); });
+  }
   if (ro.indices !== undefined) out.push(ro.indices.buffer);
   return out;
 }
@@ -129,9 +136,6 @@ function samplerAvals(ro: RenderObject): aval<ISampler>[] {
  */
 export function isHeapEligible(ro: RenderObject): aval<boolean> {
   // 1. Static hard wedges.
-  if (ro.instanceAttributes !== undefined && ro.instanceAttributes.count > 0) {
-    return AVal.constant(false);
-  }
   if (ro.storageBuffers !== undefined && ro.storageBuffers.count > 0) {
     return AVal.constant(false);
   }
@@ -139,17 +143,22 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
     return AVal.constant(false);
   }
 
-  // 2. BufferView stride wedge — only tight per-vertex layouts (and
-  //    broadcasts via `singleValue` / stride 0) are ingested. The
-  //    shader-side cyclic addressing (`vid % length`) makes broadcasts
-  //    a degenerate per-vertex case (length 1), so we don't reject
-  //    them here — but interleaved strides remain unsupported.
+  // 2. BufferView stride wedge — only tight per-vertex/per-instance
+  //    layouts (and broadcasts via `singleValue` / stride 0) are
+  //    ingested. The shader-side cyclic addressing (`vid % length`,
+  //    `iidx % length`) makes broadcasts a degenerate length-1 case,
+  //    so we don't reject them here — but interleaved strides remain
+  //    unsupported. Per-instance attributes follow the same rule.
   let strideBlocked = false;
-  ro.vertexAttributes.iter((_k, v: BufferView) => {
+  const checkStride = (v: BufferView): void => {
     const stride = v.stride ?? v.elementType.byteSize;
     const isBroadcast = v.singleValue !== undefined || stride === 0;
     if (!isBroadcast && stride !== v.elementType.byteSize) strideBlocked = true;
-  });
+  };
+  ro.vertexAttributes.iter((_k, v: BufferView) => checkStride(v));
+  if (ro.instanceAttributes !== undefined) {
+    ro.instanceAttributes.iter((_k, v: BufferView) => checkStride(v));
+  }
   if (strideBlocked) return AVal.constant(false);
 
   // 3. Index-format wedge — heap stores indices as u32.
@@ -171,7 +180,7 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
     for (const av of samplers) if (!isHeapServableSampler(av.getValue(token))) return false;
     const dc = ro.drawCall.getValue(token);
     if (dc.kind !== "indexed") return false;
-    if (dc.instanceCount !== 1) return false;
+    if (dc.instanceCount < 1) return false;
     if (dc.baseVertex !== 0) return false;
     if (dc.firstIndex !== 0) return false;
     if (dc.firstInstance !== 0) return false;

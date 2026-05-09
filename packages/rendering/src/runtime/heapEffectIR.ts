@@ -249,17 +249,22 @@ function injectVsBuiltins(m: Module): Module {
 // using `instance_index` as drawIdx. For each surviving attribute,
 // use `vertex_index` and cyclic addressing.
 
+/**
+ * Per-RO selector expression. Always reads the `heap_drawIdx` local
+ * defined by the megacall prelude.
+ */
+function drawIdxExprFor(_layout: BucketLayout): Expr {
+  return { kind: "Var", var: { name: "heap_drawIdx", type: Tu32, mutable: false } } as Expr;
+}
+
 function rewriteVertexBodies(m: Module, layout: BucketLayout): Module {
-  // For instanced buckets the bucket holds a single slot — drawIdx is
-  // baked to 0u and `instance_index` becomes iidx (per-instance index
-  // within the array uniform). For non-instanced buckets drawIdx ==
-  // instance_index (firstInstance trick) and iidx == 0u.
-  const drawIdx = layout.isInstanced
-    ? constU32(0)
-    : readScope("Builtin", "instance_index", Tu32);
-  const iidx = layout.isInstanced
-    ? readScope("Builtin", "instance_index", Tu32)
-    : constU32(0);
+  // Header-selector identifier: `heap_drawIdx` injected by
+  // megacallSearchPrelude (per-RO selector). `instance_index` holds the
+  // in-RO instance index (= `instId` from the prelude); `vertex_index`
+  // is the index pulled from `indexStorage`.
+  const instBuiltin = readScope("Builtin", "instance_index", Tu32);
+  const drawIdx: Expr = drawIdxExprFor(layout);
+  const iidx: Expr = instBuiltin;
   const vid = readScope("Builtin", "vertex_index", Tu32);
   const uniformMapping = new Map<string, Expr>();
   const attrMapping    = new Map<string, Expr>();
@@ -272,7 +277,10 @@ function rewriteVertexBodies(m: Module, layout: BucketLayout): Module {
         : loadUniformByRef(refExpr, f.uniformWgslType ?? "");
       uniformMapping.set(f.name, value);
     } else if (f.kind === "attribute-ref") {
-      attrMapping.set(f.name, loadAttributeByRef(refExpr, vid, f.attributeWgslType ?? ""));
+      const value = layout.perInstanceAttributes.has(f.name)
+        ? loadAttributeByRef(refExpr, iidx, f.attributeWgslType ?? "")
+        : loadAttributeByRef(refExpr, vid, f.attributeWgslType ?? "");
+      attrMapping.set(f.name, value);
     }
   }
   // Restrict to vertex stages: the FS substitution needs the threaded
@@ -397,7 +405,7 @@ function rewriteFsUniforms(m: Module, layout: BucketLayout): Module {
   if (used.size === 0) return m;
 
   const fieldByName = new Map(layout.drawHeaderFields.map(f => [f.name, f]));
-  const drawIdxExpr = readScope("Builtin", "instance_index", Tu32);
+  const drawIdxExpr = drawIdxExprFor(layout);
   const threadParams: EntryParameter[] = [];
   const vsWrites: Stmt[] = [];
   const fsSubst = new Map<string, Expr>();
@@ -564,7 +572,7 @@ function rewriteFsAtlasTextures(m: Module, layout: BucketLayout): Module {
     inner.set(sub, byteOffsetOf(f.byteOffset));
   }
 
-  const drawIdxExpr = readScope("Builtin", "instance_index", Tu32);
+  const drawIdxExpr = drawIdxExprFor(layout);
   const threadParams: EntryParameter[] = [];
   const vsWrites: Stmt[] = [];
 
@@ -696,7 +704,7 @@ export function compileHeapEffectIR(
   const fsStage = compiled.stages.find(s => s.stage === "fragment");
   let vsSrc = vsStage?.source ?? "";
   let fsSrc = fsStage?.source ?? "";
-  if (layout.megacall && vsSrc.length > 0) {
+  if (vsSrc.length > 0) {
     vsSrc = applyMegacallToEmittedVs(vsSrc);
   }
   if (layout.atlasTextureBindings.size > 0) {
@@ -853,7 +861,12 @@ function applyMegacallToEmittedVs(vs: string): string {
     }
     kept.push(p);
   }
-  const newHeader = `@vertex fn ${fnName}(${kept.join(", ")}) -> ${retType} {\n${megacallSearchPrelude()}  let instance_index: u32 = drawIdx;\n  let vertex_index: u32 = vid;\n`;
+  // megacallSearchPrelude exposes `heap_drawIdx`, `instId`, `vid`. The
+  // IR rewrites bind header-selector reads to `heap_drawIdx` directly
+  // (loadHeaderRef takes an Expr arg); the remaining bindings expose
+  // `instance_index` (= per-RO instance idx) and `vertex_index` for
+  // user code that reads them by builtin.
+  const newHeader = `@vertex fn ${fnName}(${kept.join(", ")}) -> ${retType} {\n${megacallSearchPrelude()}  let instance_index: u32 = instId;\n  let vertex_index: u32 = vid;\n`;
   s = s.slice(0, headerStart) + newHeader + s.slice(headerEnd);
   return decl + s;
 }

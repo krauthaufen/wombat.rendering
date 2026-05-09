@@ -44,8 +44,6 @@ export interface RuntimeContext {
    * Useful for A/B perf comparisons.
    */
   readonly heapEnabled?: aval<boolean>;
-  /** Megacall mode — see `RuntimeOptions.megacall`. */
-  readonly megacall?: boolean;
 }
 
 class RenderTask implements IRenderTask {
@@ -123,7 +121,7 @@ class RenderTask implements IRenderTask {
     const scene = this.sceneFor(cmd, cmd.tree);
     scene.update(token);
     if (!scene.hasDraws() && clearValues === undefined) return;
-    // Compute prep (megacall prefix-sum) must happen outside any
+    // Compute prep (drawTable prefix-sum) must happen outside any
     // render pass — encode it before we open the pass.
     scene.encodeComputePrep(enc, token);
     // Either we have draws or we need to clear — open a single pass.
@@ -141,7 +139,6 @@ class RenderTask implements IRenderTask {
       s = compileHybridScene(this.ctx.device, this.signature, tree, {
         compileEffect: this.ctx.compileEffect,
         ...(this.ctx.heapEnabled !== undefined ? { heapEnabled: this.ctx.heapEnabled } : {}),
-        ...(this.ctx.megacall !== undefined ? { megacall: this.ctx.megacall } : {}),
       });
       this._scenes.set(cmd, s);
     }

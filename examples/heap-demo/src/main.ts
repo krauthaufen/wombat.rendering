@@ -31,7 +31,7 @@ import {
 } from "@aardworx/wombat.rendering.experimental/core";
 import { Runtime } from "@aardworx/wombat.rendering.experimental/runtime";
 import { attachCanvas, runFrame } from "@aardworx/wombat.rendering.experimental/window";
-import { surface, texturedSurface } from "./effects.js";
+import { surface, texturedSurface, instancedSurface } from "./effects.js";
 import { buildBox, buildSphere, buildCylinder, type GeometryData } from "./geometry.js";
 
 const countParam = new URLSearchParams(location.search).get("count");
@@ -212,6 +212,54 @@ function makeRO(spec: RoSpec, viewProj: aval<Trafo3d>, eye: aval<V3d>): RenderOb
   };
 }
 
+// One RO that draws `count` copies of `spec.geo` stacked along +Z,
+// each `dz` apart. Per-instance offsets flow through the
+// `InstanceOffset: V3f` attribute on `instancedSurface`. The whole
+// tower collapses to ONE drawTable record + ONE drawHeader; the
+// heap megacall's prefix-sum multiplies indexCount × instanceCount
+// to derive total emit space, and the megacall VS prelude splits
+// vertex_index into (drawIdx, instId, vid).
+function makeInstancedTowerRO(
+  spec: RoSpec,
+  viewProj: aval<Trafo3d>,
+  eye: aval<V3d>,
+  count: number,
+  dz: number,
+): RenderObject {
+  // One offset per instance, stacked along +Z. Tight V3f stride.
+  const offsets = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) offsets[i * 3 + 2] = i * dz;
+  const offsetView = BufferView.ofArray(offsets, { elementType: ElementType.V3f });
+  const baseAttribs = HashMap.empty<string, BufferView>()
+    .add("Positions", spec.geo.positions)
+    .add("Normals",   spec.geo.normals)
+    .add("Colors",    asV4fBroadcast(spec.color));
+  const instAttribs = HashMap.empty<string, BufferView>()
+    .add("InstanceOffset", offsetView);
+  // Original drawCall is `instanceCount: 1`. Patch it to `count`.
+  const dc: aval<DrawCall> = AVal.constant<DrawCall>({
+    kind: "indexed",
+    indexCount:    spec.geo.drawCall.force(/* allow-force */).kind === "indexed"
+                   ? (spec.geo.drawCall.force(/* allow-force */) as { indexCount: number }).indexCount
+                   : 0,
+    instanceCount: count,
+    firstIndex:    0,
+    baseVertex:    0,
+    firstInstance: 0,
+  });
+  return {
+    effect: instancedSurface,
+    pipelineState: sharedPipelineState,
+    vertexAttributes: baseAttribs,
+    instanceAttributes: instAttribs,
+    uniforms: makeUniforms(spec.modelTrafo, viewProj, eye),
+    textures: HashMap.empty<string, aval<ITexture>>(),
+    samplers: HashMap.empty<string, aval<ISampler>>(),
+    indices: spec.geo.indices,
+    drawCall: dc,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Boot — async because we need a GPU adapter
 // ---------------------------------------------------------------------------
@@ -320,8 +368,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   // through the legacy per-RO renderer — handy for A/B perf comparisons.
   const heapOnParam = new URLSearchParams(location.search).get("heap-on");
   const heapEnabled = cval(heapOnParam === null || heapOnParam === "1");
-  const megacall = new URLSearchParams(location.search).get("megacall") === "1";
-  const runtime = new Runtime({ device, heapEnabled, megacall });
+  const runtime = new Runtime({ device, heapEnabled });
 
   const bBox = bundleOf(rawBox);
   const bSph = bundleOf(rawSph);
@@ -392,6 +439,17 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   // ONE derived aval each via the memo trie. Pre-§5d this would
   // have been the classic per-RO identity-defeat footgun.
   const ros: RenderObject[] = [];
+  // ?inst=N  — every K-th grid cell becomes a vertical tower of N
+  // instances stacked in +Z. One RO per tower, one drawTable record,
+  // one drawHeader. Exercises the heap path's per-RO instancing.
+  // Default 6. Set ?inst=0 to disable. ?instStride=K controls how
+  // often a cell becomes a tower (default every 37th).
+  const instParam = new URLSearchParams(location.search).get("inst");
+  const instCount = instParam !== null ? Math.max(0, parseInt(instParam, 10) | 0) : 6;
+  const instStrideParam = new URLSearchParams(location.search).get("instStride");
+  const instStride = instStrideParam !== null
+    ? Math.max(1, parseInt(instStrideParam, 10) | 0)
+    : 37;
   if (ROCount <= 4) {
     for (let i = 0; i < ROCount; i++) {
       ros.push(makeRO({
@@ -415,16 +473,24 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
         : geoIdx === 1
           ? Trafo3d.scaling(0.5, 0.5, 0.5).mul(Trafo3d.translation(new V3d(x, y, 0)))
           : Trafo3d.scaling(0.5, 0.5, 0.8).mul(Trafo3d.translation(new V3d(x, y, -0.4)));
-      ros.push(makeRO({
+      const towerHere = instCount > 1 && (k % instStride) === 0;
+      const spec: RoSpec = {
         geo: bundle, modelTrafo: t, color: colors[k % 4]!,
-        ...(atlasMode ? { texture: pickTex(k)!, sampler: sharedSampler! } : {}),
-      }, viewProj, eye));
+        // Towers can't share atlas textures with the regular grid —
+        // they use the non-textured `instancedSurface` effect.
+        ...(atlasMode && !towerHere ? { texture: pickTex(k)!, sampler: sharedSampler! } : {}),
+      };
+      if (towerHere) {
+        ros.push(makeInstancedTowerRO(spec, viewProj, eye, instCount, 1.0));
+      } else {
+        ros.push(makeRO(spec, viewProj, eye));
+      }
     }
   }
 
   // ?churn=N → wrap leaves in a cset and, each frame, remove N random
   // entries + re-add the N removed on the previous frame. Exercises
-  // addDraw/removeDraw + the megacall GPU prefix-sum redispatch.
+  // addDraw/removeDraw + the GPU prefix-sum redispatch.
   const churnParam = new URLSearchParams(location.search).get("churn");
   const churn = churnParam !== null ? Math.max(0, parseInt(churnParam, 10) | 0) : 0;
   const leaves = ros.map(o => RenderTree.leaf(o));
@@ -488,7 +554,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     if (shouldReport) {
       const elapsed = Math.max(1, now - lastReport);
       const fps = (frames * 1000 / elapsed).toFixed(0);
-      const tag = megacall ? "megacall" : (heapEnabled.value ? "heap" : "per-RO");
+      const tag = heapEnabled.value ? "heap" : "per-RO";
       const churnTag = churn > 0 ? ` · churn=${churn}/frame` : "";
       const atlasTag = atlasMode ? ` · atlas · ${NUM_ATLAS_TEXTURES} textures` : "";
       setStatus(

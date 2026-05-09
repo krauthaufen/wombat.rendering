@@ -94,7 +94,7 @@ describe("megacall IR WGSL emission", () => {
       samplers: [],
     };
 
-    const layout = buildBucketLayout(schema, false, { isInstanced: false, megacall: true });
+    const layout = buildBucketLayout(schema, false, {});
     const ir = compileHeapEffectIR(effect, layout, { target: "wgsl" });
     // eslint-disable-next-line no-console
     console.log("=== VS ===\n" + ir.vs + "\n=== FS ===\n" + ir.fs);
@@ -103,7 +103,12 @@ describe("megacall IR WGSL emission", () => {
     expect(ir.vs).toContain("@builtin(vertex_index) emitIdx: u32");
     expect(ir.vs).toMatch(/drawTable:\s+array<u32>/);
     expect(ir.vs).toMatch(/indexStorage:\s+array<u32>/);
-    expect(ir.vs).toContain("let drawIdx");
+    // Per-RO instancing: header-selector reads bind to a distinct
+    // `heap_drawIdx` identifier; `instance_index` is now the in-RO
+    // instance index (= instId from the megacall search prelude).
+    expect(ir.vs).toContain("let heap_drawIdx");
+    expect(ir.vs).not.toMatch(/let __heap_drawIdx\b/);
+    expect(ir.vs).toContain("let instance_index: u32 = instId");
     expect(ir.vs).toContain("let vid");
     // No leftover @builtin(instance_index)
     expect(ir.vs).not.toMatch(/@builtin\(\s*instance_index\s*\)/);

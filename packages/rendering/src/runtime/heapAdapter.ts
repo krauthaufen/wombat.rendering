@@ -175,6 +175,18 @@ export function renderObjectToHeapSpec(
   ro.vertexAttributes.iter((name, bv: BufferView) => { inputs[name] = bv; });
   ro.uniforms.iter((name, av) => { inputs[name] = av; });
 
+  // 1b. Instance attributes — same shape, threaded via the heap path's
+  //     per-RO instancing fast path (one record / one drawIndirect for
+  //     `instanceCount > 1`, with per-instance attribute reads indexed
+  //     by the in-RO instance idx).
+  let instanceAttributes: { [name: string]: aval<unknown> | unknown } | undefined;
+  if (ro.instanceAttributes !== undefined && ro.instanceAttributes.count > 0) {
+    instanceAttributes = {};
+    ro.instanceAttributes.iter((name, bv: BufferView) => {
+      instanceAttributes![name] = bv;
+    });
+  }
+
   // 2. Indices: BufferView → aval<Uint32Array>. Map the underlying
   //    IBuffer aval; the heap path's IndexPool will key on this aval.
   if (ro.indices === undefined) {
@@ -294,6 +306,8 @@ export function renderObjectToHeapSpec(
     effect: ro.effect,
     pipelineState: ro.pipelineState,
     inputs,
+    ...(instanceAttributes !== undefined ? { instanceAttributes } : {}),
+    ...(dc.instanceCount > 1 ? { instanceCount: dc.instanceCount } : {}),
     indices,
     ...(textures !== undefined ? { textures } : {}),
   };

@@ -75,14 +75,6 @@ export interface CompileHybridSceneOptions {
    * Default: `AVal.constant(true)` (heap path on for eligible ROs).
    */
   readonly heapEnabled?: aval<boolean>;
-  /**
-   * Megacall mode: collapse N drawIndexed-per-bucket into one
-   * `pass.drawIndirect(...)` per bucket. Per-record `firstEmit` and the
-   * indirect args are computed on-GPU by a Blelloch prefix-sum during
-   * `encodeComputePrep`. Throws on instanced specs. Compile-time flag
-   * (changes BGL + shader). Default: false.
-   */
-  readonly megacall?: boolean;
 }
 
 export interface HybridScene {
@@ -92,9 +84,9 @@ export interface HybridScene {
    */
   update(token: AdaptiveToken): void;
   /**
-   * Encode pre-pass compute work the heap path needs (megacall GPU
+   * Encode pre-pass compute work the heap path needs (drawTable GPU
    * prefix-sum). Must be called BEFORE `beginRenderPass`. No-op when
-   * the heap path has no megacall buckets or none are dirty.
+   * the heap path has no buckets or none are dirty.
    */
   encodeComputePrep(enc: GPUCommandEncoder, token: AdaptiveToken): void;
   /**
@@ -180,7 +172,6 @@ export function compileHybridScene(
   const heapScene: HeapScene = buildHeapScene(device, signature, heapSpecAset, {
     fragmentOutputLayout,
     atlasPool,
-    ...(opts.megacall !== undefined ? { megacall: opts.megacall } : {}),
   });
 
   // ─── Legacy subset → RenderTree → ScenePass ──────────────────────

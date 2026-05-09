@@ -137,7 +137,6 @@ describe("heap-atlas texture-aval reactivity (real GPU)", () => {
 
       const scene = buildHeapScene(device, sig, draws, {
         fragmentOutputLayout: { locations: new Map([["outColor", 0]]) },
-        megacall: false,
         atlasPool: pool,
       });
 

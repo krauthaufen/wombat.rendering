@@ -747,6 +747,10 @@ const SCAN_MAX_RECORDS = SCAN_TILE_SIZE * SCAN_TILE_SIZE; // numBlocks ≤ TILE_
 
 const TILE_K = 64;
 
+/** drawTable record width: (firstEmit, drawIdx, indexStart, indexCount, instanceCount). */
+const RECORD_U32   = 5;
+const RECORD_BYTES = RECORD_U32 * 4;
+
 const HEAP_SCAN_WGSL = `
 struct Params {
   numRecords: u32,
@@ -756,10 +760,11 @@ struct Params {
 };
 
 struct Record {
-  firstEmit:  u32,
-  drawIdx:    u32,
-  indexStart: u32,
-  indexCount: u32,
+  firstEmit:     u32,
+  drawIdx:       u32,
+  indexStart:    u32,
+  indexCount:    u32,
+  instanceCount: u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> drawTable:        array<Record>;
@@ -810,8 +815,8 @@ fn scanTile(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id)
   let i1 = blockOff + tid + WG_SIZE;
   var v0: u32 = 0u;
   var v1: u32 = 0u;
-  if (i0 < n) { v0 = drawTable[i0].indexCount; }
-  if (i1 < n) { v1 = drawTable[i1].indexCount; }
+  if (i0 < n) { v0 = drawTable[i0].indexCount * drawTable[i0].instanceCount; }
+  if (i1 < n) { v1 = drawTable[i1].indexCount * drawTable[i1].instanceCount; }
   sdata[tid]           = v0;
   sdata[tid + WG_SIZE] = v1;
   workgroupBarrier();
@@ -1016,6 +1021,24 @@ export interface HeapDrawSpec {
    */
   readonly inputs: { readonly [name: string]: aval<unknown> | unknown };
   /**
+   * Per-RO instance attributes — one BufferView per name, indexed by
+   * `instance_index` (= iidx in the megacall path) at shader time.
+   * Routed through the same arena-pool as `inputs` (aval-keyed
+   * sharing across draws). Triggers the heap path's per-RO
+   * instancing fast path: one record / one drawIndirect for an RO
+   * with `instanceCount=N`, total emit = `indexCount * N`.
+   *
+   * Must NOT alias names in `inputs` — instance attributes are
+   * disjoint from per-vertex attributes and from uniforms.
+   */
+  readonly instanceAttributes?: { readonly [name: string]: aval<unknown> | unknown };
+  /**
+   * Per-RO instance count for the instancing path. Defaults to 1.
+   * Reads through the arena's drawTable record so the GPU prefix-sum
+   * computes `indexCount * instanceCount` per record.
+   */
+  readonly instanceCount?: aval<number> | number;
+  /**
    * Index buffer for this draw. Indices live in their own `INDEX`-
    * usage `GPUBuffer` (WebGPU forces this), separate from the arena.
    */
@@ -1042,24 +1065,6 @@ export interface HeapDrawSpec {
    * with depth write enabled. Matches the demo's existing visuals.
    */
   readonly pipelineState?: PipelineState;
-  /**
-   * Optional per-instance values (shape 2 — "I know this is one mesh
-   * with N transforms"). When present, `count` is the instance count
-   * and each entry of `values` overrides the same-named uniform from
-   * `inputs`: it's read once per instance via `instance_index` rather
-   * than once per draw. The pool stores it as a packed array
-   * (count × stride bytes) keyed on aval identity.
-   *
-   * The keys of `values` MUST be uniforms declared by the effect's
-   * schema; they shadow any same-named entry in `inputs`.
-   *
-   * Each instanced spec gets its own bucket (single slot). Non-
-   * instanced draws are unaffected.
-   */
-  readonly instances?: {
-    readonly count: aval<number> | number;
-    readonly values: { readonly [name: string]: aval<unknown> | unknown };
-  };
 }
 
 export interface HeapSceneStats {
@@ -1211,13 +1216,6 @@ export interface BuildHeapSceneOptions {
    */
   readonly fragmentOutputLayout?: FragmentOutputLayout;
   /**
-   * Megacall mode: collapse N drawIndexed-per-bucket into one
-   * `pass.drawIndirect(...)` per bucket. Per-record `firstEmit` and the
-   * indirect-draw args are computed on-GPU each frame via a Blelloch
-   * scan in `encodeComputePrep`. Throws on instanced specs.
-   */
-  readonly megacall?: boolean;
-  /**
    * Atlas pool that owns the per-format independent page textures.
    * heapScene reads `pool.pagesFor(format)` to wire each page's
    * `GPUTexture` into the matching slot of the bucket's BGL ladder
@@ -1234,7 +1232,6 @@ export function buildHeapScene(
   initialDraws: readonly HeapDrawSpec[] | aset<HeapDrawSpec>,
   opts: BuildHeapSceneOptions = {},
 ): HeapScene {
-  const megacall = opts.megacall ?? false;
   const atlasPool = opts.atlasPool;
   const colorAttachmentName = sig.colorNames[0];
   if (colorAttachmentName === undefined) {
@@ -1250,7 +1247,7 @@ export function buildHeapScene(
   // sharing the same Positions array → 1 alloc, not 10K).
   const arena = buildArenaState(
     device, 64 * 1024, 16 * 1024, "heapScene",
-    megacall ? GPUBufferUsage.STORAGE : 0,
+    GPUBufferUsage.STORAGE,
   );
 
   // ─── Per-draw global bookkeeping (sparse, indexed by drawId) ──────
@@ -1523,7 +1520,7 @@ export function buildHeapScene(
   interface BglEntry { bgl: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout }
   const bglCache = new Map<string, BglEntry>();
   function getBgl(layout: BucketLayout, withAtlasArrays: boolean): BglEntry {
-    const key = `t${layout.textureBindings.length}|s${layout.samplerBindings.length}|m${layout.megacall ? 1 : 0}|a${withAtlasArrays ? 1 : 0}`;
+    const key = `t${layout.textureBindings.length}|s${layout.samplerBindings.length}|a${withAtlasArrays ? 1 : 0}`;
     let e = bglCache.get(key);
     if (e !== undefined) return e;
     // Heap data buffers are read by both stages: FS uniform-via-varying
@@ -1536,13 +1533,11 @@ export function buildHeapScene(
       { binding: 2, visibility: heapVis, buffer: { type: "read-only-storage" } },
       { binding: 3, visibility: heapVis, buffer: { type: "read-only-storage" } },
     ];
-    if (layout.megacall) {
-      entries.push(
-        { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-        { binding: 5, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-        { binding: 6, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-      );
-    }
+    entries.push(
+      { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      { binding: 5, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      { binding: 6, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+    );
     for (const t of layout.textureBindings) {
       entries.push({
         binding: t.binding, visibility: GPUShaderStage.FRAGMENT,
@@ -1591,7 +1586,7 @@ export function buildHeapScene(
   let scanPipeBlocks: GPUComputePipeline | undefined;
   let scanPipeAdd:   GPUComputePipeline | undefined;
   let scanPipeBuildTileIndex: GPUComputePipeline | undefined;
-  if (megacall) {
+  {
     scanBgl = device.createBindGroupLayout({
       label: "heapScene/scanBgl",
       entries: [
@@ -1707,16 +1702,16 @@ export function buildHeapScene(
       { binding: 2, resource: { buffer: arena.attrs.buffer } },          // heapF32
       { binding: 3, resource: { buffer: arena.attrs.buffer } },          // heapV4f
     ];
-    if (bucket.layout.megacall) {
+    {
       if (bucket.drawTableBuf === undefined) {
         throw new Error("heapScene: megacall bucket without drawTableBuf");
       }
-      // Bind drawTable with size = recordCount * 16 so the VS prelude's
-      // `arrayLength(&drawTable)/4u` returns exactly the live record
-      // count — keeps stale tail entries out of the binary search.
-      // Minimum 16 bytes (one zero-record) to satisfy WebGPU non-zero
-      // size constraint when the bucket is empty.
-      const dtBytes = Math.max(16, bucket.recordCount * 16);
+      // Bind drawTable with size = recordCount * RECORD_BYTES so the VS
+      // prelude's `arrayLength(&drawTable)/RECORD_U32` returns exactly
+      // the live record count — keeps stale tail entries out of the
+      // binary search. Minimum one zero-record to satisfy WebGPU non-
+      // zero size constraint when the bucket is empty.
+      const dtBytes = Math.max(RECORD_BYTES, bucket.recordCount * RECORD_BYTES);
       entries.push(
         { binding: 4, resource: { buffer: bucket.drawTableBuf.buffer, offset: 0, size: dtBytes } },
         { binding: 5, resource: { buffer: arena.indices.buffer } },
@@ -1834,16 +1829,15 @@ export function buildHeapScene(
       });
     }
   }
-  // Megacall: indexStorage is bound at slot 5 from arena.indices, so
-  // a grow there also invalidates every bucket's bind group.
-  if (megacall) {
+  // indexStorage is bound at slot 5 from arena.indices, so a grow there
+  // also invalidates every bucket's bind group.
+  {
     arena.indices.onResize(() => {
       for (const b of buckets) b.bindGroup = buildBucketBindGroup(b);
     });
   }
 
   // ─── findOrCreateBucket ───────────────────────────────────────────
-  let instancedBucketCounter = 0;
   // Atlas-variant ROs share buckets by (effect, pipelineState) regardless
   // of which atlas pages they happen to land on — the bucket extends its
   // page set lazily as new ROs join. Standalone-variant ROs keep the
@@ -1857,22 +1851,28 @@ export function buildHeapScene(
     effect: Effect,
     textures: HeapTextureSet | undefined,
     pipelineState: PipelineState | undefined,
-    instanceOpts: { isInstanced: boolean; perInstanceUniforms: ReadonlySet<string> },
+    instanceOpts: {
+      perInstanceUniforms: ReadonlySet<string>;
+      perInstanceAttributes: ReadonlySet<string>;
+    },
   ): Bucket {
     const psKey = psIdOf(pipelineState);
     const texKey = bucketTextureKey(textures);
-    const bk = instanceOpts.isInstanced
-      ? `${idOf(effect)}|${texKey}|${psKey}|inst#${instancedBucketCounter++}`
-      : `${idOf(effect)}|${texKey}|${psKey}`;
+    // Per-instance-attribute sets affect the emitted shader (per-instance
+    // attribute reads index by iidx not vid), so they wedge into the
+    // bucket key.
+    const piaKey = instanceOpts.perInstanceAttributes.size === 0
+      ? ""
+      : `|pia#${[...instanceOpts.perInstanceAttributes].sort().join(",")}`;
+    const bk = `${idOf(effect)}|${texKey}|${psKey}${piaKey}`;
     const existing = bucketByKey.get(bk);
     if (existing !== undefined) return existing;
     const ps = resolvePipelineState(pipelineState);
 
     const isAtlasBucket = textures !== undefined && textures.kind === "atlas";
     const baseLayoutOpts = {
-      isInstanced: instanceOpts.isInstanced,
       perInstanceUniforms: instanceOpts.perInstanceUniforms,
-      megacall,
+      perInstanceAttributes: instanceOpts.perInstanceAttributes,
     };
     const compiled = compileHeapEffect(effect, opts.fragmentOutputLayout);
     const atlasNames = isAtlasBucket
@@ -1932,7 +1932,7 @@ export function buildHeapScene(
       localAtlasReleases: [],
       localAtlasTextures: [],
     };
-    if (megacall) {
+    {
       const dtBuf = new GrowBuffer(
         device, `heapScene/${bk}/drawTable`,
         GPUBufferUsage.STORAGE,
@@ -1941,12 +1941,12 @@ export function buildHeapScene(
       const blockSumsBuf = new GrowBuffer(
         device, `heapScene/${bk}/blockSums`,
         GPUBufferUsage.STORAGE,
-        4 * Math.max(1, Math.ceil((dtBuf.capacity / 16) / SCAN_TILE_SIZE)),
+        4 * Math.max(1, Math.ceil((dtBuf.capacity / RECORD_BYTES) / SCAN_TILE_SIZE)),
       );
       const blockOffsetsBuf = new GrowBuffer(
         device, `heapScene/${bk}/blockOffsets`,
         GPUBufferUsage.STORAGE,
-        4 * Math.max(1, Math.ceil((dtBuf.capacity / 16) / SCAN_TILE_SIZE)),
+        4 * Math.max(1, Math.ceil((dtBuf.capacity / RECORD_BYTES) / SCAN_TILE_SIZE)),
       );
       // 32 u32 = 128 bytes is the floor; pow2-grown by ensureCapacity
       // as totalEmitEstimate grows.
@@ -1989,7 +1989,7 @@ export function buildHeapScene(
         bucket.bindGroup = buildBucketBindGroup(bucket);
         rebuildScanBg();
         bucket.drawTableDirtyMin = 0;
-        bucket.drawTableDirtyMax = bucket.recordCount * 16;
+        bucket.drawTableDirtyMax = bucket.recordCount * RECORD_BYTES;
       });
       blockSumsBuf.onResize(rebuildScanBg);
       blockOffsetsBuf.onResize(rebuildScanBg);
@@ -2132,12 +2132,14 @@ export function buildHeapScene(
   // ─── addDraw / removeDraw ─────────────────────────────────────────
   function addDraw(spec: HeapDrawSpec): number {
     const drawId = nextDrawId++;
-    const isInstanced = spec.instances !== undefined;
-    const perInstanceUniforms = isInstanced
-      ? new Set(Object.keys(spec.instances!.values))
+    const perInstanceUniforms = new Set<string>();
+    // Per-RO instancing: each entry in `instanceAttributes` is read by
+    // the shader at index `iidx` (= instance_index in the megacall path).
+    const perInstanceAttributes = spec.instanceAttributes !== undefined
+      ? new Set(Object.keys(spec.instanceAttributes))
       : new Set<string>();
     const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, {
-      isInstanced, perInstanceUniforms,
+      perInstanceUniforms, perInstanceAttributes,
     });
 
     // Indices live in their own INDEX-usage buffer (WebGPU constraint).
@@ -2148,16 +2150,16 @@ export function buildHeapScene(
     const idxAlloc = indexPool.acquire(device, arena.indices, indicesAval, indicesArr);
 
     const localSlot = bucket.drawHeap.alloc();
-    const instanceCount = isInstanced
-      ? readPlain(spec.instances!.count) as number
+    // Per-RO instancing: read `spec.instanceCount` (defaults to 1).
+    const instanceCount = spec.instanceCount !== undefined
+      ? readPlain(spec.instanceCount) as number
       : 1;
 
     // Walk the bucket's schema-driven DrawHeader fields. Per-instance
-    // uniforms (instanceOpts.perInstanceUniforms) pull from
-    // `spec.instances.values` and pack into an array allocation;
-    // everything else pulls from `spec.inputs` and packs as a single
-    // value. Both go through the same pool — sharing emerges from
-    // aval identity either way.
+    // attributes pull from `spec.instanceAttributes` and pack into an
+    // array allocation; everything else pulls from `spec.inputs` and
+    // packs as a single value. Both go through the same pool — sharing
+    // emerges from aval identity either way.
     const perDrawAvals: aval<unknown>[] = [];
     const perDrawRefs = new Map<string, number>();
     sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
@@ -2165,13 +2167,17 @@ export function buildHeapScene(
         // Atlas-variant texture bindings carry inline values rather than
         // pool refs; packAtlasTextureFields fills them after this loop.
         if (f.kind === "texture-ref") continue;
-        const isPerInstanceField =
+        const isPerInstanceUniformField =
           f.kind === "uniform-ref" && perInstanceUniforms.has(f.name);
-        const provided = isPerInstanceField
-          ? spec.instances!.values[f.name]
+        const isPerInstanceAttrField =
+          f.kind === "attribute-ref" && perInstanceAttributes.has(f.name);
+        const provided = isPerInstanceAttrField
+          ? spec.instanceAttributes![f.name]
           : spec.inputs[f.name];
         if (provided === undefined) {
-          const where = isPerInstanceField ? "spec.instances.values" : "spec.inputs";
+          const where = isPerInstanceAttrField
+            ? "spec.instanceAttributes"
+            : "spec.inputs";
           throw new Error(
             `heapScene: ${where} missing required entry '${f.name}' ` +
             `(effect declares ${f.kind === "uniform-ref"
@@ -2184,10 +2190,13 @@ export function buildHeapScene(
         // BufferView's `aval<IBuffer>` so identity-based sharing works
         // naturally across draws (two ROs with the same `buffer` aval
         // share the arena allocation). The packer extracts host data.
+        // Both per-vertex and per-instance attribute BufferViews flow
+        // through the same arena pool (the heap path doesn't need a
+        // separate "instance arena").
         let av: aval<unknown>;
         let value: unknown;
         let placement: ReturnType<typeof poolPlacementFor>;
-        if (f.kind === "attribute-ref" && !isPerInstanceField && isBufferView(provided)) {
+        if (f.kind === "attribute-ref" && !isPerInstanceUniformField && isBufferView(provided)) {
           const bv = provided;
           placement = bufferViewPlacement(f, bv);
           av = bv.buffer as aval<unknown>;
@@ -2195,7 +2204,7 @@ export function buildHeapScene(
         } else {
           av = asAval(provided as aval<unknown> | unknown);
           value = av.getValue(tok);
-          placement = isPerInstanceField
+          placement = isPerInstanceUniformField
             ? perInstancePlacementFor(f, value, instanceCount)
             : poolPlacementFor(f, value);
         }
@@ -2245,34 +2254,35 @@ export function buildHeapScene(
     const end = byteOff + bucket.layout.drawHeaderBytes;
     if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
 
-    if (bucket.layout.megacall) {
+    {
       const dtBuf = bucket.drawTableBuf!;
       const recIdx = bucket.recordCount;
       if (recIdx >= SCAN_MAX_RECORDS) {
         throw new Error(
-          `heapScene: megacall bucket exceeds SCAN_MAX_RECORDS (${SCAN_MAX_RECORDS}); ` +
+          `heapScene: bucket exceeds SCAN_MAX_RECORDS (${SCAN_MAX_RECORDS}); ` +
           `extend the scan to multi-level if you need more`,
         );
       }
-      const byteOff = recIdx * 16;
-      dtBuf.ensureCapacity(byteOff + 16);
-      dtBuf.setUsed(Math.max(dtBuf.usedBytes, byteOff + 16));
+      const byteOff = recIdx * RECORD_BYTES;
+      dtBuf.ensureCapacity(byteOff + RECORD_BYTES);
+      dtBuf.setUsed(Math.max(dtBuf.usedBytes, byteOff + RECORD_BYTES));
       // Grow scan-side buffers if recordCount crosses a tile boundary.
       const needBlocks = Math.max(1, Math.ceil((recIdx + 1) / SCAN_TILE_SIZE));
       bucket.blockSumsBuf!.ensureCapacity(needBlocks * 4);
       bucket.blockOffsetsBuf!.ensureCapacity(needBlocks * 4);
       const shadow = bucket.drawTableShadow!;
       // firstEmit is GPU-overwritten by the prefix-sum pass; 0 is fine.
-      shadow[recIdx * 4 + 0] = 0;
-      shadow[recIdx * 4 + 1] = localSlot;
-      shadow[recIdx * 4 + 2] = idxAlloc.firstIndex;
-      shadow[recIdx * 4 + 3] = idxAlloc.count;
+      shadow[recIdx * RECORD_U32 + 0] = 0;
+      shadow[recIdx * RECORD_U32 + 1] = localSlot;
+      shadow[recIdx * RECORD_U32 + 2] = idxAlloc.firstIndex;
+      shadow[recIdx * RECORD_U32 + 3] = idxAlloc.count;
+      shadow[recIdx * RECORD_U32 + 4] = instanceCount;
       bucket.recordCount = recIdx + 1;
       bucket.slotToRecord[localSlot] = recIdx;
       bucket.recordToSlot[recIdx] = localSlot;
       if (byteOff < bucket.drawTableDirtyMin) bucket.drawTableDirtyMin = byteOff;
-      if (byteOff + 16 > bucket.drawTableDirtyMax) bucket.drawTableDirtyMax = byteOff + 16;
-      bucket.totalEmitEstimate += idxAlloc.count;
+      if (byteOff + RECORD_BYTES > bucket.drawTableDirtyMax) bucket.drawTableDirtyMax = byteOff + RECORD_BYTES;
+      bucket.totalEmitEstimate += idxAlloc.count * instanceCount;
       const newNumTiles = Math.max(1, Math.ceil(bucket.totalEmitEstimate / TILE_K));
       bucket.firstDrawInTileBuf!.ensureCapacity((newNumTiles + 1) * 4);
       bucket.scanDirty = true;
@@ -2290,28 +2300,32 @@ export function buildHeapScene(
     const bucket    = drawIdToBucket[drawId];
     const localSlot = drawIdToLocalSlot[drawId];
     if (bucket === undefined || localSlot === undefined) return;
-    if (bucket.layout.megacall) {
-      const removedCount = bucket.localEntries[localSlot]?.indexCount ?? 0;
+    {
+      const removedEntry = bucket.localEntries[localSlot];
+      const removedCount = removedEntry !== undefined
+        ? removedEntry.indexCount * removedEntry.instanceCount
+        : 0;
       bucket.totalEmitEstimate = Math.max(0, bucket.totalEmitEstimate - removedCount);
       // Swap-pop: move the last record into the freed slot, decrement
       // recordCount. firstEmit is GPU-rewritten by the next scan, so
-      // we only fix (drawIdx, indexStart, indexCount).
+      // we only fix (drawIdx, indexStart, indexCount, instanceCount).
       const recIdx     = bucket.slotToRecord[localSlot]!;
       const lastRecIdx = bucket.recordCount - 1;
       const shadow = bucket.drawTableShadow!;
       if (recIdx !== lastRecIdx) {
-        const dst = recIdx * 4;
-        const src = lastRecIdx * 4;
+        const dst = recIdx * RECORD_U32;
+        const src = lastRecIdx * RECORD_U32;
         shadow[dst + 0] = 0;
         shadow[dst + 1] = shadow[src + 1]!;
         shadow[dst + 2] = shadow[src + 2]!;
         shadow[dst + 3] = shadow[src + 3]!;
+        shadow[dst + 4] = shadow[src + 4]!;
         const movedSlot = bucket.recordToSlot[lastRecIdx]!;
         bucket.slotToRecord[movedSlot] = recIdx;
         bucket.recordToSlot[recIdx] = movedSlot;
-        const byteOff = recIdx * 16;
+        const byteOff = recIdx * RECORD_BYTES;
         if (byteOff < bucket.drawTableDirtyMin) bucket.drawTableDirtyMin = byteOff;
-        if (byteOff + 16 > bucket.drawTableDirtyMax) bucket.drawTableDirtyMax = byteOff + 16;
+        if (byteOff + RECORD_BYTES > bucket.drawTableDirtyMax) bucket.drawTableDirtyMax = byteOff + RECORD_BYTES;
       }
       bucket.slotToRecord[localSlot] = -1;
       bucket.recordToSlot[lastRecIdx] = -1;
@@ -2502,7 +2516,7 @@ export function buildHeapScene(
         bucket.headerDirtyMin = Infinity;
         bucket.headerDirtyMax = 0;
       }
-      if (bucket.layout.megacall && bucket.drawTableDirtyMax > bucket.drawTableDirtyMin) {
+      if (bucket.drawTableDirtyMax > bucket.drawTableDirtyMin) {
         const shadow = bucket.drawTableShadow!;
         device.queue.writeBuffer(
           bucket.drawTableBuf!.buffer, bucket.drawTableDirtyMin,
@@ -2522,24 +2536,11 @@ export function buildHeapScene(
    * `frame()` below and (eventually) the hybrid render task.
    */
   function encodeIntoPass(pass: GPURenderPassEncoder): void {
-    if (!megacall) pass.setIndexBuffer(arena.indices.buffer, "uint32");
     let curBg: GPUBindGroup | null = null;
     for (const b of buckets) {
       if (b.bindGroup !== curBg) { pass.setBindGroup(0, b.bindGroup); curBg = b.bindGroup; }
       pass.setPipeline(b.pipeline);
-      if (b.layout.megacall) {
-        if (b.recordCount > 0) pass.drawIndirect(b.indirectBuf!, 0);
-        continue;
-      }
-      for (const localSlot of b.drawSlots) {
-        const e = b.localEntries[localSlot]!;
-        // Instanced buckets force `drawIdx = 0u` in WGSL (single slot),
-        // so firstInstance must be 0 too — `instance_index` then runs
-        // 0..instanceCount-1 and is read as `iidx`. Non-instanced
-        // buckets keep the firstInstance=slot trick.
-        const firstInstance = b.layout.isInstanced ? 0 : localSlot;
-        pass.drawIndexed(e.indexCount, e.instanceCount, e.firstIndex, 0, firstInstance);
-      }
+      if (b.recordCount > 0) pass.drawIndirect(b.indirectBuf!, 0);
     }
   }
 
@@ -2554,7 +2555,6 @@ export function buildHeapScene(
    * we just swap the bind group + dispatch shape per bucket.
    */
   function encodeComputePrep(enc: GPUCommandEncoder, _token: AdaptiveToken): void {
-    if (!megacall) return;
     let anyDirty = false;
     for (const b of buckets) { if (b.scanDirty) { anyDirty = true; break; } }
     if (!anyDirty) return;
