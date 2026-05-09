@@ -22,6 +22,7 @@
     "@types/node": "^20.11.0",
     "@vitest/browser": "^1.6.1",
     "@webgpu/types": "^0.1.69",
+    "fast-check": "^4.7.0",
     "playwright": "^1.59.1",
     "typescript": "^5.4.0",
     "vitest": "^1.4.0"

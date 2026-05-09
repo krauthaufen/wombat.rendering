@@ -49,3 +49,33 @@ export {
   type CompileHybridSceneOptions,
   type HybridScene,
 } from "./hybridScene.js";
+
+// ─── Texture atlas (heap path Tier-S texture sharing) ───────────────
+export {
+  BvhTree2d,
+  SPLIT_LIMIT_DEFAULT,
+} from "./textureAtlas/bvhTree2d.js";
+
+export {
+  TexturePacking,
+  empty as emptyTexturePacking,
+  isEmpty as isEmptyTexturePacking,
+  count as countTexturePacking,
+  occupancy as texturePackingOccupancy,
+  square as squareTexturePacking,
+  tryAddMany as texturePackingTryAddMany,
+  tryOfArray as texturePackingTryOfArray,
+} from "./textureAtlas/packer.js";
+
+export {
+  AtlasPool,
+  ATLAS_PAGE_SIZE,
+  ATLAS_MAX_DIM,
+  ATLAS_MAX_PAGES_PER_FORMAT,
+  ATLAS_PAGE_FORMATS,
+  atlasFormatIndex,
+  type AtlasPage,
+  type AtlasPageFormat,
+  type AtlasAcquisition,
+  type AtlasSource,
+} from "./textureAtlas/atlasPool.js";
