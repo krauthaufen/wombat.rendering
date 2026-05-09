@@ -22,16 +22,16 @@ import {
   ElementType,
   PipelineState,
   RenderTree,
+  ITexture,
+  ISampler,
   type RenderObject,
   type DrawCall,
   type Command,
   type ClearValues,
-  type ITexture,
-  type ISampler,
 } from "@aardworx/wombat.rendering.experimental/core";
 import { Runtime } from "@aardworx/wombat.rendering.experimental/runtime";
 import { attachCanvas, runFrame } from "@aardworx/wombat.rendering.experimental/window";
-import { surface } from "./effects.js";
+import { surface, texturedSurface } from "./effects.js";
 import { buildBox, buildSphere, buildCylinder, type GeometryData } from "./geometry.js";
 
 const countParam = new URLSearchParams(location.search).get("count");
@@ -168,6 +168,8 @@ interface RoSpec {
   readonly geo: GeoBundle;
   readonly modelTrafo: Trafo3d;
   readonly color: V4f;
+  readonly texture?: aval<ITexture>;
+  readonly sampler?: aval<ISampler>;
 }
 
 // Shared PipelineState across all ROs — the heap path's bucket key
@@ -180,16 +182,23 @@ const sharedPipelineState = PipelineState.constant({
 });
 
 function makeRO(spec: RoSpec, viewProjM44: aval<M44f>, lightLoc: aval<V3f>): RenderObject {
+  const textured = spec.texture !== undefined && spec.sampler !== undefined;
+  const textures = textured
+    ? HashMap.empty<string, aval<ITexture>>().add("albedo", spec.texture!)
+    : HashMap.empty<string, aval<ITexture>>();
+  const samplers = textured
+    ? HashMap.empty<string, aval<ISampler>>().add("albedo", spec.sampler!)
+    : HashMap.empty<string, aval<ISampler>>();
   return {
-    effect: surface,
+    effect: textured ? texturedSurface : surface,
     pipelineState: sharedPipelineState,
     vertexAttributes: HashMap.empty<string, BufferView>()
       .add("Positions", spec.geo.positions)
       .add("Normals",   spec.geo.normals)
       .add("Colors",    asV4fBroadcast(spec.color)),
     uniforms: makeUniforms(spec.modelTrafo, viewProjM44, lightLoc),
-    textures: HashMap.empty<string, aval<ITexture>>(),
-    samplers: HashMap.empty<string, aval<ISampler>>(),
+    textures,
+    samplers,
     indices: spec.geo.indices,
     drawCall: spec.geo.drawCall,
   };
@@ -311,6 +320,55 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   const bCyl = bundleOf(rawCyl);
   const geos = [bBox, bSph, bCyl, bBox];
 
+  // ─── Atlas mode (?atlas=1) ──────────────────────────────────────────
+  // Generate N distinct 64×64 textures of `rgba8unorm-srgb` (a Tier-S
+  // eligible format → AtlasPool packs them all into one atlas page;
+  // ROs sharing a texture by aval identity share an atlas sub-rect).
+  // The status banner reflects how many distinct textures the scene
+  // is rendering through one atlas-aware bucket.
+  const atlasMode = new URLSearchParams(location.search).get("atlas") === "1";
+  const NUM_ATLAS_TEXTURES = 8;
+  const atlasTextures: aval<ITexture>[] = [];
+  let sharedSampler: aval<ISampler> | undefined;
+  if (atlasMode) {
+    const W = 64, H = 64;
+    // Generate 8 distinct stripey/gradient patterns, each tinted by a
+    // different hue so a casual visual sweep across the grid clearly
+    // shows multiple textures landing in the atlas.
+    const hues: [number, number, number][] = [
+      [255,  64,  64], [ 64, 255,  64], [ 64,  64, 255], [255, 255,  64],
+      [255,  64, 255], [ 64, 255, 255], [255, 160,  32], [160,  64, 255],
+    ];
+    for (let ti = 0; ti < NUM_ATLAS_TEXTURES; ti++) {
+      const data = new Uint8Array(W * H * 4);
+      const [hr, hg, hb] = hues[ti % hues.length]!;
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const o = (y * W + x) * 4;
+          // Diagonal-stripe pattern, tinted by per-texture hue. The
+          // stripe period rotates per-texture so two adjacent ROs in
+          // the grid sampling different atlas entries look distinct.
+          const stripe = ((x + y + ti * 4) >> 3) & 1;
+          const k = stripe === 0 ? 1.0 : 0.55;
+          data[o    ] = Math.min(255, (hr * k) | 0);
+          data[o + 1] = Math.min(255, (hg * k) | 0);
+          data[o + 2] = Math.min(255, (hb * k) | 0);
+          data[o + 3] = 255;
+        }
+      }
+      atlasTextures.push(AVal.constant(ITexture.fromRaw({
+        data, width: W, height: H, format: "rgba8unorm-srgb",
+      })));
+    }
+    sharedSampler = AVal.constant(ISampler.fromDescriptor({
+      magFilter: "linear", minFilter: "linear",
+      addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge",
+    }));
+  }
+  // Pick a texture for RO index `k` (rotates through the N textures).
+  const pickTex = (k: number): aval<ITexture> | undefined =>
+    atlasMode ? atlasTextures[k % NUM_ATLAS_TEXTURES]! : undefined;
+
   // viewProj depends on both size and view (= time-driven). Use a
   // custom aval so a tick on either input recomputes; the runtime's
   // adaptive system handles the cascade.
@@ -337,6 +395,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
         geo: geos[i]!,
         modelTrafo: trafoOf(i, xPositions[i]!),
         color: colors[i]!,
+        ...(atlasMode ? { texture: pickTex(i)!, sampler: sharedSampler! } : {}),
       }, viewProjM44, lightLoc));
     }
   } else {
@@ -353,7 +412,10 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
         : geoIdx === 1
           ? Trafo3d.scaling(0.5, 0.5, 0.5).mul(Trafo3d.translation(new V3d(x, y, 0)))
           : Trafo3d.scaling(0.5, 0.5, 0.8).mul(Trafo3d.translation(new V3d(x, y, -0.4)));
-      ros.push(makeRO({ geo: bundle, modelTrafo: t, color: colors[k % 4]! }, viewProjM44, lightLoc));
+      ros.push(makeRO({
+        geo: bundle, modelTrafo: t, color: colors[k % 4]!,
+        ...(atlasMode ? { texture: pickTex(k)!, sampler: sharedSampler! } : {}),
+      }, viewProjM44, lightLoc));
     }
   }
 
@@ -396,7 +458,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   const pct = (p: number): number => pctOf(samples, sampleN, p);
   const fpct = (p: number): number => pctOf(frameSamples, frameSampleN, p);
   const gpct = (p: number): number => pctOf(gpuSamples, gpuSampleN, p);
-  setStatus(`ready — per-RO path, ${ros.length} render objects (append ?heap=1 for heap path)`);
+  setStatus(`ready — ${ros.length} render objects${atlasMode ? ` · atlas mode (${NUM_ATLAS_TEXTURES} textures)` : ""}`);
   const fbAval = attach.framebuffer as aval<import("@aardworx/wombat.rendering.experimental/core").IFramebuffer>;
   const startTime = performance.now();
   let churnPool: RenderTree[] = [];
@@ -425,8 +487,9 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       const fps = (frames * 1000 / elapsed).toFixed(0);
       const tag = megacall ? "megacall" : (heapEnabled.value ? "heap" : "per-RO");
       const churnTag = churn > 0 ? ` · churn=${churn}/frame` : "";
+      const atlasTag = atlasMode ? ` · atlas · ${NUM_ATLAS_TEXTURES} textures` : "";
       setStatus(
-        `${tag} · ${ros.length} draws${churnTag} · ${fps} fps · ` +
+        `${tag}${atlasTag} · ${ros.length} draws${churnTag} · ${fps} fps · ` +
         `encode ${pct(0.5).toFixed(2)}/${pct(0.99).toFixed(2)} · ` +
         `gpu ${gpct(0.5).toFixed(1)}/${gpct(0.99).toFixed(1)} · ` +
         `frame ${fpct(0.5).toFixed(1)}/${fpct(0.99).toFixed(1)} ms (p50/p99)`,
