@@ -13,17 +13,19 @@
 // NOT compile WGSL, does NOT rewrite IR. It only computes the
 // load-bearing descriptor that subsequent slices of §6 will consume.
 
-import type { Effect } from "@aardworx/wombat.shader";
+import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
 import { combineHashes } from "@aardworx/wombat.shader/ir";
 import {
   compileHeapEffect,
   buildBucketLayout,
+  megacallSearchPrelude,
   type HeapEffectSchema,
   type HeapVarying,
   type BucketLayout,
   type DrawHeaderField,
   type FragmentOutputLayout,
 } from "./heapEffect.js";
+import { compileHeapEffectIR } from "./heapEffectIR.js";
 
 /**
  * One varying's place in the family-wide anonymous-slot layout. Each
@@ -317,6 +319,10 @@ function unionDrawHeaders(
     byteOffset: off,
     byteSize: 4,
     kind: "uniform-ref",
+    // Logical type for the heap-load IR builder. Without this,
+    // `compileHeapEffectIR` would fail on the family layout because
+    // `loadUniformByRef` is dispatched on `uniformWgslType`.
+    uniformWgslType: "u32",
   };
   fields.push(layoutIdField);
   off += 4;
@@ -443,4 +449,475 @@ function logicalFieldType(f: DrawHeaderField): string {
   if (f.kind === "uniform-ref"   && f.uniformWgslType   !== undefined) return f.uniformWgslType;
   if (f.kind === "attribute-ref" && f.attributeWgslType !== undefined) return f.attributeWgslType;
   return f.wgslType;
+}
+
+// ─── Family WGSL synthesis (slice 3b) ───────────────────────────────
+//
+// Take an analysis-only `ShaderFamilySchema` and produce a single VS+FS
+// pair where the merged `@vertex fn family_vs_main` / `@fragment fn
+// family_fs_main` switch on `layoutId` to dispatch to a per-effect
+// helper. Per-effect helpers come from `compileHeapEffectIR(...,
+// "family-member")` after we rename their entries / structs to make
+// them collision-free at module scope.
+//
+// LIMITATIONS (v1):
+//   - Per-effect heap-arena bindings (`@group(0) @binding(0..3)`) and
+//     any user uniform bindings must agree across effects (same name ⇒
+//     same `@group/@binding` and same WGSL type). Dedup checks this
+//     and throws on conflict.
+//   - Each varying gets its own dedicated `@location(N) vec4<f32>` slot
+//     in the family `FamilyVsOut`, regardless of its real width — sub-
+//     vec4 packing across effects is a v2 problem. The varying's
+//     `FamilySlot.slot` from the schema is used directly as the
+//     family location index.
+
+export interface CompiledShaderFamily {
+  readonly vs: string;
+  readonly fs: string;
+  readonly fragmentOutputLayout?: FragmentOutputLayout | undefined;
+}
+
+/**
+ * Synthesise the merged VS+FS pair for a `ShaderFamilySchema`.
+ *
+ * The output is one self-contained WGSL module per stage. The VS
+ * carries the megacall search prelude + all bindings (heap arena 0..3
+ * plus drawTable / indexStorage / firstDrawInTile at 4..6 — same shape
+ * as the standalone path); the FS carries no megacall bindings (it
+ * receives the layoutId via `@interpolate(flat)`).
+ *
+ * Slice 3b is a pure analysis pass — it does NOT wire into heapScene.
+ * Slice 3c will adopt this output behind the existing per-effect
+ * pipeline.
+ */
+export function compileShaderFamily(
+  family: ShaderFamilySchema,
+  fragmentOutputLayout?: FragmentOutputLayout,
+): CompiledShaderFamily {
+  const opts: CompileOptions = fragmentOutputLayout !== undefined
+    ? { target: "wgsl", fragmentOutputLayout }
+    : { target: "wgsl" };
+
+  // 1. Per-effect rewrite + compile in family-member mode.
+  //    Each effect's entries get renamed to `family_vs_${K}` /
+  //    `family_fs_${K}` so they don't collide at module scope when
+  //    we concatenate them. The auto-generated VsOut / FsIn / FsOut
+  //    structs derive from the entry names, so they're disambiguated
+  //    automatically (e.g. `Family_vs_0Output`).
+  const perEffectVs: { layoutId: number; vs: string; fsHelperName: string; vsHelperName: string; outStruct: string; fsInStruct: string; fsOutStruct: string }[] = [];
+  const perEffectFs: string[] = [];
+  for (const e of family.effects) {
+    const k = family.layoutIdOf.get(e)!;
+    const vsHelper = `family_vs_${k}`;
+    const fsHelper = `family_fs_${k}`;
+    const renamed = e.rename({
+      entries: new Map([
+        ...findStageEntryNames(e, "vertex").map(n => [n, vsHelper] as [string, string]),
+        ...findStageEntryNames(e, "fragment").map(n => [n, fsHelper] as [string, string]),
+      ]),
+    });
+    const ir = compileHeapEffectIR(renamed, family.drawHeaderUnion, opts, "family-member");
+    // Auto-generated struct names = `${capitalise(entryName)}Output` /
+    // `${capitalise(entryName)}Input` (see wombat.shader/wgsl/emit).
+    const outStruct = capitalise(vsHelper) + "Output";
+    const fsInStruct = capitalise(fsHelper) + "Input";
+    const fsOutStruct = capitalise(fsHelper) + "Output";
+    perEffectVs.push({ layoutId: k, vs: ir.vs, fsHelperName: fsHelper, vsHelperName: vsHelper, outStruct, fsInStruct, fsOutStruct });
+    perEffectFs.push(ir.fs);
+  }
+
+  // 2. Strip `@vertex`/`@fragment` decorations from the per-effect
+  //    helpers (they're regular fns now) and split each output into a
+  //    set of top-level decls.
+  const vsParts = perEffectVs.map(p => splitWgslTopLevel(stripStageDecoration(p.vs)));
+  const fsParts = perEffectFs.map(s => splitWgslTopLevel(stripStageDecoration(s)));
+
+  // 3. Dedup module-scope decls (storage/uniform bindings, atlas
+  //    helpers, structs etc). The per-effect helper functions stay —
+  //    they're already uniquely named.
+  const vsDecls = dedupModuleDecls(vsParts.flat(), "VS");
+  const fsDecls = dedupModuleDecls(fsParts.flat(), "FS");
+
+  // 4. Compute drawHeader stride + layoutId offset for the wrapper.
+  const familyStrideU32 = family.drawHeaderUnion.strideU32;
+  const layoutIdField = family.drawHeaderUnion.drawHeaderFields.find(f => f.name === "__layoutId");
+  if (layoutIdField === undefined) {
+    throw new Error("compileShaderFamily: drawHeaderUnion missing '__layoutId' field");
+  }
+  const layoutIdOffsetU32 = layoutIdField.byteOffset / 4;
+
+  // 5. Synthesize the wrapper VS and FS.
+  const vs = synthesizeFamilyVs(family, perEffectVs, vsDecls, familyStrideU32, layoutIdOffsetU32);
+  const fs = synthesizeFamilyFs(family, perEffectVs, fsDecls);
+
+  return {
+    vs,
+    fs,
+    fragmentOutputLayout,
+  };
+}
+
+// ─── Helpers (slice 3b) ─────────────────────────────────────────────
+
+function capitalise(s: string): string {
+  return s.length === 0 ? s : s[0]!.toUpperCase() + s.slice(1);
+}
+
+/**
+ * Find stage entry names for the given stage by scanning the effect's
+ * stage templates for `Entry` ValueDefs. Returns a list (typically
+ * length 1, but composed effects may have more).
+ */
+function findStageEntryNames(effect: Effect, stage: "vertex" | "fragment"): string[] {
+  const names: string[] = [];
+  for (const s of effect.stages) {
+    for (const v of s.template.values) {
+      if (v.kind !== "Entry") continue;
+      if (v.entry.stage !== stage) continue;
+      names.push(v.entry.name);
+    }
+  }
+  return names;
+}
+
+/**
+ * Strip the `@vertex` / `@fragment` decoration from each stage entry
+ * function. The decoration is always immediately followed by `fn`
+ * (possibly across whitespace/newlines).
+ */
+function stripStageDecoration(src: string): string {
+  return src.replace(/@(?:vertex|fragment|compute)\s+(?=fn\s)/g, "");
+}
+
+/**
+ * Split a WGSL source into top-level declarations. We walk the source
+ * tracking brace depth to find statement boundaries:
+ *   - `@…` decorators + `var …;` / `const …;` / `alias …;` (one
+ *     statement up to the terminating `;` at depth 0).
+ *   - `struct Name { … };` (block, brace-balanced, optional trailing
+ *     `;`).
+ *   - `fn Name(…) { … }` (block, brace-balanced).
+ * Comments / blank lines between decls are dropped — we only retain
+ * the declaration text.
+ */
+function splitWgslTopLevel(src: string): string[] {
+  const decls: string[] = [];
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    // Skip whitespace and line comments.
+    while (i < n && /\s/.test(src[i]!)) i++;
+    if (i < n && src[i] === "/" && src[i + 1] === "/") {
+      while (i < n && src[i] !== "\n") i++;
+      continue;
+    }
+    if (i >= n) break;
+    const start = i;
+    // Find the end of this declaration. Walk forward, tracking braces.
+    // A decl ends either at `;` (depth 0) for non-block decls, or at
+    // the matching `}` (with optional trailing `;`) for block decls.
+    let depth = 0;
+    let sawBrace = false;
+    while (i < n) {
+      const c = src[i]!;
+      if (c === "{") { depth++; sawBrace = true; i++; continue; }
+      if (c === "}") {
+        depth--;
+        i++;
+        if (depth === 0 && sawBrace) {
+          // Optional trailing semicolon.
+          while (i < n && /\s/.test(src[i]!)) i++;
+          if (i < n && src[i] === ";") i++;
+          break;
+        }
+        continue;
+      }
+      if (c === ";" && depth === 0 && !sawBrace) {
+        i++;
+        break;
+      }
+      i++;
+    }
+    const decl = src.slice(start, i).trim();
+    if (decl.length > 0) decls.push(decl);
+  }
+  return decls;
+}
+
+/**
+ * Classify a top-level decl by kind + identifier (for dedup keying).
+ * Returns `{ key, kind }`. Decls with the same `key` must have the
+ * same text (else we throw — the family has structurally incompatible
+ * per-effect outputs).
+ */
+function classifyDecl(decl: string): { key: string; kind: "binding" | "struct" | "fn" | "var" | "alias" | "other" } {
+  // Binding: `@group(N) @binding(M) var<…> name : type;`
+  let m = /^\s*@group\(\s*\d+\s*\)\s*@binding\(\s*\d+\s*\)\s*var(?:<[^>]*>)?\s+(\w+)\s*:/.exec(decl);
+  if (m !== null) return { key: `binding:${m[1]}`, kind: "binding" };
+  // Struct
+  m = /^\s*struct\s+(\w+)\s*\{/.exec(decl);
+  if (m !== null) return { key: `struct:${m[1]}`, kind: "struct" };
+  // Fn
+  m = /^\s*fn\s+(\w+)\s*\(/.exec(decl);
+  if (m !== null) return { key: `fn:${m[1]}`, kind: "fn" };
+  // var<private>/var
+  m = /^\s*var(?:<[^>]*>)?\s+(\w+)\s*:/.exec(decl);
+  if (m !== null) return { key: `var:${m[1]}`, kind: "var" };
+  // alias
+  m = /^\s*alias\s+(\w+)\s*=/.exec(decl);
+  if (m !== null) return { key: `alias:${m[1]}`, kind: "alias" };
+  return { key: `other:${decl.slice(0, 32)}`, kind: "other" };
+}
+
+/**
+ * Dedup a flat list of top-level decls. Same-key decls must have the
+ * same canonical text (whitespace-normalised); throws on conflict.
+ * Per-effect helper fns (named `family_vs_${K}` / `family_fs_${K}`)
+ * are unique by construction so they pass through.
+ */
+function dedupModuleDecls(decls: readonly string[], stageLabel: string): string[] {
+  const seen = new Map<string, string>();
+  const ordered: string[] = [];
+  for (const d of decls) {
+    const { key } = classifyDecl(d);
+    const norm = d.replace(/\s+/g, " ").trim();
+    const existing = seen.get(key);
+    if (existing === undefined) {
+      seen.set(key, norm);
+      ordered.push(d);
+    } else if (existing !== norm) {
+      throw new Error(
+        `compileShaderFamily: ${stageLabel} declaration '${key}' conflicts across effects:\n` +
+        `  A: ${existing}\n` +
+        `  B: ${norm}\n` +
+        `Disambiguate via Effect.rename(...) or align bindings before merging.`,
+      );
+    }
+  }
+  return ordered;
+}
+
+/**
+ * Build the family `FamilyVsOut` struct text. One `vec4<f32>` per
+ * varying slot plus a flat-interpolated `layoutIdOut: u32`.
+ */
+function familyVsOutStruct(slots: number, layoutIdLoc: number): string {
+  const lines: string[] = [];
+  lines.push("struct FamilyVsOut {");
+  lines.push("  @builtin(position) gl_Position: vec4<f32>,");
+  for (let i = 0; i < slots; i++) {
+    lines.push(`  @location(${i}) Varying${i}: vec4<f32>,`);
+  }
+  lines.push(`  @interpolate(flat) @location(${layoutIdLoc}) layoutIdOut: u32,`);
+  lines.push("};");
+  return lines.join("\n");
+}
+
+function familyFsInStruct(slots: number, layoutIdLoc: number): string {
+  const lines: string[] = [];
+  lines.push("struct FamilyFsIn {");
+  for (let i = 0; i < slots; i++) {
+    lines.push(`  @location(${i}) Varying${i}: vec4<f32>,`);
+  }
+  lines.push(`  @interpolate(flat) @location(${layoutIdLoc}) layoutIdIn: u32,`);
+  lines.push("};");
+  return lines.join("\n");
+}
+
+/**
+ * Component-suffix for an offset+size into a vec4 slot. `(0,3)` →
+ * `.xyz`, `(0,4)` → `` (whole vec4), `(1,2)` → `.yz`, etc. v1: each
+ * varying takes the prefix `(0, size)` of a dedicated slot, but the
+ * helper accepts arbitrary offsets so future packing works.
+ */
+function vec4Swizzle(offset: number, size: number): string {
+  if (offset === 0 && size === 4) return "";
+  const comps = ["x", "y", "z", "w"];
+  return "." + comps.slice(offset, offset + size).join("");
+}
+
+/**
+ * Per-varying read/write expression. For vec3/vec2/scalar, the source
+ * value is a vec3/vec2/f32; we need to read/write the appropriate
+ * `.xyz` / `.xy` / `.x` slice of the slot's `vec4<f32>`.
+ */
+function slotComponentExpr(slotName: string, offset: number, size: number): string {
+  return slotName + vec4Swizzle(offset, size);
+}
+
+/**
+ * Build a dispatch case for the VS wrapper. Calls `family_vs_${K}` and
+ * packs its named-varying outputs into the family's anonymous slots.
+ */
+function buildVsCase(
+  k: number,
+  vsHelperName: string,
+  outStruct: string,
+  effect: Effect,
+  family: ShaderFamilySchema,
+): string {
+  const slotMap = family.perEffectSlotMap.get(effect)!;
+  const lines: string[] = [];
+  lines.push(`    case ${k}u: {`);
+  lines.push(`      let r: ${outStruct} = ${vsHelperName}(heap_drawIdx, instId, vid);`);
+  lines.push(`      out.gl_Position = r.gl_Position;`);
+  // Walk the effect's varyings (from schema) to know which fields exist
+  // on the per-effect struct, then place them into slots by slotMap.
+  const schema = family.perEffectSchema.get(effect)!;
+  for (const v of schema.varyings) {
+    if (v.builtin !== undefined) continue;
+    const slot = slotMap.get(v.name);
+    if (slot === undefined) continue;
+    const slotName = `out.Varying${slot.slot}`;
+    const lhs = slotComponentExpr(slotName, slot.offset, slot.size);
+    lines.push(`      ${lhs} = r.${v.name};`);
+  }
+  lines.push(`    }`);
+  return lines.join("\n");
+}
+
+function buildFsCase(
+  k: number,
+  fsHelperName: string,
+  fsInStruct: string,
+  fsOutStruct: string,
+  effect: Effect,
+  family: ShaderFamilySchema,
+): string {
+  const slotMap = family.perEffectSlotMap.get(effect)!;
+  const schema = family.perEffectSchema.get(effect)!;
+  const lines: string[] = [];
+  lines.push(`    case ${k}u: {`);
+  lines.push(`      var fin: ${fsInStruct};`);
+  for (const v of schema.varyings) {
+    if (v.builtin !== undefined) continue;
+    const slot = slotMap.get(v.name);
+    if (slot === undefined) continue;
+    const slotName = `in.Varying${slot.slot}`;
+    const rhs = slotComponentExpr(slotName, slot.offset, slot.size);
+    lines.push(`      fin.${v.name} = ${rhs};`);
+  }
+  lines.push(`      let r: ${fsOutStruct} = ${fsHelperName}(fin);`);
+  // Copy r's fields into the family FsOut. v1 assumes per-effect FS
+  // output structs all carry the same fields (driven by
+  // `fragmentOutputLayout`); we just map by name. Fragment outputs
+  // appear on the schema as `fragmentOutputs`.
+  for (const fo of schema.fragmentOutputs) {
+    lines.push(`      fout.${fo.name} = r.${fo.name};`);
+  }
+  lines.push(`    }`);
+  return lines.join("\n");
+}
+
+function familyFsOutStruct(family: ShaderFamilySchema): string {
+  // Union all per-effect fragmentOutputs by name. Mismatched types ⇒
+  // throw. v1: simple, no MRT-fan-out.
+  type FO = { name: string; location: number; wgslType: string };
+  const byName = new Map<string, FO>();
+  for (const e of family.effects) {
+    const sc = family.perEffectSchema.get(e)!;
+    for (const fo of sc.fragmentOutputs) {
+      const existing = byName.get(fo.name);
+      if (existing === undefined) {
+        byName.set(fo.name, { name: fo.name, location: fo.location, wgslType: fo.wgslType });
+      } else if (existing.wgslType !== fo.wgslType || existing.location !== fo.location) {
+        throw new Error(
+          `compileShaderFamily: fragmentOutput '${fo.name}' conflicts across effects: ` +
+          `'${existing.wgslType}@${existing.location}' vs '${fo.wgslType}@${fo.location}'`,
+        );
+      }
+    }
+  }
+  const ordered = [...byName.values()].sort((a, b) => a.location - b.location);
+  const lines: string[] = [];
+  lines.push("struct FamilyFsOut {");
+  for (const fo of ordered) {
+    lines.push(`  @location(${fo.location}) ${fo.name}: ${fo.wgslType},`);
+  }
+  lines.push("};");
+  return lines.join("\n");
+}
+
+function synthesizeFamilyVs(
+  family: ShaderFamilySchema,
+  perEffect: readonly { layoutId: number; vsHelperName: string; outStruct: string }[],
+  dedupedDecls: readonly string[],
+  familyStrideU32: number,
+  layoutIdOffsetU32: number,
+): string {
+  const slots = family.varyingSlots;
+  const layoutIdLoc = slots; // last @location after the N vec4 slots
+
+  const lines: string[] = [];
+  lines.push("// Family-merged vertex shader (slice 3b synthesis).");
+  // Megacall storage-buffer bindings (same shape as standalone path).
+  lines.push("@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;");
+  lines.push("@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;");
+  lines.push("@group(0) @binding(6) var<storage, read> firstDrawInTile: array<u32>;");
+  lines.push("");
+  // Deduped module-scope decls (heap arena, user uniforms, per-effect
+  // structs, per-effect helper fns).
+  for (const d of dedupedDecls) {
+    lines.push(d);
+    lines.push("");
+  }
+  // Family VsOut struct.
+  lines.push(familyVsOutStruct(slots, layoutIdLoc));
+  lines.push("");
+  // Wrapper @vertex.
+  lines.push("@vertex fn family_vs_main(@builtin(vertex_index) emitIdx: u32) -> FamilyVsOut {");
+  // Megacall search prelude — defines heap_drawIdx, instId, vid as
+  // locals in this function's scope.
+  lines.push(megacallSearchPrelude());
+  // layoutId from drawHeader.
+  lines.push(`  let layoutId: u32 = headersU32[(heap_drawIdx * ${familyStrideU32}u) + ${layoutIdOffsetU32}u];`);
+  lines.push("  var out: FamilyVsOut;");
+  // Initialise all slots to zero so the WGSL out-of-init-store rule
+  // is satisfied across switch arms that don't write every slot.
+  lines.push("  out.gl_Position = vec4<f32>(0.0);");
+  for (let i = 0; i < slots; i++) {
+    lines.push(`  out.Varying${i} = vec4<f32>(0.0);`);
+  }
+  lines.push("  out.layoutIdOut = layoutId;");
+  lines.push("  switch (layoutId) {");
+  for (const p of perEffect) {
+    const e = family.effects[p.layoutId]!;
+    lines.push(buildVsCase(p.layoutId, p.vsHelperName, p.outStruct, e, family));
+  }
+  lines.push("    default: { }");
+  lines.push("  }");
+  lines.push("  return out;");
+  lines.push("}");
+  return lines.join("\n");
+}
+
+function synthesizeFamilyFs(
+  family: ShaderFamilySchema,
+  perEffect: readonly { layoutId: number; fsHelperName: string; fsInStruct: string; fsOutStruct: string }[],
+  dedupedDecls: readonly string[],
+): string {
+  const slots = family.varyingSlots;
+  const layoutIdLoc = slots;
+  const lines: string[] = [];
+  lines.push("// Family-merged fragment shader (slice 3b synthesis).");
+  for (const d of dedupedDecls) {
+    lines.push(d);
+    lines.push("");
+  }
+  lines.push(familyFsInStruct(slots, layoutIdLoc));
+  lines.push("");
+  lines.push(familyFsOutStruct(family));
+  lines.push("");
+  lines.push("@fragment fn family_fs_main(in: FamilyFsIn) -> FamilyFsOut {");
+  lines.push("  var fout: FamilyFsOut;");
+  lines.push("  switch (in.layoutIdIn) {");
+  for (const p of perEffect) {
+    const e = family.effects[p.layoutId]!;
+    lines.push(buildFsCase(p.layoutId, p.fsHelperName, p.fsInStruct, p.fsOutStruct, e, family));
+  }
+  lines.push("    default: { }");
+  lines.push("  }");
+  lines.push("  return fout;");
+  lines.push("}");
+  return lines.join("\n");
 }
