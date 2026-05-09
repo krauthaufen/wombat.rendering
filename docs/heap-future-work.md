@@ -1068,18 +1068,38 @@ functions reference those names but don't have them in scope. Fixed
 by declaring all three as `var<private>` at module scope; the wrapper
 @vertex fn assigns them in the search prelude, helpers read.
 
-**FS side ⏳ remaining.** `rewriteFsUniforms` constructs FS-side header
-loads via `drawIdxExprFor(layout)`, which returns a literal
-`Var heap_drawIdx` — but the FS module never defines `heap_drawIdx`.
-It should be reading the threaded `_h_<name>Ref` flat-interpolated
-varyings the VS writes. Real Chromium rejects:
-`Error while parsing WGSL: error: unresolved value 'heap_drawIdx'`.
+**FS side ⏳ remaining — actually a wombat.shader emit-phase bug, not
+a heap-rendering issue.** Diagnosed by dumping the emitted FS WGSL
+when `compileHeapEffectIR` runs against an `effect(modelVS,
+instanceOffsetVS, clipVS, lambertFS)`. The fragment module's WGSL
+contains:
 
-The FS path appears to over-eagerly bake `heap_drawIdx` into
-expressions instead of always going through the threaded varying. The
-fix is plumbing-only: in `rewriteFsUniforms` (and any FS-side helper
-it shares with VS), generate FS uniform reads strictly from the
-threaded refs, never from `drawIdxExpr`.
+```wgsl
+fn _modelVs_instanceOffsetVs_clipVs_clipVs_2(s_in: ...) -> ... {
+    let _cse0: u32 = (heap_drawIdx * 8u);   // ← VS helper code here
+    ...
+}
+@fragment fn lambertFs(in: ...) -> ... { ... }
+```
+
+Three VS helper functions (one per fused VS stage) emitted by
+`extractFusedEntry` are landing in the FS module alongside the
+fragment entry. They reference `heap_drawIdx` (from
+`loadHeaderRef(drawIdxExpr, …)` constructed by `rewriteVertexBodies`
+in the heap rewrite). The FS module doesn't declare `heap_drawIdx`
+because the megacall prelude is VS-only — Tint rejects.
+
+Root cause: wombat.shader's per-stage WGSL emit pipeline does NOT
+tree-shake by entry-reachability. Helpers + values surviving DCE
+that aren't reachable from the fragment entry should not appear in
+the FS module. Today they're emitted into both VS and FS WGSL
+modules.
+
+**Fix location**: `wombat.shader/packages/shader/src/runtime/compile.ts`
+or wherever per-stage emit splits a Module into VS/FS WGSL strings.
+Add a tree-shake step that walks call graphs from the stage's Entry
+and includes only helper functions reachable transitively. Out of
+scope for wombat.rendering — file against wombat.shader.
 
 **User-visible workaround**: until the FS side is fixed, RO effects
 intended for the heap path stay as a single `vertex(...)` lambda. The
@@ -1087,7 +1107,10 @@ heap-demo's `trafoInstancedVS` is a deliberate hand-merge of
 `effect(modelVS, instanceOffsetVS, clipVS)` because of this; the
 comment in `examples/heap-demo/src/effects.ts` flags it.
 
-Non-heap (legacy) rendering composes fine — this is purely a
-heap-megacall postprocessing issue. See `~/claude/wombat-shader-composition.md`
-for the broader composition mechanism + design rationale.
+Non-heap (legacy) rendering composes fine — its WGSL emit happens
+to not exercise this code path (the FS doesn't read VS-rewritten
+expressions). This bug surfaces specifically when heap rewrites
+inject expressions that reference VS-only identifiers. See
+`~/claude/wombat-shader-composition.md` for the broader composition
+mechanism + design rationale.
 
