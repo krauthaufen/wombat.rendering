@@ -56,11 +56,35 @@ descriptor:
 demand when no existing page can fit a new sub-rect.
 
 **Per-page bookkeeping:**
-- 2D rectangle allocator (skyline / MaxRects / guillotine — start
-  with MaxRects-Best-Short-Side-Fit; well-studied, decent quality,
-  O(N) per insert).
-- Free list of released rectangles, periodically merged to reduce
-  fragmentation.
+- 2D rectangle allocator. **Reference implementation already exists
+  in Aardvark**: `Aardvark.Geometry.TexturePacking<'a>` at
+  `aardvark.base/src/Aardvark.Geometry/TexturePacking.fs`. Public
+  API (`TryAdd(id, size) → Option<packing'>`, `Remove(id)`,
+  `Free` / `Used` / `Occupancy`) is exactly the shape we need:
+  - **Persistent / immutable** — `TryAdd` returns a new packer.
+    Fits wombat's reactive model naturally; each scene snapshot can
+    hold its packer state in an aval.
+  - **Removal supported** — handles aset deltas as expected.
+  - **BvhTree2d-backed free-space queries** — O(log N) lookups
+    instead of the linear-freelist scan typical of MaxRects
+    implementations elsewhere. Pays off at thousands of sub-rects.
+  - `allowRotate` flag for 90° auto-rotation during packing.
+
+  Plan: port the algorithm + structure to TS. Tests are
+  FsCheck-property-based at
+  `aardvark.base/src/Tests/Aardvark.Geometry.Tests/TexturePacking.fs`
+  — port those too (vitest's property-based testing via fast-check)
+  to lock in the same correctness guarantees.
+
+  This saves ~1–2 weeks of implementation + bug-hunting compared to
+  writing MaxRects from scratch. Also keeps the algorithm consistent
+  between native Aardvark and wombat — future cross-checks and
+  feature parity become trivial.
+
+  TileRenderer has a near-clone at
+  `TileRenderer/src/TileRenderer.Base/TexturePacking.fs` — useful as
+  a secondary reference for "what consumers actually needed."
+
 - Refcount per allocated sub-rect (multiple ROs may share a
   texture identity → one sub-rect, N references).
 
