@@ -1047,3 +1047,47 @@ hardware's instance-index, respectively.
   itself is step-mode-agnostic. Two ROs with the same effect but
   one routes an attribute as per-vertex and the other as per-
   instance produce distinct buckets (different shaders).
+
+## 11. Heap-megacall + wombat.shader composition
+
+Composing VS stages — `effect(modelVS, instanceOffsetVS, clipVS, lambertFS)` —
+is the wombat.shader-native way to add a small modifier (per-instance
+offset, displacement, fade, …) without duplicating the trafo or lambert
+pieces. The wombat.shader optimizer fuses fused-stage helpers + a
+wrapper @vertex fn; it's how `DefaultSurfaces.trafo + simpleLighting`
+already works in wombat.dom.
+
+The heap-megacall post-processing in
+`packages/rendering/src/runtime/heapEffectIR.ts` doesn't yet survive
+composed stages. Two pieces:
+
+**VS side ✅ shipped fix.** `applyMegacallToEmittedVs` used to declare
+the shared megacall values (`heap_drawIdx`, `instId`, `vid`) as
+`let` locals inside the @vertex fn body. With composition, helper
+functions reference those names but don't have them in scope. Fixed
+by declaring all three as `var<private>` at module scope; the wrapper
+@vertex fn assigns them in the search prelude, helpers read.
+
+**FS side ⏳ remaining.** `rewriteFsUniforms` constructs FS-side header
+loads via `drawIdxExprFor(layout)`, which returns a literal
+`Var heap_drawIdx` — but the FS module never defines `heap_drawIdx`.
+It should be reading the threaded `_h_<name>Ref` flat-interpolated
+varyings the VS writes. Real Chromium rejects:
+`Error while parsing WGSL: error: unresolved value 'heap_drawIdx'`.
+
+The FS path appears to over-eagerly bake `heap_drawIdx` into
+expressions instead of always going through the threaded varying. The
+fix is plumbing-only: in `rewriteFsUniforms` (and any FS-side helper
+it shares with VS), generate FS uniform reads strictly from the
+threaded refs, never from `drawIdxExpr`.
+
+**User-visible workaround**: until the FS side is fixed, RO effects
+intended for the heap path stay as a single `vertex(...)` lambda. The
+heap-demo's `trafoInstancedVS` is a deliberate hand-merge of
+`effect(modelVS, instanceOffsetVS, clipVS)` because of this; the
+comment in `examples/heap-demo/src/effects.ts` flags it.
+
+Non-heap (legacy) rendering composes fine — this is purely a
+heap-megacall postprocessing issue. See `~/claude/wombat-shader-composition.md`
+for the broader composition mechanism + design rationale.
+

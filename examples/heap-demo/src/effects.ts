@@ -97,12 +97,19 @@ export const lambertTexturedFS = fragment((v: {
 export const texturedSurface = effect(trafoTexturedVS, lambertTexturedFS);
 
 // ─── Instanced variant ────────────────────────────────────────────────
-// Adds an `InstanceOffset: V3f` attribute to the vertex input. The
-// runtime decides per-vertex vs per-instance step-mode based on
-// whether the RO binds the attribute via `vertexAttributes` or
-// `instanceAttributes` — the effect itself doesn't care. We use
-// this in main.ts to spawn instanced "towers" stacked along +Z.
-
+// IDEALLY: `effect(modelVS, instanceOffsetVS, clipVS, lambertFS)` —
+// composing an `instanceOffsetVS` stage between `modelVS` and
+// `clipVS`, with no duplication of trafoVS or lambertFS. That's the
+// wombat.shader-native shape, and it's the right design.
+//
+// REALITY: heap-megacall's WGSL post-processing
+// (`applyMegacallToEmittedVs` + `rewriteFsUniforms`) doesn't yet
+// survive composition — header-offset reads leak `heap_drawIdx`
+// references into FS that should have been substituted with
+// flat-interpolated varyings. Tracked as a heap-future-work follow-up.
+//
+// Until that's fixed we keep `trafoInstancedVS` as a single combined
+// VS — duplicates the trafo math, but works through the heap path.
 export const trafoInstancedVS = vertex((v: {
   Positions:      V4f;
   Normals:        V3f;

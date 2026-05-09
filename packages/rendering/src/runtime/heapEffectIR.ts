@@ -825,7 +825,10 @@ fn atlasSample(pageRef: u32, formatBits: u32, origin: vec2<f32>, size: vec2<f32>
  */
 function applyMegacallToEmittedVs(vs: string): string {
   let s = vs;
-  const decl = `\n@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;\n@group(0) @binding(6) var<storage, read> firstDrawInTile: array<u32>;\n`;
+  // Module-scope `var<private>` for the megacall shared values so
+  // wombat.shader's composed-stage helper fns can read them. The
+  // wrapper @vertex fn writes them in the prelude; helpers read.
+  const decl = `\n@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;\n@group(0) @binding(6) var<storage, read> firstDrawInTile: array<u32>;\nvar<private> heap_drawIdx: u32;\nvar<private> instId:       u32;\nvar<private> vid:          u32;\n`;
   // Locate the @vertex fn header, then balance parens manually since
   // params can carry `@builtin(name)` decorations (regex `[^)]*` would
   // halt at the first inner `)`).
