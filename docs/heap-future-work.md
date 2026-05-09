@@ -658,6 +658,22 @@ dispatch. Concretely:
   pessimistic case (very few ROs, large effect family) pays a
   compile cost we don't recover. Acceptable for the heap path's
   target workload (lots of small ROs sharing little).
+- **Pre-optimize merged WGSL through spirv-opt** — the family
+  output has unusual shape (switch-dispatch with helper-state
+  copies, long extractFusedEntry-derived struct names, redundant
+  `_cseN` chains across switch arms). Tint optimizes well in
+  Chromium; Safari/WebKit's WGSL compiler is opaque and may handle
+  this poorly. Pipeline: `WGSL → naga → SPIR-V → spirv-opt -O →
+  naga → WGSL`. Build-time only (~50–100 ms per family compile).
+  Expected wins on Safari: `--inline-entry-points-exhaustive`
+  flattens helper-call chains; `--scalar-replacement` breaks the
+  State struct into locals; `--eliminate-dead-branches` +
+  `--simplify-instructions` can collapse redundant CSE chains
+  across switch arms; `--ccp` may fold the dispatch when only one
+  layoutId is reachable. Plug in as `compileShaderFamily(family,
+  { optimize: true })` or a vite plugin variant. spirv-opt is
+  already installed; naga-cli requires `cargo install naga-cli`
+  (one-time).
 
 ### Original framing (preserved for context)
 
