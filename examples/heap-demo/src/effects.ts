@@ -9,6 +9,17 @@ import { abs, sin, cos, type Sampler2D, texture } from "@aardworx/wombat.shader/
 import { uniform } from "@aardworx/wombat.shader/uniforms";
 import { V2f, V3f, V4f } from "@aardworx/wombat.base";
 
+// Augment the shader DSL's standard uniform namespace with our two
+// app-specific uniforms. The plugin's `uniform.X` classifier looks
+// up names against this interface; without the augmentation the
+// frontend rejects `uniform.Time` / `uniform.Tint` as unknown.
+declare module "@aardworx/wombat.shader/uniforms" {
+  interface UniformScope {
+    readonly Time: number;
+    readonly Tint: V4f;
+  }
+}
+
 // Sampler2D capture. The wombat.shader-vite plugin classifies any
 // non-ambient free identifier whose TS type maps to a Sampler IR
 // type as a `uniform-sampler` capture and emits a Sampler ValueDef
