@@ -10,6 +10,7 @@ import {
   type HeapScene,
   type HeapTextureSet,
 } from "@aardworx/wombat.rendering.experimental/runtime";
+import { ITexture, ISampler } from "@aardworx/wombat.rendering.experimental/core";
 import type { CanvasAttachment } from "@aardworx/wombat.rendering.experimental/window";
 import type { aval } from "@aardworx/wombat.adaptive";
 import { cset, cval, transact, AdaptiveToken } from "@aardworx/wombat.adaptive";
@@ -197,7 +198,11 @@ function buildCheckerTexture(device: GPUDevice): HeapTextureSet {
     addressModeU: "repeat", addressModeV: "repeat",
     label: "heap-demo: checker sampler",
   });
-  return { texture, sampler };
+  return {
+    kind: "standalone",
+    texture: ITexture.fromGPU(texture),
+    sampler: ISampler.fromGPU(sampler),
+  };
 }
 
 function specOf(

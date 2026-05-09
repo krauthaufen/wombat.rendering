@@ -40,6 +40,7 @@ import { isHeapEligible } from "./heapEligibility.js";
 import { renderObjectToHeapSpec } from "./heapAdapter.js";
 import { buildHeapScene, type HeapDrawSpec, type HeapScene } from "./heapScene.js";
 import type { FragmentOutputLayout } from "./heapEffect.js";
+import { AtlasPool } from "./textureAtlas/atlasPool.js";
 
 void (null as AdaptiveToken | _T | null);
 
@@ -151,6 +152,15 @@ export function compileHybridScene(
   const heapAset   = flat.filterA(ro => elig(ro));
   const legacyAset = flat.filterA(ro => elig(ro).map(b => !b));
 
+  // ─── Atlas pool ──────────────────────────────────────────────────
+  // Per-scene Tier-S atlas pool. Owned by this hybrid scene; disposed
+  // alongside the heap path. The adapter consults it to classify
+  // textures into Tier S (atlas-packed) vs Tier L (standalone). MVP:
+  // the adapter currently always returns Tier L (see heapAdapter
+  // comments) — the pool is wired here so the next PR can add Tier-S
+  // classification without touching this file.
+  const atlasPool = new AtlasPool(device);
+
   // ─── Heap subset → HeapDrawSpec aset ─────────────────────────────
   // Memoize the adapter: aset removal must identify the SAME spec
   // object that addition produced; the underlying HashSet uses
@@ -161,7 +171,7 @@ export function compileHybridScene(
   const heapSpecAset = heapAset.map((ro: RenderObject) => {
     let spec = specCache.get(ro);
     if (spec === undefined) {
-      spec = renderObjectToHeapSpec(ro, AdaptiveToken.top);
+      spec = renderObjectToHeapSpec(ro, AdaptiveToken.top, atlasPool);
       specCache.set(ro, spec);
     }
     return spec;
@@ -204,6 +214,7 @@ export function compileHybridScene(
     dispose(): void {
       heapScene.dispose();
       scenePass.dispose();
+      atlasPool.dispose();
     },
   };
 }

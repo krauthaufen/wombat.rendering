@@ -100,33 +100,142 @@ diagrammatic features. Anisotropic and trilinear filtering are
 disabled at the sampler level for atlas-page samplers; bilinear
 only.
 
-### Tier M (medium, packed, custom mip chain)
+### Tier M (medium, packed, embedded 1.5× mip pyramid)
 
 - Source dimensions ≤ `ATLAS_MAX_DIM`.
 - Caller wants mip filtering.
 
-**Storage:** packed into atlas pages, but the page has a
-pre-computed mip pyramid baked alongside the base layer. Each
-sub-rect's mip chain is *also* sub-packed: at mip level k, the
-sub-rect lives at `(x >> k, y >> k)` with `(w >> k, h >> k)` within
-the page's mip-k image.
+**Storage — embedded 1.5W × H mip pyramid per sub-rect:**
 
-**Sub-rect padding:** N-pixel border around each sub-rect (mirror
-or clamp), to prevent mip downsampling from bleeding neighbors. N
-= pad size for mip count we want; typically 4 pixels for ~5 mip
-levels.
+A previous version of this plan packed each mip level into a
+separate atlas image (mip 0 in the page's mip-0 image, mip 1 in
+the page's mip-1 image, etc.). That requires hardware mip filter
+and careful per-mip clamp logic, AND it forces all sub-rects in
+the atlas to the same number of mip levels. Two problems: per-
+sub-rect mip count is a real workload variation we want to honor,
+AND it makes the cost of "an atlas containing N textures, only
+one of which wants mips" needlessly large.
 
-**Sampling shader-side:** standard `textureSampleLevel(...)` with
-hardware mip filter, BUT the sampling needs to clamp UVs to the
-sub-rect at each mip level. Either:
-- Software clamp in WGSL: `uv = clamp(uv, sub.minUv + 0.5/dim,
-  sub.maxUv - 0.5/dim)`. One extra ALU per sample.
-- OR rely on padding to absorb the bleed; risky for high
-  anisotropy.
+The right layout: the classic **Iliffe / id Tech "1.5×1" mip
+pyramid**, embedded in the atlas as a single rect per texture.
 
-**Cost:** per-sub-rect mip pyramid pre-computation (CPU or compute
-shader) at upload time. Standard mip-gen + careful boundary
-handling.
+```
++---------------+-------+
+|               |  m=1  |
+|               |       |
+|     m=0       +---+---+
+|     (W × H)   |m=2|m=3|...
+|               +---+
+|               |
++---------------+-------+
+       W            W/2 = W/2
+       <--- 1.5W ---->
+```
+
+- Mip 0 occupies the left W×H block.
+- Mip 1 (W/2 × H/2) occupies the top-right.
+- Mip 2 (W/4 × H/4) below mip 1, then mip 3 below mip 2, etc.
+- All mips combined fit in **1.5W × H**.
+
+Total atlas footprint per texture: 1.5W × H instead of W × H. ~50%
+storage overhead for mips, contiguous within the atlas, single
+sub-rect per texture. The packer (TexturePacking) gets the rect
+size 1.5W × H for mipped sources and W × H for non-mipped ones —
+no other change to the packer itself.
+
+Per-texture mip count is freely variable: a texture wanting only
+3 mip levels packs `ceil(W * (1 + 0.5 + 0.25 + 0.125))` etc.; a
+texture not wanting mips packs W × H. Hetereogeneous textures
+coexist in one atlas page.
+
+**Sub-rect padding:** 1–2 pixels of mirror/clamp bleed around
+each sub-rect to absorb hardware bilinear filter at sub-rect
+boundaries. Padding lives outside the 1.5W × H footprint
+(packer asks for 1.5W+2pad × H+2pad).
+
+**Sampling: software mip filter, hardware bilinear within mip:**
+
+Hardware mip filter cannot be used (the GPU would walk the
+texture's own mip chain, not our embedded pyramid). Instead the
+shader does mip selection + lerp between two adjacent mips
+manually, with hardware bilinear within each mip:
+
+```wgsl
+fn atlasSample(
+  pageRef: u32, format: u32,
+  origin: vec2<f32>,    // top-left of mip 0 in atlas, normalized
+  size: vec2<f32>,      // mip 0 size in atlas, normalized
+  numMips: u32,
+  uv: vec2<f32>,
+  addrU: u32, addrV: u32, // wrap modes (per binding, see below)
+) -> vec4<f32> {
+  // 1. Wrap mode applied in shader, before atlas-coord transform.
+  let uvW = applyWrap(uv, addrU, addrV);
+
+  // 2. LOD from screen-space derivatives.
+  //    mip 0 is `size` in atlas-normalized units; we want LOD in
+  //    "source-texture pixels per screen pixel" terms.
+  let dx = dpdx(uvW * size);
+  let dy = dpdy(uvW * size);
+  let rho = max(length(dx), length(dy));
+  let lod = clamp(log2(max(rho * f32(atlasPx), 1e-6)),
+                  0.0, f32(numMips - 1));
+
+  // 3. Two adjacent mip levels, lerp.
+  let lo = u32(floor(lod));
+  let hi = min(lo + 1u, numMips - 1u);
+  let t  = lod - f32(lo);
+
+  let a = sampleMip(pageRef, format, origin, size, lo, uvW);
+  let b = sampleMip(pageRef, format, origin, size, hi, uvW);
+  return mix(a, b, t);
+}
+
+fn sampleMip(pageRef, format, origin, size, k, uvW) -> vec4<f32> {
+  // Mip k's region in the 1.5W × H pyramid:
+  //   k == 0: at (origin, origin + size)
+  //   k >= 1: at (origin + (size.x, sumPrev), size / 2^k)
+  //   where sumPrev = sum_{j=1..k-1} size.y / 2^j
+  let mipSize = size / pow(2.0, f32(k));
+  let mipOrigin = mipOriginInPyramid(origin, size, k);
+  let atlasUv = mipOrigin + uvW * mipSize;
+  // hardware bilinear within mip; format-dispatch as planned.
+  return select(
+    textureSampleLevel(atlasLinear[pageRef], atlasSampler, atlasUv, 0.0),
+    textureSampleLevel(atlasSrgb[pageRef],   atlasSampler, atlasUv, 0.0),
+    format == 1u,
+  );
+}
+```
+
+`mipOriginInPyramid` is a closed-form expression — for the 1.5×1
+layout it's a simple `select`-y formula. Roughly:
+`mipOrigin.x = origin.x + size.x` for k≥1; `mipOrigin.y = origin.y +
+size.y * (1 - 1/2^(k-1))` for k≥1. No table lookup needed.
+
+**Cost vs hardware mip filter:**
+- 2 `textureSampleLevel` calls instead of 1 `textureSample`.
+- ~5–10 extra ALU ops for LOD + region computation.
+- One `dpdx` + `dpdy` (which we'd issue anyway under hardware
+  filter — `textureSample` does this internally).
+- For non-mipped textures (numMips == 1): skip the lerp entirely;
+  one sample, branch on `numMips`.
+
+For the user, this is invisible. Their `textureSample(t, smp, uv)`
+call gets rewritten to `atlasSample(...)` by the IR pass; the
+shader they wrote just works.
+
+**Mip pyramid generation:**
+
+CPU- or compute-side, depending on what's available. For MVP, CPU
+generation: download to ImageBitmap, downscale via canvas-2d at
+each level, upload via `copyExternalImageToTexture` to the
+appropriate sub-region. Slow on first upload but acceptable for
+infrequent texture loads.
+
+For v2: a compute shader that takes the mip-0 region as input and
+writes mips 1..N into the pyramid sub-regions in-place. Much
+faster, no CPU round-trip.
 
 ### Tier L (large, standalone)
 
@@ -262,32 +371,58 @@ Per-texture binding in the schema becomes:
 { name: "albedo", kind: "texture-ref", wgslType: "texture_2d<f32>" }
 ```
 
-Compiles to drawHeader fields:
-- `albedoPageRef: u32` — per-bucket atlasPageId
-- `albedoUvScale: vec2<f32>` — sub-rect dimensions normalized
-- `albedoUvBias: vec2<f32>` — sub-rect origin normalized
+Compiles to drawHeader fields (the *full* mip+sampler-aware set):
 
-Total: 5 × 4 = 20 bytes per textured RO per binding. For most ROs
-with one albedo texture, +20 bytes per drawHeader. Negligible.
+- `albedoPageRef: u32` — index into the format's binding_array
+- `albedoFormatBits: u32` — packed: bit 0 = format (0=linear, 1=srgb),
+  bits 1..3 = numMips (0..7, where 0 means "no mips, single sample"),
+  bits 4..7 = addrU (clamp/repeat/mirror), bits 8..11 = addrV,
+  bits 12..15 = mag/min/mip filter (linear/nearest)
+- `albedoOrigin: vec2<f32>` — top-left of mip-0 in atlas, normalized
+- `albedoSize: vec2<f32>` — mip-0 size in atlas, normalized
+
+Total: 4 + 4 + 8 + 8 = 24 bytes per textured RO per binding. With
+the standalone-Tier-L path needing none of these (resolved
+texture is bound directly), this only costs Tier-S ROs.
+
+The packed `formatBits` u32 covers all "sampler state per RO"
+needs without requiring a separate sampler binding per
+configuration. The shader unpacks via bit-ops; one extra ALU per
+field. Sub-millisecond aggregate impact.
 
 VS prelude reads these from the drawHeader (same as uniform refs).
-FS samples:
+The IR rewriter substitutes user-shader `textureSample(albedo, smp,
+uv)` calls with `atlasSample(albedo, uv)` calls that thread the
+drawHeader fields through the helper defined earlier (with the
+1.5×1 mip pyramid layout):
 
 ```wgsl
-let uv = clamp(in.uv, vec2(0.0), vec2(1.0));
-let atlasUv = uv * uvScale + uvBias;
-let color = textureSampleLevel(atlas[pageRef], sampler, atlasUv, lod);
+fn atlasSample(
+  pageRef: u32, formatBits: u32,
+  origin: vec2<f32>, size: vec2<f32>,
+  uv: vec2<f32>,
+) -> vec4<f32> {
+  let format = formatBits & 0x1u;
+  let numMips = (formatBits >> 1u) & 0x7u;
+  let addrU   = (formatBits >> 4u) & 0xFu;
+  let addrV   = (formatBits >> 8u) & 0xFu;
+  // ... apply wrap, compute LOD, lerp two adjacent mips ...
+}
 ```
 
-`atlas[pageRef]` requires either:
-- Bindless (not in WebGPU 1.0).
-- A small statically-bound array of textures + dynamic indexing.
-  WebGPU 1.0 supports `binding_array<texture_2d<f32>, N>` with
-  uniform-control-flow indexing. Works for up to N atlas pages
-  in one bind group.
+User does not see this. They write
+`textureSample(albedo, smp, uv)` and the atlas mechanism is
+invisible — including wrap modes (clamp / repeat / mirror) and
+mip filtering. The "sampler" in the user's source is reduced to
+*sampler state*, which gets packed into formatBits at addDraw
+time from the `ISampler` they handed in.
 
-For v1 we use the second: bind group declares
-`binding_array<texture_2d<f32>, 8>` (or whatever the FS allows).
+`atlas[pageRef]` indexing: WebGPU 1.0 supports
+`binding_array<texture_2d<f32>, N>` with uniform-control-flow
+indexing. Works for up to N atlas pages in one bind group.
+
+For v1 we use this: bind group declares
+`binding_array<texture_2d<f32>, 8>` per format (linear + srgb).
 Each page assigned a slot in the array. Bucket key includes the
 *page assignment* — which atlas pages are bound to which slots.
 Slot count = `min(numPages, FS texture limit)`.

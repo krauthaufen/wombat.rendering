@@ -42,7 +42,9 @@
 // package adds the texture (binding 4) + sampler (binding 5) to that
 // group's bind-group layout; the user's FS WGSL declares them.
 
-import { Trafo3d, V3d, V4f, type M44d } from "@aardworx/wombat.base";
+import { Trafo3d, V3d, V4f, type V2f, type M44d } from "@aardworx/wombat.base";
+import type { ITexture } from "../core/texture.js";
+import type { ISampler } from "../core/sampler.js";
 import { AVal, AdaptiveObject, AdaptiveToken } from "@aardworx/wombat.adaptive";
 import type { aval, aset, IAdaptiveObject, IDisposable, IHashSetReader } from "@aardworx/wombat.adaptive";
 import type { Effect } from "@aardworx/wombat.shader";
@@ -1036,12 +1038,31 @@ export interface HeapScene {
  * Per-group texture set. Bindless isn't standard WebGPU, so a group
  * with sampled textures gets a distinct bind-group layout and is
  * keyed separately from groups with no textures or different sets.
+ *
+ * Discriminated union, in preparation for the texture-atlas
+ * integration (see `docs/heap-textures-plan.md`):
+ *   - `standalone` — Tier L; one `GPUTexture` per source. Today's path.
+ *   - `atlas`      — Tier S; the texture lives as a sub-rect of an
+ *                    `AtlasPool` page, identified by `(format, pageId)`
+ *                    plus `(uvScale, uvBias)`. NOT YET WIRED through
+ *                    the heap path; the BGL/bind-group/drawHeader work
+ *                    lands in a follow-up PR.
  */
-export interface HeapTextureSet {
-  readonly texture: GPUTexture;
-  readonly textureView?: GPUTextureView;
-  readonly sampler: GPUSampler;
-}
+export type HeapTextureSet =
+  | {
+      readonly kind: "standalone";
+      readonly texture: ITexture;
+      readonly textureView?: GPUTextureView;
+      readonly sampler: ISampler;
+    }
+  | {
+      readonly kind: "atlas";
+      readonly format: GPUTextureFormat;
+      readonly pageId: number;
+      readonly uvScale: V2f;
+      readonly uvBias: V2f;
+      readonly sampler: ISampler;
+    };
 
 /**
  * The shader contribution for a single group. Either a wombat.shader
@@ -1526,16 +1547,34 @@ export function buildHeapScene(
           `(schema declares ${texLayout.length}/${smpLayout.length})`,
         );
       }
+      const ts = bucket.textures;
+      if (ts.kind === "atlas") {
+        throw new Error(
+          "heap path: atlas-tier textures not yet wired (PR 3 of textures plan)",
+        );
+      }
       if (texLayout.length === 1) {
+        if (ts.texture.kind !== "gpu") {
+          throw new Error(
+            "heapScene: standalone texture must be ITexture.kind === 'gpu' " +
+            "(adapter is responsible for materialising host textures)",
+          );
+        }
         entries.push({
           binding: texLayout[0]!.binding,
-          resource: bucket.textures.textureView ?? bucket.textures.texture.createView(),
+          resource: ts.textureView ?? ts.texture.texture.createView(),
         });
       }
       if (smpLayout.length === 1) {
+        if (ts.sampler.kind !== "gpu") {
+          throw new Error(
+            "heapScene: standalone sampler must be ISampler.kind === 'gpu' " +
+            "(adapter is responsible for materialising descriptor samplers)",
+          );
+        }
         entries.push({
           binding: smpLayout[0]!.binding,
-          resource: bucket.textures.sampler,
+          resource: ts.sampler.sampler,
         });
       }
     }

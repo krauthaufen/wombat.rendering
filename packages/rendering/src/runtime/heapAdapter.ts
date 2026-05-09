@@ -29,10 +29,11 @@
 import { type aval, type AdaptiveToken } from "@aardworx/wombat.adaptive";
 import type { IBuffer, HostBufferSource } from "../core/buffer.js";
 import type { BufferView } from "../core/bufferView.js";
-import type { ITexture } from "../core/texture.js";
-import type { ISampler } from "../core/sampler.js";
+import { ITexture } from "../core/texture.js";
+import { ISampler } from "../core/sampler.js";
 import type { RenderObject } from "../core/renderObject.js";
 import type { HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
+import type { AtlasPool } from "./textureAtlas/atlasPool.js";
 
 /**
  * View `HostBufferSource` as `Uint32Array`. Index buffers are u32 in
@@ -78,7 +79,19 @@ function indicesAvalFor(ibAval: aval<IBuffer>): aval<Uint32Array> {
  * through the heap path's pool/repack machinery via the returned
  * spec's avals — this function does not subscribe to anything.
  */
-export function renderObjectToHeapSpec(ro: RenderObject, token: AdaptiveToken): HeapDrawSpec {
+export function renderObjectToHeapSpec(
+  ro: RenderObject,
+  token: AdaptiveToken,
+  pool?: AtlasPool,
+): HeapDrawSpec {
+  // `pool` is reserved for Tier-S atlas classification (see
+  // `docs/heap-textures-plan.md`). MVP behaviour: when we cannot
+  // confidently determine the source's format AND dimensions at
+  // adapter time, we fall back to Tier L (standalone) — the safe
+  // default that preserves today's behaviour. The next PR teaches
+  // the adapter to consult `pool.eligibleFormat` / `eligibleSize`
+  // and produce `{ kind: "atlas", ... }` for Tier-S sources.
+  void pool;
   // 1. Inputs map: vertex attributes (BufferView) + uniforms.
   const inputs: { [name: string]: aval<unknown> | unknown } = {};
   ro.vertexAttributes.iter((name, bv: BufferView) => { inputs[name] = bv; });
@@ -111,7 +124,14 @@ export function renderObjectToHeapSpec(ro: RenderObject, token: AdaptiveToken): 
       }
       sampler = s.sampler;
     });
-    textures = { texture: texture!, sampler: sampler! };
+    // MVP: Tier L only. Atlas classification is gated on knowing
+    // the source format + dims, which the resolved GPUTexture
+    // doesn't expose portably here — see the `pool` comment above.
+    textures = {
+      kind: "standalone",
+      texture: ITexture.fromGPU(texture!),
+      sampler: ISampler.fromGPU(sampler!),
+    };
   } else if (ro.textures.count > 0 || ro.samplers.count > 0) {
     throw new Error(
       `heapAdapter: RO has ${ro.textures.count} texture(s) and ${ro.samplers.count} sampler(s); ` +
