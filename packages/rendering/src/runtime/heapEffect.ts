@@ -267,14 +267,6 @@ export interface BucketLayout {
    * `atlasSample(...)` helper for these names only.
    */
   readonly atlasTextureBindings: ReadonlySet<string>;
-  /**
-   * Atlas binding-array size (N in `binding_array<texture_2d<f32>, N>`),
-   * mirrored from the heapScene's per-format slot count. The prelude
-   * substitutes this at codegen time. Always present (>=1) so the
-   * shader's BGL declarations match the runtime BGL even for buckets
-   * that don't currently route any texture through the atlas.
-   */
-  readonly atlasArraySize: number;
 }
 
 /** First texture binding number; samplers come after the textures. */
@@ -300,19 +292,12 @@ export function buildBucketLayout(
      * (default) for the standalone texture path.
      */
     atlasTextureBindings?: ReadonlySet<string>;
-    /**
-     * Atlas binding-array slot count (`binding_array<texture_2d<f32>, N>`).
-     * Defaults to 8 if omitted; the runtime always passes the value
-     * derived from `device.limits.maxSampledTexturesPerShaderStage`.
-     */
-    atlasArraySize?: number;
   } = {},
 ): BucketLayout {
   const isInstanced = opts.isInstanced ?? false;
   const perInstanceUniforms = opts.perInstanceUniforms ?? new Set<string>();
   const megacall = opts.megacall ?? false;
   const atlasTextureBindings = opts.atlasTextureBindings ?? new Set<string>();
-  const atlasArraySize = Math.max(1, opts.atlasArraySize ?? 8);
   if (megacall && isInstanced) {
     throw new Error("heapEffect: megacall + isInstanced not supported");
   }
@@ -417,7 +402,7 @@ export function buildBucketLayout(
     : schema;
   const preludeWgsl = generatePrelude(
     schemaForPrelude, textureBindings, samplerBindings, megacall,
-    isAtlasBucket, atlasArraySize,
+    isAtlasBucket,
   );
 
   return {
@@ -426,7 +411,6 @@ export function buildBucketLayout(
     textureBindings, samplerBindings,
     megacall,
     atlasTextureBindings,
-    atlasArraySize,
   };
 }
 
@@ -567,7 +551,6 @@ function generatePrelude(
   samplerBindings: readonly { name: string; wgslType: string; binding: number }[],
   megacall: boolean,
   isAtlasBucket: boolean,
-  atlasArraySize: number,
 ): string {
   // VsOut is generated from the schema's surviving VS outputs (post
   // link + DCE). No hardcoded fields — what the effect declared is
@@ -592,7 +575,7 @@ function generatePrelude(
     ? `\n@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;\n@group(0) @binding(6) var<storage, read> firstDrawInTile: array<u32>;`
     : "";
 
-  const atlasBlock = isAtlasBucket ? generateAtlasPrelude(atlasArraySize) : "";
+  const atlasBlock = isAtlasBucket ? generateAtlasPrelude() : "";
 
   return /* wgsl */`
 @group(0) @binding(0) var<storage, read> heapU32:    array<u32>;
@@ -607,24 +590,30 @@ ${vsOutBody}
 }
 
 /**
- * Atlas prelude: declares the per-format `binding_array<texture_2d<f32>, N>`s
+ * Atlas prelude: declares the per-format `texture_2d_array<f32>`
  * + the shared atlas sampler at fixed bindings 11/12/13, then the
- * `atlasSample` software-mip helper that the FS rewriter calls in place
- * of `textureSample(<atlasName>, smp, uv)`.
+ * `atlasSample` software-mip helper that the FS rewriter calls in
+ * place of `textureSample(<atlasName>, smp, uv)`.
  *
- * Mip filtering is software (the GPU's mip walk would walk the wrong
- * pyramid — our embedded 1.5×1 layout isn't visible to the hardware
- * mip filter). LOD is computed from screen-space derivatives in mip-0
- * atlas-pixel space; the constant 4096 matches `ATLAS_PAGE_SIZE`.
+ * Storage uses a single GPUTexture per format (depthOrArrayLayers
+ * grows pow2 in the AtlasPool); pageRef is the array layer index.
+ * `binding_array<texture_2d<f32>, N>` would be cleaner but requires
+ * Chrome's experimental bindless feature; texture_2d_array is
+ * native WebGPU 1.0.
+ *
+ * Mip filtering is software (the GPU's mip walk would walk the
+ * texture's mip chain, not our embedded 1.5×1 pyramid). LOD is
+ * computed from screen-space derivatives in mip-0 atlas-pixel
+ * space; the constant 4096 matches `ATLAS_PAGE_SIZE`.
  *
  * Wrap-mode mirror math: `1 - |((u - floor(u/2)*2) - 1)|` yields a
  * triangle wave with period 2 and amplitude [0,1] — matches WebGPU's
  * `mirror-repeat` address-mode spec. Verified at u={0,0.5,1,1.5,2,-0.5}.
  */
-function generateAtlasPrelude(atlasArraySize: number): string {
+function generateAtlasPrelude(): string {
   return /* wgsl */`
-@group(0) @binding(${ATLAS_BINDING_LINEAR})  var atlasLinear:  binding_array<texture_2d<f32>, ${atlasArraySize}>;
-@group(0) @binding(${ATLAS_BINDING_SRGB})    var atlasSrgb:    binding_array<texture_2d<f32>, ${atlasArraySize}>;
+@group(0) @binding(${ATLAS_BINDING_LINEAR})  var atlasLinear:  texture_2d_array<f32>;
+@group(0) @binding(${ATLAS_BINDING_SRGB})    var atlasSrgb:    texture_2d_array<f32>;
 @group(0) @binding(${ATLAS_BINDING_SAMPLER}) var atlasSampler: sampler;
 
 fn atlasWrap1(u: f32, mode: u32) -> f32 {
@@ -654,8 +643,8 @@ fn atlasSampleAtMip(
   let mipSize = size / pow(2.0, f32(k));
   let mipO = atlasMipOrigin(origin, size, k);
   let atlasUv = mipO + uvW * mipSize;
-  let lin = textureSampleLevel(atlasLinear[pageRef], atlasSampler, atlasUv, 0.0);
-  let sr  = textureSampleLevel(atlasSrgb[pageRef],   atlasSampler, atlasUv, 0.0);
+  let lin = textureSampleLevel(atlasLinear, atlasSampler, atlasUv, pageRef, 0.0);
+  let sr  = textureSampleLevel(atlasSrgb,   atlasSampler, atlasUv, pageRef, 0.0);
   return select(lin, sr, format == 1u);
 }
 

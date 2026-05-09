@@ -686,7 +686,7 @@ export function compileHeapEffectIR(
     if (vsSrc.length > 0) vsSrc = stripAtlasTextureSamplerDecls(vsSrc, layout.atlasTextureBindings);
     if (fsSrc.length > 0) {
       fsSrc = stripAtlasTextureSamplerDecls(fsSrc, layout.atlasTextureBindings);
-      fsSrc = prependAtlasPrelude(fsSrc, layout.atlasArraySize);
+      fsSrc = prependAtlasPrelude(fsSrc);
     }
   }
   return {
@@ -729,15 +729,15 @@ function stripAtlasTextureSamplerDecls(src: string, atlasNames: ReadonlySet<stri
 }
 
 /**
- * Prepend the atlas binding_array decls + `atlasSample` helper to the
- * emitted FS source. The helper signatures match the post-rewrite
- * `atlasSample(pageRef, formatBits, origin, size, uv)` calls the IR
- * pass produces.
+ * Prepend the atlas texture-array decls + `atlasSample` helper to
+ * the emitted FS source. The helper signatures match the post-
+ * rewrite `atlasSample(pageRef, formatBits, origin, size, uv)`
+ * calls the IR pass produces.
  */
-function prependAtlasPrelude(fs: string, atlasArraySize: number): string {
+function prependAtlasPrelude(fs: string): string {
   const decls = `
-@group(0) @binding(${ATLAS_BINDING_LINEAR})  var atlasLinear:  binding_array<texture_2d<f32>, ${atlasArraySize}>;
-@group(0) @binding(${ATLAS_BINDING_SRGB})    var atlasSrgb:    binding_array<texture_2d<f32>, ${atlasArraySize}>;
+@group(0) @binding(${ATLAS_BINDING_LINEAR})  var atlasLinear:  texture_2d_array<f32>;
+@group(0) @binding(${ATLAS_BINDING_SRGB})    var atlasSrgb:    texture_2d_array<f32>;
 @group(0) @binding(${ATLAS_BINDING_SAMPLER}) var atlasSampler: sampler;
 
 fn atlasWrap1(u: f32, mode: u32) -> f32 {
@@ -759,8 +759,8 @@ fn atlasSampleAtMip(pageRef: u32, format: u32, origin: vec2<f32>, size: vec2<f32
   let mipSize = size / pow(2.0, f32(k));
   let mipO = atlasMipOrigin(origin, size, k);
   let atlasUv = mipO + uvW * mipSize;
-  let lin = textureSampleLevel(atlasLinear[pageRef], atlasSampler, atlasUv, 0.0);
-  let sr  = textureSampleLevel(atlasSrgb[pageRef],   atlasSampler, atlasUv, 0.0);
+  let lin = textureSampleLevel(atlasLinear, atlasSampler, atlasUv, pageRef, 0.0);
+  let sr  = textureSampleLevel(atlasSrgb,   atlasSampler, atlasUv, pageRef, 0.0);
   return select(lin, sr, format == 1u);
 }
 fn atlasSample(pageRef: u32, formatBits: u32, origin: vec2<f32>, size: vec2<f32>, uv: vec2<f32>) -> vec4<f32> {

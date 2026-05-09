@@ -103,6 +103,13 @@ describe("heap-atlas real-GPU integration", () => {
   // The mock-GPU atlas tests (tests/heap-atlas-bucket.test.ts) cover
   // bucket / drawHeader / BGL plumbing; the WGSL rewrite is verified by
   // string-matching tests in the mock suite.
+  // FIXME: createBindGroup rejects with "Failed to read 'buffer' property
+  // from 'GPUBufferBinding': Required member is undefined" on Chromium —
+  // entries log shows valid GPUBuffer / GPUTextureView / GPUSampler
+  // resources at every binding; root cause unidentified. The mock-GPU
+  // atlas tests in tests/heap-atlas-bucket.test.ts cover the bucket key
+  // / drawHeader / BGL plumbing. Re-enable once the validation diagnosis
+  // lands.
   it.skip("two atlas-variant ROs render solid red / solid blue on left / right halves", async () => {
     const device = await requestRealDevice();
     const errors: GPUError[] = [];
@@ -212,6 +219,7 @@ describe("heap-atlas real-GPU integration", () => {
       const scene = buildHeapScene(device, sig, draws, {
         fragmentOutputLayout: { locations: new Map([["outColor", 0]]) },
         megacall: false,
+        atlasPool: pool,
       });
 
       // Verify single bucket — both ROs share the atlas page.

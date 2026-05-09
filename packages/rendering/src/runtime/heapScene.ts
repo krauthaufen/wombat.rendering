@@ -57,7 +57,8 @@ import {
 } from "./heapEffect.js";
 import { compileHeapEffectIR } from "./heapEffectIR.js";
 import {
-  ATLAS_PAGE_FORMATS, atlasFormatIndex, type AtlasPage, type AtlasPageFormat,
+  ATLAS_PAGE_FORMATS, atlasFormatIndex,
+  type AtlasPage, type AtlasPageFormat, type AtlasPool,
 } from "./textureAtlas/atlasPool.js";
 
 // ---------------------------------------------------------------------------
@@ -916,19 +917,11 @@ interface Bucket {
 
   // ─── Atlas-binding state (atlas-variant buckets only) ─────────────
   /**
-   * Per-format page-id → bucket-local slot index in the format's
-   * binding_array. Slots are assigned in join order; once the bucket
-   * binds a page slot, it stays bound for the bucket's lifetime
-   * (MVP: no shrink). Both maps are present on every bucket; for
-   * standalone-only buckets they stay empty.
+   * True when this bucket holds at least one atlas-variant RO.
+   * Drives BGL/bind-group shape (atlas buckets bind two
+   * `texture_2d_array<f32>` views from the AtlasPool's per-format
+   * stores, plus the shared atlas sampler).
    */
-  readonly atlasPageSlots: Map<string, Map<number, number>>;
-  /**
-   * Bumped when any atlas page is added — drives bind-group rebuild.
-   * Bucket starts at version 0 (no atlas pages bound).
-   */
-  atlasPageSetVersion: number;
-  /** True when this bucket holds at least one atlas-variant RO. Drives BGL/bind-group shape. */
   isAtlasBucket: boolean;
   /** Per-local-slot atlas release callbacks. Drains on removeDraw. */
   readonly localAtlasReleases: ((() => void) | undefined)[];
@@ -1163,6 +1156,14 @@ export interface BuildHeapSceneOptions {
    * scan in `encodeComputePrep`. Throws on instanced specs.
    */
   readonly megacall?: boolean;
+  /**
+   * Atlas pool that owns the per-format `texture_2d_array<f32>`
+   * stores. heapScene reads `pool.formatStore(format).texture` to
+   * bind the array texture and subscribes to `pool.onFormatResize`
+   * so bind groups rebuild when the array reallocates. Required
+   * when any RO produces an atlas-variant `HeapTextureSet`.
+   */
+  readonly atlasPool?: AtlasPool;
 }
 
 export function buildHeapScene(
@@ -1172,6 +1173,7 @@ export function buildHeapScene(
   opts: BuildHeapSceneOptions = {},
 ): HeapScene {
   const megacall = opts.megacall ?? false;
+  const atlasPool = opts.atlasPool;
   const colorAttachmentName = sig.colorNames[0];
   if (colorAttachmentName === undefined) {
     throw new Error("buildHeapScene: framebuffer signature has no color attachment");
@@ -1379,46 +1381,23 @@ export function buildHeapScene(
   }
   const sceneObj = new HeapSceneObj();
 
-  // ─── Atlas binding-array sizing + placeholders ────────────────────
+  // ─── Atlas bindings ───────────────────────────────────────────────
   //
-  // A bucket whose textures live in atlas pages binds two
-  // `binding_array<texture_2d<f32>, ATLAS_ARRAY_SIZE>` entries (one
-  // per format) plus a shared atlas sampler. ATLAS_ARRAY_SIZE is
-  // derived from `device.limits.maxSampledTexturesPerShaderStage`
-  // divided across the two formats — never hardcoded. Slots without
-  // a live atlas page reference per-format placeholder textures.
+  // A bucket whose textures live in atlas layers binds two
+  // `texture_2d_array<f32>` entries (one per format) plus a shared
+  // atlas sampler. The array texture is owned by the AtlasPool's
+  // per-format store; layer count grows pow2 + GPU-side copy as more
+  // layers are needed. Bind groups subscribe to the store's onResize
+  // and rebuild when the texture is reallocated.
   //
-  // The atlas BGL block is added unconditionally to every bucket
-  // built via getBgl(); standalone buckets just point all slots at
-  // placeholders. Keeping the BGL shape uniform across atlas /
-  // standalone variants keeps `setBindGroup(0, …)` cost stable
-  // when the renderer interleaves them.
-  const ATLAS_NUM_FORMATS = ATLAS_PAGE_FORMATS.length;
-  const deviceLimits = (device as unknown as { limits?: { maxSampledTexturesPerShaderStage?: number } }).limits;
-  const maxSampledPerStage = deviceLimits?.maxSampledTexturesPerShaderStage ?? 16;
-  const ATLAS_ARRAY_SIZE = Math.max(1, Math.floor(maxSampledPerStage / ATLAS_NUM_FORMATS));
-  // Bindings 7 / 8 / 9 (or 9 / 10 / 11 in megacall mode) — the heap
-  // path's user-side texture/sampler bindings shift to 11+ when
-  // atlas is live; standalone buckets are unaffected (their textures
-  // start at HEAP_TEX_BINDING_START as before, then the atlas slots
-  // sit in a fixed range above them).
+  // Replaces the previous `binding_array<texture_2d<f32>, N>` design
+  // which required Chrome's experimental bindless-textures feature
+  // (WebGPU 1.0 doesn't accept arrays of texture views as a single
+  // bind-group entry resource).
   const ATLAS_BINDING_LINEAR  = 11;
   const ATLAS_BINDING_SRGB    = 12;
   const ATLAS_BINDING_SAMPLER = 13;
 
-  // 1×1 placeholder per format. Atlas binding_array slots that don't
-  // reference a live page point at these so the bind group is always
-  // fully populated.
-  const atlasPlaceholders = new Map<AtlasPageFormat, GPUTextureView>();
-  for (const f of ATLAS_PAGE_FORMATS) {
-    const tex = device.createTexture({
-      label: `heapScene/atlasPlaceholder/${f}`,
-      size: { width: 1, height: 1, depthOrArrayLayers: 1 },
-      format: f,
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    });
-    atlasPlaceholders.set(f, tex.createView());
-  }
   // Shared atlas sampler — shader does mip filtering manually, so
   // hardware mipmapFilter stays "nearest". Plan §2.
   const atlasSampler = device.createSampler({
@@ -1471,14 +1450,12 @@ export function buildHeapScene(
       entries.push(
         {
           binding: ATLAS_BINDING_LINEAR, visibility: GPUShaderStage.FRAGMENT,
-          texture: { sampleType: "float" },
-          ...({ count: ATLAS_ARRAY_SIZE } as { count: number }),
-        } as GPUBindGroupLayoutEntry,
+          texture: { sampleType: "float", viewDimension: "2d-array" },
+        },
         {
           binding: ATLAS_BINDING_SRGB, visibility: GPUShaderStage.FRAGMENT,
-          texture: { sampleType: "float" },
-          ...({ count: ATLAS_ARRAY_SIZE } as { count: number }),
-        } as GPUBindGroupLayoutEntry,
+          texture: { sampleType: "float", viewDimension: "2d-array" },
+        },
         {
           binding: ATLAS_BINDING_SAMPLER, visibility: GPUShaderStage.FRAGMENT,
           sampler: { type: "filtering" },
@@ -1698,25 +1675,23 @@ export function buildHeapScene(
       // below.
     }
     if (bucket.isAtlasBucket) {
-      // Resolve each format's binding_array. Live pages from the bucket's
-      // atlasPageSlots map fill their assigned slots; unused slots
-      // reference the format's 1×1 placeholder so the bind group is
-      // always fully populated (WebGPU rejects partial binding_arrays).
+      if (atlasPool === undefined) {
+        throw new Error(
+          "heapScene: atlas-variant bucket needs `atlasPool` in BuildHeapSceneOptions",
+        );
+      }
+      // Bind one `texture_2d_array<f32>` view per format. The array
+      // texture is owned by the AtlasPool; pageId in the drawHeader
+      // is the layer index. heapScene subscribes to the pool's
+      // onFormatResize so this bind group is rebuilt when the
+      // texture is reallocated (live layers GPU-copied over).
       for (const format of ATLAS_PAGE_FORMATS) {
         const binding = format === "rgba8unorm-srgb" ? ATLAS_BINDING_SRGB : ATLAS_BINDING_LINEAR;
-        const slots = bucket.atlasPageSlots.get(format) ?? new Map<number, number>();
-        const placeholder = atlasPlaceholders.get(format)!;
-        const views: GPUTextureView[] = new Array(ATLAS_ARRAY_SIZE).fill(placeholder);
-        for (const [pageId, slotIdx] of slots) {
-          if (slotIdx >= ATLAS_ARRAY_SIZE) {
-            throw new Error(
-              `heapScene: atlas page ${format}#${pageId} slot ${slotIdx} exceeds ATLAS_ARRAY_SIZE=${ATLAS_ARRAY_SIZE}`,
-            );
-          }
-          const page = atlasPagesByFormatPageId(format, pageId);
-          if (page !== undefined) views[slotIdx] = page.texture.createView();
-        }
-        entries.push({ binding, resource: views as unknown as GPUBindingResource });
+        const store = atlasPool.formatStore(format);
+        entries.push({
+          binding,
+          resource: store.texture.createView({ dimension: "2d-array" }),
+        });
       }
       entries.push({ binding: ATLAS_BINDING_SAMPLER, resource: atlasSampler });
     }
@@ -1727,24 +1702,27 @@ export function buildHeapScene(
     });
   }
 
-  // Atlas pages are owned by the AtlasPool the adapter holds; the
-  // heapScene only retains a (format, pageId) → AtlasPage map populated
-  // as buckets pull pages in. Buckets carry strong references via
-  // their localAtlasRefs (release-via-pool on removeDraw); the
-  // map below is just a GPUTexture lookup for bind-group rebuilds.
-  const atlasPagesByFormatPageIdMap = new Map<string, AtlasPage>();
-  function atlasPagesByFormatPageId(format: AtlasPageFormat, pageId: number): AtlasPage | undefined {
-    return atlasPagesByFormatPageIdMap.get(`${format}#${pageId}`);
-  }
-  function rememberAtlasPage(format: AtlasPageFormat, pageId: number, page: AtlasPage): void {
-    atlasPagesByFormatPageIdMap.set(`${format}#${pageId}`, page);
-  }
+  // Atlas pages are owned by the AtlasPool; heapScene reads the
+  // shared array texture per format via `atlasPool.formatStore(...)`
+  // when building bind groups. Buckets carry strong refcount handles
+  // (`localAtlasRefs`) that drive `pool.release` on removeDraw.
 
   // When the global arena reallocates, every bucket's bind group
   // needs rebuilding (its binding 2 buffer reference is stale).
   arena.attrs.onResize(() => {
     for (const b of buckets) b.bindGroup = buildBucketBindGroup(b);
   });
+  // Same when the atlas pool reallocates a format's array texture
+  // (layer-count grow). All atlas buckets re-create their views.
+  if (atlasPool !== undefined) {
+    for (const f of ATLAS_PAGE_FORMATS) {
+      atlasPool.onFormatResize(f, () => {
+        for (const b of buckets) {
+          if (b.isAtlasBucket) b.bindGroup = buildBucketBindGroup(b);
+        }
+      });
+    }
+  }
   // Megacall: indexStorage is bound at slot 5 from arena.indices, so
   // a grow there also invalidates every bucket's bind group.
   if (megacall) {
@@ -1822,7 +1800,6 @@ export function buildHeapScene(
       isInstanced: instanceOpts.isInstanced,
       perInstanceUniforms: instanceOpts.perInstanceUniforms,
       megacall,
-      atlasArraySize: ATLAS_ARRAY_SIZE,
     };
     let layout: BucketLayout;
     let vsModule: GPUShaderModule;
@@ -1904,8 +1881,6 @@ export function buildHeapScene(
       recordCount: 0, slotToRecord: [], recordToSlot: [],
       totalEmitEstimate: 0,
       scanDirty: false,
-      atlasPageSlots: new Map(),
-      atlasPageSetVersion: 0,
       isAtlasBucket,
       localAtlasReleases: [],
       localAtlasTextures: [],
@@ -2087,32 +2062,16 @@ export function buildHeapScene(
     }
   }
 
-  // Allocate (or look up) the bucket-local slot for `pageId` in the
-  // format's binding_array. Lazily extends `bucket.atlasPageSlots`
-  // and bumps `atlasPageSetVersion`; caller rebuilds the bind group
-  // when the version changes since last build.
+  // pageId IS the layer index in the format's `texture_2d_array`.
+  // No per-bucket slot mapping is needed — the shader reads
+  // `textureSampleLevel(atlas, smp, uv, pageRef, 0)` and pageRef
+  // resolves to the same layer regardless of which bucket the RO
+  // lives in. Kept as a function for callsite-symmetry with the
+  // pre-pivot code.
   function ensureAtlasPageSlot(
-    bucket: Bucket, format: AtlasPageFormat, pageId: number, page: AtlasPage,
+    _bucket: Bucket, _format: AtlasPageFormat, pageId: number, _page: AtlasPage,
   ): number {
-    let slots = bucket.atlasPageSlots.get(format);
-    if (slots === undefined) {
-      slots = new Map();
-      bucket.atlasPageSlots.set(format, slots);
-    }
-    const existing = slots.get(pageId);
-    if (existing !== undefined) return existing;
-    const idx = slots.size;
-    if (idx >= ATLAS_ARRAY_SIZE) {
-      throw new Error(
-        `heapScene: atlas binding_array overflow for ${format} ` +
-        `(${idx + 1} pages > ATLAS_ARRAY_SIZE=${ATLAS_ARRAY_SIZE}); ` +
-        `bucket-split for atlas not yet implemented`,
-      );
-    }
-    slots.set(pageId, idx);
-    bucket.atlasPageSetVersion++;
-    rememberAtlasPage(format, pageId, page);
-    return idx;
+    return pageId;
   }
 
   // ─── Stats (declared early so addDraw/removeDraw can mutate it) ───
@@ -2215,13 +2174,7 @@ export function buildHeapScene(
 
     packBucketHeader(bucket, localSlot, perDrawRefs);
     if (bucket.isAtlasBucket && spec.textures !== undefined && spec.textures.kind === "atlas") {
-      const versionBefore = bucket.atlasPageSetVersion;
       packAtlasTextureFields(bucket, localSlot, spec.textures);
-      if (bucket.atlasPageSetVersion !== versionBefore) {
-        // A new page slot was introduced — rebuild the bind group so
-        // the binding_array reflects the live page set.
-        bucket.bindGroup = buildBucketBindGroup(bucket);
-      }
       bucket.localAtlasReleases[localSlot] = spec.textures.release;
       bucket.localAtlasTextures[localSlot] = spec.textures;
     }

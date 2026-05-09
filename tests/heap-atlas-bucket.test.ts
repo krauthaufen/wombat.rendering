@@ -116,7 +116,7 @@ describe("heap-atlas bucket plumbing", () => {
     const pool = new AtlasPool(gpu.device);
     const { spec: a } = geomSpec(pool, "rgba8unorm");
     const { spec: b } = geomSpec(pool, "rgba8unorm");
-    const scene = buildHeapScene(gpu.device, sig(), [a, b]);
+    const scene = buildHeapScene(gpu.device, sig(), [a, b], { atlasPool: pool });
     expect(scene.stats.groups).toBe(1);
   });
 
@@ -125,7 +125,7 @@ describe("heap-atlas bucket plumbing", () => {
     const pool = new AtlasPool(gpu.device);
     const { spec: a } = geomSpec(pool, "rgba8unorm");
     const { spec: b } = geomSpec(pool, "rgba8unorm-srgb");
-    const scene = buildHeapScene(gpu.device, sig(), [a, b]);
+    const scene = buildHeapScene(gpu.device, sig(), [a, b], { atlasPool: pool });
     // Both ROs share `(effect, pipelineState, "atlas")` bucket key.
     expect(scene.stats.groups).toBe(1);
     // Bind group should reference both format binding-arrays. The
@@ -144,7 +144,7 @@ describe("heap-atlas bucket plumbing", () => {
     const gpu = new MockGPU();
     const pool = new AtlasPool(gpu.device);
     const { spec: a, textures } = geomSpec(pool, "rgba8unorm-srgb");
-    const scene = buildHeapScene(gpu.device, sig(), [a]);
+    const scene = buildHeapScene(gpu.device, sig(), [a], { atlasPool: pool });
     // The drawHeader writeBuffer is staged in addDraw + flushed in update.
     scene.update(AdaptiveToken.top);
     // The drawHeader is uploaded via a writeBuffer call against the
@@ -197,7 +197,7 @@ describe("heap-atlas bucket plumbing", () => {
     const pool = new AtlasPool(gpu.device);
     const { spec: a } = geomSpec(pool, "rgba8unorm");
     const { spec: b } = geomSpec(pool, "rgba8unorm-srgb");
-    const scene = buildHeapScene(gpu.device, sig(), [a, b]);
+    const scene = buildHeapScene(gpu.device, sig(), [a, b], { atlasPool: pool });
     const idA = 0; // initialDraws are added in array order with sequential ids
     void idA;
     // Count distinct atlas binding-array views *before* and *after*

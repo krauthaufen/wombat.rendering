@@ -179,6 +179,7 @@ export function compileHybridScene(
 
   const heapScene: HeapScene = buildHeapScene(device, signature, heapSpecAset, {
     fragmentOutputLayout,
+    atlasPool,
     ...(opts.megacall !== undefined ? { megacall: opts.megacall } : {}),
   });
 

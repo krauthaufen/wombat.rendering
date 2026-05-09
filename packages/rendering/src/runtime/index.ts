@@ -71,11 +71,12 @@ export {
   AtlasPool,
   ATLAS_PAGE_SIZE,
   ATLAS_MAX_DIM,
-  ATLAS_MAX_PAGES_PER_FORMAT,
+  ATLAS_INITIAL_LAYERS,
   ATLAS_PAGE_FORMATS,
   atlasFormatIndex,
   type AtlasPage,
   type AtlasPageFormat,
+  type AtlasFormatStore,
   type AtlasAcquisition,
   type AtlasSource,
 } from "./textureAtlas/atlasPool.js";
