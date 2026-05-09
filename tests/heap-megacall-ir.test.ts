@@ -101,8 +101,8 @@ describe("megacall IR WGSL emission", () => {
 
     // Sanity checks: VS has emitIdx, drawTable binding, indexStorage.
     expect(ir.vs).toContain("@builtin(vertex_index) emitIdx: u32");
-    expect(ir.vs).toContain("drawTable:    array<u32>");
-    expect(ir.vs).toContain("indexStorage: array<u32>");
+    expect(ir.vs).toMatch(/drawTable:\s+array<u32>/);
+    expect(ir.vs).toMatch(/indexStorage:\s+array<u32>/);
     expect(ir.vs).toContain("let drawIdx");
     expect(ir.vs).toContain("let vid");
     // No leftover @builtin(instance_index)

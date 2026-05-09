@@ -378,9 +378,41 @@ class UniformPool {
  * upload. Index data is treated as immutable for the aval's
  * lifetime: an aval mark won't repack (we'd have to free + re-alloc
  * since size changes are likely). Use a fresh aval to swap meshes.
+ *
+ * **Value-equality dedup for constant avals (§5b):** when an
+ * incoming aval has `isConstant === true`, the pool also keys by
+ * the underlying `ArrayBuffer` tuple `(buffer, byteOffset,
+ * byteLength)`. Two distinct constant avals wrapping the same
+ * `Uint32Array` view (or two views over the same backing buffer
+ * with matching offsets) collapse to one allocation. Hashing
+ * kilobytes of indices on every acquire would be wasteful; the
+ * tuple key catches the realistic "one ArrayBuffer shared across
+ * many aval wrappers" pattern, which is the only one that matters
+ * for the heap path. Reactive (non-constant) avals fall through
+ * to identity-only — their content can change and the pool can't
+ * silently merge them.
  */
 class IndexPool {
-  private readonly byAval = new Map<aval<Uint32Array>, { firstIndex: number; count: number; refcount: number }>();
+  // Per-aval binding. `perAvalCount` tracks acquire/release balance
+  // for THIS aval; `entry` is the shared allocation (one entry can be
+  // referenced by many aliasing avals via §5b dedup).
+  private readonly byAval = new Map<
+    aval<Uint32Array>,
+    { entry: IndexPoolEntry; perAvalCount: number }
+  >();
+  private readonly byValueKey = new Map<string, IndexPoolEntry>();
+  // Stable per-ArrayBuffer numeric id for value-key composition.
+  // WeakMap-backed so buffers GC'd elsewhere drop their entry too.
+  private readonly bufferIds = new WeakMap<ArrayBufferLike, number>();
+  private nextBufferId = 1;
+  private bufferIdOf(buf: ArrayBufferLike): number {
+    let id = this.bufferIds.get(buf);
+    if (id === undefined) {
+      id = this.nextBufferId++;
+      this.bufferIds.set(buf, id);
+    }
+    return id;
+  }
 
   acquire(
     device: GPUDevice,
@@ -388,10 +420,21 @@ class IndexPool {
     aval: aval<Uint32Array>,
     arr: Uint32Array,
   ): { firstIndex: number; count: number } {
-    const existing = this.byAval.get(aval);
-    if (existing !== undefined) {
-      existing.refcount++;
-      return { firstIndex: existing.firstIndex, count: existing.count };
+    const bound = this.byAval.get(aval);
+    if (bound !== undefined) {
+      bound.perAvalCount++;
+      bound.entry.totalRefcount++;
+      return { firstIndex: bound.entry.firstIndex, count: bound.entry.count };
+    }
+    let valueKey: string | undefined;
+    if (aval.isConstant) {
+      valueKey = `${this.bufferIdOf(arr.buffer)}:${arr.byteOffset}:${arr.byteLength}`;
+      const shared = this.byValueKey.get(valueKey);
+      if (shared !== undefined) {
+        shared.totalRefcount++;
+        this.byAval.set(aval, { entry: shared, perAvalCount: 1 });
+        return { firstIndex: shared.firstIndex, count: shared.count };
+      }
     }
     const firstIndex = indices.alloc(arr.length);
     indices.write(
@@ -399,18 +442,31 @@ class IndexPool {
       new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength),
     );
     void device;
-    this.byAval.set(aval, { firstIndex, count: arr.length, refcount: 1 });
+    const entry: IndexPoolEntry = { firstIndex, count: arr.length, totalRefcount: 1, valueKey };
+    this.byAval.set(aval, { entry, perAvalCount: 1 });
+    if (valueKey !== undefined) this.byValueKey.set(valueKey, entry);
     return { firstIndex, count: arr.length };
   }
 
   release(indices: IndexAllocator, aval: aval<Uint32Array>): void {
-    const e = this.byAval.get(aval);
-    if (e === undefined) return;
-    e.refcount--;
-    if (e.refcount > 0) return;
-    indices.release(e.firstIndex, e.count);
-    this.byAval.delete(aval);
+    const bound = this.byAval.get(aval);
+    if (bound === undefined) return;
+    bound.perAvalCount--;
+    bound.entry.totalRefcount--;
+    if (bound.perAvalCount === 0) this.byAval.delete(aval);
+    if (bound.entry.totalRefcount > 0) return;
+    indices.release(bound.entry.firstIndex, bound.entry.count);
+    if (bound.entry.valueKey !== undefined) {
+      this.byValueKey.delete(bound.entry.valueKey);
+    }
   }
+}
+
+interface IndexPoolEntry {
+  firstIndex: number;
+  count: number;
+  totalRefcount: number;
+  valueKey: string | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,10 +1260,14 @@ export function buildHeapScene(
   const drawIdToIndexAval: (aval<Uint32Array> | undefined)[] = [];
   let nextDrawId = 0;
 
-  /** Unwrap an aval to its inner value, or pass through a plain value. */
+  /**
+   * Unwrap an aval to its inner value, or pass through a plain value.
+   * Boundary helper at scene-build time — no adaptive context to read
+   * through, so a plain force is the right call.
+   */
   function readPlain<T>(v: aval<T> | T): T {
     if (typeof v === "object" && v !== null && typeof (v as { force?: unknown }).force === "function") {
-      return (v as aval<T>).force();
+      return (v as aval<T>).force(/* allow-force */);
     }
     return v as T;
   }

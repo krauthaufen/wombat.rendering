@@ -86,7 +86,19 @@ export interface AtlasAcquisition {
 }
 
 interface AtlasEntry {
-  readonly key: aval<ITexture>;
+  /**
+   * Avals pointing to this entry. With §5b value-equality dedup,
+   * multiple distinct constant avals can alias the same sub-rect —
+   * `aliases` carries every one of them so final release can clear
+   * all entriesByAval bindings. Length == 1 in the non-deduped case.
+   */
+  aliases: aval<ITexture>[];
+  /**
+   * Inner-resource reference used as the byValueKey for §5b dedup
+   * (GPUTexture for kind:"gpu", HostTextureSource for kind:"host").
+   * Undefined for non-constant avals (identity-only path).
+   */
+  readonly valueKey: GPUTexture | HostTextureSource | undefined;
   readonly format: AtlasPageFormat;
   readonly pageId: number;
   /** Reserved rect in the atlas (covers the full 1.5W×H pyramid for mipped). */
@@ -210,7 +222,19 @@ export class AtlasPool {
   private readonly pageAddedListeners = new Map<AtlasPageFormat, Set<(pageId: number) => void>>();
   private readonly entriesByAval = new Map<aval<ITexture>, AtlasEntry>();
   private readonly entriesByRef = new Map<number, AtlasEntry>();
+  /**
+   * §5b value-equality dedup map. Constant avals (`isConstant ===
+   * true`) wrapping the same inner GPUTexture (kind:"gpu") or
+   * HostTextureSource (kind:"host") collapse to one sub-rect.
+   * Reactive avals fall through to identity-only since their
+   * content can change.
+   */
+  private readonly entriesByValueKey = new Map<GPUTexture | HostTextureSource, AtlasEntry>();
   private nextRef = 1;
+
+  private innerKeyOf(t: ITexture): GPUTexture | HostTextureSource {
+    return t.kind === "gpu" ? t.texture : t.source;
+  }
 
   constructor(private readonly device: GPUDevice) {
     for (const f of ATLAS_PAGE_FORMATS) {
@@ -290,6 +314,34 @@ export class AtlasPool {
       return this.makeResult(existing);
     }
 
+    // §5b: value-equality dedup for constant avals. Two distinct
+    // constant avals wrapping the same inner GPUTexture or
+    // HostTextureSource share one sub-rect. We need a *value* (not
+    // just dimensions) to compute the key; pull from `opts.source`
+    // if provided, otherwise skip dedup (fresh allocation).
+    let valueKey: GPUTexture | HostTextureSource | undefined;
+    if (sourceAval.isConstant) {
+      const sourceVal = opts.source;
+      if (sourceVal !== undefined && sourceVal.host !== undefined) {
+        valueKey = sourceVal.host;
+      }
+      // For kind:"gpu" sources, opts.source.host is undefined; the
+      // caller (heapAdapter) provides the GPUTexture via a different
+      // path and we'd need to thread it through. v1: skip dedup for
+      // GPU-backed constants, dedup only host-backed constants. The
+      // realistic dedup case is shared ImageBitmap / ImageData; GPU
+      // textures are typically already deduped at the user layer.
+      if (valueKey !== undefined) {
+        const shared = this.entriesByValueKey.get(valueKey);
+        if (shared !== undefined) {
+          shared.refcount++;
+          shared.aliases.push(sourceAval);
+          this.entriesByAval.set(sourceAval, shared);
+          return this.makeResult(shared);
+        }
+      }
+    }
+
     const wantsMips = opts.wantsMips === true;
     const numMips = wantsMips
       ? Math.max(1, Math.min(opts.numMips ?? defaultMipCount(width, height),
@@ -309,7 +361,7 @@ export class AtlasPool {
       const next = page.packing.tryAdd(this.nextRef, size);
       if (next !== null) {
         page.packing = next;
-        return this.finalize(sourceAval, format, i, page, opts.source, width, height, numMips);
+        return this.finalize(sourceAval, format, i, page, opts.source, width, height, numMips, valueKey);
       }
     }
 
@@ -330,7 +382,7 @@ export class AtlasPool {
     page.packing = placed;
     pages.push(page);
     for (const cb of this.pageAddedListeners.get(format)!) cb(pageId);
-    return this.finalize(sourceAval, format, pageId, page, opts.source, width, height, numMips);
+    return this.finalize(sourceAval, format, pageId, page, opts.source, width, height, numMips, valueKey);
   }
 
   /**
@@ -383,6 +435,19 @@ export class AtlasPool {
       );
     }
 
+    // Repack on a deduped entry (multiple aliases sharing one
+    // sub-rect) is undefined: we'd be free-and-realloc'ing the
+    // sub-rect underneath the OTHER aliases. The dedup path only
+    // engages for `isConstant` avals, which can't fire mark
+    // callbacks → repack(constant) shouldn't ever happen via the
+    // reactivity loop. If a caller invokes it manually we'd rather
+    // throw than silently corrupt the other aliases.
+    if (old.aliases.length > 1) {
+      throw new Error(
+        "AtlasPool.repack: cannot repack a deduped entry shared by multiple constant avals",
+      );
+    }
+
     // 1. Free the old rect from its page's packer + drop the maps.
     const savedRefcount = old.refcount;
     const oldPages = this.pagesByFormat.get(old.format)!;
@@ -392,6 +457,7 @@ export class AtlasPool {
     }
     this.entriesByRef.delete(old.ref);
     this.entriesByAval.delete(sourceAval);
+    if (old.valueKey !== undefined) this.entriesByValueKey.delete(old.valueKey);
 
     // 2. Acquire a fresh placement for the new texture. Reuse the
     //    `acquire` algorithm — entriesByAval no longer has us, so it
@@ -422,7 +488,8 @@ export class AtlasPool {
       page.packing = page.packing.remove(e.ref);
     }
     this.entriesByRef.delete(e.ref);
-    this.entriesByAval.delete(e.key);
+    for (const a of e.aliases) this.entriesByAval.delete(a);
+    if (e.valueKey !== undefined) this.entriesByValueKey.delete(e.valueKey);
   }
 
   /** Destroy every page texture. The pool becomes unusable. */
@@ -434,6 +501,7 @@ export class AtlasPool {
     this.pageAddedListeners.clear();
     this.entriesByAval.clear();
     this.entriesByRef.clear();
+    this.entriesByValueKey.clear();
   }
 
   private finalize(
@@ -445,6 +513,7 @@ export class AtlasPool {
     mip0W: number,
     mip0H: number,
     numMips: number,
+    valueKey: GPUTexture | HostTextureSource | undefined,
   ): AtlasAcquisition {
     const ref = this.nextRef++;
     const placed = page.packing.used.get(ref);
@@ -456,7 +525,8 @@ export class AtlasPool {
     const w = placed.max.x - placed.min.x + 1;
     const h = placed.max.y - placed.min.y + 1;
     const entry: AtlasEntry = {
-      key: aval,
+      aliases: [aval],
+      valueKey,
       format,
       pageId,
       subRect: { x, y, w, h },
@@ -467,6 +537,7 @@ export class AtlasPool {
     };
     this.entriesByAval.set(aval, entry);
     this.entriesByRef.set(ref, entry);
+    if (valueKey !== undefined) this.entriesByValueKey.set(valueKey, entry);
     if (source !== undefined && source.host !== undefined) {
       this.upload(page, x, y, source.host, mip0W, mip0H, numMips);
     }

@@ -154,7 +154,74 @@ Drop-empty-chunks pairs naturally with affinity allocation — RO data
 locality keeps chunks either live or near-empty, rarely
 bimodally fragmented.
 
-## 5b. Value-equality for constant avals (pool-level)
+## 5b. Value-equality for constant avals (pool-level) ✅ SHIPPED (scope reduced)
+
+**Shipped scope:**
+
+- **`__memo` constant-source bypass** (in `wombat.adaptive`):
+  when every aval-typed input to a memoized combinator is
+  `isConstant === true`, the trie is skipped entirely — `compute()`
+  runs directly. Constants don't mark, so caching the derived aval
+  serves only identity-sharing for downstream consumers; the
+  trie's reactive job is moot. The realistic 95% case for
+  memoization is reactive avals, which still flow through
+  normally. ~15 LOC in `src/plugin/runtime.ts`. Covers `aval`,
+  `aset`, `alist`, `amap` uniformly via duck-typed `isConstant`.
+
+- **IndexPool value-dedup** (heapScene.ts): when an incoming aval
+  has `isConstant === true`, the pool also keys by an
+  ArrayBuffer-tuple `(buffer-id, byteOffset, byteLength)`. Two
+  distinct constant avals wrapping the same `Uint32Array` view
+  collapse to one allocation. Hashing kilobytes of indices on
+  every acquire would be wasteful; the tuple test catches the
+  realistic "one ArrayBuffer shared across many aval wrappers"
+  pattern, which is the only one that matters for the heap path.
+  Refcount semantics fixed: per-aval acquire count is now tracked
+  separately from the entry's total refcount so multiple aliasing
+  avals can share one entry without leaking byAval bindings.
+
+- **AtlasPool value-dedup** (atlasPool.ts): same gating; the value
+  key is the inner resource reference (`GPUTexture` for
+  `kind:"gpu"`, `HostTextureSource` for `kind:"host"`) rather than
+  an ArrayBuffer tuple, since `ImageBitmap` /
+  `HTMLVideoElement` don't expose pixel buffers but are reference-
+  comparable. Catches the typical "N ROs all pointing at one
+  decoded PNG" pattern. AtlasEntry now carries `aliases:
+  aval<ITexture>[]` so final release clears every aliased
+  byAval binding. `repack` throws if called on a deduped entry —
+  shouldn't happen via the reactivity loop (constants don't mark)
+  but guards against manual misuse.
+
+**Skipped scope:**
+
+- **UniformPool** stays identity-only. Payloads are tiny (mat4 = 64 B,
+  vec4 = 16 B); even N copies of identical constant uniforms across
+  N ROs cost a few MB and don't break batching (bucket key is
+  effect/pipelineState/textures, not pool refs). Hashing bytes per
+  acquire isn't worth the cost when the constant-source bypass
+  already prevents the upstream memo trie from filling with
+  no-op entries.
+
+**Tests:**
+
+- `tests/plugin/transformed/memoization.test.ts` — three new
+  bypass tests for aval (constant source → distinct derived,
+  reactive source → still memoizes) plus aset variants.
+- `tests/heap-atlas-dedup.test.ts` — two AtlasPool tests:
+  same-host-source dedup, different-source disambiguation, plus
+  release semantics across both aliases.
+
+**Files:**
+
+- `wombat.adaptive/src/plugin/runtime.ts` — bypass logic.
+- `wombat.rendering/packages/rendering/src/runtime/heapScene.ts` —
+  IndexPool with `byValueKey` map + per-aval acquire counter.
+- `wombat.rendering/packages/rendering/src/runtime/textureAtlas/atlasPool.ts` —
+  AtlasPool with `entriesByValueKey` + `aliases` per entry.
+
+---
+
+(Original plan kept below for historical reference.)
 
 Today's pools (UniformPool, IndexPool, AtlasPool) key on aval
 **identity**: `WeakMap<aval, entry>`. Two `AVal.constant(matrixA)`
@@ -343,13 +410,9 @@ hidden `__memo` runtime substrate from §5c.
 | Combinator | Method `x.m(...)` | Free `m(...)` | Namespace `K.m(...)` |
 |---|---|---|---|
 | `aval × {map, bind, zipN}` | ✓ | ✓ | ✓ |
-| `aset × {map, bind, filter, collect, choose}` | ✓ | ✓ | ✓ |
-| `alist × {map, bind, filter, collect, choose}` | ✓ | ✓ | ✓ |
-| `amap × {map, bind, filter, collect, choose}` | ✓ | ✓ | ✓ |
-
-(`*A` aval-callback variants and `*i` indexed-callback variants
-are punted — same key shape applies; plugin can pick them up
-incrementally when needed.)
+| `aset × {map, bind, filter, collect, choose, mapA, filterA, chooseA}` | ✓ | ✓ | ✓ |
+| `alist × {map, bind, filter, collect, choose, mapi, filteri, choosei, collecti, mapA, filterA, chooseA, mapAi, filterAi, chooseAi}` | ✓ | ✓ | ✓ |
+| `amap × {map, bind, filter, choose, mapA, filterA, chooseA}` | ✓ | ✓ | ✓ |
 
 **What it does, per call site:**
 
@@ -389,27 +452,52 @@ stable function-identity proxy across distinct lambda allocations.
 - Hit returns the cached aval directly; miss runs the original
   call once and caches.
 
-**Known limitations (v1 punts):**
+**Known limitations:**
 
-- **Method calls on non-Identifier receivers** like
-  `cval(1).map(...)` (immediate constructor call without
-  intermediate variable) aren't detected. Adding kind inference
-  for `CallExpression` receivers extends coverage trivially —
-  follow-up.
-- **`import * as X` namespace imports** skipped. Most code uses
-  named imports.
 - **Closure-dep member-access chains** (`props.r`) reduced to
   the base identifier (`props`). Cache keys on `props` reference
   rather than `props.r` value — conservatively correct (props
   marks → cache invalidated) but slightly broader than ideal.
-- **Body hash is whitespace-sensitive** (`t=>t*2` and `t => t * 2`
-  hash differently). A normalize-via-printer pass would tighten
-  this. Acceptable for now since formatting is normally consistent
-  per-codebase via Prettier/eslint.
 - **No idempotence guard.** Vite's single-transform-per-file
   pipeline prevents re-rewriting in practice; if the plugin ever
   runs twice on the same source, nested `__memo` calls would
   result. Not a real concern with standard Vite usage.
+- **Class instances without `getHashCode()`/`equals()`** fall
+  through to reference identity in the runtime. Aardvark
+  value-types (V3f / M44f / V3i / etc.) do implement the
+  duck-type and intern correctly; arbitrary user classes don't.
+  Workaround: implement the protocol on classes whose instances
+  are commonly captured-but-structurally-shared.
+
+**Previously-known limitations now fixed:**
+
+- ✓ Method calls on non-Identifier receivers
+  (`cval(1).map(...)`) now resolved via recursive
+  `inferKindFromExpression` on the receiver.
+- ✓ `import * as X` namespace imports recognized for both
+  subpath modules (`import * as ASet from ".../aset"` →
+  `ASet.map(...)`) and the bare module
+  (`import * as W from "@aardworx/wombat.adaptive"` →
+  `W.AVal.map(...)`).
+- ✓ `*A` aval-callback variants (`mapA`, `chooseA`, `filterA`,
+  `mapAi`, `chooseAi`, `filterAi`) and `*i` indexed-callback
+  variants (`mapi`, `choosei`, `filteri`, `collecti`) covered
+  across all relevant collection kinds.
+- ✓ **Body hash is whitespace-insensitive**. Hashing now runs
+  on the AST-printed form (TypeScript printer with
+  `removeComments: true`, fixed newline/indent), so
+  `t=>t*2` and `t => t * 2` and a multiline-formatted
+  equivalent all produce the same hash. Comments inside the
+  callback are stripped before hashing too.
+- ✓ **Plain-object closure deps** with primitive leaves
+  (`{r:1, g:0, b:0}` and `[10, 20]` literals) intern by
+  structural value via a runtime `SIMPLE_INTERN` map. Plain
+  objects with `Object.prototype` and arrays with primitive (or
+  recursively simple) leaves, depth ≤ 4, are serialized to a
+  deterministic key string and assigned a stable opaque handle.
+  Two structurally-equal captures from distinct call sites
+  collapse to one cache entry. Symbols, functions, typed
+  arrays, and exotic objects bail to reference identity.
 
 **Reference implementations leaned on:**
 
@@ -422,10 +510,16 @@ stable function-identity proxy across distinct lambda allocations.
 **Tests:** 21 AST-shape tests at `tests/plugin/transform.test.ts`
 verifying tag selection, hash literal presence, fallback-closure
 preservation, closure-deps capture, type-ambiguous-skip, and
-import-injection shape. Plus behavioral tests at
-`tests/plugin/transformed/` (in flight) that apply the plugin via
-vitest config and assert real memoization reference-equality +
-value correctness end-to-end.
+import-injection shape. Plus 35 behavioral tests at
+`tests/plugin/transformed/` that apply the plugin via vitest
+config and assert real memoization reference-equality + value
+correctness end-to-end — including 5 hashable-types tests
+(`hashable.test.ts`) covering structural-equality dedup of V3-shaped
+value types, plain-object reference-identity fallback, same-instance
+reuse, and an adversarial forced-hashCode-collision case proving
+collision-safety. The behavioural suite caught a real runtime bug
+(primitive cache keys crashing the WeakMap path) that the AST-shape
+tests missed.
 
 **Files:**
 
@@ -435,28 +529,58 @@ value correctness end-to-end.
   import tracker → local-binding kind inference → call-site
   detector → closure-deps walker → FNV-1a body hash → __memo
   rebuilder → import injector.
-- `src/plugin/runtime.ts` — string-key interning shim. MemoTrie
-  needs object keys (WeakMap); the runtime wraps `__memo([..., "h:abc"])`
-  so hash strings become interned `{h}` objects via a
-  module-level `Map`.
+- `src/plugin/runtime.ts` — key-interning shim. MemoTrie needs
+  object keys (WeakMap). The runtime collapses the body-hash string
+  + all primitive closure-deps into ONE type-tagged interned
+  `{ k: string }` per unique tuple. Value-typed objects with the
+  Aardvark `getHashCode()` + `equals()` duck-type (V3f / M44f /
+  V3i / etc.) are interned via a **hash-bucket-with-equals** scheme:
+  `Map<hashCode, Array<{value, key}>>` — on hash collision, the
+  bucket is walked calling `equals()` to find a match, so distinct
+  values always get distinct opaque handles regardless of hashCode
+  collisions. Plain objects (no hashable protocol) keep reference
+  identity through the WeakMap path.
+
+**Value-typed dedup correctness note:** content-hashing the cache
+key (FNV of the value bytes) was rejected because a 1-in-2³² hash
+collision would surface as a *wrong cache hit* — silent wrong
+results, not just a missed dedup. The hash-bucket scheme uses
+`getHashCode()` only as a bucket selector and `equals()` as the
+sole equality primitive, so collisions degrade to bucket walks
+without ever returning a wrong handle.
 
 **Layered story (status of all four phases):**
 
-1. **§5b** — value-equality dedup at pool level. ⏳ Future work.
-   Catches inline `AVal.constant(value)` patterns at the
-   rendering-pool layer. Independent of §5c/§5d (lives in
-   wombat.rendering, not wombat.adaptive).
+1. **§5b** — value-equality dedup at pool level. ✅ Shipped
+   (reduced scope: IndexPool + AtlasPool only; UniformPool
+   skipped as not worth the per-acquire hash cost). Plus
+   constant-source bypass in `__memo` so the upstream trie
+   doesn't fill with no-op entries.
 2. **§5c** — runtime `__memo` substrate. ✅ Shipped as hidden
    internal at `@aardworx/wombat.adaptive/internal`.
 3. **§5d** — build-time transform. ✅ Shipped at
    `@aardworx/wombat.adaptive/plugin`. Subsumes 5c's manual
    surface — users never reach for `__memo` directly.
 
-The identity footgun is now gone everywhere `.map(closure)`-style
-calls touch the adaptive system, transparently. The remaining
-§5b is a separate rendering-side concern (per-pool value-equality
-dedup for the tiny edge case where two distinct constant avals
-carry identical values).
+The identity footgun is now gone end-to-end:
+- Constant avals: `__memo` skips the trie; pool-level dedup
+  collapses the realistic "N ROs share an ImageBitmap / index
+  array" patterns into single allocations.
+- Reactive `.map(closure)` avals: memo trie shares derived avals
+  by `(tag, body-hash, source, deps)`.
+- Reactive `.map(closure-with-state)`: trie disambiguates by
+  closure-dep identity — correct distinct entries.
+- Closure deps with structural value (V3f / M44f / V3i; plain
+  `{r,g,b}` literals; `[10, 20]` arrays): runtime intern by
+  structure. Two equal-but-distinct captures collapse to one
+  cache entry.
+- Body hash insensitive to whitespace and comments — codebases
+  with mixed formatting still dedup correctly.
+- Plugin call-shape coverage: method form on any receiver
+  (including `cval(1).map(...)` chains), free-function form,
+  named-namespace form, `import * as X` namespace form (subpath
+  AND bare-module compound), plus `*A` aval-callback and `*i`
+  indexed-callback variants across all four collection kinds.
 
 ## 6. Uber-shader families with shared header pool
 

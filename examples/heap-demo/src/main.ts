@@ -145,14 +145,19 @@ function trafoInvToM44f(t: Trafo3d): M44f {
 
 function makeUniforms(
   modelTrafo: Trafo3d,
-  viewProjM44: aval<M44f>,
-  lightLoc: aval<V3f>,
+  viewProj: aval<Trafo3d>,
+  eye: aval<V3d>,
 ): HashMap<string, aval<unknown>> {
-  // We provide what the trafo+lambert effect reads:
-  //   ModelTrafo, ModelTrafoInv, ViewProjTrafo, LightLocation.
-  // ViewProjTrafo and LightLocation are passed pre-shared so all ROs
-  // see the same aval identity → one arena allocation + one upload
-  // per frame instead of N.
+  // INTENTIONAL "old trap" demo: every RO maps `viewProj` and `eye`
+  // inline. Without §5d's build-time memoization, this would create
+  // N distinct derived avals → N pool entries → N writeBuffer calls
+  // per frame on camera move. The plugin rewrites both `.map(...)`
+  // calls into __memo with a (tag, body-hash, source) key — since
+  // `viewProj`/`eye`/`trafoToM44f` are module-stable, every call
+  // site shares ONE cached derived aval. 50K ROs collapse to 1
+  // viewProj→M44 derived + 1 eye→V3f derived.
+  const viewProjM44 = viewProj.map(trafoToM44f);
+  const lightLoc = eye.map((e) => new V3f(e.x as number, e.y as number, e.z as number));
   const m  = AVal.constant(trafoToM44f(modelTrafo));
   const mi = AVal.constant(trafoInvToM44f(modelTrafo));
   return HashMap.empty<string, aval<unknown>>()
@@ -183,7 +188,7 @@ const sharedPipelineState = PipelineState.constant({
   depth: { write: true, compare: "less" },
 });
 
-function makeRO(spec: RoSpec, viewProjM44: aval<M44f>, lightLoc: aval<V3f>): RenderObject {
+function makeRO(spec: RoSpec, viewProj: aval<Trafo3d>, eye: aval<V3d>): RenderObject {
   const textured = spec.texture !== undefined && spec.sampler !== undefined;
   const textures = textured
     ? HashMap.empty<string, aval<ITexture>>().add("albedo", spec.texture!)
@@ -199,7 +204,7 @@ function makeRO(spec: RoSpec, viewProjM44: aval<M44f>, lightLoc: aval<V3f>): Ren
     effect: textured ? texturedSurface : surface,
     pipelineState: sharedPipelineState,
     vertexAttributes: textured ? baseAttribs.add("Uvs", spec.geo.uvs) : baseAttribs,
-    uniforms: makeUniforms(spec.modelTrafo, viewProjM44, lightLoc),
+    uniforms: makeUniforms(spec.modelTrafo, viewProj, eye),
     textures,
     samplers,
     indices: spec.geo.indices,
@@ -381,16 +386,11 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     const projT  = projFor(aspect);
     return view.getValue(token).mul(projT);   // view first, then proj
   });
-  // Single shared M44f / lightLoc avals — every RO references the
-  // SAME aval objects so the runtime pool sees one identity → one
-  // arena allocation + one upload per frame instead of N.
-  const viewProjM44: aval<M44f> = viewProj.map(trafoToM44f);
-  const lightLoc: aval<V3f> = eye.map(e => new V3f(e.x as number, e.y as number, e.z as number));
-
-  // Build N RO specs — same grid as the heap path so the visual
-  // result is comparable. The Runtime path doesn't share buffers
-  // across ROs the way the heap path does, so this is the apples-
-  // to-apples scaling test.
+  // No pre-mapped sharing here — `makeRO` does `viewProj.map(...)`
+  // and `eye.map(...)` PER object. The §5d build-time plugin
+  // rewrites those calls into __memo, so all N ROs end up sharing
+  // ONE derived aval each via the memo trie. Pre-§5d this would
+  // have been the classic per-RO identity-defeat footgun.
   const ros: RenderObject[] = [];
   if (ROCount <= 4) {
     for (let i = 0; i < ROCount; i++) {
@@ -399,7 +399,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
         modelTrafo: trafoOf(i, xPositions[i]!),
         color: colors[i]!,
         ...(atlasMode ? { texture: pickTex(i)!, sampler: sharedSampler! } : {}),
-      }, viewProjM44, lightLoc));
+      }, viewProj, eye));
     }
   } else {
     const side = Math.ceil(Math.sqrt(ROCount));
@@ -418,7 +418,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       ros.push(makeRO({
         geo: bundle, modelTrafo: t, color: colors[k % 4]!,
         ...(atlasMode ? { texture: pickTex(k)!, sampler: sharedSampler! } : {}),
-      }, viewProjM44, lightLoc));
+      }, viewProj, eye));
     }
   }
 
