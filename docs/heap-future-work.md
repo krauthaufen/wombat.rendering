@@ -586,10 +586,10 @@ The identity footgun is now gone end-to-end:
 
 ## 6. Uber-shader families with shared header pool
 
-Currently the bucket key is `(effect, pipelineState, textures)` — two
-ROs with different effects always fall into different buckets even if
-their pipeline state and texture binding match. Encode = N buckets =
-N drawIndirect calls.
+Currently the bucket key is `(effect, pipelineState, textureSet,
+perInstanceAttrSet)` — two ROs with different effects always fall
+into different buckets even if everything else matches. Encode = N
+buckets = N drawIndirect calls.
 
 Goal: collapse multiple effects into one bucket / one drawIndirect.
 Earlier framing was "uber-shader unification" — merge effects into
@@ -597,6 +597,69 @@ one shader by unifying their schemas. Cleaner approach: don't unify
 schemas at all. Each effect keeps its native drawHeader layout. The
 machinery that gets shared is the storage and the dispatch, not the
 data format.
+
+### v1 PoC scope (agreed 2026-05-09)
+
+The proof-of-concept implements the strong form: **bucket key
+reduces to `(familyId, pipelineState)`**. `effect`, `textureSet`,
+and `perInstanceAttrSet` all fold inside the family via layoutId
+dispatch. Concretely:
+
+1. **Adaptive collection from the RO set.** `buildHeapScene` walks
+   the RenderTree leaves, collects every distinct `Effect`, builds
+   the family. No user-supplied family list.
+
+2. **Anonymous Varying0..N packing.** Each per-effect VS gets
+   rewritten at family-build time: named varying writes
+   (`out.WorldPositions = …`) become slot writes (`varyings[k] = …`)
+   with a slot map computed once for the whole family. Family VsOut
+   is `array<vec4<f32>, N>` where N covers the largest single
+   effect's varying budget. Per-effect FS reads similarly rewritten.
+   No struct field clashes, no wasted struct slots; semantics-free.
+
+3. **drawHeader schema = union of all per-effect schemas.** Each RO
+   populates only its effect's slots; layoutId selects what's live.
+   New mandatory `layoutId: u32` field threaded through the
+   drawHeader at a fixed offset.
+
+4. **Atlas-route everything.** `textureSet` axis disappears: every
+   heap-eligible RO routes through AtlasPool. Effects that don't
+   sample a texture get a 1×1 white sub-rect auto-bound; their FS
+   doesn't read it (DCE drops the dead sample if any). Cost is
+   one extra reserved sub-rect per scene.
+
+5. **perInstanceAttrSet inside the family.** The drawTable record
+   already carries per-record `instanceCount`; non-instanced effects
+   coexist with instanced ones in the same bucket — layoutId picks
+   which path the VS dispatch takes. Family's wrapper VS reads
+   `instance_index` AND `instId` (from the megacall prelude); each
+   per-effect helper reads whichever it needs.
+
+6. **Static rebuild.** Family compiled once at scene-build. Effect
+   set is fixed for the scene's lifetime in v1.
+
+7. **Lifecycle**: Eager compile, single render pipeline per
+   `(familyId, pipelineState)`. Synchronous family-build.
+
+### v2 punts (deferred)
+
+- **Reactive rebuild on RO add/remove** — recompile family when the
+  effect set changes. Likely cheap (compile is sub-100ms), but
+  needs a swap mechanism that doesn't drop frames mid-rebuild.
+- **Async opt-in family compile** — for very large families,
+  compile in the background and keep the unmerged buckets running
+  until the merged pipeline is ready.
+- **Multi-pipeline per family shader** — one WGSL module driving
+  multiple GPU pipelines distinguished by pipelineState (currently
+  one pipeline per `(familyId, pipelineState)` pair, so each
+  pipelineState today recompiles the family WGSL).
+- **Trace-based opt-in** — the original "merge only when bucket
+  count crosses a threshold" framing. v1 always merges; the
+  pessimistic case (very few ROs, large effect family) pays a
+  compile cost we don't recover. Acceptable for the heap path's
+  target workload (lots of small ROs sharing little).
+
+### Original framing (preserved for context)
 
 **Mechanism:**
 

@@ -19,7 +19,7 @@
 
 import { compileModule, stage as makeStage, effect as makeEffect } from "@aardworx/wombat.shader";
 import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
-import { substituteInputs, readInputs, mapExpr, mapStmt, liftReturns } from "@aardworx/wombat.shader/passes";
+import { substituteInputsInStage, readInputs, mapExpr, mapStmt, liftReturns } from "@aardworx/wombat.shader/passes";
 import {
   type Module, type Expr, type Stmt, type Type, type ValueDef,
   type EntryDef, type EntryParameter, type ParamDecoration,
@@ -248,6 +248,11 @@ function injectVsBuiltins(m: Module): Module {
 // For each surviving uniform field, build a heap-load expression
 // using `instance_index` as drawIdx. For each surviving attribute,
 // use `vertex_index` and cyclic addressing.
+//
+// These map builders extract the (name → Expr) mapping that the VS
+// substitution needs; the actual rewrite is delegated to
+// `Effect.substitute({ vertex: { uniforms, inputs } })` in
+// `compileHeapEffectIR`.
 
 /**
  * Per-RO selector expression. Always reads the `heap_drawIdx` local
@@ -257,41 +262,47 @@ function drawIdxExprFor(_layout: BucketLayout): Expr {
   return { kind: "Var", var: { name: "heap_drawIdx", type: Tu32, mutable: false } } as Expr;
 }
 
-function rewriteVertexBodies(m: Module, layout: BucketLayout): Module {
-  // Header-selector identifier: `heap_drawIdx` injected by
-  // megacallSearchPrelude (per-RO selector). `instance_index` holds the
-  // in-RO instance index (= `instId` from the prelude); `vertex_index`
-  // is the index pulled from `indexStorage`.
-  const instBuiltin = readScope("Builtin", "instance_index", Tu32);
+/**
+ * `(uniformName → loadUniformByRef(loadHeaderRef(...), wgslType))` for
+ * every uniform-ref field in `layout`. Used as the `vertex.uniforms`
+ * argument to `Effect.substitute`.
+ */
+function buildVertexUniformMap(layout: BucketLayout): Map<string, Expr> {
   const drawIdx: Expr = drawIdxExprFor(layout);
-  const iidx: Expr = instBuiltin;
-  const vid = readScope("Builtin", "vertex_index", Tu32);
-  const uniformMapping = new Map<string, Expr>();
-  const attrMapping    = new Map<string, Expr>();
+  const iidx: Expr = readScope("Builtin", "instance_index", Tu32);
   const stride = layout.strideU32;
+  const out = new Map<string, Expr>();
   for (const f of layout.drawHeaderFields) {
+    if (f.kind !== "uniform-ref") continue;
     const refExpr = loadHeaderRef(drawIdx, f.byteOffset, stride);
-    if (f.kind === "uniform-ref") {
-      const value = layout.perInstanceUniforms.has(f.name)
-        ? loadInstanceByRef(refExpr, iidx, f.uniformWgslType ?? "")
-        : loadUniformByRef(refExpr, f.uniformWgslType ?? "");
-      uniformMapping.set(f.name, value);
-    } else if (f.kind === "attribute-ref") {
-      const value = layout.perInstanceAttributes.has(f.name)
-        ? loadAttributeByRef(refExpr, iidx, f.attributeWgslType ?? "")
-        : loadAttributeByRef(refExpr, vid, f.attributeWgslType ?? "");
-      attrMapping.set(f.name, value);
-    }
+    const value = layout.perInstanceUniforms.has(f.name)
+      ? loadInstanceByRef(refExpr, iidx, f.uniformWgslType ?? "")
+      : loadUniformByRef(refExpr, f.uniformWgslType ?? "");
+    out.set(f.name, value);
   }
-  // Restrict to vertex stages: the FS substitution needs the threaded
-  // varyings, not raw heap loads. We pre-filter by walking values
-  // and only substituting inside vertex Entry bodies.
-  return mapVertexEntryBodies(m, body => {
-    let s = body;
-    s = mapStmtSubstInputScope(s, "Uniform", n => uniformMapping.get(n));
-    s = mapStmtSubstInputScope(s, "Input",   n => attrMapping.get(n));
-    return s;
-  });
+  return out;
+}
+
+/**
+ * `(attributeName → loadAttributeByRef(loadHeaderRef(...), idx, wgslType))`
+ * for every attribute-ref field in `layout`. Used as the
+ * `vertex.inputs` argument to `Effect.substitute`.
+ */
+function buildVertexAttributeMap(layout: BucketLayout): Map<string, Expr> {
+  const drawIdx: Expr = drawIdxExprFor(layout);
+  const iidx: Expr = readScope("Builtin", "instance_index", Tu32);
+  const vid = readScope("Builtin", "vertex_index", Tu32);
+  const stride = layout.strideU32;
+  const out = new Map<string, Expr>();
+  for (const f of layout.drawHeaderFields) {
+    if (f.kind !== "attribute-ref") continue;
+    const refExpr = loadHeaderRef(drawIdx, f.byteOffset, stride);
+    const value = layout.perInstanceAttributes.has(f.name)
+      ? loadAttributeByRef(refExpr, iidx, f.attributeWgslType ?? "")
+      : loadAttributeByRef(refExpr, vid, f.attributeWgslType ?? "");
+    out.set(f.name, value);
+  }
+  return out;
 }
 
 function mapVertexEntryBodies(m: Module, fn: (body: Stmt) => Stmt): Module {
@@ -345,26 +356,6 @@ function prependVsBodyStmts(m: Module, stmts: readonly Stmt[]): Module {
   });
 }
 
-function mapStmtSubstInputScope(
-  body: Stmt,
-  scope: "Uniform" | "Input" | "Builtin",
-  mapping: (name: string) => Expr | undefined,
-): Stmt {
-  // Wrap a single-stage substitution in a synthetic single-entry
-  // module so we can reuse `substituteInputs` from wombat.shader.
-  const tempEntry: EntryDef = {
-    name: "__tmp", stage: "vertex", inputs: [], outputs: [], arguments: [],
-    returnType: { kind: "Void" } as Type, body, decorations: [],
-  };
-  const tempModule: Module = {
-    types: [], values: [{ kind: "Entry", entry: tempEntry }],
-  };
-  const out = substituteInputs(tempModule, scope, mapping);
-  const ent = out.values.find(v => v.kind === "Entry");
-  if (ent === undefined || ent.kind !== "Entry") return body;
-  return ent.entry.body;
-}
-
 // ─── FS uniform threading ──────────────────────────────────────────
 //
 // FS can't access `instance_index` directly, so we thread the per-
@@ -393,6 +384,24 @@ function wgslTypeFromHeapField(wgslType: string): Type {
   }
 }
 
+/**
+ * FS uniform threading: thread `_h_<name>Ref` (and `_iidx`, when
+ * needed) varyings from VS to FS, and rewrite FS `ReadInput("Uniform",
+ * X)` into a heap-load through the threaded ref.
+ *
+ * This pass stays at Module-level rather than going through the
+ * Effect.substitute API for two reasons:
+ *
+ *   1. The VS side adds *Stmts* (WriteOutput) and entry parameters,
+ *      not Expr substitutions — outside the substitute API's scope.
+ *   2. Even the FS Expr substitution can't run pre-merge: the
+ *      frontend hides `return { outColor: ... }` field exprs in a
+ *      `_record` carrier that mapExpr doesn't traverse, so any
+ *      uniform read inside the returned record is invisible until
+ *      `liftReturns` rewrites it into explicit WriteOutput stmts.
+ *      We run after liftReturns; the matching VS-side write injection
+ *      lives in the same pass to keep the `_h_<X>Ref` names paired.
+ */
 function rewriteFsUniforms(m: Module, layout: BucketLayout): Module {
   // Scan FS bodies for uniform-scope reads.
   const used = new Set<string>();
@@ -446,8 +455,7 @@ function rewriteFsUniforms(m: Module, layout: BucketLayout): Module {
   let out = m;
   out = addInterstageParams(out, threadParams);
   out = prependVsBodyStmts(out, vsWrites);
-  out = mapStageEntryBodies(out, "fragment", body =>
-    mapStmtSubstInputScope(body, "Uniform", n => fsSubst.get(n)));
+  out = substituteInputsInStage(out, "fragment", "Uniform", n => fsSubst.get(n));
   return out;
 }
 
@@ -674,23 +682,39 @@ export function compileHeapEffectIR(
   layout: BucketLayout,
   compileOptions: CompileOptions,
 ): { vs: string; fs: string; preludeWgsl: string; vsEntry: string; fsEntry: string } {
+  // VS-side input/uniform substitution: pure read-rewrites, expressed
+  // via the Effect.substitute API. Vertex stages read uniforms and
+  // attributes by name (`uniform.X`, `input.A`); the API replaces
+  // each `ReadInput` with the heap-load Expr produced by the layout-
+  // aware builders. Applied pre-merge — for a multi-stage Effect
+  // this routes per-stage; for a single-stage Effect carrying both
+  // vsMain + fsMain the FS-side reads are unaffected because they
+  // travel through the threaded ref varying machinery below.
+  const heapShaped = userEffect.substitute({
+    vertex: {
+      inputs:   buildVertexAttributeMap(layout),
+      uniforms: buildVertexUniformMap(layout),
+    },
+  });
+
   // Build a single Module from all of the effect's stages by
-  // composing them. Then apply heap rewrites to that combined module.
-  // The composed module preserves stage entry boundaries.
-  let combined: Module = mergeStages(userEffect);
-  // Lift `return { ... }` into explicit WriteOutput stmts so the
-  // substitution passes below see (and rewrite) the ReadInputs that
-  // feed the record fields. Without this, ObjectLiteral exprs hide
+  // composing them. Then apply the remaining heap rewrites to that
+  // combined module. The composed module preserves stage entry
+  // boundaries.
+  let combined: Module = mergeStages(heapShaped);
+  // Lift `return { ... }` into explicit WriteOutput stmts so the FS
+  // uniform pass below can see (and rewrite) ReadInputs that feed the
+  // returned record fields. Without this, ObjectLiteral exprs hide
   // their fields on a `_record` carrier that mapExpr doesn't traverse.
   combined = liftReturns(combined);
   combined = injectVsBuiltins(combined);
-  // FS uniform threading must run BEFORE VS body rewriting, since it
-  // adds WriteOutput stmts that the VS rewriter shouldn't touch (the
-  // refs they write reference `instance_index` directly, not the
-  // substituted heap-load expressions).
+  // FS uniform threading must run BEFORE atlas FS rewriting in source
+  // order? No — order historically: atlas first, then uniforms. Both
+  // add interstage params and VS WriteOutput stmts; their write sets
+  // are disjoint, so the order is interchangeable in practice. Keep
+  // the original order for byte-for-byte equivalence.
   combined = rewriteFsAtlasTextures(combined, layout);
   combined = rewriteFsUniforms(combined, layout);
-  combined = rewriteVertexBodies(combined, layout);
   // Add heap storage buffers as bindings.
   combined = { ...combined, values: [...heapStorageBufferDecls(), ...combined.values] };
 
