@@ -1822,6 +1822,7 @@ export function buildHeapScene(
       isInstanced: instanceOpts.isInstanced,
       perInstanceUniforms: instanceOpts.perInstanceUniforms,
       megacall,
+      atlasArraySize: ATLAS_ARRAY_SIZE,
     };
     let layout: BucketLayout;
     let vsModule: GPUShaderModule;

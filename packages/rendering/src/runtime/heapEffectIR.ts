@@ -19,13 +19,18 @@
 
 import { compileModule, stage as makeStage, effect as makeEffect } from "@aardworx/wombat.shader";
 import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
-import { substituteInputs, readInputs } from "@aardworx/wombat.shader/passes";
+import { substituteInputs, readInputs, mapExpr, mapStmt } from "@aardworx/wombat.shader/passes";
 import {
   type Module, type Expr, type Stmt, type Type, type ValueDef,
   type EntryDef, type EntryParameter, type ParamDecoration,
   Tu32, Tf32, Vec,
 } from "@aardworx/wombat.shader/ir";
-import { megacallSearchPrelude, type BucketLayout } from "./heapEffect.js";
+import {
+  megacallSearchPrelude, atlasVaryingNames,
+  ATLAS_BINDING_LINEAR, ATLAS_BINDING_SRGB, ATLAS_BINDING_SAMPLER,
+  type BucketLayout,
+} from "./heapEffect.js";
+import type { IntrinsicRef } from "@aardworx/wombat.shader/ir";
 
 // ─── IR builders ────────────────────────────────────────────────────
 
@@ -488,6 +493,146 @@ function loadInstanceByRef(refIdent: Expr, iidx: Expr, wgslType: string): Expr {
 // the import alive.
 void wgslTypeFromHeapField;
 
+// ─── FS atlas-texture rewrite (textureSample → atlasSample) ─────────
+//
+// For each atlas-routed binding actually called from FS as
+// `textureSample(<name>, smp, uv)`:
+//   - Thread 4 flat-interpolated VsOut varyings: `_h_<name>PageRef`,
+//     `_h_<name>FormatBits`, `_h_<name>Origin`, `_h_<name>Size`.
+//   - VS body writes them from the drawHeader (`headersU32` reads,
+//     bitcast for the f32 fields since the headers buffer is u32).
+//   - FS substitutes the textureSample call with a `CallIntrinsic`
+//     emitting `atlasSample(pageRef, formatBits, origin, size, uv)`.
+//
+// The `atlasSample` helper is declared by the prelude string the post-
+// emit injector prepends to the FS source — the IR doesn't need to
+// know about its body.
+
+/** Synthetic `atlasSample` intrinsic for the IR's CallIntrinsic emit hook. */
+const ATLAS_SAMPLE_INTRINSIC: IntrinsicRef = {
+  name: "atlasSample",
+  returnTypeOf: () => Tvec4,
+  pure: true,
+  emit: { glsl: "atlasSample", wgsl: "atlasSample" },
+};
+
+function isAtlasSampleCall(e: Expr, atlasNames: ReadonlySet<string>): { name: string; uv: Expr } | null {
+  if (e.kind !== "CallIntrinsic") return null;
+  if (e.op.emit.wgsl !== "textureSample") return null;
+  if (e.args.length < 3) return null;
+  const tex = e.args[0]!;
+  if (tex.kind !== "ReadInput" || tex.scope !== "Uniform") return null;
+  if (!atlasNames.has(tex.name)) return null;
+  return { name: tex.name, uv: e.args[2]! };
+}
+
+function rewriteFsAtlasTextures(m: Module, layout: BucketLayout): Module {
+  if (layout.atlasTextureBindings.size === 0) return m;
+  // Scan FS bodies to find which atlas bindings are actually used.
+  const used = new Set<string>();
+  for (const v of m.values) {
+    if (v.kind !== "Entry" || v.entry.stage !== "fragment") continue;
+    visitStmtExprs(v.entry.body, e => {
+      const hit = isAtlasSampleCall(e, layout.atlasTextureBindings);
+      if (hit !== null) used.add(hit.name);
+    });
+  }
+  if (used.size === 0) return m;
+
+  const fieldByAtlas = new Map<string, Map<string, ReturnType<typeof byteOffsetOf>>>();
+  for (const f of layout.drawHeaderFields) {
+    if (f.kind !== "texture-ref" || f.textureBindingName === undefined) continue;
+    const sub = f.textureSub!;
+    let inner = fieldByAtlas.get(f.textureBindingName);
+    if (inner === undefined) { inner = new Map(); fieldByAtlas.set(f.textureBindingName, inner); }
+    inner.set(sub, byteOffsetOf(f.byteOffset));
+  }
+
+  const drawIdxExpr = readScope("Builtin", "instance_index", Tu32);
+  const threadParams: EntryParameter[] = [];
+  const vsWrites: Stmt[] = [];
+
+  for (const name of used) {
+    const v = atlasVaryingNames(name);
+    const fields = fieldByAtlas.get(name)!;
+    const stride = layout.strideU32;
+    const headerU32At = (offU32: number): Expr =>
+      item(headersU32, add(mul(drawIdxExpr, constU32(stride), Tu32), constU32(offU32), Tu32), Tu32);
+    const headerF32At = (offU32: number): Expr => ({
+      kind: "CallIntrinsic",
+      op: { name: "bitcast<f32>", returnTypeOf: () => Tf32, pure: true,
+            emit: { glsl: "intBitsToFloat", wgsl: "bitcast<f32>" } } as IntrinsicRef,
+      args: [headerU32At(offU32)],
+      type: Tf32,
+    });
+
+    const pageRefOff    = fields.get("pageRef")!.u32;
+    const formatBitsOff = fields.get("formatBits")!.u32;
+    const originOff     = fields.get("origin")!.u32;
+    const sizeOff       = fields.get("size")!.u32;
+
+    threadParams.push({
+      name: v.pageRef, type: Tu32, semantic: v.pageRef,
+      decorations: [{ kind: "Interpolation", mode: "flat" } as ParamDecoration],
+    });
+    threadParams.push({
+      name: v.formatBits, type: Tu32, semantic: v.formatBits,
+      decorations: [{ kind: "Interpolation", mode: "flat" } as ParamDecoration],
+    });
+    threadParams.push({
+      name: v.origin, type: Tvec2, semantic: v.origin,
+      decorations: [{ kind: "Interpolation", mode: "flat" } as ParamDecoration],
+    });
+    threadParams.push({
+      name: v.size, type: Tvec2, semantic: v.size,
+      decorations: [{ kind: "Interpolation", mode: "flat" } as ParamDecoration],
+    });
+
+    vsWrites.push({ kind: "WriteOutput", name: v.pageRef,
+      value: { kind: "Expr", value: headerU32At(pageRefOff) } });
+    vsWrites.push({ kind: "WriteOutput", name: v.formatBits,
+      value: { kind: "Expr", value: headerU32At(formatBitsOff) } });
+    vsWrites.push({ kind: "WriteOutput", name: v.origin,
+      value: { kind: "Expr", value: newVec(
+        [headerF32At(originOff), headerF32At(originOff + 1)], Tvec2) } });
+    vsWrites.push({ kind: "WriteOutput", name: v.size,
+      value: { kind: "Expr", value: newVec(
+        [headerF32At(sizeOff), headerF32At(sizeOff + 1)], Tvec2) } });
+  }
+
+  // Rewrite FS textureSample(...) → atlasSample(...) for atlas-routed names.
+  let out = m;
+  out = addInterstageParams(out, threadParams);
+  out = prependVsBodyStmts(out, vsWrites);
+  out = mapStageEntryBodies(out, "fragment", body => mapStmt(body, {
+    expr: e => mapExpr(e, sub => {
+      const hit = isAtlasSampleCall(sub, layout.atlasTextureBindings);
+      if (hit === null) return sub;
+      const v = atlasVaryingNames(hit.name);
+      const args: Expr[] = [
+        readScope("Input", v.pageRef,    Tu32),
+        readScope("Input", v.formatBits, Tu32),
+        readScope("Input", v.origin,     Tvec2),
+        readScope("Input", v.size,       Tvec2),
+        hit.uv,
+      ];
+      return { kind: "CallIntrinsic", op: ATLAS_SAMPLE_INTRINSIC, args, type: Tvec4 };
+    }),
+  }));
+  return out;
+}
+
+/** Visit every Expr inside a Stmt tree, read-only. */
+function visitStmtExprs(s: Stmt, fn: (e: Expr) => void): void {
+  mapStmt(s, {
+    expr: e => mapExpr(e, sub => { fn(sub); return sub; }),
+  });
+}
+
+function byteOffsetOf(byteOffset: number): { u32: number } {
+  return { u32: byteOffset / 4 };
+}
+
 // ─── Public entry point ────────────────────────────────────────────
 
 /**
@@ -514,6 +659,7 @@ export function compileHeapEffectIR(
   // adds WriteOutput stmts that the VS rewriter shouldn't touch (the
   // refs they write reference `instance_index` directly, not the
   // substituted heap-load expressions).
+  combined = rewriteFsAtlasTextures(combined, layout);
   combined = rewriteFsUniforms(combined, layout);
   combined = rewriteVertexBodies(combined, layout);
   // Add heap storage buffers as bindings.
@@ -528,16 +674,115 @@ export function compileHeapEffectIR(
   const vsStage = compiled.stages.find(s => s.stage === "vertex");
   const fsStage = compiled.stages.find(s => s.stage === "fragment");
   let vsSrc = vsStage?.source ?? "";
+  let fsSrc = fsStage?.source ?? "";
   if (layout.megacall && vsSrc.length > 0) {
     vsSrc = applyMegacallToEmittedVs(vsSrc);
   }
+  if (layout.atlasTextureBindings.size > 0) {
+    // Strip user-emitted texture/sampler binding decls for atlas-routed
+    // names — the IR's FS still emits `var <name>: texture_2d<f32>;` even
+    // though we've replaced every textureSample call referencing it.
+    // The render BGL has no slot for these bindings.
+    if (vsSrc.length > 0) vsSrc = stripAtlasTextureSamplerDecls(vsSrc, layout.atlasTextureBindings);
+    if (fsSrc.length > 0) {
+      fsSrc = stripAtlasTextureSamplerDecls(fsSrc, layout.atlasTextureBindings);
+      fsSrc = prependAtlasPrelude(fsSrc, layout.atlasArraySize);
+    }
+  }
   return {
     vs: vsSrc,
-    fs: fsStage?.source ?? "",
+    fs: fsSrc,
     vsEntry: vsStage?.entryName ?? "vs",
     fsEntry: fsStage?.entryName ?? "fs",
     preludeWgsl: "",
   };
+}
+
+/**
+ * Drop `@group(N) @binding(M) var <name>: texture_*<...>;` and the
+ * matching sampler decl(s) for atlas-routed binding names. We keep
+ * other texture/sampler decls intact since they belong to the standalone
+ * texture path.
+ *
+ * Sampler-name detection: WGSL emit pairs samplers with their textures
+ * positionally in the IR; the user's WGSL can name them anything. To
+ * be safe we also strip any sampler decl that is *only* referenced by
+ * a now-rewritten textureSample call. Rather than do data-flow, we
+ * pattern-match: if the FS has zero remaining textureSample calls AND
+ * a single sampler decl, drop it. Otherwise leave it. Practically the
+ * v1 surface has 0..1 atlas-routed binding per shader, so this is
+ * sufficient.
+ */
+function stripAtlasTextureSamplerDecls(src: string, atlasNames: ReadonlySet<string>): string {
+  let out = src;
+  for (const name of atlasNames) {
+    const re = new RegExp(`@group\\(\\d+\\)\\s*@binding\\(\\d+\\)\\s*var\\s+${name}\\s*:\\s*texture_\\w+(?:<[^>]*>)?\\s*;\\s*`, "g");
+    out = out.replace(re, "");
+  }
+  // If textureSample no longer appears anywhere, drop the (single)
+  // sampler decl too. Conservative: we leave samplers alone if they
+  // could still be in use.
+  if (!/textureSample\s*\(/.test(out)) {
+    out = out.replace(/@group\(\d+\)\s*@binding\(\d+\)\s*var\s+\w+\s*:\s*sampler(?:_comparison)?\s*;\s*/g, "");
+  }
+  return out;
+}
+
+/**
+ * Prepend the atlas binding_array decls + `atlasSample` helper to the
+ * emitted FS source. The helper signatures match the post-rewrite
+ * `atlasSample(pageRef, formatBits, origin, size, uv)` calls the IR
+ * pass produces.
+ */
+function prependAtlasPrelude(fs: string, atlasArraySize: number): string {
+  const decls = `
+@group(0) @binding(${ATLAS_BINDING_LINEAR})  var atlasLinear:  binding_array<texture_2d<f32>, ${atlasArraySize}>;
+@group(0) @binding(${ATLAS_BINDING_SRGB})    var atlasSrgb:    binding_array<texture_2d<f32>, ${atlasArraySize}>;
+@group(0) @binding(${ATLAS_BINDING_SAMPLER}) var atlasSampler: sampler;
+
+fn atlasWrap1(u: f32, mode: u32) -> f32 {
+  let r = u - floor(u);
+  let m = 1.0 - abs((u - floor(u * 0.5) * 2.0) - 1.0);
+  let c = clamp(u, 0.0, 1.0);
+  return select(select(c, r, mode == 1u), m, mode == 2u);
+}
+fn atlasApplyWrap(uv: vec2<f32>, addrU: u32, addrV: u32) -> vec2<f32> {
+  return vec2<f32>(atlasWrap1(uv.x, addrU), atlasWrap1(uv.y, addrV));
+}
+fn atlasMipOrigin(origin: vec2<f32>, size: vec2<f32>, k: u32) -> vec2<f32> {
+  if (k == 0u) { return origin; }
+  let x = origin.x + size.x;
+  let y = origin.y + size.y * (1.0 - 1.0 / pow(2.0, f32(k) - 1.0));
+  return vec2<f32>(x, y);
+}
+fn atlasSampleAtMip(pageRef: u32, format: u32, origin: vec2<f32>, size: vec2<f32>, k: u32, uvW: vec2<f32>) -> vec4<f32> {
+  let mipSize = size / pow(2.0, f32(k));
+  let mipO = atlasMipOrigin(origin, size, k);
+  let atlasUv = mipO + uvW * mipSize;
+  let lin = textureSampleLevel(atlasLinear[pageRef], atlasSampler, atlasUv, 0.0);
+  let sr  = textureSampleLevel(atlasSrgb[pageRef],   atlasSampler, atlasUv, 0.0);
+  return select(lin, sr, format == 1u);
+}
+fn atlasSample(pageRef: u32, formatBits: u32, origin: vec2<f32>, size: vec2<f32>, uv: vec2<f32>) -> vec4<f32> {
+  let format  = formatBits & 0x1u;
+  let numMips = (formatBits >> 1u) & 0x7u;
+  let addrU   = (formatBits >> 4u) & 0x3u;
+  let addrV   = (formatBits >> 6u) & 0x3u;
+  let uvW = atlasApplyWrap(uv, addrU, addrV);
+  if (numMips <= 1u) { return atlasSampleAtMip(pageRef, format, origin, size, 0u, uvW); }
+  let dx = dpdx(uvW * size);
+  let dy = dpdy(uvW * size);
+  let rho = max(length(dx), length(dy)) * 4096.0;
+  let lod = clamp(log2(max(rho, 1e-6)), 0.0, f32(numMips - 1u));
+  let lo = u32(floor(lod));
+  let hi = min(lo + 1u, numMips - 1u);
+  let t  = lod - f32(lo);
+  let a = atlasSampleAtMip(pageRef, format, origin, size, lo, uvW);
+  let b = atlasSampleAtMip(pageRef, format, origin, size, hi, uvW);
+  return mix(a, b, t);
+}
+`;
+  return decls + fs;
 }
 
 /**

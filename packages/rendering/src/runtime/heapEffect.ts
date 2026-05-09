@@ -261,10 +261,29 @@ export interface BucketLayout {
    * indexStorage at 5); textures shift to 6+.
    */
   readonly megacall: boolean;
+  /**
+   * Atlas-routed texture binding names, exposed for the FS rewriter so
+   * it can substitute `textureSample(name, smp, uv)` with the heap
+   * `atlasSample(...)` helper for these names only.
+   */
+  readonly atlasTextureBindings: ReadonlySet<string>;
+  /**
+   * Atlas binding-array size (N in `binding_array<texture_2d<f32>, N>`),
+   * mirrored from the heapScene's per-format slot count. The prelude
+   * substitutes this at codegen time. Always present (>=1) so the
+   * shader's BGL declarations match the runtime BGL even for buckets
+   * that don't currently route any texture through the atlas.
+   */
+  readonly atlasArraySize: number;
 }
 
 /** First texture binding number; samplers come after the textures. */
 export const HEAP_TEX_BINDING_START = 4;
+
+/** Fixed atlas binding numbers — must match the runtime BGL in `heapScene.ts`. */
+export const ATLAS_BINDING_LINEAR  = 11;
+export const ATLAS_BINDING_SRGB    = 12;
+export const ATLAS_BINDING_SAMPLER = 13;
 
 export function buildBucketLayout(
   schema: HeapEffectSchema,
@@ -281,12 +300,19 @@ export function buildBucketLayout(
      * (default) for the standalone texture path.
      */
     atlasTextureBindings?: ReadonlySet<string>;
+    /**
+     * Atlas binding-array slot count (`binding_array<texture_2d<f32>, N>`).
+     * Defaults to 8 if omitted; the runtime always passes the value
+     * derived from `device.limits.maxSampledTexturesPerShaderStage`.
+     */
+    atlasArraySize?: number;
   } = {},
 ): BucketLayout {
   const isInstanced = opts.isInstanced ?? false;
   const perInstanceUniforms = opts.perInstanceUniforms ?? new Set<string>();
   const megacall = opts.megacall ?? false;
   const atlasTextureBindings = opts.atlasTextureBindings ?? new Set<string>();
+  const atlasArraySize = Math.max(1, opts.atlasArraySize ?? 8);
   if (megacall && isInstanced) {
     throw new Error("heapEffect: megacall + isInstanced not supported");
   }
@@ -381,13 +407,26 @@ export function buildBucketLayout(
     .filter(s => !atlasSamplerNames.has(s.name))
     .map(s => ({ name: s.name, wgslType: s.wgslType, binding: nextBinding++ }));
 
-  const preludeWgsl = generatePrelude(schema, textureBindings, samplerBindings, megacall);
+  const isAtlasBucket = atlasTextureBindings.size > 0;
+  // Extend the schema's varyings with flat-interpolated atlas threading
+  // slots when atlas is in use — the prelude generator emits these into
+  // VsOut so user VS code can write them and FS can read them. The
+  // location numbers are picked after the existing varyings.
+  const schemaForPrelude = isAtlasBucket
+    ? extendSchemaWithAtlasVaryings(schema, atlasTextureBindings)
+    : schema;
+  const preludeWgsl = generatePrelude(
+    schemaForPrelude, textureBindings, samplerBindings, megacall,
+    isAtlasBucket, atlasArraySize,
+  );
 
   return {
     drawHeaderFields, drawHeaderBytes, preludeWgsl, strideU32,
     isInstanced, perInstanceUniforms,
     textureBindings, samplerBindings,
     megacall,
+    atlasTextureBindings,
+    atlasArraySize,
   };
 }
 
@@ -488,6 +527,30 @@ function attributeLoadExpr(wgslType: string, refIdent: string, vidIdent: string)
   }
 }
 
+/**
+ * Append flat-interpolated atlas threading varyings to a schema.
+ * Locations follow the highest existing `@location(N)` so we don't
+ * collide with effect-declared varyings.
+ */
+function extendSchemaWithAtlasVaryings(
+  schema: HeapEffectSchema,
+  atlasNames: ReadonlySet<string>,
+): HeapEffectSchema {
+  let nextLoc = 0;
+  for (const v of schema.varyings) {
+    if (v.location !== undefined) nextLoc = Math.max(nextLoc, v.location + 1);
+  }
+  const extras: HeapVarying[] = [];
+  for (const name of atlasNames) {
+    const v = atlasVaryingNames(name);
+    extras.push({ name: v.pageRef,    wgslType: "u32",        location: nextLoc++, interpolation: "flat" });
+    extras.push({ name: v.formatBits, wgslType: "u32",        location: nextLoc++, interpolation: "flat" });
+    extras.push({ name: v.origin,     wgslType: "vec2<f32>",  location: nextLoc++, interpolation: "flat" });
+    extras.push({ name: v.size,       wgslType: "vec2<f32>",  location: nextLoc++, interpolation: "flat" });
+  }
+  return { ...schema, varyings: [...schema.varyings, ...extras] };
+}
+
 function lowerFirst(s: string): string {
   return s.length === 0 ? s : s[0]!.toLowerCase() + s.slice(1);
 }
@@ -503,6 +566,8 @@ function generatePrelude(
   textureBindings: readonly { name: string; wgslType: string; binding: number }[],
   samplerBindings: readonly { name: string; wgslType: string; binding: number }[],
   megacall: boolean,
+  isAtlasBucket: boolean,
+  atlasArraySize: number,
 ): string {
   // VsOut is generated from the schema's surviving VS outputs (post
   // link + DCE). No hardcoded fields — what the effect declared is
@@ -527,15 +592,97 @@ function generatePrelude(
     ? `\n@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;\n@group(0) @binding(6) var<storage, read> firstDrawInTile: array<u32>;`
     : "";
 
+  const atlasBlock = isAtlasBucket ? generateAtlasPrelude(atlasArraySize) : "";
+
   return /* wgsl */`
 @group(0) @binding(0) var<storage, read> heapU32:    array<u32>;
 @group(0) @binding(1) var<storage, read> headersU32: array<u32>;
 @group(0) @binding(2) var<storage, read> heapF32:    array<f32>;
 @group(0) @binding(3) var<storage, read> heapV4f:    array<vec4<f32>>;${megacallDecls}
-${samplingBlock}
+${samplingBlock}${atlasBlock}
 struct VsOut {
 ${vsOutBody}
 };
+`;
+}
+
+/**
+ * Atlas prelude: declares the per-format `binding_array<texture_2d<f32>, N>`s
+ * + the shared atlas sampler at fixed bindings 11/12/13, then the
+ * `atlasSample` software-mip helper that the FS rewriter calls in place
+ * of `textureSample(<atlasName>, smp, uv)`.
+ *
+ * Mip filtering is software (the GPU's mip walk would walk the wrong
+ * pyramid — our embedded 1.5×1 layout isn't visible to the hardware
+ * mip filter). LOD is computed from screen-space derivatives in mip-0
+ * atlas-pixel space; the constant 4096 matches `ATLAS_PAGE_SIZE`.
+ *
+ * Wrap-mode mirror math: `1 - |((u - floor(u/2)*2) - 1)|` yields a
+ * triangle wave with period 2 and amplitude [0,1] — matches WebGPU's
+ * `mirror-repeat` address-mode spec. Verified at u={0,0.5,1,1.5,2,-0.5}.
+ */
+function generateAtlasPrelude(atlasArraySize: number): string {
+  return /* wgsl */`
+@group(0) @binding(${ATLAS_BINDING_LINEAR})  var atlasLinear:  binding_array<texture_2d<f32>, ${atlasArraySize}>;
+@group(0) @binding(${ATLAS_BINDING_SRGB})    var atlasSrgb:    binding_array<texture_2d<f32>, ${atlasArraySize}>;
+@group(0) @binding(${ATLAS_BINDING_SAMPLER}) var atlasSampler: sampler;
+
+fn atlasWrap1(u: f32, mode: u32) -> f32 {
+  let r = u - floor(u);
+  let m = 1.0 - abs((u - floor(u * 0.5) * 2.0) - 1.0);
+  let c = clamp(u, 0.0, 1.0);
+  return select(select(c, r, mode == 1u), m, mode == 2u);
+}
+
+fn atlasApplyWrap(uv: vec2<f32>, addrU: u32, addrV: u32) -> vec2<f32> {
+  return vec2<f32>(atlasWrap1(uv.x, addrU), atlasWrap1(uv.y, addrV));
+}
+
+fn atlasMipOrigin(origin: vec2<f32>, size: vec2<f32>, k: u32) -> vec2<f32> {
+  if (k == 0u) { return origin; }
+  let x = origin.x + size.x;
+  let y = origin.y + size.y * (1.0 - 1.0 / pow(2.0, f32(k) - 1.0));
+  return vec2<f32>(x, y);
+}
+
+fn atlasSampleAtMip(
+  pageRef: u32, format: u32,
+  origin: vec2<f32>, size: vec2<f32>,
+  k: u32,
+  uvW: vec2<f32>,
+) -> vec4<f32> {
+  let mipSize = size / pow(2.0, f32(k));
+  let mipO = atlasMipOrigin(origin, size, k);
+  let atlasUv = mipO + uvW * mipSize;
+  let lin = textureSampleLevel(atlasLinear[pageRef], atlasSampler, atlasUv, 0.0);
+  let sr  = textureSampleLevel(atlasSrgb[pageRef],   atlasSampler, atlasUv, 0.0);
+  return select(lin, sr, format == 1u);
+}
+
+fn atlasSample(
+  pageRef: u32, formatBits: u32,
+  origin: vec2<f32>, size: vec2<f32>,
+  uv: vec2<f32>,
+) -> vec4<f32> {
+  let format  = formatBits & 0x1u;
+  let numMips = (formatBits >> 1u) & 0x7u;
+  let addrU   = (formatBits >> 4u) & 0x3u;
+  let addrV   = (formatBits >> 6u) & 0x3u;
+  let uvW = atlasApplyWrap(uv, addrU, addrV);
+  if (numMips <= 1u) {
+    return atlasSampleAtMip(pageRef, format, origin, size, 0u, uvW);
+  }
+  let dx = dpdx(uvW * size);
+  let dy = dpdy(uvW * size);
+  let rho = max(length(dx), length(dy)) * 4096.0;
+  let lod = clamp(log2(max(rho, 1e-6)), 0.0, f32(numMips - 1u));
+  let lo = u32(floor(lod));
+  let hi = min(lo + 1u, numMips - 1u);
+  let t  = lod - f32(lo);
+  let a = atlasSampleAtMip(pageRef, format, origin, size, lo, uvW);
+  let b = atlasSampleAtMip(pageRef, format, origin, size, hi, uvW);
+  return mix(a, b, t);
+}
 `;
 }
 
@@ -575,6 +722,7 @@ export function rewriteForLayout(
   if (rawFs) {
     for (const m of rawFs.matchAll(/_w_uniform\.(\w+)/g)) fsUniformsUsed.add(m[1]!);
   }
+  const fsAtlasUsed = scanFsAtlasTextures(rawFs, layout.atlasTextureBindings);
   // FS reads of per-instance uniforms are auto-threaded too: VS stashes
   // `iidx` as a flat-interpolated `_iidx: u32` varying; FS preamble
   // pulls `let iidx = in._iidx;` and feeds it into `instanceLoadExpr`
@@ -583,12 +731,70 @@ export function rewriteForLayout(
   // the right iidx for the primitive's fragments.
   const fsNeedsIidx = layout.isInstanced &&
     [...fsUniformsUsed].some(n => layout.perInstanceUniforms.has(n));
-  const augmented = augmentPreludeForFsUniforms(layout, fsUniformsUsed, fsNeedsIidx);
+  const augmented = augmentPreludeForFsUniforms(layout, fsUniformsUsed, fsNeedsIidx, fsAtlasUsed);
   return {
-    vs: rawVs ? rewriteVertex(rawVs, layout, fsUniformsUsed, fsNeedsIidx) : "",
-    fs: rawFs ? rewriteFragment(rawFs, layout, fsUniformsUsed, fsNeedsIidx) : "",
+    vs: rawVs ? rewriteVertex(rawVs, layout, fsUniformsUsed, fsNeedsIidx, fsAtlasUsed) : "",
+    fs: rawFs ? rewriteFragment(rawFs, layout, fsUniformsUsed, fsNeedsIidx, fsAtlasUsed) : "",
     preludeWgsl: augmented,
   };
+}
+
+/** Atlas-texture varying names used by the VS→FS threading + FS preamble. */
+export function atlasVaryingNames(name: string): {
+  pageRef: string; formatBits: string; origin: string; size: string;
+} {
+  return {
+    pageRef:    `_h_${name}PageRef`,
+    formatBits: `_h_${name}FormatBits`,
+    origin:     `_h_${name}Origin`,
+    size:       `_h_${name}Size`,
+  };
+}
+
+/**
+ * Find atlas-routed texture binding names actually called via
+ * `textureSample(<name>, smp, uv)` in the FS source. Returns the subset
+ * of `atlasTextureBindings` that the FS body actually references —
+ * non-referenced atlas bindings don't need their drawHeader fields
+ * threaded through VsOut.
+ */
+function scanFsAtlasTextures(fs: string, atlasNames: ReadonlySet<string>): Set<string> {
+  const used = new Set<string>();
+  if (atlasNames.size === 0 || fs.length === 0) return used;
+  for (const name of atlasNames) {
+    const re = new RegExp(`textureSample\\s*\\(\\s*${escapeRegExp(name)}\\b`);
+    if (re.test(fs)) used.add(name);
+  }
+  return used;
+}
+
+/**
+ * Substitute `textureSample(<atlasName>, <smp>, <uv>)` with
+ * `atlasSample(_h_<name>PageRef, _h_<name>FormatBits,
+ *              _h_<name>Origin, _h_<name>Size, <uv>)`. The atlas-routed
+ * `<smp>` argument is dropped — the shared `atlasSampler` is used inside
+ * `atlasSampleAtMip`. The user's per-draw sampler state lives in
+ * `formatBits` and is consumed by `atlasSample`.
+ *
+ * Naive paren splitting on commas is fine for the v1 surface (uv args
+ * are typically simple identifiers / .xy swizzles); future work: a
+ * proper paren-balanced argument splitter if user shaders embed nested
+ * parens in the uv expression.
+ */
+export function rewriteAtlasTextureSamples(
+  src: string,
+  atlasNames: ReadonlySet<string>,
+): string {
+  if (atlasNames.size === 0 || src.length === 0) return src;
+  let out = src;
+  for (const name of atlasNames) {
+    const v = atlasVaryingNames(name);
+    const re = new RegExp(`textureSample\\s*\\(\\s*${escapeRegExp(name)}\\s*,\\s*([^,]+?)\\s*,\\s*([^)]+?)\\s*\\)`, "g");
+    out = out.replace(re, (_m, _smp: string, uv: string) =>
+      `atlasSample(${v.pageRef}, ${v.formatBits}, ${v.origin}, ${v.size}, ${uv})`,
+    );
+  }
+  return out;
 }
 
 /**
@@ -601,8 +807,11 @@ function augmentPreludeForFsUniforms(
   layout: BucketLayout,
   fsUniformsUsed: ReadonlySet<string>,
   fsNeedsIidx: boolean,
+  fsAtlasUsed: ReadonlySet<string>,
 ): string {
-  if (fsUniformsUsed.size === 0 && !fsNeedsIidx) return layout.preludeWgsl;
+  if (fsUniformsUsed.size === 0 && !fsNeedsIidx) {
+    return layout.preludeWgsl;
+  }
   // Pick locations starting after the highest existing varying location.
   const locs: number[] = [];
   for (const m of layout.preludeWgsl.matchAll(/@location\((\d+)\)/g)) {
@@ -616,6 +825,10 @@ function augmentPreludeForFsUniforms(
   if (fsNeedsIidx) {
     extraFields.push(`  @location(${next++}) @interpolate(flat) _iidx: u32,`);
   }
+  // Atlas varyings live on the schema (added by extendSchemaWithAtlasVaryings
+  // when atlasTextureBindings is non-empty), so they're already in VsOut —
+  // no extra slots needed here.
+  void fsAtlasUsed;
   return layout.preludeWgsl.replace(
     /(struct\s+VsOut\s*\{[\s\S]*?)(\n\};)/,
     (_m, body: string, close: string) => `${body}\n${extraFields.join("\n")}${close}`,
@@ -627,6 +840,7 @@ function rewriteVertex(
   layout: BucketLayout,
   fsUniformsUsed: ReadonlySet<string>,
   fsNeedsIidx: boolean,
+  fsAtlasUsed: ReadonlySet<string>,
 ): string {
   let s = wgsl;
 
@@ -655,7 +869,7 @@ function rewriteVertex(
     throw new Error("heapEffect: cannot locate VS function body");
   }
   const body = fnBodyMatch[1]!;
-  const bindings = buildVsPreamble(body, layout, paramName, fsUniformsUsed, fsNeedsIidx);
+  const bindings = buildVsPreamble(body, layout, paramName, fsUniformsUsed, fsNeedsIidx, fsAtlasUsed);
 
   // 4. Rewrite header BEFORE we rename the output struct everywhere
   //    (otherwise `fnHeader` no longer matches anything in `s`).
@@ -729,6 +943,7 @@ function buildVsPreamble(
   body: string, layout: BucketLayout, paramName: string,
   fsUniformsUsed: ReadonlySet<string>,
   fsNeedsIidx: boolean,
+  fsAtlasUsed: ReadonlySet<string>,
 ): {
   preamble: string;
   uniformReplace: Map<string, string>;
@@ -773,6 +988,39 @@ function buildVsPreamble(
       lines.push(`  let ${refIdent} = headersU32[drawIdx * ${stride}u + ${refOffU32}u];`);
       lines.push(`  let ${ident} = ${attributeLoadExpr(f.attributeWgslType ?? "vec3<f32>", refIdent, "vid")};`);
       attrReplace.set(f.name, ident);
+    } else if (
+      f.kind === "texture-ref"
+      && f.textureBindingName !== undefined
+      && fsAtlasUsed.has(f.textureBindingName)
+    ) {
+      // Atlas texture-ref: load the inline u32 / vec2<f32> drawHeader
+      // values and forward them to FS via flat-interpolated VsOut slots.
+      const v = atlasVaryingNames(f.textureBindingName);
+      switch (f.textureSub) {
+        case "pageRef": {
+          lines.push(`  let ${v.pageRef} = headersU32[drawIdx * ${stride}u + ${refOffU32}u];`);
+          writes.push(`  out.${v.pageRef} = ${v.pageRef};`);
+          break;
+        }
+        case "formatBits": {
+          lines.push(`  let ${v.formatBits} = headersU32[drawIdx * ${stride}u + ${refOffU32}u];`);
+          writes.push(`  out.${v.formatBits} = ${v.formatBits};`);
+          break;
+        }
+        case "origin": {
+          // origin is vec2<f32> packed at byteOffset; read via heapF32-of-headers
+          // is unavailable here (the headers buffer is `array<u32>`), so cast
+          // u32→f32 via bitcast.
+          lines.push(`  let ${v.origin} = vec2<f32>(bitcast<f32>(headersU32[drawIdx * ${stride}u + ${refOffU32}u]), bitcast<f32>(headersU32[drawIdx * ${stride}u + ${refOffU32}u + 1u]));`);
+          writes.push(`  out.${v.origin} = ${v.origin};`);
+          break;
+        }
+        case "size": {
+          lines.push(`  let ${v.size} = vec2<f32>(bitcast<f32>(headersU32[drawIdx * ${stride}u + ${refOffU32}u]), bitcast<f32>(headersU32[drawIdx * ${stride}u + ${refOffU32}u + 1u]));`);
+          writes.push(`  out.${v.size} = ${v.size};`);
+          break;
+        }
+      }
     }
   }
   if (fsNeedsIidx) writes.push(`  out._iidx = iidx;`);
@@ -794,11 +1042,21 @@ function buildFsPreamble(
   layout: BucketLayout,
   fsUniformsUsed: ReadonlySet<string>,
   fsNeedsIidx: boolean,
+  fsAtlasUsed: ReadonlySet<string>,
 ): { preamble: string; replace: Map<string, string> } {
-  if (fsUniformsUsed.size === 0) return { preamble: "", replace: new Map() };
+  if (fsUniformsUsed.size === 0 && fsAtlasUsed.size === 0) {
+    return { preamble: "", replace: new Map() };
+  }
   const lines: string[] = [];
   const replace = new Map<string, string>();
   if (fsNeedsIidx) lines.push(`  let iidx = in._iidx;`);
+  for (const name of fsAtlasUsed) {
+    const v = atlasVaryingNames(name);
+    lines.push(`  let ${v.pageRef} = in.${v.pageRef};`);
+    lines.push(`  let ${v.formatBits} = in.${v.formatBits};`);
+    lines.push(`  let ${v.origin} = in.${v.origin};`);
+    lines.push(`  let ${v.size} = in.${v.size};`);
+  }
   for (const f of layout.drawHeaderFields) {
     if (f.kind !== "uniform-ref") continue;
     if (!fsUniformsUsed.has(f.name)) continue;
@@ -819,6 +1077,7 @@ function rewriteFragment(
   layout: BucketLayout,
   fsUniformsUsed: ReadonlySet<string>,
   fsNeedsIidx: boolean,
+  fsAtlasUsed: ReadonlySet<string>,
 ): string {
   let s = wgsl;
 
@@ -859,7 +1118,7 @@ function rewriteFragment(
   // 4. Rewrite header. Inject FS uniform preamble: read each `in._h_FooRef`
   //    varying, then load the value via the same expression the VS would
   //    use. Substitution of `_w_uniform.X` references happens in step 6.
-  const fsPreamble = buildFsPreamble(layout, fsUniformsUsed, fsNeedsIidx);
+  const fsPreamble = buildFsPreamble(layout, fsUniformsUsed, fsNeedsIidx, fsAtlasUsed);
   s = s.replace(
     fnHeader,
     `@fragment\nfn fs(in: VsOut) -> @location(0) vec4<f32> {\n${fsPreamble.preamble}`,
@@ -875,6 +1134,13 @@ function rewriteFragment(
     }
     return r;
   });
+
+  // Rewrite atlas-routed textureSample calls. Must run after the FS
+  // preamble injection (which defines the `_h_<name>*` lets we reference)
+  // and before the var-out collapse so the rewrite catches calls that
+  // appear inside the body. The user's per-draw sampler is dropped —
+  // the helper uses the shared atlasSampler internally.
+  s = rewriteAtlasTextureSamples(s, fsAtlasUsed);
 
   // 5. Collapse var-out / out.X = expr / return out → return expr.
   const fieldRef = `out\\.${escapeRegExp(outputFieldName)}`;
