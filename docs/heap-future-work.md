@@ -154,6 +154,76 @@ Drop-empty-chunks pairs naturally with affinity allocation — RO data
 locality keeps chunks either live or near-empty, rarely
 bimodally fragmented.
 
+## 5b. Value-equality for constant avals (pool-level)
+
+Today's pools (UniformPool, IndexPool, AtlasPool) key on aval
+**identity**: `WeakMap<aval, entry>`. Two `AVal.constant(matrixA)`
+calls produce two distinct avals that share neither the entry nor
+the underlying GPU allocation, even though their values are
+identical.
+
+This has bitten us repeatedly. The viewProj.map fix (per-RO
+`.map(trafoToM44f)` defeating identity for ViewProjTrafo) and the
+indices.map fix (per-RO `.map(IBuffer→Uint32Array)` defeating
+identity for index buffers) were both symptoms of users
+constructing fresh avals where the values were dedupable. Each
+fix was a manual hoist; the next user hits the same gotcha.
+
+**Generalize: dedup constant avals by value.**
+
+`aval` already exposes `isConstant: boolean`. Pools become hybrid:
+- `WeakMap<aval, entry>` for non-constant avals (their value can
+  change; identity is the only stable key).
+- `Map<valueHash, entry>` for `aval.isConstant === true` —
+  multiple constant avals with the same value collapse to one
+  entry.
+
+**Mechanism:**
+
+On `acquire(aval, value)`:
+- If `!aval.isConstant`: identity lookup as today.
+- If `aval.isConstant`: hash `value`, look up by hash. Hit →
+  refcount++ on existing entry, return its ref. Miss → allocate,
+  register in both maps (so the same `aval` reference resolves
+  fast on subsequent acquires too), refcount = 1.
+
+On `release`: refcount--; at 0, drop from both maps.
+
+**Hashing:** Uint8Array payloads (mat4, vec, packed bytes) hash
+via xxhash or FNV-1a — ~50–100 ns per call. For 50K first-frame
+addDraws → ~5 ms. Real but acceptable; happens once at scene
+construction. Reactive churn hits the WeakMap path.
+
+64-bit hash + post-hash byte comparator eliminates collision risk
+without much cost. Or skip the comparator and live with
+theoretical 1-in-2⁶⁴ collisions; for our use case, fine.
+
+**Per-pool opt-in:** the cost / win ratio depends on payload
+size. UniformPool pays it (mat4s repeat constantly across ROs);
+IndexPool pays it (indexed meshes share index arrays); AtlasPool
+pays it (textures hash by source bytes). Tiny scalar pools (if
+any) can stay identity-only.
+
+**User-visible effect:**
+
+The natural authoring pattern starts working:
+
+```ts
+makeRO({ modelTrafo: AVal.constant(trafoToM44f(t)), ... })
+// fresh aval per RO. Pool dedups by value, so identical
+// trafos collapse to one allocation. No hoisting required.
+```
+
+The "fresh `.map(...)` per RO blows up your memory" footgun goes
+away. Users stop having to think about aval identity for the
+common-case "I'm just wrapping a value." Reactive avals (cval,
+custom) still need explicit sharing where intended, but the
+constant case stops biting.
+
+This is a small focused change — ~50 LOC per pool plus a shared
+hash utility. Pairs naturally with the AtlasPool aval-reactivity
+work (item 0 of textures plan, also pending).
+
 ## 6. Uber-shader families with shared header pool
 
 Currently the bucket key is `(effect, pipelineState, textures)` — two
