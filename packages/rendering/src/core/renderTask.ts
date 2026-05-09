@@ -23,6 +23,14 @@ export interface IRenderTask {
    */
   run(framebuffer: IFramebuffer, token: AdaptiveToken): void;
 
+  /**
+   * Total GPU buckets the heap path emits across this task's
+   * compiled scenes. With §6 family-merge in v1 this collapses to
+   * one per pipelineState per Render command. Useful for status
+   * text / dev overlays.
+   */
+  heapBucketCount(): number;
+
   /** Tear down resources owned by the task. Idempotent. */
   dispose(): void;
 }

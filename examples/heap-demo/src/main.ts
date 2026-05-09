@@ -566,8 +566,10 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       const tag = heapEnabled.value ? "heap" : "per-RO";
       const churnTag = churn > 0 ? ` · churn=${churn}/frame` : "";
       const atlasTag = atlasMode ? ` · atlas · ${NUM_ATLAS_TEXTURES} textures` : "";
+      const buckets = task.heapBucketCount();
+      const bucketsTag = ` · ${buckets} bucket${buckets === 1 ? "" : "s"}`;
       setStatus(
-        `${tag}${atlasTag} · ${ros.length} draws${churnTag} · ${fps} fps · ` +
+        `${tag}${atlasTag} · ${ros.length} draws${bucketsTag}${churnTag} · ${fps} fps · ` +
         `encode ${pct(0.5).toFixed(2)}/${pct(0.99).toFixed(2)} · ` +
         `gpu ${gpct(0.5).toFixed(1)}/${gpct(0.99).toFixed(1)} · ` +
         `frame ${fpct(0.5).toFixed(1)}/${fpct(0.99).toFixed(1)} ms (p50/p99)`,

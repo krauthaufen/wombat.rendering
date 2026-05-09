@@ -101,6 +101,12 @@ export interface HybridScene {
    * empty AND no clear is requested. Must be called after `update`.
    */
   hasDraws(): boolean;
+  /**
+   * Number of GPU buckets the heap path is currently emitting. With
+   * §6 family-merge in v1 this typically collapses to 1 per
+   * pipelineState. Useful for status / dev-overlay text.
+   */
+  heapBucketCount(): number;
   dispose(): void;
 }
 
@@ -202,6 +208,9 @@ export function compileHybridScene(
       // whether a clear-only pass is still worth opening.
       if (heapScene.stats.totalDraws > 0) return true;
       return scenePass.collect().length > 0;
+    },
+    heapBucketCount(): number {
+      return heapScene.stats.groups;
     },
     dispose(): void {
       heapScene.dispose();

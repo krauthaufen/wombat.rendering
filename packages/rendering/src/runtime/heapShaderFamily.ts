@@ -819,12 +819,30 @@ function buildVsCase(
     if (v.builtin !== undefined) continue;
     const slot = slotMap.get(v.name);
     if (slot === undefined) continue;
+    // WGSL spec: multi-component swizzles (`.xyz`/`.xy`) are r-values,
+    // not assignable l-values. Tint accepts swizzle assignment as an
+    // extension; WebKit/Safari does not. Reconstruct the whole vec4
+    // from components so the expression is spec-compliant everywhere.
     const slotName = `out.Varying${slot.slot}`;
-    const lhs = slotComponentExpr(slotName, slot.offset, slot.size);
-    lines.push(`      ${lhs} = r.${v.name};`);
+    lines.push(`      ${slotName} = ${packVec4Components(`r.${v.name}`, slot.offset, slot.size)};`);
   }
   lines.push(`    }`);
   return lines.join("\n");
+}
+
+/**
+ * Build a `vec4<f32>(c0, c1, c2, c3)` literal where the source value
+ * occupies `[offset..offset+size)` and the rest is `0.0`. The source
+ * is a scalar (size=1), vec2 (size=2), vec3 (size=3), or vec4 (size=4).
+ * Avoids multi-component swizzle l-values which Safari rejects.
+ */
+function packVec4Components(rhsExpr: string, offset: number, size: number): string {
+  const comps: string[] = ["0.0", "0.0", "0.0", "0.0"];
+  const swiz = ["x", "y", "z", "w"];
+  for (let i = 0; i < size; i++) {
+    comps[offset + i] = size === 1 ? rhsExpr : `${rhsExpr}.${swiz[i]}`;
+  }
+  return `vec4<f32>(${comps.join(", ")})`;
 }
 
 function buildFsCase(

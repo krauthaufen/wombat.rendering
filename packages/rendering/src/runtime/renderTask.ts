@@ -93,6 +93,12 @@ class RenderTask implements IRenderTask {
     });
   }
 
+  heapBucketCount(): number {
+    let total = 0;
+    for (const s of this._scenes.values()) total += s.heapBucketCount();
+    return total;
+  }
+
   dispose(): void {
     if (this._disposed) return;
     for (const s of this._scenes.values()) s.dispose();
