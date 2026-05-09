@@ -30,7 +30,6 @@ export {
   type HeapDrawSpec,
   type HeapGeometry,
   type HeapTextureSet,
-  type HeapGroupShader,
   type BuildHeapSceneOptions,
 } from "./heapScene.js";
 

@@ -12,6 +12,7 @@ import {
 } from "@aardworx/wombat.rendering.experimental/runtime";
 import { createFramebufferSignature } from "@aardworx/wombat.rendering.experimental/resources";
 import { readTexturePixels, requestRealDevice } from "./_realGpu.js";
+import { makeHeapTestEffect } from "../tests/_heapTestEffect.js";
 
 // Avoid `import { Trafo3d, V3d, V4f } from "@aardworx/wombat.base"` because
 // wombat.base pulls in poly2tri which references `global` and chokes
@@ -22,64 +23,6 @@ const IDENTITY44 = (() => { const a = new Float64Array(16); a[0]=1; a[5]=1; a[10
 const trafoIdentity = { forward: { toArray: () => IDENTITY44 } } as unknown;
 const v3 = (x: number, y: number, z: number) => ({ x, y, z }) as unknown;
 const v4 = (x: number, y: number, z: number, w: number) => ({ x, y, z, w }) as unknown;
-
-// Raw VS handling megacall: emitIdx → tile-bounded binary search →
-// derive (drawIdx, vid). Uses the heap-scene prelude bindings:
-// drawTable @ 4, indexStorage @ 5, firstDrawInTile @ 6.
-const VS_WGSL = /* wgsl */`
-@vertex
-fn vs(@builtin(vertex_index) emitIdx: u32) -> VsOut {
-  let tileIdx = emitIdx >> 6u;
-  var lo: u32 = firstDrawInTile[tileIdx];
-  var hi: u32 = firstDrawInTile[tileIdx + 1u];
-  loop {
-    if (lo >= hi) { break; }
-    let mid = (lo + hi + 1u) >> 1u;
-    if (drawTable[mid * 4u] <= emitIdx) { lo = mid; } else { hi = mid - 1u; }
-  }
-  let slot       = lo;
-  let drawIdx    = drawTable[slot * 4u + 1u];
-  let indexStart = drawTable[slot * 4u + 2u];
-  let vid        = indexStorage[indexStart + (emitIdx - drawTable[slot * 4u])];
-
-  let mtRef  = headersU32[drawIdx * 8u + 0u];
-  let cRef   = headersU32[drawIdx * 8u + 1u];
-  let vpRef  = headersU32[drawIdx * 8u + 2u];
-  let llRef  = headersU32[drawIdx * 8u + 3u];
-  let posRef = headersU32[drawIdx * 8u + 4u];
-  let norRef = headersU32[drawIdx * 8u + 5u];
-
-  let posBase = (posRef + 16u) / 4u + vid * 3u;
-  let pos = vec3<f32>(heapF32[posBase], heapF32[posBase + 1u], heapF32[posBase + 2u]);
-  let norBase = (norRef + 16u) / 4u + vid * 3u;
-  let nor = vec3<f32>(heapF32[norBase], heapF32[norBase + 1u], heapF32[norBase + 2u]);
-
-  let mtB = (mtRef + 16u) / 16u;
-  let M   = mat4x4<f32>(heapV4f[mtB], heapV4f[mtB + 1u], heapV4f[mtB + 2u], heapV4f[mtB + 3u]);
-  let vpB = (vpRef + 16u) / 16u;
-  let VP  = mat4x4<f32>(heapV4f[vpB], heapV4f[vpB + 1u], heapV4f[vpB + 2u], heapV4f[vpB + 3u]);
-  let color = heapV4f[(cRef + 16u) / 16u];
-  let llB = (llRef + 16u) / 4u;
-  let lightLoc = vec3<f32>(heapF32[llB], heapF32[llB + 1u], heapF32[llB + 2u]);
-
-  let wp = vec4<f32>(pos, 1.0) * M;
-  let n  = (vec4<f32>(nor, 0.0) * M).xyz;
-  var out: VsOut;
-  out.clipPos  = wp * VP;
-  out.worldPos = wp.xyz;
-  out.normal   = n;
-  out.color    = color;
-  out.lightLoc = lightLoc;
-  return out;
-}
-`;
-
-const FS_WGSL = /* wgsl */`
-@fragment
-fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  return in.color;
-}
-`;
 
 async function readU32(device: GPUDevice, buf: GPUBuffer, byteCount: number): Promise<Uint32Array> {
   const staging = device.createBuffer({ size: byteCount, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -122,7 +65,7 @@ describe("heap-scene megacall integration", () => {
       const indexCounts = [3, 6, 12];
       const geom = triGeom();
       // Single shader object → all draws share one bucket.
-      const sharedShader = { vs: VS_WGSL, fs: FS_WGSL };
+      const sharedShader = makeHeapTestEffect();
       const draws: HeapDrawSpec[] = indexCounts.map((n) => {
         // Build an index list of length `n` over the 3 verts (cycle).
         const idx = new Uint32Array(n);
@@ -239,7 +182,7 @@ describe("heap-scene megacall integration", () => {
         colors: { outColor: "rgba8unorm" },
         depthStencil: { format: "depth24plus" },
       });
-      const sharedShader = { vs: VS_WGSL, fs: FS_WGSL };
+      const sharedShader = makeHeapTestEffect();
       const geom = triGeom();
       const indexCounts: number[] = [];
       for (let i = 0; i < 100; i++) indexCounts.push(((i * 7) % 11) + 3);
@@ -371,7 +314,7 @@ describe("heap-scene megacall integration", () => {
         colors: { outColor: "rgba8unorm" },
         depthStencil: { format: "depth24plus" },
       });
-      const sharedShader = { vs: VS_WGSL, fs: FS_WGSL };
+      const sharedShader = makeHeapTestEffect();
       const geom = triGeom();
       // Mix of small and large indexCounts so we cover both single-tile
       // records and records that span many tiles. Total emit lands well

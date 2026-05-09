@@ -19,7 +19,7 @@
 
 import { compileModule, stage as makeStage, effect as makeEffect } from "@aardworx/wombat.shader";
 import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
-import { substituteInputs, readInputs, mapExpr, mapStmt } from "@aardworx/wombat.shader/passes";
+import { substituteInputs, readInputs, mapExpr, mapStmt, liftReturns } from "@aardworx/wombat.shader/passes";
 import {
   type Module, type Expr, type Stmt, type Type, type ValueDef,
   type EntryDef, type EntryParameter, type ParamDecoration,
@@ -271,7 +271,7 @@ function rewriteVertexBodies(m: Module, layout: BucketLayout): Module {
         ? loadInstanceByRef(refExpr, iidx, f.uniformWgslType ?? "")
         : loadUniformByRef(refExpr, f.uniformWgslType ?? "");
       uniformMapping.set(f.name, value);
-    } else {
+    } else if (f.kind === "attribute-ref") {
       attrMapping.set(f.name, loadAttributeByRef(refExpr, vid, f.attributeWgslType ?? ""));
     }
   }
@@ -654,6 +654,11 @@ export function compileHeapEffectIR(
   // composing them. Then apply heap rewrites to that combined module.
   // The composed module preserves stage entry boundaries.
   let combined: Module = mergeStages(userEffect);
+  // Lift `return { ... }` into explicit WriteOutput stmts so the
+  // substitution passes below see (and rewrite) the ReadInputs that
+  // feed the record fields. Without this, ObjectLiteral exprs hide
+  // their fields on a `_record` carrier that mapExpr doesn't traverse.
+  combined = liftReturns(combined);
   combined = injectVsBuiltins(combined);
   // FS uniform threading must run BEFORE VS body rewriting, since it
   // adds WriteOutput stmts that the VS rewriter shouldn't touch (the

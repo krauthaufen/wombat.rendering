@@ -52,8 +52,8 @@ import type { PipelineState } from "../core/pipelineState.js";
 import type { BufferView } from "../core/bufferView.js";
 import type { IBuffer, HostBufferSource } from "../core/buffer.js";
 import {
-  buildBucketLayout, compileHeapEffect, rewriteForLayout, stripTextureSamplerDecls,
-  type BucketLayout, type FragmentOutputLayout, type HeapEffectSchema,
+  buildBucketLayout, compileHeapEffect,
+  type BucketLayout, type FragmentOutputLayout,
 } from "./heapEffect.js";
 import { compileHeapEffectIR } from "./heapEffectIR.js";
 import {
@@ -938,10 +938,10 @@ interface Bucket {
 
 export interface HeapDrawSpec {
   /**
-   * The shader. Two draws with the same effect (matched by `effect.id`
-   * or by reference for raw-WGSL pairs) share a pipeline + bucket.
+   * The shader. Two draws with the same effect (matched by `effect.id`)
+   * share a pipeline + bucket.
    */
-  readonly effect: HeapGroupShader;
+  readonly effect: Effect;
   /**
    * Per-name inputs covering both vertex attributes (e.g. `Positions`,
    * `Normals`) and uniforms (e.g. `ModelTrafo`, `Color`, `ViewProjTrafo`)
@@ -1108,24 +1108,6 @@ export type HeapTextureSet =
        */
       readonly release: () => void;
     };
-
-/**
- * The shader contribution for a single group. Either a wombat.shader
- * `Effect` (composed VS+FS via `effect(vsMarker, fsMarker)`), or a
- * raw `{ vs, fs }` WGSL pair as an escape hatch for shaders that
- * step outside the DSL surface (e.g. ones that bind extra
- * texture-set resources at bindings 4/5).
- *
- * The strings (whether DSL-emitted or raw) must declare entry points
- * named `vs` and `fs` matching the heap-scene prelude — see the
- * module-level docs above.
- */
-export type HeapGroupShader = Effect | { readonly vs: string; readonly fs: string };
-
-function isRawShaderPair(s: HeapGroupShader): s is { readonly vs: string; readonly fs: string } {
-  return typeof (s as { vs?: unknown }).vs === "string"
-      && typeof (s as { fs?: unknown }).fs === "string";
-}
 
 /**
  * Build a heap-backed scene renderer from a flat list of draws.
@@ -1532,16 +1514,7 @@ export function buildHeapScene(
   const bucketByKey = new Map<string, Bucket>();
 
   // ─── id-of helpers ────────────────────────────────────────────────
-  const rawIds = new WeakMap<object, string>();
-  let rawCounter = 0;
-  const idOf = (s: HeapGroupShader): string => {
-    if (isRawShaderPair(s)) {
-      let id = rawIds.get(s as object);
-      if (id === undefined) { id = `raw#${rawCounter++}`; rawIds.set(s as object, id); }
-      return id;
-    }
-    return `effect#${s.id}`;
-  };
+  const idOf = (s: Effect): string => `effect#${s.id}`;
   const textureIds = new WeakMap<HeapTextureSet, string>();
   let texCounter = 0;
   const texIdOf = (t: HeapTextureSet | undefined): string => {
@@ -1731,44 +1704,6 @@ export function buildHeapScene(
     });
   }
 
-  // Default schema for the raw-WGSL escape hatch — covers what the
-  // demo's textured shader expects (positions, normals attribs +
-  // model/viewproj/light/color uniforms). Raw shaders that need a
-  // different binding shape have to surface a schema explicitly
-  // (future extension).
-  //
-  // The textured raw shader keeps its own hardcoded `checker` /
-  // `checkerSmp` decls at binding 4/5; we still surface them here so
-  // the bind-group layout / bind-group construction allocates slots.
-  const RAW_DEFAULT_SCHEMA: HeapEffectSchema = {
-    attributes: [
-      { name: "Positions", wgslType: "vec4<f32>", byteSize: 16, location: 0 },
-      { name: "Normals",   wgslType: "vec3<f32>", byteSize: 12, location: 1 },
-    ],
-    uniforms: [
-      { name: "ModelTrafo",    wgslType: "mat4x4<f32>", byteSize: 64 },
-      { name: "Color",         wgslType: "vec4<f32>",   byteSize: 16 },
-      { name: "ViewProjTrafo", wgslType: "mat4x4<f32>", byteSize: 64 },
-      { name: "LightLocation", wgslType: "vec3<f32>",   byteSize: 12 },
-    ],
-    varyings: [
-      { name: "clipPos",  wgslType: "vec4<f32>", builtin: "position" },
-      { name: "worldPos", wgslType: "vec3<f32>", location: 0 },
-      { name: "normal",   wgslType: "vec3<f32>", location: 1 },
-      { name: "color",    wgslType: "vec4<f32>", location: 2 },
-      { name: "lightLoc", wgslType: "vec3<f32>", location: 3 },
-    ],
-    fragmentOutputs: [{ name: "outColor", location: 0, wgslType: "vec4<f32>" }],
-    textures: [],
-    samplers: [],
-  };
-  /** Variant raw schema for the textured demo shader — adds the texture+sampler bindings. */
-  const RAW_TEXTURED_SCHEMA: HeapEffectSchema = {
-    ...RAW_DEFAULT_SCHEMA,
-    textures: [{ name: "checker", wgslType: "texture_2d<f32>" }],
-    samplers: [{ name: "checkerSmp", wgslType: "sampler" }],
-  };
-
   // ─── findOrCreateBucket ───────────────────────────────────────────
   let instancedBucketCounter = 0;
   // Atlas-variant ROs share buckets by (effect, pipelineState) regardless
@@ -1781,7 +1716,7 @@ export function buildHeapScene(
     return texIdOf(textures);
   }
   function findOrCreateBucket(
-    effect: HeapGroupShader,
+    effect: Effect,
     textures: HeapTextureSet | undefined,
     pipelineState: PipelineState | undefined,
     instanceOpts: { isInstanced: boolean; perInstanceUniforms: ReadonlySet<string> },
@@ -1801,48 +1736,22 @@ export function buildHeapScene(
       perInstanceUniforms: instanceOpts.perInstanceUniforms,
       megacall,
     };
-    let layout: BucketLayout;
-    let vsModule: GPUShaderModule;
-    let fsModule: GPUShaderModule;
-    let vsEntry = "vs";
-    let fsEntry = "fs";
-    if (isRawShaderPair(effect)) {
-      // Pick the schema variant that matches the user's textures arg:
-      // textured raw shader uses the schema with checker/checkerSmp
-      // bindings; the plain default has no texture/sampler entries.
-      const rawSchema = textures !== undefined ? RAW_TEXTURED_SCHEMA : RAW_DEFAULT_SCHEMA;
-      const atlasNames = isAtlasBucket
-        ? new Set(rawSchema.textures.map(t => t.name))
-        : new Set<string>();
-      layout = buildBucketLayout(rawSchema, textures !== undefined, { ...baseLayoutOpts, atlasTextureBindings: atlasNames });
-      // Raw-WGSL escape hatch: keep the regex-based path. Strip any
-      // texture/sampler decls the raw shader hand-wrote (the prelude
-      // re-emits them at the BGL-correct bindings).
-      const code = layout.preludeWgsl
-        + stripTextureSamplerDecls(effect.vs)
-        + stripTextureSamplerDecls(effect.fs);
-      const single = device.createShaderModule({ code, label: `heapScene/${bk}/shader` });
-      vsModule = single; fsModule = single;
-    } else {
-      // DSL effect: route through the IR-based rewriter. The schema
-      // (for the BucketLayout) still comes from the unmodified effect
-      // — IR rewriting substitutes uniform/attribute reads with heap
-      // loads, so post-rewrite the original names are gone from the
-      // ProgramInterface.
-      const compiled = compileHeapEffect(effect, opts.fragmentOutputLayout);
-      const atlasNames = isAtlasBucket
-        ? new Set(compiled.schema.textures.map(t => t.name))
-        : new Set<string>();
-      layout = buildBucketLayout(compiled.schema, textures !== undefined, { ...baseLayoutOpts, atlasTextureBindings: atlasNames });
-      const ir = compileHeapEffectIR(effect, layout, {
-        target: "wgsl",
-        ...(opts.fragmentOutputLayout !== undefined ? { fragmentOutputLayout: opts.fragmentOutputLayout } : {}),
-      });
-      vsModule = device.createShaderModule({ code: ir.vs, label: `heapScene/${bk}/vs` });
-      fsModule = device.createShaderModule({ code: ir.fs, label: `heapScene/${bk}/fs` });
-      vsEntry = ir.vsEntry;
-      fsEntry = ir.fsEntry;
-    }
+    const compiled = compileHeapEffect(effect, opts.fragmentOutputLayout);
+    const atlasNames = isAtlasBucket
+      ? new Set(compiled.schema.textures.map(t => t.name))
+      : new Set<string>();
+    const layout: BucketLayout = buildBucketLayout(
+      compiled.schema, textures !== undefined,
+      { ...baseLayoutOpts, atlasTextureBindings: atlasNames },
+    );
+    const ir = compileHeapEffectIR(effect, layout, {
+      target: "wgsl",
+      ...(opts.fragmentOutputLayout !== undefined ? { fragmentOutputLayout: opts.fragmentOutputLayout } : {}),
+    });
+    const vsModule = device.createShaderModule({ code: ir.vs, label: `heapScene/${bk}/vs` });
+    const fsModule = device.createShaderModule({ code: ir.fs, label: `heapScene/${bk}/fs` });
+    const vsEntry = ir.vsEntry;
+    const fsEntry = ir.fsEntry;
     const { pipelineLayout } = getBgl(layout, isAtlasBucket);
 
     const pipeline = device.createRenderPipeline({
@@ -2527,6 +2436,7 @@ export function buildHeapScene(
       firstDrawInTileBuf: GPUBuffer | undefined;
       totalEmitEstimate: number;
       recordCount: number;
+      layout: BucketLayout;
     }[] {
       return buckets.map(b => ({
         indirectBuf: b.indirectBuf,
@@ -2534,6 +2444,7 @@ export function buildHeapScene(
         firstDrawInTileBuf: b.firstDrawInTileBuf?.buffer,
         totalEmitEstimate: b.totalEmitEstimate,
         recordCount: b.recordCount,
+        layout: b.layout,
       }));
     },
   };

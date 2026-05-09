@@ -42,29 +42,11 @@ const trafoIdentity = { forward: { toArray: () => IDENTITY44 } } as unknown;
 const v3 = (x: number, y: number, z: number) => ({ x, y, z }) as unknown;
 const v4 = (x: number, y: number, z: number, w: number) => ({ x, y, z, w }) as unknown;
 
-// Raw VS/FS pair driving the textured RAW_TEXTURED_SCHEMA on the heap
-// path. The shader bodies don't matter for these tests (we never
-// dispatch GPU work) — they just need to parse far enough for the
-// regex rewriter and the bind-group construction.
-const VS_WGSL = /* wgsl */`
-@vertex
-fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) drawIdx: u32) -> VsOut {
-  var out: VsOut;
-  out.clipPos  = vec4<f32>(0.0, 0.0, 0.0, 1.0);
-  out.worldPos = vec3<f32>(0.0);
-  out.normal   = vec3<f32>(0.0, 0.0, 1.0);
-  out.color    = vec4<f32>(1.0);
-  out.lightLoc = vec3<f32>(0.0);
-  return out;
-}
-`;
-const FS_WGSL = /* wgsl */`
-@fragment
-fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  return in.color;
-}
-`;
-const sharedShader = { vs: VS_WGSL, fs: FS_WGSL } as const;
+import { makeHeapTestEffectTextured } from "./_heapTestEffect.js";
+
+// One DSL effect shared by every spec — bucket-keying tests that two
+// atlas-variant ROs sharing this effect collapse into one bucket.
+const sharedEffect = makeHeapTestEffectTextured();
 
 function geomSpec(pool: AtlasPool, format: "rgba8unorm" | "rgba8unorm-srgb"): {
   spec: HeapDrawSpec; textures: HeapTextureSet & { kind: "atlas" };
@@ -90,7 +72,7 @@ function geomSpec(pool: AtlasPool, format: "rgba8unorm" | "rgba8unorm-srgb"): {
     release: () => pool.release(acq.ref),
   };
   const spec: HeapDrawSpec = {
-    effect: sharedShader,
+    effect: sharedEffect,
     inputs: {
       Positions: AVal.constant(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0])),
       Normals:   AVal.constant(new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1])),
@@ -153,29 +135,24 @@ describe("heap-atlas bucket plumbing", () => {
     const drawHeapWrites = gpu.writeBufferCalls.filter(c => /drawHeap/.test(c.buffer.label ?? ""));
     expect(drawHeapWrites.length).toBeGreaterThan(0);
     const w = drawHeapWrites[drawHeapWrites.length - 1]!;
-    // The written region covers the slot's full drawHeader. Decode it
-    // into a u32+f32 view; the texture-ref subfields live AFTER the
-    // schema's uniform/attribute ref slots. The textured raw schema
-    // declares 4 uniform refs + 2 attribute refs = 24 bytes; the
-    // `checker` texture-ref block follows at offset 24.
-    //
-    // The data parameter to writeBuffer is the staging Float32Array's
-    // ArrayBuffer; the call carries (buffer, offset, data, dataOffset, size).
-    // We slice out the slot's 56 bytes (24 ref + 24 atlas + 8 pad).
     const ab = w.data as ArrayBuffer | ArrayBufferView;
     const buf = ab instanceof ArrayBuffer ? ab : ab.buffer;
     const slotBytes = w.size;
     const slotOff   = (ab instanceof ArrayBuffer ? 0 : ab.byteOffset) + w.dataOffset;
     const u32 = new Uint32Array(buf, slotOff, slotBytes / 4);
     const f32 = new Float32Array(buf, slotOff, slotBytes / 4);
-    // Atlas block starts at byteOffset 24 / float index 6.
-    const ATLAS_OFF_U32 = 24 / 4;
-    const pageRef    = u32[ATLAS_OFF_U32 + 0];
-    const formatBits = u32[ATLAS_OFF_U32 + 1];
-    const originX    = f32[ATLAS_OFF_U32 + 2];
-    const originY    = f32[ATLAS_OFF_U32 + 3];
-    const sizeX      = f32[ATLAS_OFF_U32 + 4];
-    const sizeY      = f32[ATLAS_OFF_U32 + 5];
+    // Atlas-block layout depends on the effect's schema (uniform/attribute
+    // ref ordering); discover the texture-ref offsets from the bucket layout.
+    type DH = { name: string; byteOffset: number; kind: string; textureSub?: string };
+    const buckets = (scene as unknown as { _debug: { bucketsForTest(): readonly { layout: { drawHeaderFields: readonly DH[] } }[] } })._debug.bucketsForTest();
+    const fields = buckets[0]!.layout.drawHeaderFields;
+    const subOff = (sub: string): number => fields.find(f => f.kind === "texture-ref" && f.textureSub === sub)!.byteOffset;
+    const pageRef    = u32[subOff("pageRef") / 4];
+    const formatBits = u32[subOff("formatBits") / 4];
+    const originX    = f32[subOff("origin") / 4];
+    const originY    = f32[subOff("origin") / 4 + 1];
+    const sizeX      = f32[subOff("size") / 4];
+    const sizeY      = f32[subOff("size") / 4 + 1];
 
     expect(pageRef).toBe(0); // first page slot in the bucket
     // formatBits low bit = format index (srgb = 1).

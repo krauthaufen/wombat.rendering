@@ -22,72 +22,13 @@ import { AtlasPool } from "../packages/rendering/src/runtime/textureAtlas/atlasP
 import { createFramebufferSignature } from "@aardworx/wombat.rendering.experimental/resources";
 import { readTexturePixels, requestRealDevice } from "./_realGpu.js";
 
+import { makeHeapTestEffectTextured } from "../tests/_heapTestEffect.js";
+
 // Stub trafo / vec helpers (avoid wombat.base — see heap-scene-megacall.test.ts).
 const IDENTITY44 = (() => { const a = new Float64Array(16); a[0]=1; a[5]=1; a[10]=1; a[15]=1; return a; })();
 const trafoIdentity = { forward: { toArray: () => IDENTITY44 } } as unknown;
 const v3 = (x: number, y: number, z: number) => ({ x, y, z }) as unknown;
 const v4 = (x: number, y: number, z: number, w: number) => ({ x, y, z, w }) as unknown;
-
-// Raw-shader VS/FS. The schema (RAW_TEXTURED_SCHEMA) declares a single
-// `checker` texture binding + `checkerSmp` sampler. With the atlas
-// route, those names get expanded into 4 drawHeader fields:
-//   _h_checker.pageRefRef      → pageRef u32
-//   _h_checker.formatBitsRef   → formatBits u32
-//   _h_checker.originRef       → origin vec2<f32>  (bitcast from headersU32)
-//   _h_checker.sizeRef         → size   vec2<f32>
-//
-// drawHeader layout:
-//   ModelTrafo (off 0)        ViewProjTrafo (off 8)   LightLocation (off 12)
-//   Color (off 4)             Positions (off 16)      Normals (off 20)
-//   checker.pageRef (24)      checker.formatBits (28)
-//   checker.origin   (32)     checker.size       (40) → drawHeaderBytes 48
-const VS_WGSL = /* wgsl */`
-@vertex
-fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) drawIdx: u32) -> VsOut {
-  // Positions: vec4 schema (V3-tight + .w=1 in shader); we use .xy for clip pos.
-  let posRef = headersU32[drawIdx * 12u + 4u];
-  let posBase = (posRef + 16u) / 4u + vid * 3u;
-  let pos = vec3<f32>(heapF32[posBase], heapF32[posBase + 1u], heapF32[posBase + 2u]);
-
-  // Normals: vec3 schema; we abuse it to carry uv in .xy (.z = 0).
-  let norRef = headersU32[drawIdx * 12u + 5u];
-  let norBase = (norRef + 16u) / 4u + vid * 3u;
-  let nor = vec3<f32>(heapF32[norBase], heapF32[norBase + 1u], heapF32[norBase + 2u]);
-
-  // Atlas drawHeader: pageRef u32 @24, formatBits u32 @28, origin vec2 @32, size vec2 @40.
-  let pageRef    = headersU32[drawIdx * 12u + 6u];
-  let formatBits = headersU32[drawIdx * 12u + 7u];
-  let oX = bitcast<f32>(headersU32[drawIdx * 12u + 8u]);
-  let oY = bitcast<f32>(headersU32[drawIdx * 12u + 9u]);
-  let sX = bitcast<f32>(headersU32[drawIdx * 12u + 10u]);
-  let sY = bitcast<f32>(headersU32[drawIdx * 12u + 11u]);
-
-  var out: VsOut;
-  out.clipPos  = vec4<f32>(pos.x, pos.y, 0.0, 1.0);
-  out.worldPos = vec3<f32>(0.0);
-  out.normal   = vec3<f32>(0.0, 0.0, 1.0);
-  out.color    = vec4<f32>(nor.x, nor.y, 0.0, 1.0); // uv in .rg
-  out.lightLoc = vec3<f32>(0.0);
-  out._h_checkerPageRef    = pageRef;
-  out._h_checkerFormatBits = formatBits;
-  out._h_checkerOrigin     = vec2<f32>(oX, oY);
-  out._h_checkerSize       = vec2<f32>(sX, sY);
-  return out;
-}
-`;
-
-// FS samples atlas with the threaded fields; uv = in.color.rg.
-const FS_WGSL = /* wgsl */`
-@fragment
-fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  let uv = in.color.rg;
-  return atlasSample(
-    in._h_checkerPageRef, in._h_checkerFormatBits,
-    in._h_checkerOrigin,  in._h_checkerSize,
-    uv,
-  );
-}
-`;
 
 describe("heap-atlas real-GPU integration", () => {
   // Currently skipped: Chrome's WebGPU JS API rejects passing a
@@ -148,7 +89,7 @@ describe("heap-atlas real-GPU integration", () => {
         { source: { width: 64, height: 64, host: { kind: "raw", data: blueData } } },
       );
 
-      const sharedShader = { vs: VS_WGSL, fs: FS_WGSL } as const;
+      const sharedShader = makeHeapTestEffectTextured();
       const sampler = ISampler.fromDescriptor({
         magFilter: "linear", minFilter: "linear",
         addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge",
