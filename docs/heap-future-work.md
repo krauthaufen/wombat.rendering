@@ -312,6 +312,102 @@ Implementation cost: ~30 LOC in `wombat.adaptive`. Zero changes
 in rendering layer; the existing identity-keyed pools just see
 fewer distinct avals.
 
+## 5d. Build-time combinator transform (the real destination)
+
+The runtime `memoMap` / `memoMapWithDeps` of §5c is the *bridge*
+while a build-time transform doesn't exist. The transform is the
+actual destination — it eliminates the identity footgun
+*completely*, across all combinators, for the user's natural code.
+
+Sibling in spirit to React Compiler, Solid.js's reactivity
+transform, Million.js — same algorithm, different target
+ecosystem.
+
+**The transform:**
+
+A vite/SWC/babel plugin walks all `<adaptive>.<combinator>(fn, ...)`
+call sites. For each, it:
+
+1. Hashes the function body at compile time → stable string
+   constant.
+2. Statically analyzes the function's free variables, classifies:
+   - Module-level identifier (import, const, etc.) → stable;
+     ignored.
+   - Closure capture (variable from enclosing scope) → goes into
+     a deps array.
+   - Parameter / local → ignored.
+3. Rewrites:
+   ```ts
+   // user wrote:
+   av.map(t => mix(t, r))
+   // plugin emits:
+   av.__memoMap("h:a3f2b1...", (t) => mix(t, r), [r])
+   ```
+4. Same for every adaptive combinator that takes a callback —
+   `bind`, `filter`, `collect`, `choose`, `aset.map`, `alist.map`,
+   `amap.map`, etc. The plugin's "interesting calls" list is ~10
+   method names; everything else is left alone.
+
+Runtime cost per call site: hash is a string constant (zero
+runtime work to compute), deps array is a few `===` per frame.
+Cache hit/miss is one Map lookup.
+
+**Advantages over runtime workarounds:**
+
+- **Unified across all combinators.** Runtime `memoMap` would
+  require shipping a memoizing variant for every combinator; the
+  transform handles them all uniformly because they share an AST
+  shape.
+- **Full scope info at build time.** Free-variable analysis is
+  unambiguous; the bundler knows what's a module import vs a
+  closure capture. Runtime `f.toString()` parsing can't tell.
+- **Zero runtime hash cost.** Function body hash is baked in as
+  a string constant. Runtime hashing was 50–100 ns per call;
+  transform path is zero.
+- **Transparent to users.** They write `av.map(...)`, never see
+  `memoMap`. Authoring stays clean; identity sharing is automatic.
+
+**Reference implementations to borrow from:**
+
+- **React Compiler** (formerly React Forget) — does exactly this
+  for `useMemo` / `useCallback`. Mature; algorithm well-documented.
+- **Solid.js reactivity transform** — similar shape, applies to
+  JSX. Compiler is open source and small enough to read end to end.
+- **Million.js** — memoization at JSX level for perf.
+
+The wombat-specific work is identifying *which* method calls are
+"adaptive combinators that need this treatment" — a hardcoded list
+of ~10 names from `wombat.adaptive`'s public API. Everything else
+in the algorithm is borrowed.
+
+**Where it lives:**
+
+`wombat.shader` already has a vite plugin that AST-rewrites inline
+`vertex(...)` / `fragment(...)` calls into compiled shader
+modules. Adding a co-pass for adaptive combinators is the natural
+sibling — same plugin infrastructure, same project layout. Lives
+in a `wombat.adaptive` plugin package next to `wombat.shader`'s.
+
+**Implementation cost:** ~2–3 weeks of focused work. Most of it
+is wiring the AST analysis (free-variable detection in TS/JS is
+non-trivial but solved); the actual rewrite logic is ~50 LOC.
+
+**Layered story (ship in this order):**
+
+1. §5b — value-equality dedup at pool level. Catches inline
+   `AVal.constant(value)` patterns. ~50 LOC per pool.
+2. §5c — `memoMap(f)` runtime helper for module-level pure
+   functions. ~30 LOC.
+3. §5c++ — `memoMapWithDeps(f, deps)` for explicit closure
+   captures. ~10 LOC on top of 5c.
+4. §5d — build-time transform. Subsumes 5c and 5c++; users
+   stop knowing they exist. The natural authoring pattern just
+   works.
+
+Each step is shippable; each gives compounding payoff. By 5d
+the identity footgun is gone everywhere — not just in the heap
+path, but in any wombat code that uses adaptive combinators.
+
 ## 6. Uber-shader families with shared header pool
 
 Currently the bucket key is `(effect, pipelineState, textures)` — two
