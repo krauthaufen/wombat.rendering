@@ -1063,9 +1063,18 @@ fixed:
 **VS side ✅ shipped.** `applyMegacallToEmittedVs` used to declare the
 shared megacall values (`heap_drawIdx`, `instId`, `vid`) as `let` locals
 inside the @vertex fn body. With composition, helper functions reference
-those names but don't have them in scope. Fixed by declaring all three
-as `var<private>` at module scope; the wrapper @vertex fn assigns them
-in the search prelude, helpers read.
+those names but don't have them in scope. Initially fixed by declaring
+all three as `var<private>` at module scope (Chromium/Tint accepts this);
+later replaced with **parameter threading** for cross-parser portability
+(Safari/WebKit rejects helper-fn reads of module-scope private vars in
+some configurations). The current shape: wrapper @vertex fn declares the
+three as `let` locals in the search prelude, then a post-emit text pass
+(`threadMegacallParamsThroughHelpers` in `heapEffectIR.ts`) scans every
+`fn _<name>(...)` body for references to the three identifiers, appends
+them as `u32` parameters to the helper signature, and rewrites every
+call site in the wrapper to pass the locals. No `var<private>` for these
+three values in the final WGSL — portable across Chromium/Tint, Safari/
+WebKit, and any conforming WGSL implementation.
 
 **FS side ✅ shipped (wombat.shader fix).** wombat.shader's per-stage
 WGSL emit now tree-shakes by entry-reachability. The new

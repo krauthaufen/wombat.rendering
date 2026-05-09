@@ -825,10 +825,12 @@ fn atlasSample(pageRef: u32, formatBits: u32, origin: vec2<f32>, size: vec2<f32>
  */
 function applyMegacallToEmittedVs(vs: string): string {
   let s = vs;
-  // Module-scope `var<private>` for the megacall shared values so
-  // wombat.shader's composed-stage helper fns can read them. The
-  // wrapper @vertex fn writes them in the prelude; helpers read.
-  const decl = `\n@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;\n@group(0) @binding(6) var<storage, read> firstDrawInTile: array<u32>;\nvar<private> heap_drawIdx: u32;\nvar<private> instId:       u32;\nvar<private> vid:          u32;\n`;
+  // Megacall storage bindings only — the shared values (`heap_drawIdx`,
+  // `instId`, `vid`) are declared as `let` locals in the @vertex body
+  // and threaded as parameters into any helper fn that references them.
+  // No module-scope `var<private>` (Safari/WebKit rejects reading
+  // those from helper fn bodies).
+  const decl = `\n@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;\n@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;\n@group(0) @binding(6) var<storage, read> firstDrawInTile: array<u32>;\n`;
   // Locate the @vertex fn header, then balance parens manually since
   // params can carry `@builtin(name)` decorations (regex `[^)]*` would
   // halt at the first inner `)`).
@@ -871,7 +873,116 @@ function applyMegacallToEmittedVs(vs: string): string {
   // user code that reads them by builtin.
   const newHeader = `@vertex fn ${fnName}(${kept.join(", ")}) -> ${retType} {\n${megacallSearchPrelude()}  let instance_index: u32 = instId;\n  let vertex_index: u32 = vid;\n`;
   s = s.slice(0, headerStart) + newHeader + s.slice(headerEnd);
+  s = threadMegacallParamsThroughHelpers(s);
   return decl + s;
+}
+
+/**
+ * Post-emit text rewrite that threads `heap_drawIdx`, `instId`, and
+ * `vid` through any helper function whose body references them. The
+ * IR's composeStages pass extracts same-stage entries into helper fns
+ * (`fn _<name>(s_in: <State>) -> <State>`) called from the wrapper
+ * `@vertex` fn. Those helpers can carry CSE-extracted expressions that
+ * reference `heap_drawIdx`/`instId`/`vid` — declared as locals in the
+ * wrapper, those identifiers are out of scope inside helpers, so we
+ * append them as `u32` parameters and pass them at every call site.
+ *
+ * Module-scope `var<private>` would also work but Safari/WebKit's WGSL
+ * parser rejects helper-fn reads of module-scope private vars in some
+ * configurations; explicit parameter passing is portable across all
+ * conforming WGSL implementations.
+ */
+function threadMegacallParamsThroughHelpers(src: string): string {
+  const idents = ["heap_drawIdx", "instId", "vid"] as const;
+  // Find every `fn _<name>(...) -> <ret> { ... }` declaration. We only
+  // touch fns whose name starts with `_` (the convention used by
+  // extractFusedEntry's helpers); user code with a leading-underscore
+  // name is not expected in IR-emitted WGSL.
+  const fnRe = /\bfn\s+(_\w+)\s*\(/g;
+  // Collect (helperName, paramRange, bodyRange, neededIdents).
+  type Edit = { name: string; needed: string[]; paramOpen: number; paramClose: number };
+  const edits: Edit[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = fnRe.exec(src)) !== null) {
+    const name = m[1]!;
+    const paramOpen = m.index + m[0]!.length; // position after `(`
+    // Balance parens to find the matching `)`.
+    let depth = 1;
+    let i = paramOpen;
+    for (; i < src.length && depth > 0; i++) {
+      const c = src[i];
+      if (c === "(") depth++;
+      else if (c === ")") depth--;
+    }
+    if (depth !== 0) continue;
+    const paramClose = i - 1; // position of the matching `)`
+    // Find the function body `{ ... }` after the return type.
+    const afterParens = src.slice(i);
+    const braceIdx = afterParens.indexOf("{");
+    if (braceIdx < 0) continue;
+    const bodyOpen = i + braceIdx;
+    let bdepth = 1;
+    let j = bodyOpen + 1;
+    for (; j < src.length && bdepth > 0; j++) {
+      const c = src[j];
+      if (c === "{") bdepth++;
+      else if (c === "}") bdepth--;
+    }
+    if (bdepth !== 0) continue;
+    const bodyClose = j - 1;
+    const body = src.slice(bodyOpen + 1, bodyClose);
+    const needed = idents.filter(id => new RegExp(`\\b${id}\\b`).test(body));
+    if (needed.length === 0) continue;
+    edits.push({ name, needed, paramOpen, paramClose });
+  }
+  if (edits.length === 0) return src;
+  // Apply param-list edits from the back so earlier offsets stay valid.
+  const helperNeeds = new Map<string, string[]>();
+  let out = src;
+  for (let k = edits.length - 1; k >= 0; k--) {
+    const e = edits[k]!;
+    helperNeeds.set(e.name, e.needed);
+    const existing = out.slice(e.paramOpen, e.paramClose).trim();
+    const extra = e.needed.map(id => `${id}: u32`).join(", ");
+    const newParams = existing.length === 0 ? extra : `${existing}, ${extra}`;
+    out = out.slice(0, e.paramOpen) + newParams + out.slice(e.paramClose);
+  }
+  // Rewrite call sites for each touched helper. Match `<name>(<args>)`
+  // and append the corresponding identifiers. Match the bare name so
+  // we don't accidentally hit a substring inside another identifier.
+  for (const [name, needed] of helperNeeds) {
+    const callRe = new RegExp(`\\b${name}\\s*\\(`, "g");
+    let result = "";
+    let lastIdx = 0;
+    let cm: RegExpExecArray | null;
+    while ((cm = callRe.exec(out)) !== null) {
+      const callOpen = cm.index + cm[0]!.length;
+      // Skip if this is the `fn <name>(` declaration itself (preceded
+      // by `fn`).
+      const before = out.slice(0, cm.index).trimEnd();
+      if (/\bfn$/.test(before)) continue;
+      // Balance parens to find matching `)`.
+      let depth = 1;
+      let p = callOpen;
+      for (; p < out.length && depth > 0; p++) {
+        const c = out[p];
+        if (c === "(") depth++;
+        else if (c === ")") depth--;
+      }
+      if (depth !== 0) continue;
+      const callClose = p - 1;
+      const args = out.slice(callOpen, callClose).trim();
+      const extras = needed.join(", ");
+      const newArgs = args.length === 0 ? extras : `${args}, ${extras}`;
+      result += out.slice(lastIdx, callOpen) + newArgs + ")";
+      lastIdx = p; // p is one past the `)`
+    }
+    if (lastIdx > 0) {
+      result += out.slice(lastIdx);
+      out = result;
+    }
+  }
+  return out;
 }
 
 function mergeStages(eff: Effect): Module {

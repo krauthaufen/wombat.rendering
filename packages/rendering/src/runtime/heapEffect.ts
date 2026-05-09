@@ -656,12 +656,11 @@ export function atlasVaryingNames(name: string): {
  */
 export function megacallSearchPrelude(): string {
   // The shared megacall values (`heap_drawIdx`, `instId`, `vid`) are
-  // declared at module scope as `var<private>` and assigned here at the
-  // top of the @vertex fn — module-scope so wombat.shader's composed-
-  // stage helper functions (extractFusedEntry produces helpers per
-  // stage that the wrapper @vertex fn calls) can read them too.
-  // Without this, helper bodies that reference `heap_drawIdx` (via
-  // header-offset CSE-extracted expressions) fail with
-  // `unresolved value 'heap_drawIdx'` at WGSL parse time.
-  return `  let _tileIdx = emitIdx >> 6u;\n  var lo: u32 = firstDrawInTile[_tileIdx];\n  var hi: u32 = firstDrawInTile[_tileIdx + 1u];\n  loop {\n    if (lo >= hi) { break; }\n    let _mid = (lo + hi + 1u) >> 1u;\n    if (drawTable[_mid * 5u] <= emitIdx) { lo = _mid; } else { hi = _mid - 1u; }\n  }\n  let _slot = lo;\n  let _firstEmit  = drawTable[_slot * 5u + 0u];\n  heap_drawIdx    = drawTable[_slot * 5u + 1u];\n  let _indexStart = drawTable[_slot * 5u + 2u];\n  let _indexCount = drawTable[_slot * 5u + 3u];\n  let _local      = emitIdx - _firstEmit;\n  instId          = _local / _indexCount;\n  vid             = indexStorage[_indexStart + (_local % _indexCount)];\n`;
+  // declared as `let` locals inside the @vertex fn body. Wombat.shader's
+  // composed-stage helper functions (extractFusedEntry) that reference
+  // these identifiers are post-processed in `applyMegacallToEmittedVs`
+  // to receive them as `u32` parameters — module-scope `var<private>`
+  // is rejected by some WGSL parsers (Safari/WebKit), so we thread the
+  // values through helper signatures instead.
+  return `  let _tileIdx = emitIdx >> 6u;\n  var lo: u32 = firstDrawInTile[_tileIdx];\n  var hi: u32 = firstDrawInTile[_tileIdx + 1u];\n  loop {\n    if (lo >= hi) { break; }\n    let _mid = (lo + hi + 1u) >> 1u;\n    if (drawTable[_mid * 5u] <= emitIdx) { lo = _mid; } else { hi = _mid - 1u; }\n  }\n  let _slot = lo;\n  let _firstEmit  = drawTable[_slot * 5u + 0u];\n  let heap_drawIdx: u32 = drawTable[_slot * 5u + 1u];\n  let _indexStart = drawTable[_slot * 5u + 2u];\n  let _indexCount = drawTable[_slot * 5u + 3u];\n  let _local      = emitIdx - _firstEmit;\n  let instId: u32 = _local / _indexCount;\n  let vid: u32    = indexStorage[_indexStart + (_local % _indexCount)];\n`;
 }

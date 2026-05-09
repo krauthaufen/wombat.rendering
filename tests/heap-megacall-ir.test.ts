@@ -104,15 +104,22 @@ describe("megacall IR WGSL emission", () => {
     expect(ir.vs).toMatch(/drawTable:\s+array<u32>/);
     expect(ir.vs).toMatch(/indexStorage:\s+array<u32>/);
     // Per-RO instancing: header-selector reads bind to a distinct
-    // `heap_drawIdx` identifier declared at module scope as
-    // `var<private>` (so wombat.shader's composed-stage helpers can
-    // read it). `instance_index` is now the in-RO instance index
-    // (= instId from the megacall search prelude).
-    expect(ir.vs).toMatch(/var<private>\s+heap_drawIdx:\s+u32;/);
-    expect(ir.vs).toContain("heap_drawIdx    = drawTable[");
+    // `heap_drawIdx` identifier declared as a `let` local in the @vertex
+    // body. Helpers that reference it receive it as a u32 parameter
+    // (handled by `threadMegacallParamsThroughHelpers`). `instance_index`
+    // is the in-RO instance index (= instId from the megacall search
+    // prelude). No `var<private>` for the megacall shared values —
+    // module-scope mutable state is rejected by some WGSL parsers
+    // (Safari/WebKit) when read from helper fn bodies, so we thread
+    // the values as parameters instead.
+    expect(ir.vs).not.toMatch(/var<private>\s+heap_drawIdx/);
+    expect(ir.vs).not.toMatch(/var<private>\s+instId/);
+    expect(ir.vs).not.toMatch(/var<private>\s+vid/);
+    expect(ir.vs).toMatch(/let heap_drawIdx:\s*u32\s*=\s*drawTable\[/);
+    expect(ir.vs).toMatch(/let instId:\s*u32\s*=\s*_local\s*\/\s*_indexCount/);
+    expect(ir.vs).toMatch(/let vid:\s*u32\s*=\s*indexStorage\[/);
     expect(ir.vs).not.toMatch(/let __heap_drawIdx\b/);
     expect(ir.vs).toContain("let instance_index: u32 = instId");
-    expect(ir.vs).toMatch(/var<private>\s+vid:/);
     // No leftover @builtin(instance_index)
     expect(ir.vs).not.toMatch(/@builtin\(\s*instance_index\s*\)/);
   });
