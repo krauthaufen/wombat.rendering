@@ -18,7 +18,13 @@ import { V2f, V3f, V4f } from "@aardworx/wombat.base";
 // handles bound by name).
 const albedo: Sampler2D = null as unknown as Sampler2D;
 
-export const trafoVS = vertex((v: {
+// Split into modelVS (object→world) + clipVS (world→clip) so an
+// instance-offset modifier can be inserted between them without
+// duplicating either piece. Same observable behaviour as the old
+// monolithic `trafoVS`; same-stage fusion (`composeStages`) recombines
+// them via `extractFusedEntry`.
+
+export const modelVS = vertex((v: {
   Positions: V4f;
   Normals:   V3f;
   Colors:    V4f;
@@ -26,9 +32,37 @@ export const trafoVS = vertex((v: {
   const wp = uniform.ModelTrafo.mul(v.Positions);
   const n4 = new V4f(v.Normals.xyz, 0.0);   // raw object-space normal, no matrix
   return {
-    gl_Position:    uniform.ViewProjTrafo.mul(wp),
     WorldPositions: wp,
     Normals:        n4.xyz,
+    Colors:         v.Colors,
+  };
+});
+
+// Reads the current `WorldPositions` (whatever upstream stage produced
+// it) and adds the per-instance offset attribute. Pass-through for
+// Normals + Colors — they're untouched by the offset.
+export const instanceOffsetVS = vertex((v: {
+  WorldPositions: V4f;
+  Normals:        V3f;
+  Colors:         V4f;
+  InstanceOffset: V3f;
+}) => {
+  return {
+    WorldPositions: new V4f(v.WorldPositions.xyz.add(v.InstanceOffset), v.WorldPositions.w),
+    Normals:        v.Normals,
+    Colors:         v.Colors,
+  };
+});
+
+export const clipVS = vertex((v: {
+  WorldPositions: V4f;
+  Normals:        V3f;
+  Colors:         V4f;
+}) => {
+  return {
+    gl_Position:    uniform.ViewProjTrafo.mul(v.WorldPositions),
+    WorldPositions: v.WorldPositions,
+    Normals:        v.Normals,
     Colors:         v.Colors,
   };
 });
@@ -50,7 +84,7 @@ export const lambertFS = fragment((v: {
   };
 });
 
-export const surface = effect(trafoVS, lambertFS);
+export const surface = effect(modelVS, clipVS, lambertFS);
 
 // ─── Textured variant ─────────────────────────────────────────────────
 // Same lambert lighting as `lambertFS`, with the base surface colour
@@ -97,34 +131,8 @@ export const lambertTexturedFS = fragment((v: {
 export const texturedSurface = effect(trafoTexturedVS, lambertTexturedFS);
 
 // ─── Instanced variant ────────────────────────────────────────────────
-// IDEALLY: `effect(modelVS, instanceOffsetVS, clipVS, lambertFS)` —
-// composing an `instanceOffsetVS` stage between `modelVS` and
-// `clipVS`, with no duplication of trafoVS or lambertFS. That's the
-// wombat.shader-native shape, and it's the right design.
-//
-// REALITY: heap-megacall's WGSL post-processing
-// (`applyMegacallToEmittedVs` + `rewriteFsUniforms`) doesn't yet
-// survive composition — header-offset reads leak `heap_drawIdx`
-// references into FS that should have been substituted with
-// flat-interpolated varyings. Tracked as a heap-future-work follow-up.
-//
-// Until that's fixed we keep `trafoInstancedVS` as a single combined
-// VS — duplicates the trafo math, but works through the heap path.
-export const trafoInstancedVS = vertex((v: {
-  Positions:      V4f;
-  Normals:        V3f;
-  Colors:         V4f;
-  InstanceOffset: V3f;
-}) => {
-  const wp0 = uniform.ModelTrafo.mul(v.Positions);
-  const wp  = new V4f(wp0.xyz.add(v.InstanceOffset), wp0.w);
-  const n4  = new V4f(v.Normals.xyz, 0.0);
-  return {
-    gl_Position:    uniform.ViewProjTrafo.mul(wp),
-    WorldPositions: wp,
-    Normals:        n4.xyz,
-    Colors:         v.Colors,
-  };
-});
-
-export const instancedSurface = effect(trafoInstancedVS, lambertFS);
+// Proper composition: model → instanceOffset → clip → lambert. No
+// duplication; `composeStages` fuses the three VS stages via
+// `extractFusedEntry`, and the per-stage emit's `pruneToStage` keeps
+// the FS module free of VS-only helper bodies.
+export const instancedSurface = effect(modelVS, instanceOffsetVS, clipVS, lambertFS);
