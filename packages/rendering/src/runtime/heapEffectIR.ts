@@ -27,7 +27,7 @@ import {
 } from "@aardworx/wombat.shader/ir";
 import {
   megacallSearchPrelude, atlasVaryingNames,
-  ATLAS_BINDING_LINEAR, ATLAS_BINDING_SRGB, ATLAS_BINDING_SAMPLER,
+  generateAtlasBindings, generateAtlasSwitch,
   type BucketLayout,
 } from "./heapEffect.js";
 import type { IntrinsicRef } from "@aardworx/wombat.shader/ir";
@@ -519,11 +519,27 @@ const ATLAS_SAMPLE_INTRINSIC: IntrinsicRef = {
 function isAtlasSampleCall(e: Expr, atlasNames: ReadonlySet<string>): { name: string; uv: Expr } | null {
   if (e.kind !== "CallIntrinsic") return null;
   if (e.op.emit.wgsl !== "textureSample") return null;
-  if (e.args.length < 3) return null;
+  if (e.args.length < 2) return null;
   const tex = e.args[0]!;
-  if (tex.kind !== "ReadInput" || tex.scope !== "Uniform") return null;
-  if (!atlasNames.has(tex.name)) return null;
-  return { name: tex.name, uv: e.args[2]! };
+  // Pre-legaliseTypes the sampler arg is a Var or ReadInput referencing
+  // the Sampler ValueDef by its schema name. Match either shape.
+  let name: string | undefined;
+  if (tex.kind === "ReadInput" && tex.scope === "Uniform") name = tex.name;
+  else if (tex.kind === "Var") name = (tex as { var: { name: string } }).var.name;
+  if (name === undefined) return null;
+  // The schema (extracted post-legaliseTypes) names the binding
+  // `<sampler>_view`; the IR pre-pass sees the user-written sampler
+  // name. Match either form so the rewrite fires regardless of which
+  // shape the layout's atlas-binding set carries.
+  const matched =
+    atlasNames.has(name) ? name :
+    atlasNames.has(`${name}_view`) ? `${name}_view` :
+    undefined;
+  if (matched === undefined) return null;
+  // texture(sampler, uv) parses as a 2-arg call (no separate sampler/
+  // texture pair until splitWgslSamplers runs). The uv is args[1].
+  const uv = e.args[1]!;
+  return { name: matched, uv };
 }
 
 function rewriteFsAtlasTextures(m: Module, layout: BucketLayout): Module {
@@ -741,9 +757,7 @@ function stripAtlasTextureSamplerDecls(src: string, atlasNames: ReadonlySet<stri
  */
 function prependAtlasPrelude(fs: string): string {
   const decls = `
-@group(0) @binding(${ATLAS_BINDING_LINEAR})  var atlasLinear:  texture_2d_array<f32>;
-@group(0) @binding(${ATLAS_BINDING_SRGB})    var atlasSrgb:    texture_2d_array<f32>;
-@group(0) @binding(${ATLAS_BINDING_SAMPLER}) var atlasSampler: sampler;
+${generateAtlasBindings()}
 
 fn atlasWrap1(u: f32, mode: u32) -> f32 {
   let r = u - floor(u);
@@ -764,9 +778,8 @@ fn atlasSampleAtMip(pageRef: u32, format: u32, origin: vec2<f32>, size: vec2<f32
   let mipSize = size / pow(2.0, f32(k));
   let mipO = atlasMipOrigin(origin, size, k);
   let atlasUv = mipO + uvW * mipSize;
-  let lin = textureSampleLevel(atlasLinear, atlasSampler, atlasUv, pageRef, 0.0);
-  let sr  = textureSampleLevel(atlasSrgb,   atlasSampler, atlasUv, pageRef, 0.0);
-  return select(lin, sr, format == 1u);
+${generateAtlasSwitch()}
+  return vec4<f32>(0.0);
 }
 fn atlasSample(pageRef: u32, formatBits: u32, origin: vec2<f32>, size: vec2<f32>, uv: vec2<f32>) -> vec4<f32> {
   let format  = formatBits & 0x1u;
@@ -774,15 +787,16 @@ fn atlasSample(pageRef: u32, formatBits: u32, origin: vec2<f32>, size: vec2<f32>
   let addrU   = (formatBits >> 4u) & 0x3u;
   let addrV   = (formatBits >> 6u) & 0x3u;
   let uvW = atlasApplyWrap(uv, addrU, addrV);
-  if (numMips <= 1u) { return atlasSampleAtMip(pageRef, format, origin, size, 0u, uvW); }
   let dx = dpdx(uvW * size);
   let dy = dpdy(uvW * size);
   let rho = max(length(dx), length(dy)) * 4096.0;
-  let lod = clamp(log2(max(rho, 1e-6)), 0.0, f32(numMips - 1u));
+  let maxLod = f32(max(numMips, 1u) - 1u);
+  let lod = clamp(log2(max(rho, 1e-6)), 0.0, maxLod);
   let lo = u32(floor(lod));
-  let hi = min(lo + 1u, numMips - 1u);
+  let hi = min(lo + 1u, max(numMips, 1u) - 1u);
   let t  = lod - f32(lo);
   let a = atlasSampleAtMip(pageRef, format, origin, size, lo, uvW);
+  if (numMips <= 1u) { return a; }
   let b = atlasSampleAtMip(pageRef, format, origin, size, hi, uvW);
   return mix(a, b, t);
 }

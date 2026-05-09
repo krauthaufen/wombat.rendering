@@ -274,10 +274,20 @@ export interface BucketLayout {
 /** First texture binding number; samplers come after the textures. */
 export const HEAP_TEX_BINDING_START = 4;
 
-/** Fixed atlas binding numbers — must match the runtime BGL in `heapScene.ts`. */
-export const ATLAS_BINDING_LINEAR  = 11;
-export const ATLAS_BINDING_SRGB    = 12;
-export const ATLAS_BINDING_SAMPLER = 13;
+/**
+ * Number of independent pages per format. Drives both the BGL slot
+ * count (N consecutive linear bindings + N consecutive srgb bindings
+ * + 1 sampler) and the shader's `switch pageRef` ladder. Must match
+ * `ATLAS_MAX_PAGES_PER_FORMAT` in `textureAtlas/atlasPool.ts`.
+ */
+export const ATLAS_ARRAY_SIZE = 8;
+
+/** First atlas binding (linear texture for page 0). */
+export const ATLAS_LINEAR_BINDING_BASE = 11;
+/** First srgb atlas binding (= linear base + N). */
+export const ATLAS_SRGB_BINDING_BASE = ATLAS_LINEAR_BINDING_BASE + ATLAS_ARRAY_SIZE;
+/** Atlas sampler binding (= linear base + 2N). */
+export const ATLAS_SAMPLER_BINDING = ATLAS_LINEAR_BINDING_BASE + 2 * ATLAS_ARRAY_SIZE;
 
 export function buildBucketLayout(
   schema: HeapEffectSchema,
@@ -495,16 +505,17 @@ ${vsOutBody}
 }
 
 /**
- * Atlas prelude: declares the per-format `texture_2d_array<f32>`
- * + the shared atlas sampler at fixed bindings 11/12/13, then the
- * `atlasSample` software-mip helper that the FS rewriter calls in
- * place of `textureSample(<atlasName>, smp, uv)`.
+ * Atlas prelude: declares N independent `texture_2d<f32>` bindings
+ * per format (linear + srgb), plus a shared atlas sampler. The N-way
+ * `switch pageRef` ladder picks the matching texture pair for each
+ * draw. Each atlas page is its own `GPUTexture` — adding pages to a
+ * format is just a fresh allocation slotted into the next BGL entry,
+ * no GPU-side `copyTextureToTexture` required.
  *
- * Storage uses a single GPUTexture per format (depthOrArrayLayers
- * grows pow2 in the AtlasPool); pageRef is the array layer index.
- * `binding_array<texture_2d<f32>, N>` would be cleaner but requires
- * Chrome's experimental bindless feature; texture_2d_array is
- * native WebGPU 1.0.
+ * `binding_array<texture_2d<f32>, N>` would collapse the switch into
+ * a runtime index but requires Chrome's experimental bindless
+ * feature; the N-consecutive-bindings + switch pattern is native
+ * WebGPU 1.0.
  *
  * Mip filtering is software (the GPU's mip walk would walk the
  * texture's mip chain, not our embedded 1.5×1 pyramid). LOD is
@@ -517,9 +528,7 @@ ${vsOutBody}
  */
 function generateAtlasPrelude(): string {
   return /* wgsl */`
-@group(0) @binding(${ATLAS_BINDING_LINEAR})  var atlasLinear:  texture_2d_array<f32>;
-@group(0) @binding(${ATLAS_BINDING_SRGB})    var atlasSrgb:    texture_2d_array<f32>;
-@group(0) @binding(${ATLAS_BINDING_SAMPLER}) var atlasSampler: sampler;
+${generateAtlasBindings()}
 
 fn atlasWrap1(u: f32, mode: u32) -> f32 {
   let r = u - floor(u);
@@ -548,9 +557,8 @@ fn atlasSampleAtMip(
   let mipSize = size / pow(2.0, f32(k));
   let mipO = atlasMipOrigin(origin, size, k);
   let atlasUv = mipO + uvW * mipSize;
-  let lin = textureSampleLevel(atlasLinear, atlasSampler, atlasUv, pageRef, 0.0);
-  let sr  = textureSampleLevel(atlasSrgb,   atlasSampler, atlasUv, pageRef, 0.0);
-  return select(lin, sr, format == 1u);
+${generateAtlasSwitch()}
+  return vec4<f32>(0.0);
 }
 
 fn atlasSample(
@@ -563,21 +571,61 @@ fn atlasSample(
   let addrU   = (formatBits >> 4u) & 0x3u;
   let addrV   = (formatBits >> 6u) & 0x3u;
   let uvW = atlasApplyWrap(uv, addrU, addrV);
-  if (numMips <= 1u) {
-    return atlasSampleAtMip(pageRef, format, origin, size, 0u, uvW);
-  }
+  // Compute derivatives unconditionally — WGSL forbids dpdx/dpdy in
+  // non-uniform control flow, and the per-page switch in
+  // atlasSampleAtMip taints anything below it. LOD is clamped so the
+  // numMips==1 case still picks mip 0.
   let dx = dpdx(uvW * size);
   let dy = dpdy(uvW * size);
   let rho = max(length(dx), length(dy)) * 4096.0;
-  let lod = clamp(log2(max(rho, 1e-6)), 0.0, f32(numMips - 1u));
+  let maxLod = f32(max(numMips, 1u) - 1u);
+  let lod = clamp(log2(max(rho, 1e-6)), 0.0, maxLod);
   let lo = u32(floor(lod));
-  let hi = min(lo + 1u, numMips - 1u);
+  let hi = min(lo + 1u, max(numMips, 1u) - 1u);
   let t  = lod - f32(lo);
   let a = atlasSampleAtMip(pageRef, format, origin, size, lo, uvW);
+  if (numMips <= 1u) { return a; }
   let b = atlasSampleAtMip(pageRef, format, origin, size, hi, uvW);
   return mix(a, b, t);
 }
 `;
+}
+
+/**
+ * Emit `2 * ATLAS_ARRAY_SIZE + 1` binding declarations: N linear
+ * `texture_2d<f32>`, N srgb `texture_2d<f32>`, then the shared
+ * atlas sampler.
+ */
+export function generateAtlasBindings(): string {
+  const lines: string[] = [];
+  for (let i = 0; i < ATLAS_ARRAY_SIZE; i++) {
+    lines.push(`@group(0) @binding(${ATLAS_LINEAR_BINDING_BASE + i}) var atlasLinear${i}: texture_2d<f32>;`);
+  }
+  for (let i = 0; i < ATLAS_ARRAY_SIZE; i++) {
+    lines.push(`@group(0) @binding(${ATLAS_SRGB_BINDING_BASE + i}) var atlasSrgb${i}: texture_2d<f32>;`);
+  }
+  lines.push(`@group(0) @binding(${ATLAS_SAMPLER_BINDING}) var atlasSampler: sampler;`);
+  return lines.join("\n");
+}
+
+/**
+ * Emit the `switch pageRef` ladder body for `atlasSampleAtMip`. Each
+ * case picks the matching `atlasLinear<i>` / `atlasSrgb<i>` decl and
+ * blends on `format == 1u`. The fallback (page out of range) is the
+ * function-level `vec4<f32>(0.0)` after the switch.
+ */
+export function generateAtlasSwitch(): string {
+  const lines: string[] = ["  switch pageRef {"];
+  for (let i = 0; i < ATLAS_ARRAY_SIZE; i++) {
+    lines.push(`    case ${i}u: {`);
+    lines.push(`      let lin = textureSampleLevel(atlasLinear${i}, atlasSampler, atlasUv, 0.0);`);
+    lines.push(`      let sr  = textureSampleLevel(atlasSrgb${i},   atlasSampler, atlasUv, 0.0);`);
+    lines.push(`      return select(lin, sr, format == 1u);`);
+    lines.push(`    }`);
+  }
+  lines.push("    default: {}");
+  lines.push("  }");
+  return lines.join("\n");
 }
 
 /** Render one varying as the WGSL field declaration: `[@builtin(...) | @location(N)] [@interpolate(...)] name`. */

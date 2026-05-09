@@ -110,16 +110,17 @@ describe("heap-atlas bucket plumbing", () => {
     const scene = buildHeapScene(gpu.device, sig(), [a, b], { atlasPool: pool });
     // Both ROs share `(effect, pipelineState, "atlas")` bucket key.
     expect(scene.stats.groups).toBe(1);
-    // Bind group should reference both format binding-arrays. The
-    // last-built bind group descriptor for an atlas-variant bucket
-    // includes 13 bindings: 4 heap views + 2 atlas binding_arrays
-    // (linear + srgb) + 1 atlas sampler = 7 visible entries. We
-    // assert the atlas-array entries exist by binding number.
+    // Bind group should reference all atlas slots. Layout: bindings
+    // 11..18 = N linear pages, 19..26 = N srgb pages, 27 = sampler
+    // (with N = ATLAS_ARRAY_SIZE = 8). Slots without a real page hold
+    // a 1×1 placeholder view.
     const lastBg = gpu.bindGroups[gpu.bindGroups.length - 1]!;
     const bindings = (lastBg.entries as readonly GPUBindGroupEntry[]).map(e => e.binding);
-    expect(bindings).toContain(11); // ATLAS_BINDING_LINEAR
-    expect(bindings).toContain(12); // ATLAS_BINDING_SRGB
-    expect(bindings).toContain(13); // ATLAS_BINDING_SAMPLER
+    expect(bindings).toContain(11); // linear page 0
+    expect(bindings).toContain(18); // linear page 7
+    expect(bindings).toContain(19); // srgb   page 0
+    expect(bindings).toContain(26); // srgb   page 7
+    expect(bindings).toContain(27); // atlas sampler
   });
 
   it("addDraw of an atlas-variant RO writes the four drawHeader fields with expected values", () => {
@@ -181,8 +182,8 @@ describe("heap-atlas bucket plumbing", () => {
     // removing one draw: the bucket should still bind both pages.
     const bgBefore = gpu.bindGroups[gpu.bindGroups.length - 1]!;
     const bindingsBefore = (bgBefore.entries as readonly GPUBindGroupEntry[]).map(e => e.binding);
-    expect(bindingsBefore).toContain(11);
-    expect(bindingsBefore).toContain(12);
+    expect(bindingsBefore).toContain(11); // linear slot 0
+    expect(bindingsBefore).toContain(19); // srgb   slot 0
     scene.removeDraw(0);
     // No page-set shrink → no fresh bind-group rebuild driven by it.
     // The latest bind-group on record either remains the pre-remove
@@ -190,6 +191,6 @@ describe("heap-atlas bucket plumbing", () => {
     const bgAfter = gpu.bindGroups[gpu.bindGroups.length - 1]!;
     const bindingsAfter = (bgAfter.entries as readonly GPUBindGroupEntry[]).map(e => e.binding);
     expect(bindingsAfter).toContain(11);
-    expect(bindingsAfter).toContain(12);
+    expect(bindingsAfter).toContain(19);
   });
 });
