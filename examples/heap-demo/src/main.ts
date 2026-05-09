@@ -34,7 +34,10 @@ import { attachCanvas, runFrame } from "@aardworx/wombat.rendering.experimental/
 import {
   surface, texturedSurface,
   instancedSurface, instancedTexturedSurface,
+  tintedSurface, pulsingSurface,
+  wobblingInstancedSurface, swirlingTexturedSurface,
 } from "./effects.js";
+import type { Effect } from "@aardworx/wombat.shader";
 import { buildBox, buildSphere, buildCylinder, type GeometryData } from "./geometry.js";
 
 const countParam = new URLSearchParams(location.search).get("count");
@@ -150,7 +153,13 @@ function makeUniforms(
   modelTrafo: Trafo3d,
   viewProj: aval<Trafo3d>,
   eye: aval<V3d>,
+  extras?: { time?: aval<number>; tint?: V4f },
 ): HashMap<string, aval<unknown>> {
+  // Note: addDraw skips drawHeader fields whose name isn't in the RO's
+  // effect schema (`effectFields` filter). So uniforms passed here that
+  // the effect doesn't actually read get silently ignored at pack time.
+  // We can therefore bind every potentially-used uniform unconditionally
+  // — saves the per-effect plumbing decision at the call site.
   // INTENTIONAL "old trap" demo: every RO maps `viewProj` and `eye`
   // inline. Without §5d's build-time memoization, this would create
   // N distinct derived avals → N pool entries → N writeBuffer calls
@@ -163,11 +172,14 @@ function makeUniforms(
   const lightLoc = eye.map((e) => new V3f(e.x as number, e.y as number, e.z as number));
   const m  = AVal.constant(trafoToM44f(modelTrafo));
   const mi = AVal.constant(trafoInvToM44f(modelTrafo));
-  return HashMap.empty<string, aval<unknown>>()
+  let map = HashMap.empty<string, aval<unknown>>()
     .add("ModelTrafo",     m)
     .add("ModelTrafoInv",  mi)
     .add("ViewProjTrafo",  viewProjM44)
     .add("LightLocation",  lightLoc);
+  if (extras?.time !== undefined) map = map.add("Time", extras.time);
+  if (extras?.tint !== undefined) map = map.add("Tint", AVal.constant(extras.tint));
+  return map;
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +192,15 @@ interface RoSpec {
   readonly color: V4f;
   readonly texture?: aval<ITexture>;
   readonly sampler?: aval<ISampler>;
+  /** Optional explicit effect override; defaults follow the textured/instanced flags. */
+  readonly effect?: Effect;
+  /** Tint value for `tintedSurface`-family effects. */
+  readonly tint?: V4f;
+  /** Time aval for time-driven effects (`pulsing*`, `wobbling*`, `swirling*`). */
+  readonly time?: aval<number>;
+  /** Mark as instanced for the dispatch picker. The actual instance attrs live on
+   * `makeInstancedTowerRO`'s tower path. */
+  readonly instanced?: boolean;
 }
 
 // Shared PipelineState across all ROs — the heap path's bucket key
@@ -204,10 +225,10 @@ function makeRO(spec: RoSpec, viewProj: aval<Trafo3d>, eye: aval<V3d>): RenderOb
     .add("Normals",   spec.geo.normals)
     .add("Colors",    asV4fBroadcast(spec.color));
   return {
-    effect: textured ? texturedSurface : surface,
+    effect: spec.effect ?? (textured ? texturedSurface : surface),
     pipelineState: sharedPipelineState,
     vertexAttributes: textured ? baseAttribs.add("Uvs", spec.geo.uvs) : baseAttribs,
-    uniforms: makeUniforms(spec.modelTrafo, viewProj, eye),
+    uniforms: makeUniforms(spec.modelTrafo, viewProj, eye, { time: spec.time, tint: spec.tint }),
     textures,
     samplers,
     indices: spec.geo.indices,
@@ -259,11 +280,11 @@ function makeInstancedTowerRO(
     firstInstance: 0,
   });
   return {
-    effect: textured ? instancedTexturedSurface : instancedSurface,
+    effect: spec.effect ?? (textured ? instancedTexturedSurface : instancedSurface),
     pipelineState: sharedPipelineState,
     vertexAttributes: vertexAttribs,
     instanceAttributes: instAttribs,
-    uniforms: makeUniforms(spec.modelTrafo, viewProj, eye),
+    uniforms: makeUniforms(spec.modelTrafo, viewProj, eye, { time: spec.time, tint: spec.tint }),
     textures,
     samplers,
     indices: spec.geo.indices,
@@ -450,17 +471,54 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   // ONE derived aval each via the memo trie. Pre-§5d this would
   // have been the classic per-RO identity-defeat footgun.
   const ros: RenderObject[] = [];
-  // ?inst=N  — every K-th grid cell becomes a vertical tower of N
-  // instances stacked in +Z. One RO per tower, one drawTable record,
-  // one drawHeader. Exercises the heap path's per-RO instancing.
-  // Default 6. Set ?inst=0 to disable. ?instStride=K controls how
-  // often a cell becomes a tower (default every 37th).
+  // ?inst=N — instance count for instanced-effect cells (default 6).
+  // ?fx=N   — force a single effect (0..7); default cycles through all 8.
+  // 8 effects covering all combinations of (atlas?, instanced?, time?, tint?):
+  //   0: surface                       — base
+  //   1: texturedSurface                — atlas
+  //   2: instancedSurface               — instance offset
+  //   3: instancedTexturedSurface       — atlas + instance
+  //   4: tintedSurface                  — Tint uniform (FS chain)
+  //   5: pulsingSurface                 — Time uniform → FS pulse
+  //   6: wobblingInstancedSurface       — Time → VS wobble + instance
+  //   7: swirlingTexturedSurface        — Time → VS UV swirl + atlas
+  // With family-merge, all 8 collapse to ONE bucket; the family WGSL has
+  // 8 layoutId switch arms.
   const instParam = new URLSearchParams(location.search).get("inst");
-  const instCount = instParam !== null ? Math.max(0, parseInt(instParam, 10) | 0) : 6;
-  const instStrideParam = new URLSearchParams(location.search).get("instStride");
-  const instStride = instStrideParam !== null
-    ? Math.max(1, parseInt(instStrideParam, 10) | 0)
-    : 37;
+  const instCount = instParam !== null ? Math.max(2, parseInt(instParam, 10) | 0) : 6;
+  const fxParam = new URLSearchParams(location.search).get("fx");
+  const forcedFx = fxParam !== null ? Math.max(0, Math.min(7, parseInt(fxParam, 10) | 0)) : -1;
+
+  type FxPick = {
+    readonly effect: Effect;
+    readonly textured: boolean;
+    readonly instanced: boolean;
+    readonly needsTime: boolean;
+    readonly needsTint: boolean;
+  };
+  const fxTable: readonly FxPick[] = [
+    { effect: surface,                       textured: false, instanced: false, needsTime: false, needsTint: false },
+    { effect: texturedSurface,               textured: true,  instanced: false, needsTime: false, needsTint: false },
+    { effect: instancedSurface,              textured: false, instanced: true,  needsTime: false, needsTint: false },
+    { effect: instancedTexturedSurface,      textured: true,  instanced: true,  needsTime: false, needsTint: false },
+    { effect: tintedSurface,                 textured: false, instanced: false, needsTime: false, needsTint: true  },
+    { effect: pulsingSurface,                textured: false, instanced: false, needsTime: true,  needsTint: false },
+    { effect: wobblingInstancedSurface,      textured: false, instanced: true,  needsTime: true,  needsTint: false },
+    { effect: swirlingTexturedSurface,       textured: true,  instanced: false, needsTime: true,  needsTint: false },
+  ];
+  // Tints used by effect 4 — distinct hues per RO (cycle by k>>3 so
+  // adjacent cells of effect 4 alternate tints).
+  const tints: readonly V4f[] = [
+    new V4f(1.0, 0.5, 0.5, 1.0),
+    new V4f(0.5, 1.0, 0.5, 1.0),
+    new V4f(0.5, 0.5, 1.0, 1.0),
+    new V4f(1.0, 1.0, 0.4, 1.0),
+  ];
+  // Time uniform for effects 5/6/7 — bound to the demo's `time` cval
+  // (already ticked per frame). The aval value is JS number; the heap
+  // uniform packer handles f32. All time-using ROs share this aval.
+  const timeAval: aval<number> = time;
+
   if (ROCount <= 4) {
     for (let i = 0; i < ROCount; i++) {
       ros.push(makeRO({
@@ -484,13 +542,21 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
         : geoIdx === 1
           ? Trafo3d.scaling(0.5, 0.5, 0.5).mul(Trafo3d.translation(new V3d(x, y, 0)))
           : Trafo3d.scaling(0.5, 0.5, 0.8).mul(Trafo3d.translation(new V3d(x, y, -0.4)));
-      const towerHere = instCount > 1 && (k % instStride) === 0;
+      const fx = fxTable[forcedFx >= 0 ? forcedFx : (k % 8)]!;
+      // Atlas-only effects fall back to non-textured sibling when
+      // ?atlas=0 (no AtlasPool slot picker).
+      const wantTex = fx.textured && atlasMode;
+      // Bind every uniform unconditionally — addDraw filters by
+      // effectFields, so unused ones are silently ignored at pack time.
       const spec: RoSpec = {
         geo: bundle, modelTrafo: t, color: colors[k % 4]!,
-        ...(atlasMode ? { texture: pickTex(k)!, sampler: sharedSampler! } : {}),
+        effect: fx.effect,
+        ...(wantTex ? { texture: pickTex(k)!, sampler: sharedSampler! } : {}),
+        time: timeAval,
+        tint: tints[(k >> 3) % tints.length]!,
       };
-      if (towerHere) {
-        ros.push(makeInstancedTowerRO(spec, viewProj, eye, instCount, 1.0));
+      if (fx.instanced) {
+        ros.push(makeInstancedTowerRO(spec, viewProj, eye, instCount, 0.7));
       } else {
         ros.push(makeRO(spec, viewProj, eye));
       }

@@ -5,7 +5,7 @@
 // `vertex(...) / fragment(...)` calls into an `Effect` at build time.
 
 import { effect, vertex, fragment } from "@aardworx/wombat.shader";
-import { abs, type Sampler2D, texture } from "@aardworx/wombat.shader/types";
+import { abs, sin, cos, type Sampler2D, texture } from "@aardworx/wombat.shader/types";
 import { uniform } from "@aardworx/wombat.shader/uniforms";
 import { V2f, V3f, V4f } from "@aardworx/wombat.base";
 
@@ -150,4 +150,81 @@ export const instancedSurface = effect(modelVS, instanceOffsetVS, clipVS, lamber
 // `lambertTexturedFS` can sample the atlas.
 export const instancedTexturedSurface = effect(
   modelVS, uvsVS, instanceOffsetVS, clipVS, lambertTexturedFS,
+);
+
+// ─── Time-driven and tinted variants — stress the family-merge ────────
+//
+// Goal: 8 distinct effects that exercise different uniform/attribute
+// combinations through the family. With family-merge in v1, all 8
+// collapse into ONE bucket per pipelineState; the family WGSL has 8
+// switch arms, each calling its own composed-stage chain.
+
+// Time-driven Z-wobble. Modifies WorldPositions using uniform.Time
+// before clipVS multiplies by ViewProj. Composes into the chain
+// AFTER modelVS produces WorldPositions.
+export const wobbleVS = vertex((v: {
+  WorldPositions: V4f;
+  Normals:        V3f;
+  Colors:         V4f;
+}) => {
+  const t = uniform.Time;
+  const wob = sin(t.mul(2.0).add(v.WorldPositions.x)).mul(0.3);
+  return {
+    WorldPositions: new V4f(
+      v.WorldPositions.x,
+      v.WorldPositions.y,
+      v.WorldPositions.z + wob,
+      v.WorldPositions.w,
+    ),
+    Normals:        v.Normals,
+    Colors:         v.Colors,
+  };
+});
+
+// Time-driven UV swirl. Rotates Uvs around (0.5, 0.5) by Time.
+export const swirlUvsVS = vertex((v: {
+  Uvs:            V2f;
+  WorldPositions: V4f;
+  Normals:        V3f;
+  Colors:         V4f;
+}) => {
+  const t = uniform.Time.mul(0.7);
+  const c = cos(t);
+  const s = sin(t);
+  const u = v.Uvs.x - 0.5;
+  const w = v.Uvs.y - 0.5;
+  return {
+    Uvs:            new V2f(c.mul(u).sub(s.mul(w)).add(0.5), s.mul(u).add(c.mul(w)).add(0.5)),
+    WorldPositions: v.WorldPositions,
+    Normals:        v.Normals,
+    Colors:         v.Colors,
+  };
+});
+
+// FS chain: tint multiplication. Reads `outColor` from the previous
+// FS stage, multiplies by uniform.Tint. Composed AFTER lambertFS so
+// the lit result gets re-tinted. The wombat.shader composer threads
+// the carrier by name.
+export const tintFS = fragment((v: { outColor: V4f }) => ({
+  outColor: new V4f(v.outColor.xyz.mul(uniform.Tint.xyz), v.outColor.w),
+}));
+
+// FS chain: Time-driven brightness pulse. Multiplies outColor's xyz
+// by `0.6 + 0.4 * sin(Time*3)` so it pulses between 0.2 and 1.0.
+export const pulseFS = fragment((v: { outColor: V4f }) => {
+  const t = uniform.Time.mul(3.0);
+  const k = sin(t).mul(0.4).add(0.6);
+  return {
+    outColor: new V4f(v.outColor.xyz.mul(k), v.outColor.w),
+  };
+});
+
+// Effects 5..8 — extra family members.
+export const tintedSurface = effect(modelVS, clipVS, lambertFS, tintFS);
+export const pulsingSurface = effect(modelVS, clipVS, lambertFS, pulseFS);
+export const wobblingInstancedSurface = effect(
+  modelVS, wobbleVS, instanceOffsetVS, clipVS, lambertFS,
+);
+export const swirlingTexturedSurface = effect(
+  modelVS, uvsVS, swirlUvsVS, clipVS, lambertTexturedFS,
 );
