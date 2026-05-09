@@ -1666,15 +1666,33 @@ export function buildHeapScene(
    * effect actually populates; everything else stays 0). */
   let familyFieldsForEffect: Map<Effect, Set<string>> | undefined;
 
-  function buildFamilyFromEffects(effects: readonly Effect[]): void {
+  function buildFamilyFromSpecs(specs: readonly HeapDrawSpec[]): void {
     if (family !== undefined) return;
-    if (effects.length === 0) {
-      throw new Error("heapScene: cannot build shader family from an empty effect set");
+    if (specs.length === 0) {
+      throw new Error("heapScene: cannot build shader family from an empty spec set");
     }
-    // Deduplicate by Effect identity preserving order.
+    // Deduplicate by Effect identity preserving order; derive per-effect
+    // per-instance info from the spec's `instanceAttributes` map. The
+    // IR substitution needs `perInstanceAttributes` set on the family
+    // layout to address per-instance attribute reads via `instId`
+    // instead of `vertex_index` — without this, instanced effects
+    // produce broken geometry (triangles spanning instance boundaries).
     const seen = new Set<Effect>();
     const unique: Effect[] = [];
-    for (const e of effects) {
+    const perInstanceByEffect = new Map<Effect, {
+      attributes: Set<string>;
+      uniforms: Set<string>;
+    }>();
+    for (const spec of specs) {
+      const e = spec.effect;
+      let entry = perInstanceByEffect.get(e);
+      if (entry === undefined) {
+        entry = { attributes: new Set<string>(), uniforms: new Set<string>() };
+        perInstanceByEffect.set(e, entry);
+      }
+      if (spec.instanceAttributes !== undefined) {
+        for (const name of Object.keys(spec.instanceAttributes)) entry.attributes.add(name);
+      }
       if (!seen.has(e)) { seen.add(e); unique.push(e); }
     }
     family = buildShaderFamily(
@@ -1682,7 +1700,10 @@ export function buildHeapScene(
       // Atlas-route every textured effect's bindings when an atlas pool
       // is in scope (§6 v1 spec point 4). Without a pool, fall back to
       // standalone texture bindings — the per-effect rare path.
-      { atlasizeAllTextures: atlasPool !== undefined },
+      {
+        atlasizeAllTextures: atlasPool !== undefined,
+        perEffectPerInstance: perInstanceByEffect,
+      },
     );
     const compiled = compileShaderFamily(family, opts.fragmentOutputLayout);
     familyVsModule = device.createShaderModule({ code: compiled.vs, label: `heapScene/family/${family.id}/vs` });
@@ -2203,7 +2224,7 @@ export function buildHeapScene(
     // direct addDraw at runtime). The aset / array initial-population
     // paths build from the full effect set up front.
     if (family === undefined) {
-      buildFamilyFromEffects([spec.effect]);
+      buildFamilyFromSpecs([spec]);
     } else {
       ensureFamilyKnowsEffect(spec.effect);
     }
@@ -2486,7 +2507,7 @@ export function buildHeapScene(
     // bucket is built against the union right away. Skipped when the
     // array is empty (family will build lazily when an addDraw fires).
     const arr = initialDraws as readonly HeapDrawSpec[];
-    if (arr.length > 0) buildFamilyFromEffects(arr.map(d => d.effect));
+    if (arr.length > 0) buildFamilyFromSpecs(arr);
     for (const d of arr) addDraw(d);
   } else {
     asetReader = (initialDraws as aset<HeapDrawSpec>).getReader();
@@ -2504,7 +2525,7 @@ export function buildHeapScene(
           remaining.push(op);
           if (op.count > 0) adds.push(op.value);
         });
-        if (adds.length > 0) buildFamilyFromEffects(adds.map(s => s.effect));
+        if (adds.length > 0) buildFamilyFromSpecs(adds);
         for (const op of remaining) {
           if (op.count > 0) {
             const id = addDraw(op.value);

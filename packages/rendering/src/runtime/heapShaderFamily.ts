@@ -129,6 +129,20 @@ export interface BuildShaderFamilyOptions {
    * textured. Defaults to false (analysis-only callers don't need it).
    */
   readonly atlasizeAllTextures?: boolean;
+  /**
+   * Per-effect per-instance attribute / uniform sets. Required for any
+   * effect that uses per-instance attributes (e.g. `InstanceOffset` on
+   * `instancedSurface`); without this, the IR substitution falls
+   * through to per-vertex `vertex_index` addressing for those reads
+   * and instances produce malformed triangles. heapScene's family
+   * lazy-build derives this from the first batch's
+   * `spec.instanceAttributes` per effect. Optional for analysis-only
+   * callers (no per-instance attrs in their effects).
+   */
+  readonly perEffectPerInstance?: ReadonlyMap<Effect, {
+    readonly attributes: ReadonlySet<string>;
+    readonly uniforms?: ReadonlySet<string>;
+  }>;
 }
 
 export function buildShaderFamily(
@@ -180,6 +194,7 @@ export function buildShaderFamily(
   // 6. drawHeader union across all effects, then append layoutId.
   const drawHeaderUnion = unionDrawHeaders(
     sortedEffects, perEffectSchema, options.atlasizeAllTextures === true,
+    options.perEffectPerInstance,
   );
 
   return {
@@ -298,6 +313,10 @@ function unionDrawHeaders(
   sortedEffects: readonly Effect[],
   perEffectSchema: ReadonlyMap<Effect, HeapEffectSchema>,
   atlasizeAllTextures: boolean,
+  perEffectPerInstance: ReadonlyMap<Effect, {
+    readonly attributes: ReadonlySet<string>;
+    readonly uniforms?: ReadonlySet<string>;
+  }> | undefined,
 ): BucketLayout {
   // Build each effect's BucketLayout with default opts. The v1 PoC's
   // family-build call site (a future slice) will pass the real
@@ -309,8 +328,11 @@ function unionDrawHeaders(
     const atlasNames = atlasizeAllTextures
       ? new Set(schema.textures.map(t => t.name))
       : new Set<string>();
+    const perI = perEffectPerInstance?.get(e);
     perEffectLayout.set(e, buildBucketLayout(schema, false, {
       atlasTextureBindings: atlasNames,
+      ...(perI?.attributes !== undefined ? { perInstanceAttributes: perI.attributes } : {}),
+      ...(perI?.uniforms !== undefined ? { perInstanceUniforms: perI.uniforms } : {}),
     }));
   }
 
