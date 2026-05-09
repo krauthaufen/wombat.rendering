@@ -149,9 +149,55 @@ there are few of these per scene (typically <20).
 efficiency (large enough to fit big textures) and not requiring
 exotic device limits (4096 is universal in WebGPU).
 
-**Format:** `rgba8unorm` for color, `rgba8unorm-srgb` for sRGB. One
-page per format (since shaders can't read both linearly from one
-texture). If both are needed, two distinct pages.
+**Format policy — per-format page sets, with limited promotion:**
+
+The naive answer ("everything → rgba8unorm") wastes memory and
+breaks sRGB. A 256² r8unorm mask is 64 KB; promoted to rgba8unorm
+that's 256 KB — 4× waste. At thousands of small single-channel
+textures (glyph SDFs, point splats, brush stamps) this adds up to
+hundreds of MB of pure padding. And mixing sRGB content into a
+linear page loses the hardware gamma decode.
+
+So: **each page format gets its own page set.** ROs whose textures
+reference different page formats still work — the bucket binds
+multiple page sets, and the shader declares each as a separate
+`binding_array<texture_2d<f32>, N>`.
+
+Page format types:
+
+1. `rgba8unorm-srgb` — color textures, the common case. Most
+   icons, photos, color decals.
+2. `rgba8unorm` — linear color data, normal maps stored as 4-ch.
+3. `r8unorm` — single-channel masks, alpha sprites, glyph SDFs.
+4. `rg8unorm` — two-channel data (normal-map XY, custom encodings).
+5. (v2) `rgba16float` / `rg16float` for HDR. Almost certainly
+   Tier L (large + unique) anyway.
+
+**Promotion rules (limited):**
+
+- `rgb8` (no actual WebGPU format) → promoted to rgba8unorm or
+  rgba8unorm-srgb at upload. 33% memory penalty per such texture;
+  unavoidable.
+- `bgra8unorm` → swizzled to rgba8unorm at upload. Same memory.
+- Otherwise: source format → same-format page.
+
+**Format inference at addDraw:**
+
+- Default policy: PNG/JPEG → rgba8unorm-srgb. Color is the common
+  case; getting hardware gamma for free is the win.
+- Explicit override: `ITexture.fromUrl(url, { format: "linear" })`,
+  `{ format: "r8" }`, etc. The user knows when their texture is
+  data, not color.
+- Auto-detect 1-channel grayscale PNGs → r8unorm if the user hasn't
+  overridden.
+
+**MVP scope (phase 1–3): rgba8unorm-srgb + rgba8unorm only.**
+Two page sets. Covers 90%+ of real scene texture content (color
+images dominate). r8/rg8 page support comes in phase 5 alongside
+other format optimizations. For MVP, a 64×64 alpha-only icon DOES
+get bloated to 4 channels — acceptable trade-off; profile real
+workloads to decide whether the extra format complexity is worth
+the per-channel memory savings.
 
 **Capacity per page:** 4096² × 4 bytes = 64 MB per color page.
 With mips: 64 MB × 1.33 = ~85 MB. A scene with ~5 atlas pages →
