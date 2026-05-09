@@ -173,13 +173,17 @@ export const instancedTexturedSurface = effect(
 // Time-driven Z-wobble. Modifies WorldPositions using uniform.Time
 // before clipVS multiplies by ViewProj. Composes into the chain
 // AFTER modelVS produces WorldPositions.
+//
+// Note: `Time` is in MILLISECONDS (set from performance.now() in
+// main.ts), so multipliers must scale accordingly — `t * 0.002`
+// gives ~2 rad/s ≈ one cycle every 3 seconds.
 export const wobbleVS = vertex((v: {
   WorldPositions: V4f;
   Normals:        V3f;
   Colors:         V4f;
 }) => {
   const t = uniform.Time;
-  const wob = sin(t.mul(2.0).add(v.WorldPositions.x)).mul(0.3);
+  const wob = sin(t.mul(0.002).add(v.WorldPositions.x)).mul(0.3);
   return {
     WorldPositions: new V4f(
       v.WorldPositions.x,
@@ -193,13 +197,14 @@ export const wobbleVS = vertex((v: {
 });
 
 // Time-driven UV swirl. Rotates Uvs around (0.5, 0.5) by Time.
+// `t * 0.0007` ≈ one full rotation every ~9 seconds.
 export const swirlUvsVS = vertex((v: {
   Uvs:            V2f;
   WorldPositions: V4f;
   Normals:        V3f;
   Colors:         V4f;
 }) => {
-  const t = uniform.Time.mul(0.7);
+  const t = uniform.Time.mul(0.0007);
   const c = cos(t);
   const s = sin(t);
   const u = v.Uvs.x - 0.5;
@@ -221,9 +226,10 @@ export const tintFS = fragment((v: { outColor: V4f }) => ({
 }));
 
 // FS chain: Time-driven brightness pulse. Multiplies outColor's xyz
-// by `0.6 + 0.4 * sin(Time*3)` so it pulses between 0.2 and 1.0.
+// by `0.6 + 0.4 * sin(Time*0.003)` so it pulses between 0.2 and 1.0
+// over ~2 seconds.
 export const pulseFS = fragment((v: { outColor: V4f }) => {
-  const t = uniform.Time.mul(3.0);
+  const t = uniform.Time.mul(0.003);
   const k = sin(t).mul(0.4).add(0.6);
   return {
     outColor: new V4f(v.outColor.xyz.mul(k), v.outColor.w),
