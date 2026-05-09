@@ -189,19 +189,38 @@ On `acquire(aval, value)`:
 
 On `release`: refcount--; at 0, drop from both maps.
 
-**Hashing:** Uint8Array payloads (mat4, vec, packed bytes) hash
-via xxhash or FNV-1a — ~50–100 ns per call. For 50K first-frame
-addDraws → ~5 ms. Real but acceptable; happens once at scene
-construction. Reactive churn hits the WeakMap path.
+**Per-pool key strategy** — the cost / win ratio depends on
+payload size, so each pool picks its dedup mechanism:
 
-64-bit hash + post-hash byte comparator eliminates collision risk
-without much cost. Or skip the comparator and live with
-theoretical 1-in-2⁶⁴ collisions; for our use case, fine.
+- **UniformPool** (small payloads — mat4 = 64 B, vec4 = 16 B,
+  scalars). Hash bytes via xxhash / FNV-1a. ~50–100 ns per
+  acquire. Catches the `AVal.constant(new Float32Array([…]))`
+  pattern where two distinct allocations have identical values
+  (common when user code constructs uniforms inline per RO).
+- **IndexPool** (large payloads — Uint32Arrays often kilobytes
+  to megabytes). **ArrayBuffer-tuple key**:
+  `(arr.buffer === b.buffer && arr.byteOffset === b.byteOffset
+   && arr.byteLength === b.byteLength)`. Doesn't catch "two
+  distinct ArrayBuffers with identical content," but that's a
+  rare authoring pattern; the common case is "one ArrayBuffer
+  shared across multiple typed-array views or multiple aval
+  wrappers," which IS caught. Hashing kilobytes of indices on
+  every acquire is wasteful when this O(1) test handles the
+  realistic case.
+- **AtlasPool** (image data — usually large `ImageBitmap` /
+  `ImageData`). Same: ArrayBuffer-tuple key. The "one
+  ImageBitmap shared across ROs" pattern is exactly the common
+  case for atlasing — N markers all pointing at one decoded
+  PNG. Hashing every upload is wasteful and not worth catching
+  the "two ImageBitmaps with the same pixels" edge case.
 
-**Per-pool opt-in:** the cost / win ratio depends on payload
-size. UniformPool pays it (mat4s repeat constantly across ROs);
-IndexPool pays it (indexed meshes share index arrays); AtlasPool
-pays it (textures hash by source bytes). Tiny scalar pools (if
+64-bit hash + post-hash byte comparator eliminates collision
+risk for the UniformPool case without much cost. Or skip the
+comparator and live with theoretical 1-in-2⁶⁴ collisions; for
+our use case, fine.
+
+The pool's `valueKey` hook abstracts this — each pool plugs in
+its preferred strategy at construction. Tiny scalar pools (if
 any) can stay identity-only.
 
 **User-visible effect:**
