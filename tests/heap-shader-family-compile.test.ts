@@ -233,7 +233,7 @@ describe("compileShaderFamily", () => {
     expect(out.vs).toMatch(re);
   });
 
-  it("FamilyVsOut has one Varying<i> location per slot plus flat layoutIdOut", () => {
+  it("FamilyVsOut has one Varying<i> location per slot plus flat HeapVarying<k> + layoutIdOut", () => {
     const family = buildShaderFamily([makeSurfaceEffect(), makeTexturedEffect()]);
     const out = compileShaderFamily(family);
     for (let i = 0; i < family.varyingSlots; i++) {
@@ -241,8 +241,18 @@ describe("compileShaderFamily", () => {
       expect(out.vs).toMatch(re);
       expect(out.fs).toMatch(re);
     }
-    // layoutIdOut sits at @location(N) flat-interpolated.
-    const N = family.varyingSlots;
+    // Heap-injected slots (vec4<u32>, flat) sit immediately after the
+    // user vec4<f32> slots. For these fixtures (no FS uniform reads /
+    // no atlas) the count is 0; if the IR rewrite adds threading, the
+    // count grows and this loop catches it.
+    for (let i = 0; i < family.heapVaryingSlots; i++) {
+      const loc = family.varyingSlots + i;
+      const re = new RegExp(`@interpolate\\(flat\\)\\s+@location\\(${loc}\\)\\s+HeapVarying${i}\\s*:\\s*vec4<u32>`);
+      expect(out.vs).toMatch(re);
+      expect(out.fs).toMatch(re);
+    }
+    // layoutIdOut sits at @location(N + M) flat-interpolated.
+    const N = family.varyingSlots + family.heapVaryingSlots;
     expect(out.vs).toMatch(new RegExp(`@interpolate\\(flat\\)\\s+@location\\(${N}\\)\\s+layoutIdOut\\s*:\\s*u32`));
     expect(out.fs).toMatch(new RegExp(`@interpolate\\(flat\\)\\s+@location\\(${N}\\)\\s+layoutIdIn\\s*:\\s*u32`));
   });
