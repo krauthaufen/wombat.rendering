@@ -47,7 +47,14 @@ import type { RenderObject } from "../core/renderObject.js";
 const LEGACY_MAX_DIM = 4096;
 
 const isHostBuffer = (b: IBuffer): boolean => b.kind === "host";
-const isGpuSampler = (s: ISampler): boolean => s.kind === "gpu";
+// Samplers: accept both descriptor-form (`kind: "host"`) and resolved
+// (`kind: "gpu"`). The heap atlas path uses ONE shared GPU sampler for
+// all atlas reads — per-RO sampler state (filter modes, wrap modes)
+// is packed into the drawHeader's formatBits and consumed by the
+// shader, not bound as a per-RO GPUSampler. So the heap path doesn't
+// care whether the user handed in a descriptor or a pre-resolved
+// sampler; both are equivalent at this level.
+const isHeapServableSampler = (_s: ISampler): boolean => true;
 
 /**
  * Heap-servability check for a single texture value. Returns `true`
@@ -161,7 +168,7 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
   return AVal.custom(token => {
     for (const av of buffers)  if (!isHostBuffer(av.getValue(token)))         return false;
     for (const av of textures) if (!isHeapServableTexture(av.getValue(token))) return false;
-    for (const av of samplers) if (!isGpuSampler(av.getValue(token)))          return false;
+    for (const av of samplers) if (!isHeapServableSampler(av.getValue(token))) return false;
     const dc = ro.drawCall.getValue(token);
     if (dc.kind !== "indexed") return false;
     if (dc.instanceCount !== 1) return false;
