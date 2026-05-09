@@ -677,10 +677,26 @@ function byteOffsetOf(byteOffset: number): { u32: number } {
  *   - FS uniform substitution still TBD — falls back to current
  *     regex rewriter for FS until the cross-stage threading is wired.
  */
+/**
+ * Emission mode for `compileHeapEffectIR`.
+ *
+ *   - `"standalone"` (default): emit a self-contained pipeline. The VS
+ *     entry takes `@builtin(vertex_index) emitIdx` and runs the megacall
+ *     binary-search prelude inline; storage-buffer bindings 4..6 for
+ *     drawTable / indexStorage / firstDrawInTile are appended.
+ *   - `"family-member"`: emit a VS entry shaped to be invoked from a
+ *     family wrapper. The wrapper performs the megacall search and
+ *     passes `heap_drawIdx`, `instId`, `vid` down. The emitted entry
+ *     becomes `@vertex fn vs(heap_drawIdx: u32, instId: u32, vid: u32)`;
+ *     no megacall prelude or bindings 4..6 are emitted at this level.
+ */
+export type HeapEffectEmitMode = "standalone" | "family-member";
+
 export function compileHeapEffectIR(
   userEffect: Effect,
   layout: BucketLayout,
   compileOptions: CompileOptions,
+  mode: HeapEffectEmitMode = "standalone",
 ): { vs: string; fs: string; preludeWgsl: string; vsEntry: string; fsEntry: string } {
   // VS-side input/uniform substitution: pure read-rewrites, expressed
   // via the Effect.substitute API. Vertex stages read uniforms and
@@ -729,7 +745,9 @@ export function compileHeapEffectIR(
   let vsSrc = vsStage?.source ?? "";
   let fsSrc = fsStage?.source ?? "";
   if (vsSrc.length > 0) {
-    vsSrc = applyMegacallToEmittedVs(vsSrc);
+    vsSrc = mode === "family-member"
+      ? applyFamilyMemberShape(vsSrc)
+      : applyMegacallToEmittedVs(vsSrc);
   }
   if (layout.atlasTextureBindings.size > 0) {
     // Strip user-emitted texture/sampler binding decls for atlas-routed
@@ -899,6 +917,75 @@ function applyMegacallToEmittedVs(vs: string): string {
   s = s.slice(0, headerStart) + newHeader + s.slice(headerEnd);
   s = threadMegacallParamsThroughHelpers(s);
   return decl + s;
+}
+
+/**
+ * Family-member shape: the wrapper performs the megacall binary search
+ * and invokes this VS as a regular function, passing `heap_drawIdx`,
+ * `instId`, and `vid` as plain `u32` parameters. We rewrite the emitted
+ * @vertex signature so its first three params are exactly those names
+ * (no `@builtin` decorations), and inject local aliases so any body
+ * references to `vertex_index` / `instance_index` (the names produced
+ * by IR `Builtin` reads + `injectVsBuiltins`) resolve to the new
+ * parameters.
+ *
+ * The megacall storage-buffer bindings (drawTable / indexStorage /
+ * firstDrawInTile) are NOT emitted — the wrapper module owns them.
+ *
+ * `threadMegacallParamsThroughHelpers` is run unchanged: helper fns
+ * extracted by composeStages may still reference `heap_drawIdx`,
+ * `instId`, `vid` after CSE; threading the params is a pure text walk
+ * and does not depend on the entry shape.
+ */
+function applyFamilyMemberShape(vs: string): string {
+  let s = vs;
+  // Locate the @vertex fn header, then balance parens manually since
+  // params can carry `@builtin(name)` decorations.
+  const startRe = /@vertex\s+fn\s+(\w+)\s*\(/;
+  const startMatch = s.match(startRe);
+  if (startMatch === null) return s;
+  const fnName = startMatch[1]!;
+  const paramOpen = startMatch.index! + startMatch[0]!.length;
+  let depth = 1;
+  let i = paramOpen;
+  for (; i < s.length && depth > 0; i++) {
+    const c = s[i];
+    if (c === "(") depth++;
+    else if (c === ")") depth--;
+  }
+  if (depth !== 0) return s;
+  const paramList = s.slice(paramOpen, i - 1);
+  const tailRe = /\s*->\s*([\w<>,\s]+?)\s*\{/y;
+  tailRe.lastIndex = i;
+  const tailMatch = tailRe.exec(s);
+  if (tailMatch === null) return s;
+  const retType = tailMatch[1]!.trim();
+  const headerEnd = tailRe.lastIndex;
+  const headerStart = startMatch.index!;
+  const params = paramList.split(",").map(p => p.trim()).filter(p => p.length > 0);
+  // Drop the megacall builtins; user-declared params (carrying
+  // @location/etc decorations) are preserved.
+  const kept: string[] = [];
+  for (const p of params) {
+    if (/@builtin\(\s*instance_index\s*\)/.test(p)) continue;
+    if (/@builtin\(\s*vertex_index\s*\)/.test(p)) continue;
+    kept.push(p);
+  }
+  // The three megacall values arrive as plain u32 parameters from the
+  // wrapper. We list them first so the calling convention is stable
+  // regardless of any user-declared params the IR may have left in
+  // place (in practice there are none for the heap path).
+  const newParamList = ["heap_drawIdx: u32", "instId: u32", "vid: u32", ...kept].join(", ");
+  // Body aliases: IR-emitted body code reads `vertex_index` and
+  // `instance_index` (the names of the @builtin params standalone mode
+  // adds). Re-bind those names to the incoming `vid` / `instId`.
+  const bodyAliases =
+    `  let instance_index: u32 = instId;\n` +
+    `  let vertex_index: u32 = vid;\n`;
+  const newHeader = `@vertex fn ${fnName}(${newParamList}) -> ${retType} {\n${bodyAliases}`;
+  s = s.slice(0, headerStart) + newHeader + s.slice(headerEnd);
+  s = threadMegacallParamsThroughHelpers(s);
+  return s;
 }
 
 /**
