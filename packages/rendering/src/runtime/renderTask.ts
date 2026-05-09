@@ -45,10 +45,10 @@ export interface RuntimeContext {
    */
   readonly heapEnabled?: aval<boolean>;
   /**
-   * §6 family-merge bypass — propagated to every HybridScene
-   * compiled against this context. Default: merge on.
+   * §6 family-merge opt-in — propagated to every HybridScene
+   * compiled against this context. Default: merge off.
    */
-  readonly disableFamilyMerge?: boolean;
+  readonly enableFamilyMerge?: boolean;
 }
 
 class RenderTask implements IRenderTask {
@@ -150,7 +150,7 @@ class RenderTask implements IRenderTask {
       s = compileHybridScene(this.ctx.device, this.signature, tree, {
         compileEffect: this.ctx.compileEffect,
         ...(this.ctx.heapEnabled !== undefined ? { heapEnabled: this.ctx.heapEnabled } : {}),
-        ...(this.ctx.disableFamilyMerge === true ? { disableFamilyMerge: true } : {}),
+        ...(this.ctx.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
       });
       this._scenes.set(cmd, s);
     }

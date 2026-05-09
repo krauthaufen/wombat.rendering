@@ -76,10 +76,11 @@ export interface CompileHybridSceneOptions {
    */
   readonly heapEnabled?: aval<boolean>;
   /**
-   * §6 family-merge bypass — pass-through to `BuildHeapSceneOptions`.
-   * When true, each effect lands in its own bucket / shader / pipeline.
+   * §6 family-merge opt-in — pass-through to `BuildHeapSceneOptions`.
+   * When true, all effects collapse into one bucket per pipelineState.
+   * Default false (per-effect buckets).
    */
-  readonly disableFamilyMerge?: boolean;
+  readonly enableFamilyMerge?: boolean;
 }
 
 export interface HybridScene {
@@ -183,7 +184,7 @@ export function compileHybridScene(
   const heapScene: HeapScene = buildHeapScene(device, signature, heapSpecAset, {
     fragmentOutputLayout,
     atlasPool,
-    ...(opts.disableFamilyMerge === true ? { disableFamilyMerge: true } : {}),
+    ...(opts.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
   });
 
   // ─── Legacy subset → RenderTree → ScenePass ──────────────────────

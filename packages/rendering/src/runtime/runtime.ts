@@ -25,12 +25,14 @@ export interface RuntimeOptions {
    */
   readonly heapEnabled?: aval<boolean>;
   /**
-   * §6 family-merge bypass. When `true`, each effect lands in its
-   * own bucket / shader module / pipeline (no layoutId switch
-   * dispatch). Useful for A/B perf comparison against the merged
-   * path. Default: merge on.
+   * §6 family-merge opt-in. When `true`, all heap-eligible effects
+   * collapse into one bucket per pipelineState via layoutId-switch
+   * dispatch. Default `false`: each effect lands in its own bucket /
+   * shader / pipeline. Per-effect bucketing is at-or-better than
+   * merged on tested workloads; merge stays opt-in until the v2
+   * trace-based auto-trigger lands.
    */
-  readonly disableFamilyMerge?: boolean;
+  readonly enableFamilyMerge?: boolean;
 }
 
 /**
@@ -65,7 +67,7 @@ export class Runtime {
         fragmentOutputLayout: layoutFromSignature(sig),
       })),
       ...(opts.heapEnabled !== undefined ? { heapEnabled: opts.heapEnabled } : {}),
-      ...(opts.disableFamilyMerge === true ? { disableFamilyMerge: true } : {}),
+      ...(opts.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
     };
     // `device.lost` is a real-WebGPU promise; mock devices may not
     // expose it. Treat as "never lost" in that case.

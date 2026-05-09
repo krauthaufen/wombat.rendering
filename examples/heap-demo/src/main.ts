@@ -400,12 +400,13 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   // through the legacy per-RO renderer — handy for A/B perf comparisons.
   const heapOnParam = new URLSearchParams(location.search).get("heap-on");
   const heapEnabled = cval(heapOnParam === null || heapOnParam === "1");
-  // `?merge=0` disables §6 family-merge — each effect lands in its own
-  // bucket / shader module / pipeline. Used for A/B perf comparison
-  // against the merged path.
+  // `?merge=1` enables §6 family-merge (one bucket per pipelineState
+  // via layoutId-switch dispatch). Default is per-effect buckets —
+  // empirically at-or-better than merged on tested workloads at
+  // 10K–30K small ROs across 8 effects.
   const mergeParam = new URLSearchParams(location.search).get("merge");
-  const disableFamilyMerge = mergeParam === "0";
-  const runtime = new Runtime({ device, heapEnabled, disableFamilyMerge });
+  const enableFamilyMerge = mergeParam === "1";
+  const runtime = new Runtime({ device, heapEnabled, enableFamilyMerge });
 
   const bBox = bundleOf(rawBox);
   const bSph = bundleOf(rawSph);

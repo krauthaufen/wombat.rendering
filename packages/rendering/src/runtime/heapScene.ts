@@ -1236,14 +1236,15 @@ export interface BuildHeapSceneOptions {
    */
   readonly atlasPool?: AtlasPool;
   /**
-   * §6 family-merge bypass — when true, build ONE family per distinct
-   * effect (each containing exactly that effect, layoutId=0 always).
-   * Bucket key partitions by effect's family.id so each effect lands
-   * in its own bucket / shader module / pipeline. Recovers the
-   * pre-merge baseline for perf comparison against the merged path.
-   * Default false (single merged family across all effects).
+   * §6 family-merge opt-in — when true, build ONE family covering all
+   * effects in the scene, with a single bucket per pipelineState.
+   * Default false: each effect lands in its own bucket / shader /
+   * pipeline (the simpler baseline). Empirically the per-effect path
+   * is at-or-better than merged on tested workloads (10K–30K small
+   * ROs across 8 effects); merge stays available as opt-in until the
+   * trace-based auto-trigger lands as v2.
    */
-  readonly disableFamilyMerge?: boolean;
+  readonly enableFamilyMerge?: boolean;
 }
 
 export function buildHeapScene(
@@ -1680,7 +1681,7 @@ export function buildHeapScene(
   }
   const familyByEffect = new Map<Effect, FamilyState>();
   let familyBuilt = false;
-  const disableFamilyMerge = opts.disableFamilyMerge === true;
+  const enableFamilyMerge = opts.enableFamilyMerge === true;
 
   function compileFamilyFor(
     effects: readonly Effect[],
@@ -1737,18 +1738,19 @@ export function buildHeapScene(
       }
       if (!seen.has(e)) { seen.add(e); unique.push(e); }
     }
-    if (disableFamilyMerge) {
-      // One family per effect — no shared layoutId switch, no merge.
-      // Useful for perf comparison against the merged path.
+    if (enableFamilyMerge) {
+      const merged = compileFamilyFor(unique, perInstanceByEffect);
+      for (const e of unique) familyByEffect.set(e, merged);
+    } else {
+      // Default: one family per effect — no shared layoutId switch.
+      // Per-effect bucketing is at-or-better than merged on tested
+      // workloads; merge stays opt-in pending trace-based v2.
       for (const e of unique) {
         const perI = perInstanceByEffect.get(e);
         const singleMap = new Map<Effect, { attributes: Set<string>; uniforms: Set<string> }>();
         if (perI !== undefined) singleMap.set(e, perI);
         familyByEffect.set(e, compileFamilyFor([e], singleMap));
       }
-    } else {
-      const merged = compileFamilyFor(unique, perInstanceByEffect);
-      for (const e of unique) familyByEffect.set(e, merged);
     }
     familyBuilt = true;
   }

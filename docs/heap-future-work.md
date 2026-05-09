@@ -598,9 +598,21 @@ schemas at all. Each effect keeps its native drawHeader layout. The
 machinery that gets shared is the storage and the dispatch, not the
 data format.
 
-### v1 PoC scope (agreed 2026-05-09) ✅ SHIPPED
+### v1 PoC scope (agreed 2026-05-09) ✅ SHIPPED — opt-in only
 
-The proof-of-concept implements the strong form: **bucket key
+**Status update 2026-05-09 (post-measurement):** family-merge is
+shipped and works correctly, but on tested workloads (10K–30K ROs
+across 8 effects) per-effect bucketing is at-or-better. The merge
+overhead per fragment/vertex (layoutId-switch dispatch + helper-state
+copies + uvec4 ref-pack varyings) outweighs the encode-CPU savings
+from collapsing bucket count. **Default flipped to per-effect
+buckets**; merge stays selectable via `BuildHeapSceneOptions.
+enableFamilyMerge: true` (URL flag `?merge=1` in heap-demo) until
+the v2 trace-based auto-trigger lands — at that point the runtime
+decides per-bucket-population whether to merge based on observed
+draw shape.
+
+The original v1 PoC implemented the strong form: **bucket key
 reduces to `(familyId, pipelineState)`**. `effect`, `textureSet`,
 and `perInstanceAttrSet` all fold inside the family via layoutId
 dispatch. Concretely:

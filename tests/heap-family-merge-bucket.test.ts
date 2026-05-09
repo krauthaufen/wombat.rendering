@@ -104,14 +104,27 @@ function texturedSpec(
 }
 
 describe("§6 family-merge — bucket collapse (slice 3c)", () => {
-  it("two effects (textured + non-textured) at one pipelineState → 1 bucket", () => {
+  it("two effects (textured + non-textured) at one pipelineState → 1 bucket (merge enabled)", () => {
+    const gpu = new MockGPU();
+    const pool = new AtlasPool(gpu.device);
+    const plain = plainSpec(makeHeapTestEffect());
+    const tex   = texturedSpec(makeHeapTestEffectTextured(), pool);
+    const scene = buildHeapScene(gpu.device, sig(), [plain, tex], {
+      atlasPool: pool, enableFamilyMerge: true,
+    });
+    expect(scene.stats.groups).toBe(1);
+    // Ensure update path runs without throwing.
+    scene.update(AdaptiveToken.top);
+  });
+
+  it("two effects at one pipelineState → 2 buckets (merge default-off)", () => {
     const gpu = new MockGPU();
     const pool = new AtlasPool(gpu.device);
     const plain = plainSpec(makeHeapTestEffect());
     const tex   = texturedSpec(makeHeapTestEffectTextured(), pool);
     const scene = buildHeapScene(gpu.device, sig(), [plain, tex], { atlasPool: pool });
-    expect(scene.stats.groups).toBe(1);
-    // Ensure update path runs without throwing.
+    // Default per-effect bucketing — 2 distinct effects → 2 buckets.
+    expect(scene.stats.groups).toBe(2);
     scene.update(AdaptiveToken.top);
   });
 
@@ -119,7 +132,9 @@ describe("§6 family-merge — bucket collapse (slice 3c)", () => {
     const gpu = new MockGPU();
     const pool = new AtlasPool(gpu.device);
     const plain = plainSpec(makeHeapTestEffect());
-    const scene = buildHeapScene(gpu.device, sig(), [plain], { atlasPool: pool });
+    const scene = buildHeapScene(gpu.device, sig(), [plain], {
+      atlasPool: pool, enableFamilyMerge: true,
+    });
     const stranger = makeHeapTestEffectTextured();
     expect(() => scene.addDraw(texturedSpec(stranger, pool))).toThrow(/family is frozen/);
   });
