@@ -557,3 +557,44 @@ unlocks heterogeneous-texture scenes for the heap path.
 - **CPU-side cache of decoded image data** for fast re-upload after
   eviction. Trades RAM for re-decode cost. Sane defaults: keep
   decoded data for textures < 1 MB; evict from RAM for larger.
+
+## Future work — non-2D textures
+
+The current plan handles 2D textures only. Cubemaps, volumes
+(3D), and texture arrays escalate to the legacy per-RO path via
+`isHeapEligible`. Of these, **cubemaps will eventually want
+atlasing** — environment maps, IBL prefilter chains, and shadow
+cubes are common-enough cases that bucket-per-cubemap will start
+hurting at scale.
+
+**Sketch (when we get there):**
+
+- Each face packs as its own 1.5W × H mip pyramid (same layout as
+  Tier M today). All 6 faces of one cubemap allocate in one
+  contiguous block — most natural is a 6-wide row of pyramids
+  (9W × H per cubemap) or 2×3 grid (3W × 2H), pick whichever the
+  packer is happier with.
+- The drawHeader carries the cubemap's `origin` and per-face
+  `size` (or one face size + a deterministic face layout offset
+  formula). One extra `cubeFaceLayout: u32` field tells the
+  shader which arrangement was chosen, so the math is uniform.
+- Shader: `textureSampleCube(cube, sampler, dir)` rewrites to
+  `atlasSampleCube(...)` which:
+  1. Computes face index + face-local UV from `dir` (standard
+     cubemap math: dominant axis selection, then 2D project).
+  2. Selects the face's region in the atlas via the layout
+     formula.
+  3. Sample as a Tier-M 1.5×1 mip pyramid within that face.
+
+For prefiltered IBL cubemaps with per-mip roughness baking, the
+existing per-face mip pyramid already serves — each mip level is
+a separately-baked roughness layer.
+
+This pulls in shader complexity (cubemap projection math) but no
+new pool/packer infrastructure beyond what Tier M already has.
+
+**Volumes (3D textures) and 2D arrays** stay legacy-only. Volumes
+have no clean atlas story (slicing a 3D dataset into 2D tiles
+breaks trilinear filtering), and 2D arrays are typically used by
+the user precisely because they want array semantics — atlasing
+flattens that abstraction in ways that defeat the purpose.

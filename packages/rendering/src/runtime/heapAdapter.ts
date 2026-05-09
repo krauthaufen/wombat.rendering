@@ -29,11 +29,11 @@
 import { type aval, type AdaptiveToken } from "@aardworx/wombat.adaptive";
 import type { IBuffer, HostBufferSource } from "../core/buffer.js";
 import type { BufferView } from "../core/bufferView.js";
-import { ITexture } from "../core/texture.js";
+import { ITexture, type HostTextureSource } from "../core/texture.js";
 import { ISampler } from "../core/sampler.js";
 import type { RenderObject } from "../core/renderObject.js";
 import type { HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
-import type { AtlasPool } from "./textureAtlas/atlasPool.js";
+import { AtlasPool } from "./textureAtlas/atlasPool.js";
 
 /**
  * View `HostBufferSource` as `Uint32Array`. Index buffers are u32 in
@@ -70,6 +70,78 @@ function indicesAvalFor(ibAval: aval<IBuffer>): aval<Uint32Array> {
 }
 
 /**
+ * Pull `(format, width, height, mipLevelCount)` out of an ITexture so
+ * we can run Tier-S eligibility against it. Both variants expose this:
+ *
+ *   - `kind: "host"` with a `raw` source carries the fields directly
+ *     (`width`, `height`, `format`, optional `mipLevelCount`).
+ *   - `kind: "host"` with an `external` source (`ImageBitmap`,
+ *     `HTMLCanvasElement`, `ImageData`, …) reads `.width`/`.height`
+ *     off the image and uses the source's `format` override (default
+ *     `rgba8unorm`); `generateMips` triggers a >1 mip count.
+ *   - `kind: "gpu"` reads `.format`/`.width`/`.height`/`.mipLevelCount`
+ *     off the resolved `GPUTexture`. Width/height come from the WebGPU
+ *     texture surface; no host source is exposed (the pool can't
+ *     CPU-downscale, so mip generation defers to the existing GPU
+ *     mip chain when wantsMips is true).
+ *
+ * Returns `null` for sources we can't measure (e.g. an `external`
+ * source without dimensions — `HTMLVideoElement` whose readyState
+ * hasn't given us a video frame yet).
+ */
+interface TextureDescriptor {
+  format: GPUTextureFormat;
+  width: number;
+  height: number;
+  mipLevelCount: number;
+  host?: HostTextureSource;
+}
+function describeTexture(t: ITexture): TextureDescriptor | null {
+  if (t.kind === "gpu") {
+    const tex = t.texture;
+    return {
+      format: tex.format,
+      width: tex.width,
+      height: tex.height,
+      mipLevelCount: tex.mipLevelCount,
+    };
+  }
+  const src = t.source;
+  if (src.kind === "raw") {
+    return {
+      format: src.format,
+      width: src.width,
+      height: src.height,
+      mipLevelCount: src.mipLevelCount ?? 1,
+      host: src,
+    };
+  }
+  // external — read width/height off the source. Most types have it,
+  // HTMLVideoElement uses `videoWidth/videoHeight`.
+  const ext = src.source as unknown;
+  let w = 0, h = 0;
+  if (typeof HTMLVideoElement !== "undefined" && ext instanceof HTMLVideoElement) {
+    w = ext.videoWidth; h = ext.videoHeight;
+  } else if (
+    typeof ImageData !== "undefined" && ext instanceof ImageData
+  ) {
+    w = ext.width; h = ext.height;
+  } else {
+    const any = ext as { width?: number; height?: number };
+    w = any.width ?? 0;
+    h = any.height ?? 0;
+  }
+  if (w <= 0 || h <= 0) return null;
+  return {
+    format: src.format ?? "rgba8unorm",
+    width: w,
+    height: h,
+    mipLevelCount: src.generateMips ? Math.floor(Math.log2(Math.max(w, h))) + 1 : 1,
+    host: src,
+  };
+}
+
+/**
  * Convert a heap-eligible `RenderObject` into a `HeapDrawSpec`. The
  * caller (hybrid render task) is responsible for ensuring eligibility
  * before calling — this adapter throws on any disagreement.
@@ -84,14 +156,6 @@ export function renderObjectToHeapSpec(
   token: AdaptiveToken,
   pool?: AtlasPool,
 ): HeapDrawSpec {
-  // `pool` is reserved for Tier-S atlas classification (see
-  // `docs/heap-textures-plan.md`). MVP behaviour: when we cannot
-  // confidently determine the source's format AND dimensions at
-  // adapter time, we fall back to Tier L (standalone) — the safe
-  // default that preserves today's behaviour. The next PR teaches
-  // the adapter to consult `pool.eligibleFormat` / `eligibleSize`
-  // and produce `{ kind: "atlas", ... }` for Tier-S sources.
-  void pool;
   // 1. Inputs map: vertex attributes (BufferView) + uniforms.
   const inputs: { [name: string]: aval<unknown> | unknown } = {};
   ro.vertexAttributes.iter((name, bv: BufferView) => { inputs[name] = bv; });
@@ -108,30 +172,75 @@ export function renderObjectToHeapSpec(
   //    counts at 1 each.
   let textures: HeapTextureSet | undefined;
   if (ro.textures.count === 1 && ro.samplers.count === 1) {
-    let texture: GPUTexture | undefined;
-    let sampler: GPUSampler | undefined;
+    let texAval: aval<unknown> | undefined;
+    let texVal: ITexture | undefined;
+    let samplerAval: aval<unknown> | undefined;
+    let samplerVal: ISampler | undefined;
     ro.textures.iter((_n, av) => {
-      const t = av.getValue(token) as ITexture;
-      if (t.kind !== "gpu") {
-        throw new Error("heapAdapter: texture kind != 'gpu'; classifier should have caught this");
-      }
-      texture = t.texture;
+      texAval = av;
+      texVal = av.getValue(token) as ITexture;
     });
     ro.samplers.iter((_n, av) => {
-      const s = av.getValue(token) as ISampler;
-      if (s.kind !== "gpu") {
-        throw new Error("heapAdapter: sampler kind != 'gpu'; classifier should have caught this");
-      }
-      sampler = s.sampler;
+      samplerAval = av;
+      samplerVal = av.getValue(token) as ISampler;
     });
-    // MVP: Tier L only. Atlas classification is gated on knowing
-    // the source format + dims, which the resolved GPUTexture
-    // doesn't expose portably here — see the `pool` comment above.
-    textures = {
-      kind: "standalone",
-      texture: ITexture.fromGPU(texture!),
-      sampler: ISampler.fromGPU(sampler!),
-    };
+    void samplerAval;
+    if (texVal === undefined || samplerVal === undefined) {
+      throw new Error("heapAdapter: missing texture/sampler value");
+    }
+
+    // Inspect format/dimensions/mipLevels from ITexture. Both
+    // variants expose enough to classify:
+    //   - kind: "host" → carries width/height/format on the source
+    //     descriptor (raw) or implicit (external; default rgba8unorm).
+    //   - kind: "gpu"  → resolved GPUTexture exposes .format/.width/
+    //     .height/.mipLevelCount.
+    const dims = describeTexture(texVal);
+
+    // Tier-S routing: pool present, format eligible, dims ≤ cap. Mips
+    // are honoured if the source advertises them.
+    const atlasFormat = dims === null ? null : AtlasPool.eligibleFormat(dims.format);
+    if (
+      pool !== undefined &&
+      dims !== null &&
+      atlasFormat !== null &&
+      AtlasPool.eligibleSize(dims.width, dims.height)
+    ) {
+      const wantsMips = dims.mipLevelCount > 1;
+      const acq = pool.acquire(
+        atlasFormat,
+        texAval as aval<ITexture>,
+        dims.width,
+        dims.height,
+        {
+          wantsMips,
+          ...(dims.host !== undefined ? { source: { width: dims.width, height: dims.height, host: dims.host } } : {}),
+        },
+      );
+      textures = {
+        kind: "atlas",
+        format: atlasFormat,
+        pageId: acq.pageId,
+        origin: acq.origin,
+        size: acq.size,
+        numMips: acq.numMips,
+        sampler: samplerVal,
+      };
+    } else {
+      // Tier-L fallback: keep the existing standalone path, which
+      // requires a resolved GPUTexture/GPUSampler.
+      if (texVal.kind !== "gpu") {
+        throw new Error("heapAdapter: standalone path requires ITexture.kind === 'gpu'");
+      }
+      if (samplerVal.kind !== "gpu") {
+        throw new Error("heapAdapter: standalone path requires ISampler.kind === 'gpu'");
+      }
+      textures = {
+        kind: "standalone",
+        texture: ITexture.fromGPU(texVal.texture),
+        sampler: ISampler.fromGPU(samplerVal.sampler),
+      };
+    }
   } else if (ro.textures.count > 0 || ro.samplers.count > 0) {
     throw new Error(
       `heapAdapter: RO has ${ro.textures.count} texture(s) and ${ro.samplers.count} sampler(s); ` +

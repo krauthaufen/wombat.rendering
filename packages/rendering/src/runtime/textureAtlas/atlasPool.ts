@@ -6,22 +6,27 @@
 // same texture share one sub-rect; refcount drives free-on-release.
 //
 // MVP scope (per docs/heap-textures-plan.md):
-//   - Tier S only: source ≤ 1024×1024, no mip chain.
+//   - Tier S/M: source ≤ 1024×1024.
 //   - Two formats: rgba8unorm, rgba8unorm-srgb. Each format has its
 //     own page set (separate `binding_array` in the bind group).
 //   - Pages are independent GPUTextures, NOT a texture_2d_array.
 //   - No eviction. No grow-copy.
 //
+// Mipped textures use the classic Iliffe / id Tech 1.5×1 layout: the
+// packer reserves a `1.5W × H` rect, mip 0 occupies the left W×H block
+// and mips 1..N stack vertically in the right W/2-wide column. CPU
+// mip generation (canvas-2d) for v1; compute-shader path is future.
+//
 // When `tryAdd` fails on every existing page in the requested format,
 // a new 4096² page is allocated.
 
-import { V2i } from "@aardworx/wombat.base";
+import { V2f, V2i } from "@aardworx/wombat.base";
 import type { aval } from "@aardworx/wombat.adaptive";
 import type { ITexture, HostTextureSource } from "../../core/texture.js";
 import { TexturePacking } from "./packer.js";
 
 export const ATLAS_PAGE_SIZE = 4096;
-/** Tier S source-side dimension cap. */
+/** Tier S/M source-side dimension cap. */
 export const ATLAS_MAX_DIM = 1024;
 /** Max pages bound per format in one bind group (`binding_array<...,N>`). */
 export const ATLAS_MAX_PAGES_PER_FORMAT = 8;
@@ -47,10 +52,12 @@ export interface AtlasPage {
 export interface AtlasAcquisition {
   /** Page index within the format's page set (0..N-1). */
   readonly pageId: number;
-  /** UV scale for sub-rect — multiply incoming UV (in [0,1]) by this. */
-  readonly uvScale: { readonly x: number; readonly y: number };
-  /** UV bias for sub-rect — add after multiplying by uvScale. */
-  readonly uvBias: { readonly x: number; readonly y: number };
+  /** Top-left of mip 0 in the atlas, in normalized [0,1] coords. */
+  readonly origin: V2f;
+  /** Size of mip 0 in the atlas, in normalized [0,1] coords. */
+  readonly size: V2f;
+  /** Number of mip levels stored for this acquisition (1 = no pyramid). */
+  readonly numMips: number;
   /** Stable refcount handle: pass back to `release`. */
   readonly ref: number;
   /** The page's GPUTexture (so the caller can pin it in the bind group). */
@@ -61,7 +68,11 @@ interface AtlasEntry {
   readonly key: aval<ITexture>;
   readonly format: AtlasPageFormat;
   readonly pageIndex: number;
+  /** Reserved rect in the atlas (covers the full 1.5W×H pyramid for mipped). */
   readonly subRect: { x: number; y: number; w: number; h: number };
+  /** Mip-0 size in atlas pixels (== logical source W×H). */
+  readonly mip0: { w: number; h: number };
+  readonly numMips: number;
   refcount: number;
   /** Stable handle returned to callers. */
   readonly ref: number;
@@ -75,10 +86,55 @@ export interface AtlasSource {
    * The host source for upload. The pool calls
    * `device.queue.copyExternalImageToTexture` (external) or
    * `writeTexture` (raw) into the page region the first time the
-   * sub-rect is allocated.
+   * sub-rect is allocated. For mipped uploads the pool downscales
+   * via canvas-2d and uploads each level into the pyramid sub-region.
    */
   readonly host?: HostTextureSource;
 }
+
+export interface AtlasAcquireOptions {
+  readonly source?: AtlasSource;
+  /** When true, reserve a 1.5W×H rect and store an embedded mip pyramid. */
+  readonly wantsMips?: boolean;
+  /**
+   * Number of mip levels to store. Defaults to
+   * `floor(log2(max(w,h))) + 1` (full chain to 1×1).
+   */
+  readonly numMips?: number;
+}
+
+/**
+ * Default mip count for a `w×h` source: full chain down to 1×1.
+ */
+export const defaultMipCount = (w: number, h: number): number =>
+  Math.floor(Math.log2(Math.max(w, h))) + 1;
+
+/**
+ * Mip-k pixel size given mip-0 size `(w,h)`. Halves each level and
+ * floors at 1×1.
+ */
+export const mipPixelSize = (w: number, h: number, k: number): { w: number; h: number } => ({
+  w: Math.max(1, w >> k),
+  h: Math.max(1, h >> k),
+});
+
+/**
+ * Mip-k offset within the embedded 1.5×1 pyramid relative to the
+ * pyramid's top-left. Mip 0 is at (0,0). Mips 1..N stack vertically
+ * in the right column starting at x=W with cumulative y offsets:
+ *   y_k = sum_{j=1..k-1} (H >> j).
+ * Caller uses max(1, ...) clamping to track 1px-floor mips.
+ */
+export const mipOffsetInPyramid = (
+  w: number,
+  h: number,
+  k: number,
+): { x: number; y: number } => {
+  if (k === 0) return { x: 0, y: 0 };
+  let y = 0;
+  for (let j = 1; j < k; j++) y += Math.max(1, h >> j);
+  return { x: w, y };
+};
 
 /**
  * Aval-identity keyed pool over the per-format page sets. Multiple
@@ -117,16 +173,17 @@ export class AtlasPool {
 
   /**
    * Acquire (or share) a sub-rect. The returned `AtlasAcquisition`
-   * gives the page index within `pagesFor(format)` plus the UV
-   * transform. If the texture is already known (same aval), refcount
-   * bumps and we return the existing placement.
+   * gives the page index within `pagesFor(format)` plus the mip-0
+   * `origin`/`size` (in normalized atlas coords) and `numMips`. If
+   * the texture is already known (same aval), refcount bumps and we
+   * return the existing placement.
    */
   acquire(
     format: AtlasPageFormat,
     sourceAval: aval<ITexture>,
     width: number,
     height: number,
-    options: { source?: AtlasSource } = {},
+    opts: AtlasAcquireOptions = {},
   ): AtlasAcquisition {
     const existing = this.entriesByAval.get(sourceAval);
     if (existing !== undefined) {
@@ -134,8 +191,22 @@ export class AtlasPool {
       return this.makeResult(existing);
     }
 
+    const wantsMips = opts.wantsMips === true;
+    const numMips = wantsMips
+      ? Math.max(1, Math.min(opts.numMips ?? defaultMipCount(width, height),
+                             defaultMipCount(width, height)))
+      : 1;
+
+    // For mipped textures, reserve a 1.5W × H rect; otherwise W × H.
+    // The 1-pixel padding referenced in the design lives outside the
+    // stored size — packer-level padding is not currently applied
+    // (matches the previous non-mipped behaviour); add it uniformly
+    // when we wire bilinear bleed handling.
+    const reservedW = wantsMips ? Math.ceil(width * 1.5) : width;
+    const reservedH = height;
+    const size = new V2i(reservedW, reservedH);
+
     const pages = this.pagesByFormat.get(format)!;
-    const size = new V2i(width, height);
 
     // Try fitting into existing pages first.
     for (let i = 0; i < pages.length; i++) {
@@ -143,7 +214,7 @@ export class AtlasPool {
       const next = page.packing.tryAdd(this.nextRef, size);
       if (next !== null) {
         page.packing = next;
-        return this.finalize(sourceAval, format, i, page, options.source);
+        return this.finalize(sourceAval, format, i, page, opts.source, width, height, numMips);
       }
     }
 
@@ -163,13 +234,13 @@ export class AtlasPool {
     const placed = packing.tryAdd(this.nextRef, size);
     if (placed === null) {
       throw new Error(
-        `AtlasPool: ${width}×${height} doesn't fit a fresh ${ATLAS_PAGE_SIZE}² page`,
+        `AtlasPool: ${reservedW}×${reservedH} doesn't fit a fresh ${ATLAS_PAGE_SIZE}² page`,
       );
     }
     packing = placed;
     const page: AtlasPage = { format, texture: tex, packing, pageIndex };
     pages.push(page);
-    return this.finalize(sourceAval, format, pageIndex, page, options.source);
+    return this.finalize(sourceAval, format, pageIndex, page, opts.source, width, height, numMips);
   }
 
   /** Decrement the refcount; on zero, free the sub-rect. */
@@ -201,6 +272,9 @@ export class AtlasPool {
     pageIndex: number,
     page: AtlasPage,
     source: AtlasSource | undefined,
+    mip0W: number,
+    mip0H: number,
+    numMips: number,
   ): AtlasAcquisition {
     const ref = this.nextRef++;
     const placed = page.packing.used.get(ref);
@@ -216,18 +290,57 @@ export class AtlasPool {
       format,
       pageIndex,
       subRect: { x, y, w, h },
+      mip0: { w: mip0W, h: mip0H },
+      numMips,
       refcount: 1,
       ref,
     };
     this.entriesByAval.set(aval, entry);
     this.entriesByRef.set(ref, entry);
     if (source !== undefined && source.host !== undefined) {
-      this.upload(page, x, y, source.host, w, h);
+      this.upload(page, x, y, source.host, mip0W, mip0H, numMips);
     }
     return this.makeResult(entry);
   }
 
   private upload(
+    page: AtlasPage,
+    x: number,
+    y: number,
+    host: HostTextureSource,
+    w: number,
+    h: number,
+    numMips: number,
+  ): void {
+    // Mip 0 always lands at (x, y) with size w×h.
+    this.uploadLevel(page, x, y, host, w, h);
+    if (numMips <= 1) return;
+
+    // Mip k≥1: downscale via canvas-2d, upload at the pyramid offset.
+    // Source for downscaling: the original ImageBitmap/Canvas/etc. for
+    // `external`; a freshly created ImageData for `raw`.
+    const src = this.toDrawable(host, w, h);
+    if (src === null) {
+      // Headless / unsupported source — skip mip generation; level 0
+      // is still in place. Callers that need mips should provide a
+      // host source the pool can render-2d.
+      return;
+    }
+    for (let k = 1; k < numMips; k++) {
+      const off = mipOffsetInPyramid(w, h, k);
+      const mw = Math.max(1, w >> k);
+      const mh = Math.max(1, h >> k);
+      const mip = this.makeMipCanvas(src, mw, mh);
+      if (mip === null) continue;
+      this.device.queue.copyExternalImageToTexture(
+        { source: mip as GPUImageCopyExternalImageSource },
+        { texture: page.texture, origin: { x: x + off.x, y: y + off.y } },
+        { width: mw, height: mh, depthOrArrayLayers: 1 },
+      );
+    }
+  }
+
+  private uploadLevel(
     page: AtlasPage,
     x: number,
     y: number,
@@ -257,13 +370,82 @@ export class AtlasPool {
     );
   }
 
+  /**
+   * Produce a `CanvasImageSource` we can feed to `drawImage` for
+   * downscaling. Returns null when the runtime can't synthesise one
+   * (no DOM / OffscreenCanvas / ImageBitmap support).
+   */
+  private toDrawable(
+    host: HostTextureSource,
+    w: number,
+    h: number,
+  ): CanvasImageSource | null {
+    if (host.kind === "external") {
+      const s = host.source as unknown;
+      // ImageBitmap / HTMLCanvasElement / HTMLImageElement / OffscreenCanvas /
+      // HTMLVideoElement / ImageData (last needs a wrapping canvas).
+      if (typeof ImageData !== "undefined" && s instanceof ImageData) {
+        return this.imageDataToCanvas(s);
+      }
+      return s as CanvasImageSource;
+    }
+    // raw — synthesise an ImageData and wrap in a canvas.
+    if (typeof ImageData === "undefined") return null;
+    const bytes = host.data instanceof ArrayBuffer
+      ? new Uint8Array(host.data)
+      : new Uint8Array(host.data.buffer, host.data.byteOffset, host.data.byteLength);
+    const out = new Uint8ClampedArray(bytes.length);
+    out.set(bytes);
+    const img = new ImageData(out, w, h);
+    return this.imageDataToCanvas(img);
+  }
+
+  private imageDataToCanvas(img: ImageData): CanvasImageSource | null {
+    const c = this.makeCanvas(img.width, img.height);
+    if (c === null) return null;
+    const ctx = c.getContext("2d");
+    if (ctx === null) return null;
+    (ctx as CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D).putImageData(img, 0, 0);
+    return c as unknown as CanvasImageSource;
+  }
+
+  private makeMipCanvas(
+    src: CanvasImageSource,
+    w: number,
+    h: number,
+  ): CanvasImageSource | null {
+    const c = this.makeCanvas(w, h);
+    if (c === null) return null;
+    const ctx = c.getContext("2d") as
+      | CanvasRenderingContext2D
+      | OffscreenCanvasRenderingContext2D
+      | null;
+    if (ctx === null) return null;
+    ctx.imageSmoothingEnabled = true;
+    (ctx as CanvasRenderingContext2D).imageSmoothingQuality = "high";
+    ctx.drawImage(src, 0, 0, w, h);
+    return c as unknown as CanvasImageSource;
+  }
+
+  private makeCanvas(w: number, h: number): HTMLCanvasElement | OffscreenCanvas | null {
+    if (typeof OffscreenCanvas !== "undefined") return new OffscreenCanvas(w, h);
+    if (typeof document !== "undefined") {
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      return c;
+    }
+    return null;
+  }
+
   private makeResult(e: AtlasEntry): AtlasAcquisition {
     const page = this.pagesByFormat.get(e.format)![e.pageIndex]!;
     const inv = 1.0 / ATLAS_PAGE_SIZE;
     return {
       pageId: e.pageIndex,
-      uvScale: { x: e.subRect.w * inv, y: e.subRect.h * inv },
-      uvBias: { x: e.subRect.x * inv, y: e.subRect.y * inv },
+      origin: new V2f(e.subRect.x * inv, e.subRect.y * inv),
+      size: new V2f(e.mip0.w * inv, e.mip0.h * inv),
+      numMips: e.numMips,
       ref: e.ref,
       page,
     };

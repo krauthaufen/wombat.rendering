@@ -1042,11 +1042,13 @@ export interface HeapScene {
  * Discriminated union, in preparation for the texture-atlas
  * integration (see `docs/heap-textures-plan.md`):
  *   - `standalone` — Tier L; one `GPUTexture` per source. Today's path.
- *   - `atlas`      — Tier S; the texture lives as a sub-rect of an
+ *   - `atlas`      — Tier S/M; the texture lives as a sub-rect of an
  *                    `AtlasPool` page, identified by `(format, pageId)`
- *                    plus `(uvScale, uvBias)`. NOT YET WIRED through
- *                    the heap path; the BGL/bind-group/drawHeader work
- *                    lands in a follow-up PR.
+ *                    plus mip-0 `(origin, size)` in normalized atlas
+ *                    coords and `numMips` (1 = no embedded pyramid;
+ *                    >1 = 1.5×1 Iliffe pyramid stored in the page).
+ *                    NOT YET WIRED through the heap path; the BGL/
+ *                    bind-group/drawHeader work lands in a follow-up PR.
  */
 export type HeapTextureSet =
   | {
@@ -1059,8 +1061,12 @@ export type HeapTextureSet =
       readonly kind: "atlas";
       readonly format: GPUTextureFormat;
       readonly pageId: number;
-      readonly uvScale: V2f;
-      readonly uvBias: V2f;
+      /** Top-left of mip-0 in the atlas, normalized [0,1]. */
+      readonly origin: V2f;
+      /** Size of mip-0 in the atlas, normalized [0,1]. */
+      readonly size: V2f;
+      /** Mip-level count stored at this acquisition (1 = no pyramid). */
+      readonly numMips: number;
       readonly sampler: ISampler;
     };
 
