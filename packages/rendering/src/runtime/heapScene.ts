@@ -1235,6 +1235,15 @@ export interface BuildHeapSceneOptions {
    * variant `HeapTextureSet`.
    */
   readonly atlasPool?: AtlasPool;
+  /**
+   * §6 family-merge bypass — when true, build ONE family per distinct
+   * effect (each containing exactly that effect, layoutId=0 always).
+   * Bucket key partitions by effect's family.id so each effect lands
+   * in its own bucket / shader module / pipeline. Recovers the
+   * pre-merge baseline for perf comparison against the merged path.
+   * Default false (single merged family across all effects).
+   */
+  readonly disableFamilyMerge?: boolean;
 }
 
 export function buildHeapScene(
@@ -1657,17 +1666,50 @@ export function buildHeapScene(
   // Bucket key collapses to (familyId, pipelineState): every effect
   // in the family shares one bucket per pipelineState. The family
   // VS/FS dispatches to per-effect helpers via `layoutId`.
-  let family: ShaderFamilySchema | undefined;
-  let familyVsModule: GPUShaderModule | undefined;
-  let familyFsModule: GPUShaderModule | undefined;
-  /** Per-effect schemas, indexed by Effect identity for fast lookup in addDraw. */
-  let familyPerEffectSchema: ReadonlyMap<Effect, HeapEffectSchema> | undefined;
-  /** Cached "field name → membership" sets per effect (drawHeader fields the
-   * effect actually populates; everything else stays 0). */
-  let familyFieldsForEffect: Map<Effect, Set<string>> | undefined;
+  /**
+   * Per-family compiled state. With merge enabled, every Effect in
+   * `familyByEffect` points at the same `FamilyState`. With merge
+   * disabled (`opts.disableFamilyMerge`), each Effect gets its own
+   * single-member family + its own shader module + pipeline.
+   */
+  interface FamilyState {
+    schema: ShaderFamilySchema;
+    vsModule: GPUShaderModule;
+    fsModule: GPUShaderModule;
+    fieldsForEffect: Map<Effect, Set<string>>;
+  }
+  const familyByEffect = new Map<Effect, FamilyState>();
+  let familyBuilt = false;
+  const disableFamilyMerge = opts.disableFamilyMerge === true;
+
+  function compileFamilyFor(
+    effects: readonly Effect[],
+    perInstanceByEffect: ReadonlyMap<Effect, { attributes: Set<string>; uniforms: Set<string> }>,
+  ): FamilyState {
+    const schema = buildShaderFamily(
+      effects, opts.fragmentOutputLayout, undefined,
+      {
+        atlasizeAllTextures: atlasPool !== undefined,
+        perEffectPerInstance: perInstanceByEffect,
+      },
+    );
+    const compiled = compileShaderFamily(schema, opts.fragmentOutputLayout);
+    const vsModule = device.createShaderModule({ code: compiled.vs, label: `heapScene/family/${schema.id}/vs` });
+    const fsModule = device.createShaderModule({ code: compiled.fs, label: `heapScene/family/${schema.id}/fs` });
+    const fieldsForEffect = new Map<Effect, Set<string>>();
+    for (const e of schema.effects) {
+      const s = schema.perEffectSchema.get(e)!;
+      const fields = new Set<string>();
+      for (const a of s.attributes) fields.add(a.name);
+      for (const u of s.uniforms)   fields.add(u.name);
+      for (const t of s.textures)   fields.add(t.name);
+      fieldsForEffect.set(e, fields);
+    }
+    return { schema, vsModule, fsModule, fieldsForEffect };
+  }
 
   function buildFamilyFromSpecs(specs: readonly HeapDrawSpec[]): void {
-    if (family !== undefined) return;
+    if (familyBuilt) return;
     if (specs.length === 0) {
       throw new Error("heapScene: cannot build shader family from an empty spec set");
     }
@@ -1676,7 +1718,7 @@ export function buildHeapScene(
     // IR substitution needs `perInstanceAttributes` set on the family
     // layout to address per-instance attribute reads via `instId`
     // instead of `vertex_index` — without this, instanced effects
-    // produce broken geometry (triangles spanning instance boundaries).
+    // produce broken geometry.
     const seen = new Set<Effect>();
     const unique: Effect[] = [];
     const perInstanceByEffect = new Map<Effect, {
@@ -1695,42 +1737,39 @@ export function buildHeapScene(
       }
       if (!seen.has(e)) { seen.add(e); unique.push(e); }
     }
-    family = buildShaderFamily(
-      unique, opts.fragmentOutputLayout, undefined,
-      // Atlas-route every textured effect's bindings when an atlas pool
-      // is in scope (§6 v1 spec point 4). Without a pool, fall back to
-      // standalone texture bindings — the per-effect rare path.
-      {
-        atlasizeAllTextures: atlasPool !== undefined,
-        perEffectPerInstance: perInstanceByEffect,
-      },
-    );
-    const compiled = compileShaderFamily(family, opts.fragmentOutputLayout);
-    familyVsModule = device.createShaderModule({ code: compiled.vs, label: `heapScene/family/${family.id}/vs` });
-    familyFsModule = device.createShaderModule({ code: compiled.fs, label: `heapScene/family/${family.id}/fs` });
-    familyPerEffectSchema = family.perEffectSchema;
-    familyFieldsForEffect = new Map();
-    for (const e of family.effects) {
-      const s = family.perEffectSchema.get(e)!;
-      const fields = new Set<string>();
-      for (const a of s.attributes) fields.add(a.name);
-      for (const u of s.uniforms)   fields.add(u.name);
-      for (const t of s.textures)   fields.add(t.name);
-      familyFieldsForEffect.set(e, fields);
+    if (disableFamilyMerge) {
+      // One family per effect — no shared layoutId switch, no merge.
+      // Useful for perf comparison against the merged path.
+      for (const e of unique) {
+        const perI = perInstanceByEffect.get(e);
+        const singleMap = new Map<Effect, { attributes: Set<string>; uniforms: Set<string> }>();
+        if (perI !== undefined) singleMap.set(e, perI);
+        familyByEffect.set(e, compileFamilyFor([e], singleMap));
+      }
+    } else {
+      const merged = compileFamilyFor(unique, perInstanceByEffect);
+      for (const e of unique) familyByEffect.set(e, merged);
     }
+    familyBuilt = true;
   }
 
-  function ensureFamilyKnowsEffect(effect: Effect): void {
-    if (family === undefined) {
-      throw new Error("heapScene: ensureFamilyKnowsEffect called before family build");
-    }
-    if (!family.layoutIdOf.has(effect)) {
-      const known = [...family.effects].map(e => e.id).join(",");
+  function familyFor(effect: Effect): FamilyState {
+    const f = familyByEffect.get(effect);
+    if (f === undefined) {
+      const known = [...familyByEffect.keys()].map(e => e.id).join(",");
       throw new Error(
         `heapScene: family is frozen; effect ${effect.id} not in {${known}}; ` +
         `reactive family rebuild is v2`,
       );
     }
+    return f;
+  }
+
+  function ensureFamilyKnowsEffect(effect: Effect): void {
+    if (!familyBuilt) {
+      throw new Error("heapScene: ensureFamilyKnowsEffect called before family build");
+    }
+    familyFor(effect); // throws if unknown
   }
 
   // ─── id-of helpers ────────────────────────────────────────────────
@@ -1940,23 +1979,24 @@ export function buildHeapScene(
   // from `family.drawHeaderUnion.atlasTextureBindings.size > 0`.
   void texIdOf; // retained for future per-bucket diagnostics
   function findOrCreateBucket(
-    _effect: Effect,
+    effect: Effect,
     _textures: HeapTextureSet | undefined,
     pipelineState: PipelineState | undefined,
   ): Bucket {
-    if (family === undefined || familyVsModule === undefined || familyFsModule === undefined) {
+    if (!familyBuilt) {
       throw new Error("heapScene: findOrCreateBucket called before family build");
     }
+    const fam = familyFor(effect);
     const psKey = psIdOf(pipelineState);
-    const bk = `family#${family.id}|${psKey}`;
+    const bk = `family#${fam.schema.id}|${psKey}`;
     const existing = bucketByKey.get(bk);
     if (existing !== undefined) return existing;
     const ps = resolvePipelineState(pipelineState);
 
-    const layout: BucketLayout = family.drawHeaderUnion;
+    const layout: BucketLayout = fam.schema.drawHeaderUnion;
     const isAtlasBucket = layout.atlasTextureBindings.size > 0;
-    const vsModule = familyVsModule;
-    const fsModule = familyFsModule;
+    const vsModule = fam.vsModule;
+    const fsModule = fam.fsModule;
     const vsEntry = "family_vs_main";
     const fsEntry = "family_fs_main";
     const { pipelineLayout } = getBgl(layout, isAtlasBucket);
@@ -2223,7 +2263,7 @@ export function buildHeapScene(
     // single spec when no batched lazy-build occurred earlier (e.g.
     // direct addDraw at runtime). The aset / array initial-population
     // paths build from the full effect set up front.
-    if (family === undefined) {
+    if (!familyBuilt) {
       buildFamilyFromSpecs([spec]);
     } else {
       ensureFamilyKnowsEffect(spec.effect);
@@ -2233,7 +2273,8 @@ export function buildHeapScene(
       ? new Set(Object.keys(spec.instanceAttributes))
       : new Set<string>();
     const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState);
-    const effectFields = familyFieldsForEffect!.get(spec.effect)!;
+    const fam = familyFor(spec.effect);
+    const effectFields = fam.fieldsForEffect.get(spec.effect)!;
 
     // Indices live in their own INDEX-usage buffer (WebGPU constraint).
     // Aval-keyed: 19K instanced clones of the same mesh share one
@@ -2324,7 +2365,7 @@ export function buildHeapScene(
     bucket.drawSlots.push(localSlot);
     bucket.localPerDrawAvals[localSlot] = perDrawAvals;
     bucket.localPerDrawRefs[localSlot]  = perDrawRefs;
-    const layoutId = family!.layoutIdOf.get(spec.effect)!;
+    const layoutId = fam.schema.layoutIdOf.get(spec.effect)!;
     bucket.localLayoutIds[localSlot] = layoutId;
 
     packBucketHeader(bucket, localSlot, perDrawRefs, layoutId);
@@ -2516,7 +2557,7 @@ export function buildHeapScene(
       // effects up front, then run addDraw. Subsequent drains either
       // reuse the frozen family (matching effects) or throw on a new
       // unseen effect (per the v1 frozen-family contract).
-      if (family === undefined) {
+      if (!familyBuilt) {
         const reader = asetReader!;
         const delta = reader.getChanges(tok);
         const adds: HeapDrawSpec[] = [];

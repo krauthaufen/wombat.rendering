@@ -75,6 +75,11 @@ export interface CompileHybridSceneOptions {
    * Default: `AVal.constant(true)` (heap path on for eligible ROs).
    */
   readonly heapEnabled?: aval<boolean>;
+  /**
+   * §6 family-merge bypass — pass-through to `BuildHeapSceneOptions`.
+   * When true, each effect lands in its own bucket / shader / pipeline.
+   */
+  readonly disableFamilyMerge?: boolean;
 }
 
 export interface HybridScene {
@@ -178,6 +183,7 @@ export function compileHybridScene(
   const heapScene: HeapScene = buildHeapScene(device, signature, heapSpecAset, {
     fragmentOutputLayout,
     atlasPool,
+    ...(opts.disableFamilyMerge === true ? { disableFamilyMerge: true } : {}),
   });
 
   // ─── Legacy subset → RenderTree → ScenePass ──────────────────────

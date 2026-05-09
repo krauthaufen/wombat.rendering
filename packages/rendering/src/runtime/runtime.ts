@@ -24,6 +24,13 @@ export interface RuntimeOptions {
    * flips. Useful for A/B perf comparisons. Default: heap on.
    */
   readonly heapEnabled?: aval<boolean>;
+  /**
+   * §6 family-merge bypass. When `true`, each effect lands in its
+   * own bucket / shader module / pipeline (no layoutId switch
+   * dispatch). Useful for A/B perf comparison against the merged
+   * path. Default: merge on.
+   */
+  readonly disableFamilyMerge?: boolean;
 }
 
 /**
@@ -58,6 +65,7 @@ export class Runtime {
         fragmentOutputLayout: layoutFromSignature(sig),
       })),
       ...(opts.heapEnabled !== undefined ? { heapEnabled: opts.heapEnabled } : {}),
+      ...(opts.disableFamilyMerge === true ? { disableFamilyMerge: true } : {}),
     };
     // `device.lost` is a real-WebGPU promise; mock devices may not
     // expose it. Treat as "never lost" in that case.

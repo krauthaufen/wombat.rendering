@@ -400,7 +400,12 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   // through the legacy per-RO renderer — handy for A/B perf comparisons.
   const heapOnParam = new URLSearchParams(location.search).get("heap-on");
   const heapEnabled = cval(heapOnParam === null || heapOnParam === "1");
-  const runtime = new Runtime({ device, heapEnabled });
+  // `?merge=0` disables §6 family-merge — each effect lands in its own
+  // bucket / shader module / pipeline. Used for A/B perf comparison
+  // against the merged path.
+  const mergeParam = new URLSearchParams(location.search).get("merge");
+  const disableFamilyMerge = mergeParam === "0";
+  const runtime = new Runtime({ device, heapEnabled, disableFamilyMerge });
 
   const bBox = bundleOf(rawBox);
   const bSph = bundleOf(rawSph);
