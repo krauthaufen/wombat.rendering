@@ -7,7 +7,7 @@
 import { effect, vertex, fragment } from "@aardworx/wombat.shader";
 import { abs, type Sampler2D, texture } from "@aardworx/wombat.shader/types";
 import { uniform } from "@aardworx/wombat.shader/uniforms";
-import { V3f, V4f } from "@aardworx/wombat.base";
+import { V2f, V3f, V4f } from "@aardworx/wombat.base";
 
 // Sampler2D capture. The wombat.shader-vite plugin classifies any
 // non-ambient free identifier whose TS type maps to a Sampler IR
@@ -53,16 +53,33 @@ export const lambertFS = fragment((v: {
 export const surface = effect(trafoVS, lambertFS);
 
 // ─── Textured variant ─────────────────────────────────────────────────
-// Same lambert lighting as `lambertFS`, but the base surface colour
-// is `Colors * sample(albedo, Normals.xy)`. Reusing `Normals` as the
-// UV channel keeps the VS / vertex layout identical to the untextured
-// path — the demo's geometries have no real UVs and we just want a
-// visibly-distinct texture sample, not perfect mapping.
+// Same lambert lighting as `lambertFS`, with the base surface colour
+// modulated by `sample(albedo, Uvs)`. Per-vertex UVs come from the
+// geometry: planar per-face UVs for box, lat/long parameterization
+// for sphere, side wraps + cap projection for cylinder.
+
+export const trafoTexturedVS = vertex((v: {
+  Positions: V4f;
+  Normals:   V3f;
+  Colors:    V4f;
+  Uvs:       V2f;
+}) => {
+  const wp = uniform.ModelTrafo.mul(v.Positions);
+  const n4 = new V4f(v.Normals.xyz, 0.0);
+  return {
+    gl_Position:    uniform.ViewProjTrafo.mul(wp),
+    WorldPositions: wp,
+    Normals:        n4.xyz,
+    Colors:         v.Colors,
+    Uvs:            v.Uvs,
+  };
+});
 
 export const lambertTexturedFS = fragment((v: {
   Normals:        V3f;
   Colors:         V4f;
   WorldPositions: V4f;
+  Uvs:            V2f;
 }) => {
   const n  = v.Normals.normalize();
   const wp = v.WorldPositions.xyz;
@@ -70,15 +87,11 @@ export const lambertTexturedFS = fragment((v: {
   const ambient = 0.2;
   const diffuse = abs(l.dot(n));
   const k = ambient + (1.0 - ambient) * diffuse;
-  // `Normals.xy` is a stand-in UV — values are face-axis-aligned for
-  // the box / cylinder, sphere parameter for the sphere — sufficient
-  // to prove the texture is being sampled per-RO from a distinct
-  // atlas sub-rect.
-  const tex = texture(albedo, v.Normals.xy);
+  const tex = texture(albedo, v.Uvs);
   const lit = v.Colors.xyz.mul(tex.xyz).mul(k);
   return {
     outColor: new V4f(lit, v.Colors.w),
   };
 });
 
-export const texturedSurface = effect(trafoVS, lambertTexturedFS);
+export const texturedSurface = effect(trafoTexturedVS, lambertTexturedFS);

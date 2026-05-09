@@ -58,6 +58,7 @@ setStatus("requesting GPU adapter…");
 interface GeoBundle {
   readonly positions: BufferView;
   readonly normals:   BufferView;
+  readonly uvs:       BufferView;
   readonly indices:   BufferView;
   readonly drawCall:  aval<DrawCall>;
 }
@@ -69,6 +70,7 @@ function bundleOf(g: GeometryData): GeoBundle {
   return {
     positions: BufferView.ofArray(g.positions, { elementType: ElementType.V3f }),
     normals:   BufferView.ofArray(g.normals,   { elementType: ElementType.V3f }),
+    uvs:       BufferView.ofArray(g.uvs,       { elementType: ElementType.V2f }),
     indices:   BufferView.ofArray(g.indices),                    // Uint32Array → ElementType.U32 ✓
     drawCall: AVal.constant<DrawCall>({
       kind: "indexed",
@@ -189,13 +191,14 @@ function makeRO(spec: RoSpec, viewProjM44: aval<M44f>, lightLoc: aval<V3f>): Ren
   const samplers = textured
     ? HashMap.empty<string, aval<ISampler>>().add("albedo", spec.sampler!)
     : HashMap.empty<string, aval<ISampler>>();
+  const baseAttribs = HashMap.empty<string, BufferView>()
+    .add("Positions", spec.geo.positions)
+    .add("Normals",   spec.geo.normals)
+    .add("Colors",    asV4fBroadcast(spec.color));
   return {
     effect: textured ? texturedSurface : surface,
     pipelineState: sharedPipelineState,
-    vertexAttributes: HashMap.empty<string, BufferView>()
-      .add("Positions", spec.geo.positions)
-      .add("Normals",   spec.geo.normals)
-      .add("Colors",    asV4fBroadcast(spec.color)),
+    vertexAttributes: textured ? baseAttribs.add("Uvs", spec.geo.uvs) : baseAttribs,
     uniforms: makeUniforms(spec.modelTrafo, viewProjM44, lightLoc),
     textures,
     samplers,

@@ -11,6 +11,8 @@
 export interface GeometryData {
   readonly positions: Float32Array;
   readonly normals:   Float32Array;
+  /** V2f per vertex; texture-mapping coordinates in [0,1]². */
+  readonly uvs:       Float32Array;
   readonly indices:   Uint32Array;
 }
 
@@ -42,12 +44,25 @@ export function buildBox(): GeometryData {
     [-1,0,0],[-1,0,0],[-1,0,0],[-1,0,0],[-1,0,0],[-1,0,0],
     [ 1,0,0],[ 1,0,0],[ 1,0,0],[ 1,0,0],[ 1,0,0],[ 1,0,0],
   ];
+  // Per-face UV mapping. Six faces × six vertices each. The triangle
+  // winding differs per face so two patterns repeat: A for faces where
+  // the second triangle goes top-left → bot-right → top-right, B for
+  // the mirror order.
+  const A: ReadonlyArray<[number, number]> = [[0,0],[0,1],[1,0],[1,0],[0,1],[1,1]];
+  const B: ReadonlyArray<[number, number]> = [[0,0],[1,0],[0,1],[0,1],[1,0],[1,1]];
+  const facePat = [A, B, B, A, A, B];           // -Z, +Z, -Y, +Y, -X, +X
+  const uvs = new Float32Array(verts.length * 2);
   const positions = new Float32Array(verts.length * 3);
   const normals   = new Float32Array(verts.length * 3);
-  for (let i = 0; i < verts.length; i++) { pushV3(positions, i*3, verts[i]!); pushV3(normals, i*3, ns[i]!); }
+  for (let i = 0; i < verts.length; i++) {
+    pushV3(positions, i*3, verts[i]!);
+    pushV3(normals, i*3, ns[i]!);
+    const uv = facePat[Math.floor(i / 6)]![i % 6]!;
+    uvs[i*2] = uv[0]; uvs[i*2 + 1] = uv[1];
+  }
   const indices = new Uint32Array(verts.length);
   for (let i = 0; i < indices.length; i++) indices[i] = i;
-  return { positions, normals, indices };
+  return { positions, normals, uvs, indices };
 }
 
 // ---- Sphere: unit sphere centred at origin ----
@@ -59,6 +74,11 @@ export function buildSphere(tessellation: number): GeometryData {
   const vertCount = (tessellation + 1) * (h - 1) + 2 * tessellation;
   const positions = new Float32Array(vertCount * 3);
   const normals   = new Float32Array(vertCount * 3);
+  // Standard lat/long UV. Bands: u = x / tessellation, v = y / h.
+  // Poles: u = (i + 0.5) / tessellation, v = 0 (bottom) or 1 (top).
+  // Seam handled by the (tessellation + 1) verts per band — x=0 and
+  // x=tessellation share position but get u=0 and u=1 respectively.
+  const uvs = new Float32Array(vertCount * 2);
   let oi = 0;
   let theta = -PI / 2 + dTheta;
   for (let y = 1; y < h; y++) {
@@ -66,18 +86,24 @@ export function buildSphere(tessellation: number): GeometryData {
     const ct = Math.cos(theta), st = Math.sin(theta);
     for (let x = 0; x <= tessellation; x++) {
       const v: [number, number, number] = [Math.cos(phi)*ct, Math.sin(phi)*ct, st];
-      pushV3(positions, oi*3, v); pushV3(normals, oi*3, v); oi++;
+      pushV3(positions, oi*3, v); pushV3(normals, oi*3, v);
+      uvs[oi*2] = x / tessellation; uvs[oi*2 + 1] = y / h;
+      oi++;
       phi += dPhi;
     }
     theta += dTheta;
   }
   const n = oi;
   for (let i = 0; i < tessellation; i++) {
-    pushV3(positions, oi*3, [0,0, 1]); pushV3(normals, oi*3, [0,0, 1]); oi++;
+    pushV3(positions, oi*3, [0,0, 1]); pushV3(normals, oi*3, [0,0, 1]);
+    uvs[oi*2] = (i + 0.5) / tessellation; uvs[oi*2 + 1] = 1;
+    oi++;
   }
   const sIdx = oi;
   for (let i = 0; i < tessellation; i++) {
-    pushV3(positions, oi*3, [0,0,-1]); pushV3(normals, oi*3, [0,0,-1]); oi++;
+    pushV3(positions, oi*3, [0,0,-1]); pushV3(normals, oi*3, [0,0,-1]);
+    uvs[oi*2] = (i + 0.5) / tessellation; uvs[oi*2 + 1] = 0;
+    oi++;
   }
 
   const faces = 3 * (2 * tessellation + 2 * (h - 2) * tessellation);
@@ -100,7 +126,7 @@ export function buildSphere(tessellation: number): GeometryData {
       indices[ii++] = i10; indices[ii++] = i01; indices[ii++] = i11;
     }
   }
-  return { positions, normals, indices };
+  return { positions, normals, uvs, indices };
 }
 
 // ---- Cylinder: unit cylinder, radius 1, axis along +Z, [0..1] high ----
@@ -110,6 +136,9 @@ export function buildCylinder(tessellation: number): GeometryData {
   const indexCount  = tessellation * 12;
   const positions = new Float32Array(vertexCount * 3);
   const normals   = new Float32Array(vertexCount * 3);
+  // UV: side wraps as (angle/2π, z). Cap verts use planar projection
+  // of (cos, sin) into [0,1]² centred at (0.5, 0.5).
+  const uvs = new Float32Array(vertexCount * 2);
   const step = TWO_PI / tessellation;
   let oi = 0;
   let phi = 0;
@@ -117,16 +146,24 @@ export function buildCylinder(tessellation: number): GeometryData {
     const c = Math.cos(phi), s = Math.sin(phi);
     const p0: [number, number, number] = [c, s, 0];
     const p1: [number, number, number] = [c, s, 1];
-    pushV3(positions, oi*3, p0); pushV3(normals, oi*3, [0,0,-1]); oi++;
-    pushV3(positions, oi*3, p0); pushV3(normals, oi*3, [c, s, 0]); oi++;
-    pushV3(positions, oi*3, p1); pushV3(normals, oi*3, [0,0, 1]); oi++;
-    pushV3(positions, oi*3, p1); pushV3(normals, oi*3, [c, s, 0]); oi++;
+    const u = i / tessellation;
+    const capU = 0.5 + 0.5 * c, capV = 0.5 + 0.5 * s;
+    pushV3(positions, oi*3, p0); pushV3(normals, oi*3, [0,0,-1]);
+    uvs[oi*2] = capU; uvs[oi*2 + 1] = capV;     oi++;   // bottom-cap vertex
+    pushV3(positions, oi*3, p0); pushV3(normals, oi*3, [c, s, 0]);
+    uvs[oi*2] = u;    uvs[oi*2 + 1] = 0;        oi++;   // side-bottom vertex
+    pushV3(positions, oi*3, p1); pushV3(normals, oi*3, [0,0, 1]);
+    uvs[oi*2] = capU; uvs[oi*2 + 1] = capV;     oi++;   // top-cap vertex
+    pushV3(positions, oi*3, p1); pushV3(normals, oi*3, [c, s, 0]);
+    uvs[oi*2] = u;    uvs[oi*2 + 1] = 1;        oi++;   // side-top vertex
     phi += step;
   }
   const bottom = oi;
-  pushV3(positions, oi*3, [0,0,0]); pushV3(normals, oi*3, [0,0,-1]); oi++;
+  pushV3(positions, oi*3, [0,0,0]); pushV3(normals, oi*3, [0,0,-1]);
+  uvs[oi*2] = 0.5; uvs[oi*2 + 1] = 0.5; oi++;
   const top = oi;
-  pushV3(positions, oi*3, [0,0,1]); pushV3(normals, oi*3, [0,0, 1]); oi++;
+  pushV3(positions, oi*3, [0,0,1]); pushV3(normals, oi*3, [0,0, 1]);
+  uvs[oi*2] = 0.5; uvs[oi*2 + 1] = 0.5; oi++;
 
   const indices = new Uint32Array(indexCount);
   let ii = 0;
@@ -142,5 +179,5 @@ export function buildCylinder(tessellation: number): GeometryData {
     indices[ii++] = j00; indices[ii++] = bottom; indices[ii++] = j10;
     indices[ii++] = j01; indices[ii++] = j11;     indices[ii++] = top;
   }
-  return { positions, normals, indices };
+  return { positions, normals, uvs, indices };
 }
