@@ -225,7 +225,17 @@ export function renderObjectToHeapSpec(
         size: acq.size,
         numMips: acq.numMips,
         sampler: samplerVal,
+        page: acq.page,
+        poolRef: acq.ref,
+        release: () => pool.release(acq.ref),
       };
+      // FUTURE: texture-aval reactivity. The pool keys on `texAval`
+      // identity once at addDraw; if the source aval flips to a new
+      // ITexture, the heap path won't re-acquire. Mirror UniformPool's
+      // repack(av, newValue) shape — track a dirty atlas-aval set,
+      // release the old sub-rect + acquire a new one + update the
+      // drawHeader fields in `update(token)`. Single-PR scope here is
+      // the BGL/bind-group/drawHeader plumbing for the static case.
     } else {
       // Tier-L fallback: keep the existing standalone path, which
       // requires a resolved GPUTexture/GPUSampler.

@@ -135,6 +135,9 @@ export class MockGPU {
     this.device = {
       queue,
       get lost() { return self.lost; },
+      // Minimal limits exposed for code paths that compute capacity
+      // from device.limits (e.g. heapScene's atlas binding_array sizing).
+      limits: { maxSampledTexturesPerShaderStage: 16 },
       createCommandEncoder: () => self.createCommandEncoder(),
       createShaderModule(desc: GPUShaderModuleDescriptor): GPUShaderModule {
         self.shaderModules.push(desc);

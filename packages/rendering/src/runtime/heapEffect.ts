@@ -197,10 +197,10 @@ function irTypePackedSize(t: IrType): number {
 export interface DrawHeaderField {
   readonly name: string;            // schema name (e.g. "ModelTrafo")
   readonly wgslName: string;        // WGSL field name (e.g. "modelTrafoRef")
-  readonly wgslType: string;        // "u32" for both uniform refs and attribute refs
+  readonly wgslType: string;        // "u32" for refs; "scalar"-packed for atlas texture-ref entries
   readonly byteOffset: number;
   readonly byteSize: number;
-  readonly kind: "uniform-ref" | "attribute-ref";
+  readonly kind: "uniform-ref" | "attribute-ref" | "texture-ref";
   /**
    * For `uniform-ref`: the uniform's underlying WGSL type. The
    * rewriter uses this to pick the right inline read expression
@@ -212,6 +212,18 @@ export interface DrawHeaderField {
    * the inline `attributeLoadExpr` when generating preamble lets.
    */
   readonly attributeWgslType?: string;
+  /**
+   * For `texture-ref`: which sub-entry this is. Atlas-variant texture
+   * bindings expand into four contiguous drawHeader entries —
+   * `pageRef` (u32 slot index), `formatBits` (u32 packed sampler
+   * state + mip + format), `origin` (vec2<f32>, mip-0 top-left in
+   * normalized atlas coords), `size` (vec2<f32>, mip-0 size). The
+   * runtime packs these as inline values (not pool refs); the
+   * shader pass that consumes them lands in a follow-up PR.
+   */
+  readonly textureSub?: "pageRef" | "formatBits" | "origin" | "size";
+  /** For `texture-ref`: the schema's logical texture binding name (shared by all four sub-entries). */
+  readonly textureBindingName?: string;
 }
 
 export interface BucketLayout {
@@ -257,11 +269,24 @@ export const HEAP_TEX_BINDING_START = 4;
 export function buildBucketLayout(
   schema: HeapEffectSchema,
   _hasTextures: boolean,
-  opts: { isInstanced?: boolean; perInstanceUniforms?: ReadonlySet<string>; megacall?: boolean } = {},
+  opts: {
+    isInstanced?: boolean;
+    perInstanceUniforms?: ReadonlySet<string>;
+    megacall?: boolean;
+    /**
+     * Names of schema texture bindings routed via the atlas binding-array
+     * path. Each such binding is dropped from `textureBindings` /
+     * `samplerBindings` and replaced with four `texture-ref` drawHeader
+     * fields (pageRef / formatBits / origin / size). Pass an empty set
+     * (default) for the standalone texture path.
+     */
+    atlasTextureBindings?: ReadonlySet<string>;
+  } = {},
 ): BucketLayout {
   const isInstanced = opts.isInstanced ?? false;
   const perInstanceUniforms = opts.perInstanceUniforms ?? new Set<string>();
   const megacall = opts.megacall ?? false;
+  const atlasTextureBindings = opts.atlasTextureBindings ?? new Set<string>();
   if (megacall && isInstanced) {
     throw new Error("heapEffect: megacall + isInstanced not supported");
   }
@@ -292,19 +317,69 @@ export function buildBucketLayout(
     dhOff += 4;
   }
 
+  // Atlas-routed texture bindings: 24 bytes / binding split into
+  // pageRef (u32) + formatBits (u32) + origin (vec2<f32>) + size
+  // (vec2<f32>). Inline values, not pool refs — the runtime packs
+  // them at addDraw time from the atlas acquisition + ISampler.
+  for (const t of schema.textures) {
+    if (!atlasTextureBindings.has(t.name)) continue;
+    const base = lowerFirst(t.name);
+    dhOff = roundUp(dhOff, 4);
+    drawHeaderFields.push({
+      name: `${t.name}.pageRef`, wgslName: `${base}PageRef`, wgslType: "u32",
+      byteOffset: dhOff, byteSize: 4, kind: "texture-ref",
+      textureSub: "pageRef", textureBindingName: t.name,
+    });
+    dhOff += 4;
+    drawHeaderFields.push({
+      name: `${t.name}.formatBits`, wgslName: `${base}FormatBits`, wgslType: "u32",
+      byteOffset: dhOff, byteSize: 4, kind: "texture-ref",
+      textureSub: "formatBits", textureBindingName: t.name,
+    });
+    dhOff += 4;
+    dhOff = roundUp(dhOff, 8);
+    drawHeaderFields.push({
+      name: `${t.name}.origin`, wgslName: `${base}Origin`, wgslType: "vec2<f32>",
+      byteOffset: dhOff, byteSize: 8, kind: "texture-ref",
+      textureSub: "origin", textureBindingName: t.name,
+    });
+    dhOff += 8;
+    drawHeaderFields.push({
+      name: `${t.name}.size`, wgslName: `${base}Size`, wgslType: "vec2<f32>",
+      byteOffset: dhOff, byteSize: 8, kind: "texture-ref",
+      textureSub: "size", textureBindingName: t.name,
+    });
+    dhOff += 8;
+  }
+
   const drawHeaderBytes = roundUp(dhOff, 16);
   const strideU32 = drawHeaderBytes / 4;
 
   // Allocate texture + sampler bindings starting at HEAP_TEX_BINDING_START.
   // Order: all textures, then all samplers — matches the prelude
   // layout below and the runtime's BGL/bind-group construction.
+  // Atlas-routed bindings drop out — their data flows through the
+  // drawHeader instead of through individual texture/sampler slots.
   let nextBinding = megacall ? HEAP_TEX_BINDING_START + 2 : HEAP_TEX_BINDING_START;
-  const textureBindings = schema.textures.map(t => ({
-    name: t.name, wgslType: t.wgslType, binding: nextBinding++,
-  }));
-  const samplerBindings = schema.samplers.map(s => ({
-    name: s.name, wgslType: s.wgslType, binding: nextBinding++,
-  }));
+  const textureBindings = schema.textures
+    .filter(t => !atlasTextureBindings.has(t.name))
+    .map(t => ({ name: t.name, wgslType: t.wgslType, binding: nextBinding++ }));
+  // Samplers: drop the matching one when its texture is atlas-routed.
+  // Heuristic: assume position-aligned (nth sampler pairs with nth
+  // texture). Heap path's v1 surface only ever has 0..1 of each, so
+  // this collapses to "if the lone texture is atlas, drop the lone
+  // sampler too".
+  const atlasSamplerNames = new Set<string>();
+  for (let i = 0; i < schema.textures.length; i++) {
+    const t = schema.textures[i]!;
+    if (atlasTextureBindings.has(t.name)) {
+      const s = schema.samplers[i];
+      if (s !== undefined) atlasSamplerNames.add(s.name);
+    }
+  }
+  const samplerBindings = schema.samplers
+    .filter(s => !atlasSamplerNames.has(s.name))
+    .map(s => ({ name: s.name, wgslType: s.wgslType, binding: nextBinding++ }));
 
   const preludeWgsl = generatePrelude(schema, textureBindings, samplerBindings, megacall);
 
