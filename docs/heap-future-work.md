@@ -36,7 +36,7 @@ unsupported wedges") into a positive declaration ("this RO opts
 into the fast path because it fits"). Anything that fails the
 predicate sails through the legacy renderer untouched.
 
-## 1. Tile-bounded binary search (in flight)
+## 1. Tile-bounded binary search ✅ SHIPPED
 
 The VS prelude binary-searches `drawTable[*].firstEmit` to derive
 `(drawIdx, vid)` from `vertex_index`. Today the search is unbounded:
@@ -243,11 +243,23 @@ This is a small focused change — ~50 LOC per pool plus a shared
 hash utility. Pairs naturally with the AtlasPool aval-reactivity
 work (item 0 of textures plan, also pending).
 
-## 5c. memoMap — pure-function dedup at the aval layer
+## 5c. memoMap — pure-function dedup at the aval layer ✅ SHIPPED (as hidden internal)
 
 (Lives in `wombat.adaptive`, not the rendering package — but in
 the same architectural thread as §5b. Listed here because the
 heap path is the loudest victim of the identity gotcha it fixes.)
+
+**Shipped state**: as a hidden internal API at
+`@aardworx/wombat.adaptive/internal`. NOT a public method on
+`aval`. The implementation moved to a single `__memo(keys, compute)`
+runtime + 17 per-combinator helpers (`memoAvalMap`, `memoAsetFilter`,
+etc.) covering all combinators of all four collection types
+(aval/aset/alist/amap × map/bind/filter/collect/choose + zipN).
+
+Users should NOT call these directly. The intended consumer is the
+build-time transform plugin (§5d) which lowers user `.map(closure)`
+calls into the appropriate `__memo([...keys], () => original())`
+shape. Public collection interfaces stay untouched.
 
 §5b dedupes constant avals by value. The remaining identity
 gotcha is **reactive avals derived via `.map(f)`** where `f` is
@@ -279,21 +291,27 @@ JS doesn't expose purity statically. Three cases:
    hash, and `.toString()` hashing isn't safe (closures'
    captured variables don't appear in source).
 
-**Solution: opt-in via `memoMap`:**
+**Solution as shipped: hidden runtime substrate:**
 
 ```ts
-aval.memoMap(f)   // user asserts f is pure + reference-stable
+// Internal API (plugin-only):
+import { __memo, TAG_AVAL_MAP } from "@aardworx/wombat.adaptive/internal";
+__memo([TAG_AVAL_MAP, "h:bodyHash", source, ...closureDeps], () => source.map(fn))
 ```
 
-Internally: `WeakMap<aval, WeakMap<Function, aval>>`. First call
-with `(av, f)` creates and caches; subsequent calls return the
-same reference. Both keys weakly held; cache entries die with
-their sources.
+The `__memo` function uses a shared **`MemoTrie`** (generic
+weak-keyed cache trie at `src/core/memoTrie.ts`): each level is a
+`WeakMap<object, MemoTrie>`, leaf is a `WeakRef<object>`. Lookup
+walks the path; insert nests as needed; null/dead level falls
+through to a miss. Every key in the path is held weakly — source
+aval, function, deps. The derived aval is held via WeakRef. Any
+component dies → entry naturally collected. No FinalizationRegistry,
+no manual cleanup.
 
-User opt-in is fine — same shape as React's `useMemo` (caller
-asserts dependency-correctness) or Reactor's `cache`. One-line
-API note: "use memoMap for pure module-level functions; plain
-map for closures with captured state."
+The 17 per-combinator helpers (`memoAvalMap(av, f)`,
+`memoAsetFilter(set, p)`, etc.) are convenience wrappers; the
+plugin can also emit `__memo(...)` directly for arity flexibility
+(n-ary zips, multiple closure deps).
 
 **Combined with §5b, the identity-footgun surface closes:**
 
@@ -312,101 +330,133 @@ Implementation cost: ~30 LOC in `wombat.adaptive`. Zero changes
 in rendering layer; the existing identity-keyed pools just see
 fewer distinct avals.
 
-## 5d. Build-time combinator transform (the real destination)
+## 5d. Build-time combinator transform ✅ SHIPPED
 
-The runtime `memoMap` / `memoMapWithDeps` of §5c is the *bridge*
-while a build-time transform doesn't exist. The transform is the
-actual destination — it eliminates the identity footgun
-*completely*, across all combinators, for the user's natural code.
+Vite plugin at `@aardworx/wombat.adaptive/plugin`. Detects user
+calls to adaptive combinators (in 3 call shapes — method,
+free-function, namespace) across all 17 combinator helpers, and
+rewrites them at compile time to memoizing equivalents using the
+hidden `__memo` runtime substrate from §5c.
 
-Sibling in spirit to React Compiler, Solid.js's reactivity
-transform, Million.js — same algorithm, different target
-ecosystem.
+**What it catches:**
 
-**The transform:**
+| Combinator | Method `x.m(...)` | Free `m(...)` | Namespace `K.m(...)` |
+|---|---|---|---|
+| `aval × {map, bind, zipN}` | ✓ | ✓ | ✓ |
+| `aset × {map, bind, filter, collect, choose}` | ✓ | ✓ | ✓ |
+| `alist × {map, bind, filter, collect, choose}` | ✓ | ✓ | ✓ |
+| `amap × {map, bind, filter, collect, choose}` | ✓ | ✓ | ✓ |
 
-A vite/SWC/babel plugin walks all `<adaptive>.<combinator>(fn, ...)`
-call sites. For each, it:
+(`*A` aval-callback variants and `*i` indexed-callback variants
+are punted — same key shape applies; plugin can pick them up
+incrementally when needed.)
 
-1. Hashes the function body at compile time → stable string
-   constant.
-2. Statically analyzes the function's free variables, classifies:
-   - Module-level identifier (import, const, etc.) → stable;
-     ignored.
-   - Closure capture (variable from enclosing scope) → goes into
-     a deps array.
-   - Parameter / local → ignored.
-3. Rewrites:
+**What it does, per call site:**
+
+1. Statically infers the source's collection kind from import
+   context (no TypeChecker — pure syntactic analysis tracking
+   imported `cval`/`cset`/`clist`/`cmap` constructors and namespace
+   imports). Skips the call if kind is ambiguous.
+2. Walks the callback body collecting free-variable references.
+   Classifies each: callback-local (param / body-decl) → ignored;
+   module-stable (import / known namespace / builtin global) →
+   ignored (covered by code hash); inner-scope capture → goes into
+   the deps array.
+3. Computes deterministic FNV-1a 32-bit hash of the callback's
+   trimmed source text.
+4. Rewrites the call to:
    ```ts
-   // user wrote:
-   av.map(t => mix(t, r))
-   // plugin emits:
-   av.__memoMap("h:a3f2b1...", (t) => mix(t, r), [r])
+   __memo(
+     [opTag, "h:hash", ...sources, ...closureDeps],
+     () => /* original call */,
+   )
    ```
-4. Same for every adaptive combinator that takes a callback —
-   `bind`, `filter`, `collect`, `choose`, `aset.map`, `alist.map`,
-   `amap.map`, etc. The plugin's "interesting calls" list is ~10
-   method names; everything else is left alone.
+   The fallback closure preserves the exact original call shape;
+   the plugin doesn't need to know each helper's signature.
+5. Injects the `__memo` + tag imports at the top of the file.
 
-Runtime cost per call site: hash is a string constant (zero
-runtime work to compute), deps array is a few `===` per frame.
-Cache hit/miss is one Map lookup.
+**Cache key shape decision:** The emit deliberately OMITS the
+function reference (`fn`) from the cache key path. Reasoning:
+inline lambdas re-allocate per call site invocation; if `fn` were
+a key, fresh lambdas would always miss. The body hash is the
+stable function-identity proxy across distinct lambda allocations.
 
-**Advantages over runtime workarounds:**
+**Runtime cost per call site:**
 
-- **Unified across all combinators.** Runtime `memoMap` would
-  require shipping a memoizing variant for every combinator; the
-  transform handles them all uniformly because they share an AST
-  shape.
-- **Full scope info at build time.** Free-variable analysis is
-  unambiguous; the bundler knows what's a module import vs a
-  closure capture. Runtime `f.toString()` parsing can't tell.
-- **Zero runtime hash cost.** Function body hash is baked in as
-  a string constant. Runtime hashing was 50–100 ns per call;
-  transform path is zero.
-- **Transparent to users.** They write `av.map(...)`, never see
-  `memoMap`. Authoring stays clean; identity sharing is automatic.
+- Hash is a string constant (zero runtime work to compute).
+- Cache lookup is one MemoTrie walk through the key path
+  (typically 3-5 levels for `[tag, hash, source, ...deps]`).
+- Hit returns the cached aval directly; miss runs the original
+  call once and caches.
 
-**Reference implementations to borrow from:**
+**Known limitations (v1 punts):**
 
-- **React Compiler** (formerly React Forget) — does exactly this
-  for `useMemo` / `useCallback`. Mature; algorithm well-documented.
-- **Solid.js reactivity transform** — similar shape, applies to
-  JSX. Compiler is open source and small enough to read end to end.
-- **Million.js** — memoization at JSX level for perf.
+- **Method calls on non-Identifier receivers** like
+  `cval(1).map(...)` (immediate constructor call without
+  intermediate variable) aren't detected. Adding kind inference
+  for `CallExpression` receivers extends coverage trivially —
+  follow-up.
+- **`import * as X` namespace imports** skipped. Most code uses
+  named imports.
+- **Closure-dep member-access chains** (`props.r`) reduced to
+  the base identifier (`props`). Cache keys on `props` reference
+  rather than `props.r` value — conservatively correct (props
+  marks → cache invalidated) but slightly broader than ideal.
+- **Body hash is whitespace-sensitive** (`t=>t*2` and `t => t * 2`
+  hash differently). A normalize-via-printer pass would tighten
+  this. Acceptable for now since formatting is normally consistent
+  per-codebase via Prettier/eslint.
+- **No idempotence guard.** Vite's single-transform-per-file
+  pipeline prevents re-rewriting in practice; if the plugin ever
+  runs twice on the same source, nested `__memo` calls would
+  result. Not a real concern with standard Vite usage.
 
-The wombat-specific work is identifying *which* method calls are
-"adaptive combinators that need this treatment" — a hardcoded list
-of ~10 names from `wombat.adaptive`'s public API. Everything else
-in the algorithm is borrowed.
+**Reference implementations leaned on:**
 
-**Where it lives:**
+- **React Compiler** (formerly React Forget) — same shape for
+  `useMemo` / `useCallback`. Algorithm well-documented.
+- **Solid.js reactivity transform** — similar AST-rewrite for
+  reactive primitives.
+- **Million.js** — memoization at JSX level.
 
-`wombat.shader` already has a vite plugin that AST-rewrites inline
-`vertex(...)` / `fragment(...)` calls into compiled shader
-modules. Adding a co-pass for adaptive combinators is the natural
-sibling — same plugin infrastructure, same project layout. Lives
-in a `wombat.adaptive` plugin package next to `wombat.shader`'s.
+**Tests:** 21 AST-shape tests at `tests/plugin/transform.test.ts`
+verifying tag selection, hash literal presence, fallback-closure
+preservation, closure-deps capture, type-ambiguous-skip, and
+import-injection shape. Plus behavioral tests at
+`tests/plugin/transformed/` (in flight) that apply the plugin via
+vitest config and assert real memoization reference-equality +
+value correctness end-to-end.
 
-**Implementation cost:** ~2–3 weeks of focused work. Most of it
-is wiring the AST analysis (free-variable detection in TS/JS is
-non-trivial but solved); the actual rewrite logic is ~50 LOC.
+**Files:**
 
-**Layered story (ship in this order):**
+- `src/plugin/index.ts` — Vite plugin entry exposing
+  `adaptiveMemoPlugin()`.
+- `src/plugin/transform.ts` — pure AST transform (~811 LOC):
+  import tracker → local-binding kind inference → call-site
+  detector → closure-deps walker → FNV-1a body hash → __memo
+  rebuilder → import injector.
+- `src/plugin/runtime.ts` — string-key interning shim. MemoTrie
+  needs object keys (WeakMap); the runtime wraps `__memo([..., "h:abc"])`
+  so hash strings become interned `{h}` objects via a
+  module-level `Map`.
 
-1. §5b — value-equality dedup at pool level. Catches inline
-   `AVal.constant(value)` patterns. ~50 LOC per pool.
-2. §5c — `memoMap(f)` runtime helper for module-level pure
-   functions. ~30 LOC.
-3. §5c++ — `memoMapWithDeps(f, deps)` for explicit closure
-   captures. ~10 LOC on top of 5c.
-4. §5d — build-time transform. Subsumes 5c and 5c++; users
-   stop knowing they exist. The natural authoring pattern just
-   works.
+**Layered story (status of all four phases):**
 
-Each step is shippable; each gives compounding payoff. By 5d
-the identity footgun is gone everywhere — not just in the heap
-path, but in any wombat code that uses adaptive combinators.
+1. **§5b** — value-equality dedup at pool level. ⏳ Future work.
+   Catches inline `AVal.constant(value)` patterns at the
+   rendering-pool layer. Independent of §5c/§5d (lives in
+   wombat.rendering, not wombat.adaptive).
+2. **§5c** — runtime `__memo` substrate. ✅ Shipped as hidden
+   internal at `@aardworx/wombat.adaptive/internal`.
+3. **§5d** — build-time transform. ✅ Shipped at
+   `@aardworx/wombat.adaptive/plugin`. Subsumes 5c's manual
+   surface — users never reach for `__memo` directly.
+
+The identity footgun is now gone everywhere `.map(closure)`-style
+calls touch the adaptive system, transparently. The remaining
+§5b is a separate rendering-side concern (per-pool value-equality
+dedup for the tiny edge case where two distinct constant avals
+carry identical values).
 
 ## 6. Uber-shader families with shared header pool
 
@@ -682,7 +732,41 @@ bottlenecked, AND memory headroom exists. For mobile GPUs, the
 ~5 MB extra pressure could push the working set out of cache and
 make the "fast" version slower — measure before assuming.
 
-## 9. Texture array atlasing
+## 9. Texture atlasing ✅ SHIPPED (different architecture than originally sketched)
+
+**Note:** the architecture below is preserved as the original
+plan; the actual ship landed at a *third* design after two
+real-world architectural discoveries during integration. See
+**`heap-textures-plan.md`** for the up-to-date design.
+
+**Final shipped architecture (summary):**
+
+- **N independent `GPUTexture` per format**, NOT a
+  `texture_2d_array`. No grow-copy on adding pages.
+- Bound via **N consecutive single-texture BGL bindings** per
+  format (linear + srgb), addressed in WGSL via a `switch pageRef`
+  ladder. Replaces the failed attempt at `binding_array<texture_2d<f32>, N>`
+  (not core in WebGPU 1.0).
+- **1.5×1 mip pyramid embedded per sub-rect** (Iliffe layout).
+  Software mip filter in shader; hardware bilinear within each
+  mip; LOD computed from screen-space derivatives.
+- **Per-RO sampler state in drawHeader bits** (wrap modes + filter
+  flags packed into formatBits u32). Shader applies wrap modes
+  before atlas-coord transform.
+- **AtlasPool with refcount + texture aval reactivity**: sprite
+  swap / theme change just works (release old sub-rect + acquire
+  new + update drawHeader + bump page-set version).
+- **Verified end-to-end on real GPU**, including iPhone Safari.
+- Tests: 25/25 mock-GPU + 2/2 real-GPU integration.
+
+The original plan below is kept for historical reference and
+for the bin-by-format-and-size discussion that's still relevant
+(only one bin per format shipped in v1).
+
+---
+
+(Original plan from before discovery of `binding_array`'s
+non-portability and `texture_2d_array`'s grow-copy cost):
 
 The merging story in §6 has a hard precondition: ROs that share a
 bucket must reference the SAME concrete texture/sampler resources.
