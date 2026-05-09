@@ -154,6 +154,38 @@ inside lines.
   `derive()` helper produces a child resource that forwards
   acquire/release to its parent.
 
+## Test imports
+
+Tests import from one of two namespaces depending on what they need:
+
+- **Public API tests** (e.g. `tests/render-attribute-reactivity.test.ts`):
+  import from `@aardworx/wombat.rendering.experimental` (note the
+  `.experimental` suffix — this is the workspace alias defined in
+  `package.json`'s `dependencies`/`exports` map). Only symbols
+  re-exported via the package's subpath exports are reachable.
+  Subpaths: `/core`, `/resources`, `/commands`, `/runtime`, `/window`.
+- **Internal tests** that need symbols not yet on the public surface
+  (e.g. `tests/heap-atlas-mip.test.ts` importing `AtlasPool`,
+  `tests/heap-eligibility.test.ts` importing `isHeapEligible`):
+  import via direct relative paths from the test file:
+  `../packages/rendering/src/core/<file>.js`,
+  `../packages/rendering/src/runtime/<file>.js`. Use the `.js`
+  extension; the TS resolver maps it back to the `.ts` source.
+
+For browser-mode tests in `tests-browser/`, the same rules apply
+relative to that directory.
+
+When adding a new test, prefer the public-API path if the symbol
+is exported. Otherwise reach into `../packages/rendering/src/...`
+directly. Don't try to import from `@aardworx/wombat.rendering`
+without the `.experimental` suffix — that resolves to the published
+npm package, which is older than the workspace source and missing
+work-in-progress symbols.
+
+The internal-import convention is also why `bunx vitest run` works
+without npm-publishing the workspace: vitest picks up the relative
+paths via TypeScript's path resolution.
+
 ## Don'ts
 
 - Don't add new packages or split this one. Subpath exports cover
