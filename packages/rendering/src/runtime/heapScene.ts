@@ -3593,6 +3593,29 @@ export function buildHeapScene(
 
       let trianglesChecked = 0;
       let bucketIdx = 0;
+      // Stage arena + arena.indices once (shared across buckets).
+      const arenaCopy = device.createBuffer({
+        size: arena.attrs.buffer.size,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      const indicesCopy = arena.indices.buffer.size > 0 ? device.createBuffer({
+        size: arena.indices.buffer.size,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      }) : undefined;
+      {
+        const enc = device.createCommandEncoder({ label: "checkTriangleCoherence.arena" });
+        enc.copyBufferToBuffer(arena.attrs.buffer, 0, arenaCopy, 0, arena.attrs.buffer.size);
+        if (indicesCopy !== undefined) enc.copyBufferToBuffer(arena.indices.buffer, 0, indicesCopy, 0, arena.indices.buffer.size);
+        device.queue.submit([enc.finish()]);
+      }
+      await arenaCopy.mapAsync(GPUMapMode.READ);
+      if (indicesCopy !== undefined) await indicesCopy.mapAsync(GPUMapMode.READ);
+      const arenaU32 = new Uint32Array(arenaCopy.getMappedRange());
+      const arenaF32 = new Float32Array(arenaU32.buffer, arenaU32.byteOffset, arenaU32.length);
+      const indicesU32 = indicesCopy !== undefined
+        ? new Uint32Array(indicesCopy.getMappedRange())
+        : new Uint32Array(0);
+
       for (const target of buckets) {
         if (target.recordCount === 0 || target.totalEmitEstimate === 0) { bucketIdx++; continue; }
         const recordCount = target.recordCount;
@@ -3604,24 +3627,42 @@ export function buildHeapScene(
           crossSlot++;
         }
 
+        // drawTable + drawHeap readback (per-bucket).
         const dtCopy = device.createBuffer({
           size: recordCount * RECORD_BYTES,
           usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         });
+        const dhCopy = device.createBuffer({
+          size: recordCount * target.layout.drawHeaderBytes,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
         const enc0 = device.createCommandEncoder({ label: "checkTriangleCoherence.dt" });
         enc0.copyBufferToBuffer(target.drawTableBuf!.buffer, 0, dtCopy, 0, recordCount * RECORD_BYTES);
+        enc0.copyBufferToBuffer(target.drawHeap.buffer, 0, dhCopy, 0, recordCount * target.layout.drawHeaderBytes);
         device.queue.submit([enc0.finish()]);
         await dtCopy.mapAsync(GPUMapMode.READ);
+        await dhCopy.mapAsync(GPUMapMode.READ);
         const dtU32 = new Uint32Array(dtCopy.getMappedRange());
+        const dhU32 = new Uint32Array(dhCopy.getMappedRange());
         const firstEmits: number[] = [];
+        const drawIdxs:    number[] = [];
+        const indexStarts: number[] = [];
         const indexCounts: number[] = [];
         const instCounts:  number[] = [];
         for (let r = 0; r < recordCount; r++) {
           firstEmits.push(dtU32[r * RECORD_U32 + 0]!);
+          drawIdxs.push(dtU32[r * RECORD_U32 + 1]!);
+          indexStarts.push(dtU32[r * RECORD_U32 + 2]!);
           indexCounts.push(dtU32[r * RECORD_U32 + 3]!);
           instCounts.push(dtU32[r * RECORD_U32 + 4]!);
         }
-        dtCopy.unmap(); dtCopy.destroy();
+        // Resolve drawHeader field offsets for ModelTrafo + Positions.
+        let mtOff = -1, posOff = -1;
+        for (const f of target.layout.drawHeaderFields) {
+          if (f.name === "ModelTrafo")  mtOff  = f.byteOffset;
+          if (f.name === "Positions")   posOff = f.byteOffset;
+        }
+        const stride2 = target.layout.drawHeaderBytes;
 
         // Per-record correctness: indexCount * instanceCount must be
         // a multiple of 3, otherwise THIS record's last triangle would
@@ -3636,8 +3677,27 @@ export function buildHeapScene(
           }
         }
 
+        // Read firstDrawInTile so we can bound the search EXACTLY the
+        // same way the VS does — `lo = fdt[tileIdx]; hi = fdt[tileIdx+1]`.
+        const numTilesLocal = Math.ceil(totalEmit / 64);
+        const fdtSize = (numTilesLocal + 1) * 4;
+        const fdtCopy = device.createBuffer({
+          size: fdtSize, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        {
+          const enc1 = device.createCommandEncoder();
+          enc1.copyBufferToBuffer(target.firstDrawInTileBuf!.buffer, 0, fdtCopy, 0, fdtSize);
+          device.queue.submit([enc1.finish()]);
+          await fdtCopy.mapAsync(GPUMapMode.READ);
+        }
+        const fdt = new Uint32Array(fdtCopy.getMappedRange().slice(0));
+        fdtCopy.unmap(); fdtCopy.destroy();
+
         const slotFor = (emit: number): number => {
-          let lo = 0, hi = recordCount - 1;
+          // Match the VS preamble exactly: bound by firstDrawInTile.
+          const tileIdx = emit >>> 6;
+          let lo = fdt[tileIdx]!;
+          let hi = fdt[tileIdx + 1]!;
           while (lo < hi) {
             const mid = (lo + hi + 1) >>> 1;
             if (firstEmits[mid]! <= emit) lo = mid;
@@ -3646,10 +3706,13 @@ export function buildHeapScene(
           return lo;
         };
 
-        // Exhaustive — walk EVERY triangle. The bug observed visually
-        // could affect any tiny fraction of triangles, so sampling
-        // misses it. With up to ~3M triangles per bucket this is
-        // fine on CPU (linear scan plus a tiny binary search per).
+        // Exhaustive — walk EVERY triangle. For each:
+        //   1. Verify all 3 emits resolve to the same slot AND the
+        //      same instId (cross-RO or cross-instance triangle).
+        //   2. Read drawHeader[drawIdx] for ModelTrafo + Positions.
+        //   3. Look up the 3 vid values via indexStorage.
+        //   4. Apply ModelTrafo to each vertex, verify world position
+        //      lies within a sane radius of the trafo's translation.
         let here = 0;
         for (let t = 0; t < totalTris; t++) {
           const e0 = t * 3;
@@ -3665,11 +3728,72 @@ export function buildHeapScene(
               `bucket#${bucketIdx} tri=${t} emits=(${e0},${e1},${e2}) slots=(${s0},${s1},${s2}) ` +
               `firstEmits[${s0}]=${firstEmits[s0]} [${s1}]=${firstEmits[s1]} [${s2}]=${firstEmits[s2]}`,
             );
+            continue;
           }
+          const slot = s0;
+          const indexCount = indexCounts[slot]!;
+          const indexStart = indexStarts[slot]!;
+          const drawIdx = drawIdxs[slot]!;
+          const fe = firstEmits[slot]!;
+          const localBase = e0 - fe;
+          const inst0 = Math.floor(localBase / indexCount);
+          const inst1 = Math.floor((localBase + 1) / indexCount);
+          const inst2 = Math.floor((localBase + 2) / indexCount);
+          if (inst0 !== inst1 || inst1 !== inst2) {
+            crossSlot++;
+            push(
+              `bucket#${bucketIdx} tri=${t} slot=${slot} cross-instance: ` +
+              `instIds=(${inst0},${inst1},${inst2}) localBase=${localBase} indexCount=${indexCount}`,
+            );
+            continue;
+          }
+          if (mtOff < 0 || posOff < 0) continue;  // bucket lacks one of the fields
+          const mtRef = dhU32[(drawIdx * stride2 + mtOff) >>> 2]!;
+          const posRef = dhU32[(drawIdx * stride2 + posOff) >>> 2]!;
+          if (mtRef === 0 || posRef === 0) continue;
+          const mBase = (mtRef + ALLOC_HEADER_PAD_TO) >>> 2;
+          const posLen = arenaU32[(posRef >>> 2) + 1]!;
+          const pBase = (posRef + ALLOC_HEADER_PAD_TO) >>> 2;
+          // Aardvark M44d row-major: M[r][c] = arenaF32[mBase + r*4+c].
+          // Translation column = (M[0][3], M[1][3], M[2][3]).
+          const ox = arenaF32[mBase + 0 * 4 + 3]!;
+          const oy = arenaF32[mBase + 1 * 4 + 3]!;
+          const oz = arenaF32[mBase + 2 * 4 + 3]!;
+          // Three vid lookups via indexStorage[indexStart + (local % indexCount)].
+          const v0 = indicesU32[indexStart + (localBase % indexCount)]! % posLen;
+          const v1 = indicesU32[indexStart + ((localBase + 1) % indexCount)]! % posLen;
+          const v2 = indicesU32[indexStart + ((localBase + 2) % indexCount)]! % posLen;
+          let triBad = false;
+          for (const v of [v0, v1, v2]) {
+            const px = arenaF32[pBase + v * 3 + 0]!;
+            const py = arenaF32[pBase + v * 3 + 1]!;
+            const pz = arenaF32[pBase + v * 3 + 2]!;
+            const wx = arenaF32[mBase + 0 * 4 + 0]! * px + arenaF32[mBase + 0 * 4 + 1]! * py + arenaF32[mBase + 0 * 4 + 2]! * pz + arenaF32[mBase + 0 * 4 + 3]!;
+            const wy = arenaF32[mBase + 1 * 4 + 0]! * px + arenaF32[mBase + 1 * 4 + 1]! * py + arenaF32[mBase + 1 * 4 + 2]! * pz + arenaF32[mBase + 1 * 4 + 3]!;
+            const wz = arenaF32[mBase + 2 * 4 + 0]! * px + arenaF32[mBase + 2 * 4 + 1]! * py + arenaF32[mBase + 2 * 4 + 2]! * pz + arenaF32[mBase + 2 * 4 + 3]!;
+            const dx = wx - ox, dy = wy - oy, dz = wz - oz;
+            const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if (!Number.isFinite(wx + wy + wz) || dist > 50) {
+              if (!triBad) {
+                push(
+                  `bucket#${bucketIdx} tri=${t} slot=${slot} drawIdx=${drawIdx} ` +
+                  `vid=${v} pos=(${px.toFixed(2)},${py.toFixed(2)},${pz.toFixed(2)}) ` +
+                  `world=(${wx.toFixed(2)},${wy.toFixed(2)},${wz.toFixed(2)}) ` +
+                  `origin=(${ox.toFixed(2)},${oy.toFixed(2)},${oz.toFixed(2)}) dist=${dist.toFixed(2)}`,
+                );
+              }
+              triBad = true;
+            }
+          }
+          if (triBad) crossSlot++;
         }
         trianglesChecked += here;
+        dtCopy.unmap(); dtCopy.destroy();
+        dhCopy.unmap(); dhCopy.destroy();
         bucketIdx++;
       }
+      arenaCopy.unmap(); arenaCopy.destroy();
+      if (indicesCopy !== undefined) { indicesCopy.unmap(); indicesCopy.destroy(); }
       void samples;
 
       return { trianglesChecked, crossSlot, issues };
