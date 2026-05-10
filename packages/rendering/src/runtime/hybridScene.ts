@@ -141,6 +141,18 @@ export interface HybridScene {
   simulateDraws(samples?: number): Promise<{
     emitsChecked: number; oob: number; issues: string[];
   }>;
+  /** GPU-side binary-search probe — dispatches a kernel mirroring the
+   *  render VS preamble; for each sampled emit, compares GPU-resolved
+   *  slot to CPU-resolved slot. Mismatches indicate the search loop
+   *  (or one of its inputs as seen by the kernel) miscomputes. */
+  probeBinarySearch(samples?: number): Promise<{
+    emitsChecked: number; gpuMismatches: number; issues: string[];
+  }>;
+  /** Triangle-level coherence check — for each sampled triangle base,
+   *  verifies all three of its emits resolve to the same slot. */
+  checkTriangleCoherence(samples?: number): Promise<{
+    trianglesChecked: number; crossSlot: number; issues: string[];
+  }>;
   dispose(): void;
 }
 
@@ -272,6 +284,16 @@ export function compileHybridScene(
       return (heapScene as unknown as { _debug: { simulateDraws(s?: number): Promise<{
         emitsChecked: number; oob: number; issues: string[];
       }> } })._debug.simulateDraws(samples);
+    },
+    probeBinarySearch(samples?: number) {
+      return (heapScene as unknown as { _debug: { probeBinarySearch(s?: number): Promise<{
+        emitsChecked: number; gpuMismatches: number; issues: string[];
+      }> } })._debug.probeBinarySearch(samples);
+    },
+    checkTriangleCoherence(samples?: number) {
+      return (heapScene as unknown as { _debug: { checkTriangleCoherence(s?: number): Promise<{
+        trianglesChecked: number; crossSlot: number; issues: string[];
+      }> } })._debug.checkTriangleCoherence(samples);
     },
     dispose(): void {
       heapScene.dispose();

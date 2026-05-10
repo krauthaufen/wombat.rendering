@@ -49,6 +49,10 @@ const gpuDebug = new URLSearchParams(location.search).get("gpudebug") === "1";
 const validateHeap = new URLSearchParams(location.search).get("validate") === "1";
 const simulateParam = new URLSearchParams(location.search).get("simulate");
 const simulateSamples = simulateParam !== null ? Math.max(1, parseInt(simulateParam, 10) | 0) : 0;
+const probeBsParam = new URLSearchParams(location.search).get("probebs");
+const probeBsSamples = probeBsParam !== null ? Math.max(1, parseInt(probeBsParam, 10) | 0) : 0;
+const trianglesParam = new URLSearchParams(location.search).get("triangles");
+const trianglesSamples = trianglesParam !== null ? Math.max(1, parseInt(trianglesParam, 10) | 0) : 0;
 
 // ---------------------------------------------------------------------------
 // Status banner
@@ -656,6 +660,42 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       if (validateHeap) setStatus("validateHeap failed: " + err.message, true);
     });
   }, 2000);
+
+  if (trianglesSamples > 0) {
+    setTimeout(() => {
+      void task.checkTriangleCoherence(trianglesSamples).then((r) => {
+        const summary =
+          `triangleCoherence: tris=${r.trianglesChecked} crossSlot=${r.crossSlot}` +
+          (r.crossSlot > 0 ? ` ⚠ ${r.issues.length} issue(s) (see console)` : " ✓");
+        console.log("[triangleCoherence]", summary);
+        if (r.crossSlot > 0) {
+          for (const issue of r.issues) console.warn("[triangleCoherence]", issue);
+          setStatus(summary, true);
+        }
+      }).catch((err) => {
+        console.error("[triangleCoherence] failed:", err);
+        setStatus("triangleCoherence failed: " + err.message, true);
+      });
+    }, 2500);
+  }
+
+  if (probeBsSamples > 0) {
+    setTimeout(() => {
+      void task.probeBinarySearch(probeBsSamples).then((r) => {
+        const summary =
+          `probeBinarySearch: emits=${r.emitsChecked} gpuMismatches=${r.gpuMismatches}` +
+          (r.gpuMismatches > 0 ? ` ⚠ ${r.issues.length} disagreement(s) (see console)` : " ✓");
+        console.log("[probeBinarySearch]", summary);
+        if (r.gpuMismatches > 0) {
+          for (const issue of r.issues) console.warn("[probeBinarySearch]", issue);
+          setStatus(summary, true);
+        }
+      }).catch((err) => {
+        console.error("[probeBinarySearch] failed:", err);
+        setStatus("probeBinarySearch failed: " + err.message, true);
+      });
+    }, 2500);
+  }
 
   if (simulateSamples > 0) {
     setTimeout(() => {

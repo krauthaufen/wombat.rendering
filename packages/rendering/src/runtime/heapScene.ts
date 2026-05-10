@@ -3512,6 +3512,58 @@ export function buildHeapScene(
             oob++;
           }
         }
+
+        // ── Bounding-box check: read ModelTrafo + Positions, transform
+        //    the vertex, verify it lands near the RO's origin (the
+        //    modelTrafo's translation column). Distance > MAX × geometry
+        //    extent flags overlapping-write corruption: if two ROs'
+        //    arena allocs got cross-wired, the transformed position
+        //    will land in a different RO's region, far from this RO's
+        //    expected origin.
+        const fsMap = new Map(fs.map(x => [x.name, x] as const));
+        const modelF = fsMap.get("ModelTrafo");
+        const positionsF = fsMap.get("Positions");
+        if (modelF !== undefined && positionsF !== undefined) {
+          const modelRef = headerU32[(headerOff + modelF.byteOffset) >>> 2];
+          const posRef = headerU32[(headerOff + positionsF.byteOffset) >>> 2];
+          if (modelRef !== undefined && modelRef !== 0 && posRef !== undefined && posRef !== 0) {
+            const mBase = (modelRef + ALLOC_HEADER_PAD_TO) >>> 2;
+            const posLen = arenaU32[(posRef >>> 2) + 1]!;
+            // Aardvark M44d is row-major; CPU mirror packs row-major.
+            // M[r][c] = arenaF32[mBase + r*4 + c]. Multiply M·v with
+            // v = (px, py, pz, 1).
+            const m = new Float32Array(16);
+            for (let i = 0; i < 16; i++) m[i] = arenaF32[mBase + i]!;
+            // RO origin = M·(0,0,0,1) = column 3 (translation).
+            const ox = m[0 * 4 + 3]!;
+            const oy = m[1 * 4 + 3]!;
+            const oz = m[2 * 4 + 3]!;
+            // Read vertex (cyclic vid%length).
+            const vidWrap = vid % posLen;
+            const pBase = (posRef + ALLOC_HEADER_PAD_TO) >>> 2;
+            const px = arenaF32[pBase + vidWrap * 3 + 0]!;
+            const py = arenaF32[pBase + vidWrap * 3 + 1]!;
+            const pz = arenaF32[pBase + vidWrap * 3 + 2]!;
+            // World = M·vec4(px,py,pz,1).
+            const wx = m[0 * 4 + 0]! * px + m[0 * 4 + 1]! * py + m[0 * 4 + 2]! * pz + m[0 * 4 + 3]!;
+            const wy = m[1 * 4 + 0]! * px + m[1 * 4 + 1]! * py + m[1 * 4 + 2]! * pz + m[1 * 4 + 3]!;
+            const wz = m[2 * 4 + 0]! * px + m[2 * 4 + 1]! * py + m[2 * 4 + 2]! * pz + m[2 * 4 + 3]!;
+            const dx = wx - ox, dy = wy - oy, dz = wz - oz;
+            const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+            // Conservative bound: scale ≤ ~3 in any axis × max-vertex-mag ≤ ~1.5
+            // → expected dist ≤ ~5. Anything > 50 is corruption.
+            if (!Number.isFinite(wx + wy + wz) || dist > 50) {
+              push(
+                `emit=${s} bucket=${dcIdx} slot=${slot} drawIdx=${drawIdx} vid=${vid} ` +
+                `pos=(${px.toFixed(2)},${py.toFixed(2)},${pz.toFixed(2)}) ` +
+                `world=(${wx.toFixed(2)},${wy.toFixed(2)},${wz.toFixed(2)}) ` +
+                `origin=(${ox.toFixed(2)},${oy.toFixed(2)},${oz.toFixed(2)}) ` +
+                `distFromOrigin=${dist.toFixed(2)}`,
+              );
+              oob++;
+            }
+          }
+        }
       }
 
       // Cleanup
@@ -3523,6 +3575,255 @@ export function buildHeapScene(
       }
 
       return { emitsChecked, oob, issues };
+    },
+    /** Triangle-level coherence: walks N triangle bases (3 consecutive
+     *  emits each) and verifies all three vertices of each triangle
+     *  resolve to the SAME slot. A mismatch means the rasterizer would
+     *  stitch a triangle across two ROs — the cross-RO stretched-band
+     *  bug. Vertex-level OOB / BB checks miss this because they sample
+     *  individual emits in isolation. */
+    async checkTriangleCoherence(samples = 50_000): Promise<{
+      trianglesChecked: number;
+      crossSlot: number;
+      issues: string[];
+    }> {
+      const issues: string[] = [];
+      let crossSlot = 0;
+      const push = (s: string) => { if (issues.length < 30) issues.push(s); };
+
+      let trianglesChecked = 0;
+      let bucketIdx = 0;
+      for (const target of buckets) {
+        if (target.recordCount === 0 || target.totalEmitEstimate === 0) { bucketIdx++; continue; }
+        const recordCount = target.recordCount;
+        const totalEmit = target.totalEmitEstimate;
+        const totalTris = Math.floor(totalEmit / 3);
+        const remainder = totalEmit % 3;
+        if (remainder !== 0) {
+          push(`bucket#${bucketIdx} totalEmit=${totalEmit} not multiple of 3 (remainder ${remainder}) — partial triangle from indirect-draw`);
+          crossSlot++;
+        }
+
+        const dtCopy = device.createBuffer({
+          size: recordCount * RECORD_BYTES,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        const enc0 = device.createCommandEncoder({ label: "checkTriangleCoherence.dt" });
+        enc0.copyBufferToBuffer(target.drawTableBuf!.buffer, 0, dtCopy, 0, recordCount * RECORD_BYTES);
+        device.queue.submit([enc0.finish()]);
+        await dtCopy.mapAsync(GPUMapMode.READ);
+        const dtU32 = new Uint32Array(dtCopy.getMappedRange());
+        const firstEmits: number[] = [];
+        const indexCounts: number[] = [];
+        const instCounts:  number[] = [];
+        for (let r = 0; r < recordCount; r++) {
+          firstEmits.push(dtU32[r * RECORD_U32 + 0]!);
+          indexCounts.push(dtU32[r * RECORD_U32 + 3]!);
+          instCounts.push(dtU32[r * RECORD_U32 + 4]!);
+        }
+        dtCopy.unmap(); dtCopy.destroy();
+
+        // Per-record correctness: indexCount * instanceCount must be
+        // a multiple of 3, otherwise THIS record's last triangle would
+        // lack a third vertex and the next record's first emit would
+        // be pulled into it by the rasterizer.
+        for (let r = 0; r < recordCount; r++) {
+          const sub = indexCounts[r]! * instCounts[r]!;
+          if (sub % 3 !== 0) {
+            push(`bucket#${bucketIdx} record[${r}] indexCount=${indexCounts[r]} instanceCount=${instCounts[r]} ` +
+              `→ sub-emit=${sub} not multiple of 3 (CROSS-RO TRIANGLE!)`);
+            crossSlot++;
+          }
+        }
+
+        const slotFor = (emit: number): number => {
+          let lo = 0, hi = recordCount - 1;
+          while (lo < hi) {
+            const mid = (lo + hi + 1) >>> 1;
+            if (firstEmits[mid]! <= emit) lo = mid;
+            else hi = mid - 1;
+          }
+          return lo;
+        };
+
+        const sampleCount = Math.min(samples - trianglesChecked, totalTris);
+        if (sampleCount <= 0) { bucketIdx++; continue; }
+        const stride = Math.max(1, Math.floor(totalTris / sampleCount));
+        let here = 0;
+        for (let t = 0; t < totalTris && here < sampleCount; t += stride) {
+          const e0 = t * 3;
+          const e1 = e0 + 1;
+          const e2 = e0 + 2;
+          const s0 = slotFor(e0);
+          const s1 = slotFor(e1);
+          const s2 = slotFor(e2);
+          here++;
+          if (s0 !== s1 || s1 !== s2) {
+            crossSlot++;
+            push(
+              `bucket#${bucketIdx} tri=${t} emits=(${e0},${e1},${e2}) slots=(${s0},${s1},${s2}) ` +
+              `firstEmits[${s0}]=${firstEmits[s0]} [${s1}]=${firstEmits[s1]} [${s2}]=${firstEmits[s2]}`,
+            );
+          }
+        }
+        trianglesChecked += here;
+        bucketIdx++;
+      }
+
+      return { trianglesChecked, crossSlot, issues };
+    },
+    /** GPU-side binary-search probe: dispatches a tiny compute kernel
+     *  that, for each sampled global emit-index, runs the SAME binary
+     *  search the render VS does (using firstDrawInTile + drawTable)
+     *  and writes the resulting slot into a debug buffer. Returns the
+     *  list of (emit, gpuSlot, cpuSlot) where the GPU disagrees with
+     *  the CPU. Cross-device comparison: if Chromium reports 0
+     *  disagreements but iOS reports any, we've localized the bug to
+     *  Apple's WGSL-lowered binary-search loop.
+     *
+     *  Bucket selection: validates the FIRST non-empty bucket only
+     *  (most diagnostic, simpler kernel; expand later if needed). */
+    async probeBinarySearch(samples = 50_000): Promise<{
+      emitsChecked: number;
+      gpuMismatches: number;
+      issues: string[];
+    }> {
+      const issues: string[] = [];
+      let gpuMismatches = 0;
+      const push = (s: string) => { if (issues.length < 30) issues.push(s); };
+
+      const target = buckets.find(b => b.recordCount > 0 && b.totalEmitEstimate > 0);
+      if (target === undefined) return { emitsChecked: 0, gpuMismatches: 0, issues };
+
+      const recordCount = target.recordCount;
+      const totalEmit = target.totalEmitEstimate;
+      const sampleCount = Math.min(samples, totalEmit);
+      const stride = Math.max(1, Math.floor(totalEmit / sampleCount));
+
+      // CPU's firstEmit is GPU-computed — must read it back from the
+      // drawTable GPU buffer (the CPU shadow's firstEmit field is
+      // always 0, written by the scan kernel only). Otherwise the
+      // CPU binary search would compare against zeros.
+      const dtCopy = device.createBuffer({
+        size: recordCount * RECORD_BYTES,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      {
+        const enc0 = device.createCommandEncoder({ label: "probeBinarySearch.dtCopy" });
+        enc0.copyBufferToBuffer(target.drawTableBuf!.buffer, 0, dtCopy, 0, recordCount * RECORD_BYTES);
+        device.queue.submit([enc0.finish()]);
+        await dtCopy.mapAsync(GPUMapMode.READ);
+      }
+      const dtU32 = new Uint32Array(dtCopy.getMappedRange());
+      const cpuFirstEmit: number[] = [];
+      for (let r = 0; r < recordCount; r++) cpuFirstEmit.push(dtU32[r * RECORD_U32 + 0]!);
+      dtCopy.unmap(); dtCopy.destroy();
+
+      // Build sample list of emit indices on CPU.
+      const sampleIdxArr = new Uint32Array(sampleCount);
+      for (let i = 0; i < sampleCount; i++) sampleIdxArr[i] = Math.min(i * stride, totalEmit - 1);
+
+      // CPU expected slots.
+      const cpuSlots = new Uint32Array(sampleCount);
+      for (let i = 0; i < sampleCount; i++) {
+        const emit = sampleIdxArr[i]!;
+        let lo = 0, hi = recordCount - 1;
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >>> 1;
+          if (cpuFirstEmit[mid]! <= emit) lo = mid;
+          else hi = mid - 1;
+        }
+        cpuSlots[i] = lo;
+      }
+
+      // GPU kernel — mirrors the render VS preamble's search exactly.
+      const wgsl = /* wgsl */ `
+        @group(0) @binding(0) var<storage, read>       drawTable:       array<u32>;
+        @group(0) @binding(1) var<storage, read>       firstDrawInTile: array<u32>;
+        @group(0) @binding(2) var<storage, read>       sampleEmits:     array<u32>;
+        @group(0) @binding(3) var<storage, read_write> outSlots:        array<u32>;
+        @group(0) @binding(4) var<uniform>             P:               vec4<u32>;
+
+        @compute @workgroup_size(64)
+        fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+          let i = gid.x;
+          if (i >= P.x) { return; }
+          let emitIdx = sampleEmits[i];
+          let _tileIdx = emitIdx >> 6u;
+          var lo: u32 = firstDrawInTile[_tileIdx];
+          var hi: u32 = firstDrawInTile[_tileIdx + 1u];
+          loop {
+            if (lo >= hi) { break; }
+            let _mid = (lo + hi + 1u) >> 1u;
+            if (drawTable[_mid * 5u] <= emitIdx) { lo = _mid; } else { hi = _mid - 1u; }
+          }
+          outSlots[i] = lo;
+        }
+      `;
+      const module = device.createShaderModule({ code: wgsl });
+      const bgl = device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+          { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+          { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        ],
+      });
+      const pipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+        compute: { module, entryPoint: "main" },
+      });
+
+      const sampleBuf = device.createBuffer({
+        size: sampleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      device.queue.writeBuffer(sampleBuf, 0, sampleIdxArr.buffer, sampleIdxArr.byteOffset, sampleIdxArr.byteLength);
+      const outBuf = device.createBuffer({
+        size: sampleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+      const paramBuf = device.createBuffer({
+        size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      device.queue.writeBuffer(paramBuf, 0, new Uint32Array([sampleCount, 0, 0, 0]));
+
+      const bg = device.createBindGroup({
+        layout: bgl,
+        entries: [
+          { binding: 0, resource: { buffer: target.drawTableBuf!.buffer } },
+          { binding: 1, resource: { buffer: target.firstDrawInTileBuf!.buffer } },
+          { binding: 2, resource: { buffer: sampleBuf } },
+          { binding: 3, resource: { buffer: outBuf } },
+          { binding: 4, resource: { buffer: paramBuf } },
+        ],
+      });
+
+      const enc = device.createCommandEncoder({ label: "probeBinarySearch" });
+      const pass = enc.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(Math.ceil(sampleCount / 64));
+      pass.end();
+      const readback = device.createBuffer({
+        size: sampleCount * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      enc.copyBufferToBuffer(outBuf, 0, readback, 0, sampleCount * 4);
+      device.queue.submit([enc.finish()]);
+      await readback.mapAsync(GPUMapMode.READ);
+      const gpuSlots = new Uint32Array(readback.getMappedRange().slice(0));
+      readback.unmap(); readback.destroy();
+      sampleBuf.destroy(); outBuf.destroy(); paramBuf.destroy();
+
+      for (let i = 0; i < sampleCount; i++) {
+        if (gpuSlots[i] !== cpuSlots[i]) {
+          gpuMismatches++;
+          push(
+            `emit=${sampleIdxArr[i]} gpuSlot=${gpuSlots[i]} cpuSlot=${cpuSlots[i]} ` +
+            `tile=${(sampleIdxArr[i]!) >>> 6}`,
+          );
+        }
+      }
+      return { emitsChecked: sampleCount, gpuMismatches, issues };
     },
   };
 

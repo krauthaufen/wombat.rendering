@@ -54,6 +54,16 @@ export interface IRenderTask {
   simulateDraws(samples?: number): Promise<{
     emitsChecked: number; oob: number; issues: string[];
   }>;
+  /** GPU-side binary-search probe — runs the same search the render VS
+   *  does and compares its result with the CPU's. */
+  probeBinarySearch(samples?: number): Promise<{
+    emitsChecked: number; gpuMismatches: number; issues: string[];
+  }>;
+  /** Triangle-level coherence — verifies each triangle's 3 emits land
+   *  in the same slot (no cross-RO triangles). */
+  checkTriangleCoherence(samples?: number): Promise<{
+    trianglesChecked: number; crossSlot: number; issues: string[];
+  }>;
 
   /** Tear down resources owned by the task. Idempotent. */
   dispose(): void;

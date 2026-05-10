@@ -180,6 +180,34 @@ class RenderTask implements IRenderTask {
     return { emitsChecked, oob, issues };
   }
 
+  async probeBinarySearch(samples?: number): Promise<{
+    emitsChecked: number; gpuMismatches: number; issues: string[];
+  }> {
+    let emitsChecked = 0, gpuMismatches = 0;
+    const issues: string[] = [];
+    for (const s of this._scenes.values()) {
+      const r = await s.probeBinarySearch(samples);
+      emitsChecked += r.emitsChecked;
+      gpuMismatches += r.gpuMismatches;
+      for (const i of r.issues) issues.push(i);
+    }
+    return { emitsChecked, gpuMismatches, issues };
+  }
+
+  async checkTriangleCoherence(samples?: number): Promise<{
+    trianglesChecked: number; crossSlot: number; issues: string[];
+  }> {
+    let trianglesChecked = 0, crossSlot = 0;
+    const issues: string[] = [];
+    for (const s of this._scenes.values()) {
+      const r = await s.checkTriangleCoherence(samples);
+      trianglesChecked += r.trianglesChecked;
+      crossSlot += r.crossSlot;
+      for (const i of r.issues) issues.push(i);
+    }
+    return { trianglesChecked, crossSlot, issues };
+  }
+
   dispose(): void {
     if (this._disposed) return;
     for (const s of this._scenes.values()) s.dispose();
