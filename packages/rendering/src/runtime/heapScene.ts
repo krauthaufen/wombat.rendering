@@ -895,7 +895,17 @@ fn buildTileIndex(@builtin(global_invocation_id) gid: vec3<u32>) {
     return;
   }
   if (tileIdx == numTiles) {
-    firstDrawInTile[tileIdx] = params.numRecords;
+    // Sentinel for the open upper bound — the LAST VALID SLOT, not
+    // numRecords. The render VS uses
+    //     hi = firstDrawInTile[_tileIdx + 1u]
+    // and the binary search treats hi as INCLUSIVE. If the sentinel
+    // were numRecords (one past last), the search would drag lo into
+    // the OOB slot for emits in the last tile, since drawTable reads
+    // past recordCount return 0 (binding size clamping) and 0 ≤ emit
+    // is always true. Visible symptom: the LAST few emits in the
+    // bucket land on slot=numRecords (drawIdx=0, indexCount=0 → /-by-
+    // zero) → degenerate / cross-RO triangle stitched to slot 0.
+    firstDrawInTile[tileIdx] = params.numRecords - 1u;
     return;
   }
   let tileStart = tileIdx * TILE_K;
@@ -3593,6 +3603,14 @@ export function buildHeapScene(
 
       let trianglesChecked = 0;
       let bucketIdx = 0;
+      // Cross-bucket paranoia: collect every (ref, allocBytes, owner)
+      // claimed by any drawHeader of any bucket. After all buckets are
+      // walked, sort and verify no two distinct refs overlap in arena.
+      // Distinct refs that overlap = arena allocator handed the same
+      // bytes to two avals → two ROs reading each other's data → the
+      // cross-RO triangle symptom.
+      const allocClaims: { ref: number; bytes: number; owner: string }[] = [];
+
       // Stage arena + arena.indices once (shared across buckets).
       const arenaCopy = device.createBuffer({
         size: arena.attrs.buffer.size,
@@ -3730,6 +3748,43 @@ export function buildHeapScene(
             );
             continue;
           }
+          // Paranoid re-derive: drawIdx + ModelTrafoRef per-emit. If
+          // any of these read paths gives a different value across
+          // the three emits of one triangle, the triangle is using
+          // multiple model trafos.
+          const drawIdxA = drawIdxs[s0]!;
+          const drawIdxB = drawIdxs[s1]!;
+          const drawIdxC = drawIdxs[s2]!;
+          if (drawIdxA !== drawIdxB || drawIdxB !== drawIdxC) {
+            crossSlot++;
+            push(`bucket#${bucketIdx} tri=${t} drawIdx mismatch across emits: ${drawIdxA},${drawIdxB},${drawIdxC}`);
+            continue;
+          }
+          if (mtOff >= 0) {
+            const mtRefA = dhU32[(drawIdxA * stride2 + mtOff) >>> 2]!;
+            const mtRefB = dhU32[(drawIdxB * stride2 + mtOff) >>> 2]!;
+            const mtRefC = dhU32[(drawIdxC * stride2 + mtOff) >>> 2]!;
+            if (mtRefA !== mtRefB || mtRefB !== mtRefC) {
+              crossSlot++;
+              push(`bucket#${bucketIdx} tri=${t} ModelTrafoRef mismatch: ${mtRefA.toString(16)},${mtRefB.toString(16)},${mtRefC.toString(16)}`);
+              continue;
+            }
+            // Triple-read mat4 bytes and assert identical (in case
+            // the per-vertex shader gets different bytes from
+            // arena due to some aliasing/coherency anomaly the CPU
+            // can model only as identical reads).
+            if (mtRefA !== 0) {
+              const mb = (mtRefA + ALLOC_HEADER_PAD_TO) >>> 2;
+              for (let k = 0; k < 16; k++) {
+                const a = arenaF32[mb + k]!;
+                if (!Number.isFinite(a)) {
+                  crossSlot++;
+                  push(`bucket#${bucketIdx} tri=${t} ModelTrafo[${k}] non-finite=${a}`);
+                  break;
+                }
+              }
+            }
+          }
           const slot = s0;
           const indexCount = indexCounts[slot]!;
           const indexStart = indexStarts[slot]!;
@@ -3792,6 +3847,64 @@ export function buildHeapScene(
         dhCopy.unmap(); dhCopy.destroy();
         bucketIdx++;
       }
+      // ── Cross-bucket arena allocation overlap detection. ──────────
+      // Walk every drawHeader of every bucket, collect (ref, size,
+      // owner) for every uniform-ref + attribute-ref field. Sort by
+      // ref. Verify: two consecutive entries with DIFFERENT ref do
+      // NOT have overlapping byte ranges. Distinct refs overlapping
+      // = the arena allocator handed the same bytes to two distinct
+      // allocations → two ROs read each other's data → cross-RO
+      // triangle. Bug is invisible to per-triangle checks because
+      // each individual triangle reads "valid" bytes (just not its
+      // own bytes).
+      bucketIdx = 0;
+      for (const target of buckets) {
+        if (target.recordCount === 0) { bucketIdx++; continue; }
+        // Re-stage drawHeap for this bucket.
+        const dhBytes = target.recordCount * target.layout.drawHeaderBytes;
+        const dhCopy = device.createBuffer({
+          size: dhBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        const enc1 = device.createCommandEncoder();
+        enc1.copyBufferToBuffer(target.drawHeap.buffer, 0, dhCopy, 0, dhBytes);
+        device.queue.submit([enc1.finish()]);
+        await dhCopy.mapAsync(GPUMapMode.READ);
+        const dhU32 = new Uint32Array(dhCopy.getMappedRange());
+        const stride2 = target.layout.drawHeaderBytes;
+        for (let slot = 0; slot < target.recordCount; slot++) {
+          for (const f of target.layout.drawHeaderFields) {
+            if (f.kind !== "uniform-ref" && f.kind !== "attribute-ref") continue;
+            const ref = dhU32[(slot * stride2 + f.byteOffset) >>> 2];
+            if (ref === undefined || ref === 0) continue;
+            // Read alloc length (u32 at ref/4 + 1) → derive bytes.
+            const len = arenaU32[(ref >>> 2) + 1]!;
+            const stride = arenaU32[(ref >>> 2) + 2]!;  // stride bytes
+            const dataBytes = stride > 0 ? stride * len : 64; // fallback for uniform-ref
+            const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
+            allocClaims.push({ ref, bytes: allocBytes, owner: `b${bucketIdx}.slot${slot}.${f.name}` });
+          }
+        }
+        dhCopy.unmap(); dhCopy.destroy();
+        bucketIdx++;
+      }
+      // Sort + walk for overlap. Group by ref first — same ref is OK
+      // (legit dedup). Different refs whose ranges intersect = bug.
+      allocClaims.sort((a, b) => a.ref - b.ref);
+      let prevRef = -1, prevEnd = -1, prevOwner = "";
+      for (const c of allocClaims) {
+        if (c.ref === prevRef) continue;  // shared (legit)
+        if (prevEnd > c.ref) {
+          crossSlot++;
+          push(
+            `arena overlap: ${prevOwner} [0x${prevRef.toString(16)}, 0x${prevEnd.toString(16)}) ` +
+            `vs ${c.owner} [0x${c.ref.toString(16)}, 0x${(c.ref + c.bytes).toString(16)})`,
+          );
+        }
+        prevRef = c.ref;
+        prevEnd = c.ref + c.bytes;
+        prevOwner = c.owner;
+      }
+
       arenaCopy.unmap(); arenaCopy.destroy();
       if (indicesCopy !== undefined) { indicesCopy.unmap(); indicesCopy.destroy(); }
       void samples;
@@ -3840,9 +3953,11 @@ export function buildHeapScene(
         device.queue.submit([enc0.finish()]);
         await dtCopy.mapAsync(GPUMapMode.READ);
       }
-      const dtU32 = new Uint32Array(dtCopy.getMappedRange());
+      // Snapshot ALL drawTable u32s into a regular array — we'll need
+      // them after unmap to compute the per-emit CPU expectation.
+      const dtSnapshot = new Uint32Array(dtCopy.getMappedRange().slice(0));
       const cpuFirstEmit: number[] = [];
-      for (let r = 0; r < recordCount; r++) cpuFirstEmit.push(dtU32[r * RECORD_U32 + 0]!);
+      for (let r = 0; r < recordCount; r++) cpuFirstEmit.push(dtSnapshot[r * RECORD_U32 + 0]!);
       dtCopy.unmap(); dtCopy.destroy();
 
       // Build sample list of emit indices on CPU.
@@ -3863,12 +3978,16 @@ export function buildHeapScene(
       }
 
       // GPU kernel — mirrors the render VS preamble's search exactly.
+      // Writes (slot, drawIdx, indexStart, indexCount, instanceCount,
+      // _local, instId, vid) per emit so we can verify EVERY field
+      // the VS computes, not just the slot. 8 u32 per emit.
       const wgsl = /* wgsl */ `
         @group(0) @binding(0) var<storage, read>       drawTable:       array<u32>;
         @group(0) @binding(1) var<storage, read>       firstDrawInTile: array<u32>;
         @group(0) @binding(2) var<storage, read>       sampleEmits:     array<u32>;
-        @group(0) @binding(3) var<storage, read_write> outSlots:        array<u32>;
-        @group(0) @binding(4) var<uniform>             P:               vec4<u32>;
+        @group(0) @binding(3) var<storage, read>       indexStorage:    array<u32>;
+        @group(0) @binding(4) var<storage, read_write> outRows:         array<u32>;
+        @group(0) @binding(5) var<uniform>             P:               vec4<u32>;
 
         @compute @workgroup_size(64)
         fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -3883,7 +4002,24 @@ export function buildHeapScene(
             let _mid = (lo + hi + 1u) >> 1u;
             if (drawTable[_mid * 5u] <= emitIdx) { lo = _mid; } else { hi = _mid - 1u; }
           }
-          outSlots[i] = lo;
+          let _slot = lo;
+          let _firstEmit  = drawTable[_slot * 5u + 0u];
+          let _drawIdx    = drawTable[_slot * 5u + 1u];
+          let _indexStart = drawTable[_slot * 5u + 2u];
+          let _indexCount = drawTable[_slot * 5u + 3u];
+          let _instCount  = drawTable[_slot * 5u + 4u];
+          let _local      = emitIdx - _firstEmit;
+          let _instId     = _local / _indexCount;
+          let _vid        = indexStorage[_indexStart + (_local % _indexCount)];
+          let base = i * 8u;
+          outRows[base + 0u] = _slot;
+          outRows[base + 1u] = _drawIdx;
+          outRows[base + 2u] = _indexStart;
+          outRows[base + 3u] = _indexCount;
+          outRows[base + 4u] = _instCount;
+          outRows[base + 5u] = _local;
+          outRows[base + 6u] = _instId;
+          outRows[base + 7u] = _vid;
         }
       `;
       const module = device.createShaderModule({ code: wgsl });
@@ -3892,8 +4028,9 @@ export function buildHeapScene(
           { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
           { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
           { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-          { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-          { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+          { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+          { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+          { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
         ],
       });
       const pipeline = device.createComputePipeline({
@@ -3906,7 +4043,7 @@ export function buildHeapScene(
       });
       device.queue.writeBuffer(sampleBuf, 0, sampleIdxArr.buffer, sampleIdxArr.byteOffset, sampleIdxArr.byteLength);
       const outBuf = device.createBuffer({
-        size: sampleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        size: sampleCount * 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
       });
       const paramBuf = device.createBuffer({
         size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -3919,8 +4056,9 @@ export function buildHeapScene(
           { binding: 0, resource: { buffer: target.drawTableBuf!.buffer } },
           { binding: 1, resource: { buffer: target.firstDrawInTileBuf!.buffer } },
           { binding: 2, resource: { buffer: sampleBuf } },
-          { binding: 3, resource: { buffer: outBuf } },
-          { binding: 4, resource: { buffer: paramBuf } },
+          { binding: 3, resource: { buffer: arena.indices.buffer } },
+          { binding: 4, resource: { buffer: outBuf } },
+          { binding: 5, resource: { buffer: paramBuf } },
         ],
       });
 
@@ -3931,21 +4069,68 @@ export function buildHeapScene(
       pass.dispatchWorkgroups(Math.ceil(sampleCount / 64));
       pass.end();
       const readback = device.createBuffer({
-        size: sampleCount * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        size: sampleCount * 32, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
       });
-      enc.copyBufferToBuffer(outBuf, 0, readback, 0, sampleCount * 4);
+      enc.copyBufferToBuffer(outBuf, 0, readback, 0, sampleCount * 32);
       device.queue.submit([enc.finish()]);
       await readback.mapAsync(GPUMapMode.READ);
-      const gpuSlots = new Uint32Array(readback.getMappedRange().slice(0));
+      const gpuRows = new Uint32Array(readback.getMappedRange().slice(0));
       readback.unmap(); readback.destroy();
       sampleBuf.destroy(); outBuf.destroy(); paramBuf.destroy();
 
+      // Read drawTable + indices for CPU expectation.
+      const indicesCopy2 = device.createBuffer({
+        size: arena.indices.buffer.size,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      const enc2 = device.createCommandEncoder();
+      enc2.copyBufferToBuffer(arena.indices.buffer, 0, indicesCopy2, 0, arena.indices.buffer.size);
+      device.queue.submit([enc2.finish()]);
+      await indicesCopy2.mapAsync(GPUMapMode.READ);
+      const indicesU32 = new Uint32Array(indicesCopy2.getMappedRange().slice(0));
+      indicesCopy2.unmap(); indicesCopy2.destroy();
+
       for (let i = 0; i < sampleCount; i++) {
-        if (gpuSlots[i] !== cpuSlots[i]) {
+        const emit = sampleIdxArr[i]!;
+        const cpuSlot = cpuSlots[i]!;
+        const cpuFirstEmit_  = dtSnapshot[cpuSlot * RECORD_U32 + 0]!;
+        const cpuDrawIdx     = dtSnapshot[cpuSlot * RECORD_U32 + 1]!;
+        const cpuIndexStart  = dtSnapshot[cpuSlot * RECORD_U32 + 2]!;
+        const cpuIndexCount  = dtSnapshot[cpuSlot * RECORD_U32 + 3]!;
+        const cpuInstCount   = dtSnapshot[cpuSlot * RECORD_U32 + 4]!;
+        const cpuLocal       = emit - cpuFirstEmit_;
+        const cpuInstId      = Math.floor(cpuLocal / cpuIndexCount);
+        const cpuVid         = indicesU32[cpuIndexStart + (cpuLocal % cpuIndexCount)]!;
+        const base = i * 8;
+        const got = {
+          slot: gpuRows[base + 0]!, drawIdx: gpuRows[base + 1]!,
+          indexStart: gpuRows[base + 2]!, indexCount: gpuRows[base + 3]!,
+          instCount: gpuRows[base + 4]!, local: gpuRows[base + 5]!,
+          instId: gpuRows[base + 6]!, vid: gpuRows[base + 7]!,
+        };
+        const exp = {
+          slot: cpuSlot, drawIdx: cpuDrawIdx,
+          indexStart: cpuIndexStart, indexCount: cpuIndexCount,
+          instCount: cpuInstCount, local: cpuLocal,
+          instId: cpuInstId, vid: cpuVid,
+        };
+        if (
+          got.slot       !== exp.slot       ||
+          got.drawIdx    !== exp.drawIdx    ||
+          got.indexStart !== exp.indexStart ||
+          got.indexCount !== exp.indexCount ||
+          got.instCount  !== exp.instCount  ||
+          got.local      !== exp.local      ||
+          got.instId     !== exp.instId     ||
+          got.vid        !== exp.vid
+        ) {
           gpuMismatches++;
           push(
-            `emit=${sampleIdxArr[i]} gpuSlot=${gpuSlots[i]} cpuSlot=${cpuSlots[i]} ` +
-            `tile=${(sampleIdxArr[i]!) >>> 6}`,
+            `emit=${emit} GPU vs CPU: ` +
+            `slot=${got.slot}/${exp.slot} drawIdx=${got.drawIdx}/${exp.drawIdx} ` +
+            `idxStart=${got.indexStart}/${exp.indexStart} idxCount=${got.indexCount}/${exp.indexCount} ` +
+            `instCount=${got.instCount}/${exp.instCount} local=${got.local}/${exp.local} ` +
+            `instId=${got.instId}/${exp.instId} vid=${got.vid}/${exp.vid}`,
           );
         }
       }
