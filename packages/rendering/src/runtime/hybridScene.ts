@@ -132,6 +132,7 @@ export interface HybridScene {
     attrAllocsChecked: number; attrAllocsBad: number;
     tilesChecked: number; tilesBad: number;
     vidChecks: number; vidBad: number;
+    indicesHash: string;
   }>;
   /** Per-emit CPU draw simulator — samples the global emit space,
    *  reproduces the binary-search + (slot, _local, instId, vid)
@@ -264,6 +265,7 @@ export function compileHybridScene(
         attrAllocsChecked: number; attrAllocsBad: number;
         tilesChecked: number; tilesBad: number;
         vidChecks: number; vidBad: number;
+        indicesHash: string;
       }> } })._debug.validateHeap();
     },
     simulateDraws(samples?: number) {

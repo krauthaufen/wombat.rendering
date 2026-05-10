@@ -3006,6 +3006,7 @@ export function buildHeapScene(
       tilesBad: number;
       vidChecks: number;
       vidBad: number;
+      indicesHash: string;
     }> {
       const issues: string[] = [];
       let okRefs = 0, badRefs = 0;
@@ -3258,6 +3259,28 @@ export function buildHeapScene(
         dc.drawHeap.destroy();
         bucketIdx++;
       }
+      // ── 7. Content fingerprints over scene-deterministic regions.
+      //       Hashing the FULL arena would change per frame because
+      //       view/proj uniforms are repacked each tick — not useful
+      //       for cross-device comparison. Restrict to what's stable
+      //       across the whole scene lifetime: indices buffer (vertex
+      //       indices, written once at addDraw and never touched).
+      //       fnv1a is fast and good enough.
+      const fnv1a = (u32: Uint32Array): string => {
+        let h = 0x811c9dc5 >>> 0;
+        for (let i = 0; i < u32.length; i++) {
+          const v = u32[i]!;
+          h = (h ^ (v & 0xff)) >>> 0;     h = Math.imul(h, 0x01000193) >>> 0;
+          h = (h ^ ((v >>> 8) & 0xff)) >>> 0;  h = Math.imul(h, 0x01000193) >>> 0;
+          h = (h ^ ((v >>> 16) & 0xff)) >>> 0; h = Math.imul(h, 0x01000193) >>> 0;
+          h = (h ^ ((v >>> 24) & 0xff)) >>> 0; h = Math.imul(h, 0x01000193) >>> 0;
+        }
+        return h.toString(16).padStart(8, "0");
+      };
+      const indicesHash = indicesCopy !== undefined
+        ? fnv1a(new Uint32Array(indicesCopy.getMappedRange(), 0, indicesSize >>> 2))
+        : "—";
+
       arenaCopy.unmap();
       arenaCopy.destroy();
       if (indicesCopy !== undefined) {
@@ -3273,6 +3296,7 @@ export function buildHeapScene(
         attrAllocsChecked, attrAllocsBad,
         tilesChecked, tilesBad,
         vidChecks, vidBad,
+        indicesHash,
       };
     },
     /** Per-emit CPU draw simulator. Samples N emits across all

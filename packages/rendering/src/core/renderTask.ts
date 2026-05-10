@@ -46,6 +46,7 @@ export interface IRenderTask {
     attrAllocsChecked: number; attrAllocsBad: number;
     tilesChecked: number; tilesBad: number;
     vidChecks: number; vidBad: number;
+    indicesHash: string;
   }>;
   /** CPU draw simulator. Walks N sampled emits, runs the binary-search
    *  + index/instance recovery, and verifies every storage read lands

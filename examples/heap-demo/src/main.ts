@@ -625,30 +625,37 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   const gpct = (p: number): number => pctOf(gpuSamples, gpuSampleN, p);
   setStatus(`ready — ${ros.length} render objects${atlasMode ? ` · atlas mode (${NUM_ATLAS_TEXTURES} textures)` : ""}`);
 
-  // ?validate=1 → run the heap-structure check after a few frames so
-  // initial population + first dispatch have settled. Logs to console
-  // and surfaces a one-line summary in status.
-  if (validateHeap) {
-    setTimeout(() => {
-      void task.validateHeap().then((r) => {
+  // Captured on first validateHeap run; surfaced in the stats overlay
+  // for cross-device comparison (Chromium hash should equal iOS hash
+  // since indices are upload-once and never touched).
+  let indicesHashStr: string | undefined;
+
+  // Always run validateHeap once after init so we always have an
+  // `indicesHash` for the stats line. ?validate=1 additionally logs
+  // the full summary + flags errors in red.
+  setTimeout(() => {
+    void task.validateHeap().then((r) => {
+      indicesHashStr = r.indicesHash;
+      if (validateHeap) {
         const total = r.badRefs + r.drawTableErrs + r.prefixSumErrs + r.attrAllocsBad + r.tilesBad;
         const summary =
           `validateHeap: arena=${r.arenaBytes}B refs=${r.okRefs}ok/${r.badRefs}bad ` +
           `rows=${r.drawTableRows}/${r.drawTableErrs}err prefix=${r.prefixSumErrs}err ` +
           `attrAllocs=${r.attrAllocsChecked}/${r.attrAllocsBad}bad ` +
-          `tiles=${r.tilesChecked}/${r.tilesBad}bad` +
+          `tiles=${r.tilesChecked}/${r.tilesBad}bad ` +
+          `idxHash=${r.indicesHash}` +
           (total > 0 ? ` ⚠ ${r.issues.length} issue(s) (see console)` : " ✓");
         console.log("[validateHeap]", summary);
         if (total > 0) {
           for (const issue of r.issues) console.warn("[validateHeap]", issue);
           setStatus(summary, true);
         }
-      }).catch((err) => {
-        console.error("[validateHeap] failed:", err);
-        setStatus("validateHeap failed: " + err.message, true);
-      });
-    }, 2000);
-  }
+      }
+    }).catch((err) => {
+      console.error("[validateHeap] failed:", err);
+      if (validateHeap) setStatus("validateHeap failed: " + err.message, true);
+    });
+  }, 2000);
 
   if (simulateSamples > 0) {
     setTimeout(() => {
@@ -742,7 +749,11 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
           `§7 dispatch ${f(t.encodeMs, 3)} ms`;
       }
 
-      const line = `${row1}\n${row2}${row3}`;
+      const row4 = indicesHashStr !== undefined
+        ? `\nidxHash  ${indicesHashStr}`
+        : "";
+
+      const line = `${row1}\n${row2}${row3}${row4}`;
       setStatus(line);
       console.log("[STATS]", line);
       frames = 0;

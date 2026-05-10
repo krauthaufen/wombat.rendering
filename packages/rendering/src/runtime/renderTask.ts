@@ -130,12 +130,14 @@ class RenderTask implements IRenderTask {
     attrAllocsChecked: number; attrAllocsBad: number;
     tilesChecked: number; tilesBad: number;
     vidChecks: number; vidBad: number;
+    indicesHash: string;
   }> {
     let arenaBytes = 0, okRefs = 0, badRefs = 0;
     let drawTableRows = 0, drawTableErrs = 0, prefixSumErrs = 0;
     let attrAllocsChecked = 0, attrAllocsBad = 0;
     let tilesChecked = 0, tilesBad = 0;
     let vidChecks = 0, vidBad = 0;
+    const indicesHashes: string[] = [];
     const issues: string[] = [];
     for (const s of this._scenes.values()) {
       const r = await s.validateHeap();
@@ -151,6 +153,7 @@ class RenderTask implements IRenderTask {
       tilesBad += r.tilesBad;
       vidChecks += r.vidChecks;
       vidBad += r.vidBad;
+      indicesHashes.push(r.indicesHash);
       for (const i of r.issues) issues.push(i);
     }
     return {
@@ -159,6 +162,7 @@ class RenderTask implements IRenderTask {
       attrAllocsChecked, attrAllocsBad,
       tilesChecked, tilesBad,
       vidChecks, vidBad,
+      indicesHash: indicesHashes.join(","),
     };
   }
 
