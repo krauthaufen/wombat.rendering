@@ -130,6 +130,15 @@ export interface HybridScene {
     okRefs: number; badRefs: number;
     drawTableRows: number; drawTableErrs: number; prefixSumErrs: number;
     attrAllocsChecked: number; attrAllocsBad: number;
+    tilesChecked: number; tilesBad: number;
+    vidChecks: number; vidBad: number;
+  }>;
+  /** Per-emit CPU draw simulator — samples the global emit space,
+   *  reproduces the binary-search + (slot, _local, instId, vid)
+   *  recovery, and verifies every storage-buffer read address is
+   *  in-bounds and reads finite data. Reports any out-of-bounds. */
+  simulateDraws(samples?: number): Promise<{
+    emitsChecked: number; oob: number; issues: string[];
   }>;
   dispose(): void;
 }
@@ -253,7 +262,14 @@ export function compileHybridScene(
         okRefs: number; badRefs: number;
         drawTableRows: number; drawTableErrs: number; prefixSumErrs: number;
         attrAllocsChecked: number; attrAllocsBad: number;
+        tilesChecked: number; tilesBad: number;
+        vidChecks: number; vidBad: number;
       }> } })._debug.validateHeap();
+    },
+    simulateDraws(samples?: number) {
+      return (heapScene as unknown as { _debug: { simulateDraws(s?: number): Promise<{
+        emitsChecked: number; oob: number; issues: string[];
+      }> } })._debug.simulateDraws(samples);
     },
     dispose(): void {
       heapScene.dispose();

@@ -44,6 +44,14 @@ export interface IRenderTask {
     okRefs: number; badRefs: number;
     drawTableRows: number; drawTableErrs: number; prefixSumErrs: number;
     attrAllocsChecked: number; attrAllocsBad: number;
+    tilesChecked: number; tilesBad: number;
+    vidChecks: number; vidBad: number;
+  }>;
+  /** CPU draw simulator. Walks N sampled emits, runs the binary-search
+   *  + index/instance recovery, and verifies every storage read lands
+   *  inside the bound buffer. */
+  simulateDraws(samples?: number): Promise<{
+    emitsChecked: number; oob: number; issues: string[];
   }>;
 
   /** Tear down resources owned by the task. Idempotent. */

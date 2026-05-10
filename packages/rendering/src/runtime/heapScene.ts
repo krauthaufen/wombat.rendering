@@ -3002,11 +3002,17 @@ export function buildHeapScene(
       prefixSumErrs: number;
       attrAllocsChecked: number;
       attrAllocsBad: number;
+      tilesChecked: number;
+      tilesBad: number;
+      vidChecks: number;
+      vidBad: number;
     }> {
       const issues: string[] = [];
       let okRefs = 0, badRefs = 0;
       let drawTableRows = 0, drawTableErrs = 0, prefixSumErrs = 0;
       let attrAllocsChecked = 0, attrAllocsBad = 0;
+      let tilesChecked = 0, tilesBad = 0;
+      let vidChecks = 0, vidBad = 0;
       const push = (s: string) => { if (issues.length < 60) issues.push(s); };
       const arenaSize = arena.attrs.buffer.size;
       const indicesSize = arena.indices.buffer.size;
@@ -3027,7 +3033,11 @@ export function buildHeapScene(
         bucket: typeof buckets[number];
         drawHeap: GPUBuffer;
         drawTable?: GPUBuffer;
+        firstDrawInTile?: GPUBuffer;
+        indirect?: GPUBuffer;
+        numTiles: number;
       };
+      const TILE_K_LOCAL = 64;
       const dcs: DC[] = [];
       for (const b of buckets) {
         const dhSize = Math.min(b.drawHeap.buffer.size, b.recordCount * b.layout.drawHeaderBytes);
@@ -3036,7 +3046,18 @@ export function buildHeapScene(
         const dt = b.drawTableBuf !== undefined && b.recordCount > 0
           ? stage(b.drawTableBuf.buffer, b.recordCount * RECORD_BYTES)
           : undefined;
-        dcs.push({ bucket: b, drawHeap: dh, ...(dt !== undefined ? { drawTable: dt } : {}) });
+        const totalEmit = b.totalEmitEstimate;
+        const numTiles = totalEmit > 0 ? Math.ceil(totalEmit / TILE_K_LOCAL) : 0;
+        const fdt = b.firstDrawInTileBuf !== undefined && numTiles > 0
+          ? stage(b.firstDrawInTileBuf.buffer, Math.min(b.firstDrawInTileBuf.buffer.size, (numTiles + 1) * 4))
+          : undefined;
+        const ind = b.indirectBuf !== undefined ? stage(b.indirectBuf, 16) : undefined;
+        dcs.push({
+          bucket: b, drawHeap: dh, numTiles,
+          ...(dt !== undefined ? { drawTable: dt } : {}),
+          ...(fdt !== undefined ? { firstDrawInTile: fdt } : {}),
+          ...(ind !== undefined ? { indirect: ind } : {}),
+        });
       }
       device.queue.submit([enc.finish()]);
 
@@ -3045,6 +3066,8 @@ export function buildHeapScene(
       for (const dc of dcs) {
         await dc.drawHeap.mapAsync(GPUMapMode.READ);
         if (dc.drawTable !== undefined) await dc.drawTable.mapAsync(GPUMapMode.READ);
+        if (dc.firstDrawInTile !== undefined) await dc.firstDrawInTile.mapAsync(GPUMapMode.READ);
+        if (dc.indirect !== undefined) await dc.indirect.mapAsync(GPUMapMode.READ);
       }
 
       // ── 1+4. drawHeader refs inside arena, drawTable indices in range,
@@ -3172,8 +3195,63 @@ export function buildHeapScene(
             }
             runningSum += indexCount * instanceCount;
           }
+          // ── 5. firstDrawInTile validation: per-tile CPU binary
+          //       search using the drawTable.firstEmit values must
+          //       match the GPU-computed values in firstDrawInTile.
+          //       firstEmit was just verified vs CPU prefix-sum, so
+          //       we use the GPU-stored values as the trusted truth.
+          if (dc.firstDrawInTile !== undefined && dc.numTiles > 0) {
+            const fdt = new Uint32Array(dc.firstDrawInTile.getMappedRange());
+            const firstEmits: number[] = [];
+            for (let r = 0; r < recordCount; r++) {
+              firstEmits.push(dt[r * RECORD_U32 + 0]!);
+            }
+            for (let t = 0; t < dc.numTiles; t++) {
+              const tileStart = t * TILE_K_LOCAL;
+              let lo = 0, hi = recordCount - 1;
+              while (lo < hi) {
+                const mid = (lo + hi + 1) >>> 1;
+                if (firstEmits[mid]! <= tileStart) lo = mid;
+                else hi = mid - 1;
+              }
+              const got = fdt[t]!;
+              tilesChecked++;
+              if (got !== lo) {
+                push(`bucket#${bucketIdx} firstDrawInTile[${t}] (tileStart=${tileStart}) ` +
+                  `got=${got} expected=${lo}`);
+                tilesBad++;
+              }
+            }
+            const sentinel = fdt[dc.numTiles]!;
+            tilesChecked++;
+            if (sentinel !== recordCount) {
+              push(`bucket#${bucketIdx} firstDrawInTile[${dc.numTiles}] sentinel ` +
+                `got=${sentinel} expected=${recordCount}`);
+              tilesBad++;
+            }
+            dc.firstDrawInTile.unmap();
+            dc.firstDrawInTile.destroy();
+          }
           dc.drawTable.unmap();
           dc.drawTable.destroy();
+        }
+
+        // ── 6. indirect[0] (totalEmit) must match CPU prefix sum.
+        if (dc.indirect !== undefined) {
+          const ind = new Uint32Array(dc.indirect.getMappedRange());
+          const expectedTotal = dc.bucket.totalEmitEstimate;
+          const got = ind[0]!;
+          if (got !== expectedTotal) {
+            push(`bucket#${bucketIdx} indirect[0]=${got} ≠ expected totalEmit=${expectedTotal}`);
+            drawTableErrs++;
+          }
+          // [1]=instanceCount must be 1 (megacall pattern).
+          if (ind[1] !== 1) {
+            push(`bucket#${bucketIdx} indirect[1]=${ind[1]} ≠ 1`);
+            drawTableErrs++;
+          }
+          dc.indirect.unmap();
+          dc.indirect.destroy();
         }
 
         dc.drawHeap.unmap();
@@ -3193,7 +3271,234 @@ export function buildHeapScene(
         okRefs, badRefs,
         drawTableRows, drawTableErrs, prefixSumErrs,
         attrAllocsChecked, attrAllocsBad,
+        tilesChecked, tilesBad,
+        vidChecks, vidBad,
       };
+    },
+    /** Per-emit CPU draw simulator. Samples N emits across all
+     *  buckets; for each, performs the same binary search the render
+     *  kernel does, recovers (slot, _local, instId, vid), and verifies
+     *  every storage-buffer read address the vertex shader would
+     *  perform lands inside its bound buffer.
+     *
+     *  Returns counts + first few sites of any OOB read. The shader's
+     *  cyclic addressing on per-vertex attrs and direct (non-cyclic)
+     *  addressing on per-instance attrs are both modelled. */
+    async simulateDraws(samples = 50_000): Promise<{
+      emitsChecked: number;
+      oob: number;
+      issues: string[];
+    }> {
+      const issues: string[] = [];
+      let oob = 0;
+      let emitsChecked = 0;
+      const push = (s: string) => { if (issues.length < 30) issues.push(s); };
+
+      const arenaSize = arena.attrs.buffer.size;
+      const indicesSize = arena.indices.buffer.size;
+
+      // Stage all buffers we'll need.
+      const enc = device.createCommandEncoder({ label: "simulateDraws" });
+      const stage = (src: GPUBuffer, size: number): GPUBuffer => {
+        const c = device.createBuffer({
+          size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        enc.copyBufferToBuffer(src, 0, c, 0, size);
+        return c;
+      };
+      const arenaCopy = stage(arena.attrs.buffer, arenaSize);
+      const indicesCopy = indicesSize > 0 ? stage(arena.indices.buffer, indicesSize) : undefined;
+      type DC = {
+        bucket: typeof buckets[number];
+        drawHeap: GPUBuffer;
+        drawTable: GPUBuffer;
+        firstEmit: number[];
+        totalEmit: number;
+      };
+      const dcs: DC[] = [];
+      for (const b of buckets) {
+        if (b.recordCount === 0 || b.totalEmitEstimate === 0) continue;
+        const dh = stage(b.drawHeap.buffer, Math.min(b.drawHeap.buffer.size, b.recordCount * b.layout.drawHeaderBytes));
+        const dt = stage(b.drawTableBuf!.buffer, b.recordCount * RECORD_BYTES);
+        dcs.push({ bucket: b, drawHeap: dh, drawTable: dt, firstEmit: [], totalEmit: b.totalEmitEstimate });
+      }
+      device.queue.submit([enc.finish()]);
+
+      await arenaCopy.mapAsync(GPUMapMode.READ);
+      if (indicesCopy !== undefined) await indicesCopy.mapAsync(GPUMapMode.READ);
+      for (const dc of dcs) {
+        await dc.drawHeap.mapAsync(GPUMapMode.READ);
+        await dc.drawTable.mapAsync(GPUMapMode.READ);
+      }
+
+      const arenaU32 = new Uint32Array(arenaCopy.getMappedRange());
+      const arenaF32 = new Float32Array(arenaU32.buffer, arenaU32.byteOffset, arenaU32.length);
+      const indicesU32 = indicesCopy !== undefined
+        ? new Uint32Array(indicesCopy.getMappedRange())
+        : undefined;
+
+      // Compute per-bucket cumulative emit ranges + cache mapped views.
+      const bucketCumEmit: number[] = [];
+      const bucketDt:     Uint32Array[] = [];
+      const bucketHdr:    Uint32Array[] = [];
+      let totalEmitGlobal = 0;
+      for (const dc of dcs) {
+        const dt = new Uint32Array(dc.drawTable.getMappedRange());
+        bucketDt.push(dt);
+        bucketHdr.push(new Uint32Array(dc.drawHeap.getMappedRange()));
+        for (let r = 0; r < dc.bucket.recordCount; r++) {
+          dc.firstEmit.push(dt[r * RECORD_U32 + 0]!);
+        }
+        bucketCumEmit.push(totalEmitGlobal);
+        totalEmitGlobal += dc.totalEmit;
+      }
+
+      // For each bucket, precompute per-field metadata: byteOffset in
+      // drawHeader, eltFloats, isInstance.
+      type Field = {
+        name: string;
+        byteOffset: number;
+        kind: "uniform-ref" | "attribute-ref";
+        eltFloats: number;     // floats per element
+        isInstance: boolean;   // per-instance attr (non-cyclic)
+        uniSizeFloats: number; // for uniform: 16 (mat4), 4 (vec4), 3 (vec3), …
+      };
+      const fieldMap = new Map<typeof buckets[number], Field[]>();
+      for (const dc of dcs) {
+        const fs: Field[] = [];
+        for (const f of dc.bucket.layout.drawHeaderFields) {
+          if (f.name === "__layoutId") continue;
+          if (f.kind !== "uniform-ref" && f.kind !== "attribute-ref") continue;
+          const wt = f.kind === "uniform-ref" ? f.uniformWgslType : f.attributeWgslType;
+          const eltF =
+            wt === "vec3<f32>" ? 3 :
+            wt === "vec4<f32>" ? 4 :
+            wt === "vec2<f32>" ? 2 :
+            wt === "mat4x4<f32>" ? 16 : 1;
+          const isInstance = f.kind === "attribute-ref" && dc.bucket.layout.perInstanceAttributes.has(f.name);
+          fs.push({
+            name: f.name,
+            byteOffset: f.byteOffset,
+            kind: f.kind,
+            eltFloats: eltF,
+            isInstance,
+            uniSizeFloats: eltF,
+          });
+        }
+        fieldMap.set(dc.bucket, fs);
+      }
+
+      // Sample emits uniformly.
+      const sampleCount = Math.min(samples, totalEmitGlobal);
+      const stride = Math.max(1, Math.floor(totalEmitGlobal / sampleCount));
+      for (let s = 0; s < totalEmitGlobal && emitsChecked < sampleCount; s += stride) {
+        // Find which bucket this global emit lands in.
+        let dc = dcs[0]!;
+        let dcIdx = 0;
+        let emit = s;
+        for (let i = 0; i < dcs.length; i++) {
+          if (s < bucketCumEmit[i]! + dcs[i]!.totalEmit) {
+            dc = dcs[i]!; dcIdx = i; emit = s - bucketCumEmit[i]!; break;
+          }
+        }
+        emitsChecked++;
+
+        // Binary search for slot.
+        const recCount = dc.bucket.recordCount;
+        let lo = 0, hi = recCount - 1;
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >>> 1;
+          if (dc.firstEmit[mid]! <= emit) lo = mid;
+          else hi = mid - 1;
+        }
+        const slot = lo;
+        const dt = bucketDt[dcIdx]!;
+        const off = slot * RECORD_U32;
+        const firstEmit     = dt[off + 0]!;
+        const drawIdx       = dt[off + 1]!;
+        const indexStart    = dt[off + 2]!;
+        const indexCount    = dt[off + 3]!;
+        const instanceCount = dt[off + 4]!;
+
+        // Recover _local, instId, vid.
+        const _local = emit - firstEmit;
+        const instId = Math.floor(_local / indexCount);
+        const idxIdx = indexStart + (_local % indexCount);
+        if (idxIdx * 4 >= indicesSize) {
+          push(`emit=${s} bucket=${dcIdx} slot=${slot} idxIdx=${idxIdx} OOB indices`);
+          oob++; continue;
+        }
+        if (instId >= instanceCount) {
+          push(`emit=${s} slot=${slot} instId=${instId} ≥ instanceCount=${instanceCount}`);
+          oob++; continue;
+        }
+        const vid = indicesU32![idxIdx]!;
+
+        // Walk drawHeader fields for this drawIdx.
+        const stride2 = dc.bucket.layout.drawHeaderBytes;
+        const headerU32 = bucketHdr[dcIdx]!;
+        const headerOff = drawIdx * stride2;
+
+        const fs = fieldMap.get(dc.bucket)!;
+        for (const f of fs) {
+          const ref = headerU32[(headerOff + f.byteOffset) >>> 2];
+          if (ref === undefined || ref === 0) continue;
+          const allocBase = ref + ALLOC_HEADER_PAD_TO;
+          const length = arenaU32[(ref >>> 2) + 1]!;
+          if (length === 0) {
+            push(`emit=${s} field='${f.name}' alloc length=0`);
+            oob++;
+            continue;
+          }
+          let elemIdx: number;
+          if (f.kind === "uniform-ref") {
+            elemIdx = 0;
+          } else if (f.isInstance) {
+            // direct: iidx * eltFloats. (`cyclic=false` codepath I added.)
+            elemIdx = instId;
+          } else {
+            // cyclic: vid % length.
+            elemIdx = vid % length;
+          }
+          const byteOffset = allocBase + elemIdx * (f.eltFloats * 4);
+          const endByte = byteOffset + f.eltFloats * 4;
+          if (endByte > arenaSize) {
+            push(
+              `emit=${s} bucket=${dcIdx} slot=${slot} drawIdx=${drawIdx} ` +
+              `field='${f.name}' kind=${f.kind} isInstance=${f.isInstance} ` +
+              `vid=${vid} instId=${instId} length=${length} elemIdx=${elemIdx} ` +
+              `byteOffset=${byteOffset} endByte=${endByte} > arenaSize=${arenaSize}`,
+            );
+            oob++;
+            continue;
+          }
+          // Check finiteness of the data we're reading.
+          let nonFinite = 0;
+          const baseF = byteOffset >>> 2;
+          for (let i = 0; i < f.eltFloats; i++) {
+            const v = arenaF32[baseF + i]!;
+            if (!Number.isFinite(v)) nonFinite++;
+          }
+          if (nonFinite > 0) {
+            push(
+              `emit=${s} field='${f.name}' kind=${f.kind} isInstance=${f.isInstance} ` +
+              `vid=${vid} instId=${instId} elemIdx=${elemIdx} ` +
+              `nonFinite=${nonFinite}/${f.eltFloats}`,
+            );
+            oob++;
+          }
+        }
+      }
+
+      // Cleanup
+      arenaCopy.unmap(); arenaCopy.destroy();
+      if (indicesCopy !== undefined) { indicesCopy.unmap(); indicesCopy.destroy(); }
+      for (const dc of dcs) {
+        dc.drawHeap.unmap(); dc.drawHeap.destroy();
+        dc.drawTable.unmap(); dc.drawTable.destroy();
+      }
+
+      return { emitsChecked, oob, issues };
     },
   };
 

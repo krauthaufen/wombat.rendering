@@ -47,6 +47,8 @@ const ROCount = countParam !== null ? Math.max(1, parseInt(countParam, 10) | 0) 
 const enableDerivedUniforms = new URLSearchParams(location.search).get("derived") === "1";
 const gpuDebug = new URLSearchParams(location.search).get("gpudebug") === "1";
 const validateHeap = new URLSearchParams(location.search).get("validate") === "1";
+const simulateParam = new URLSearchParams(location.search).get("simulate");
+const simulateSamples = simulateParam !== null ? Math.max(1, parseInt(simulateParam, 10) | 0) : 0;
 
 // ---------------------------------------------------------------------------
 // Status banner
@@ -629,11 +631,12 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   if (validateHeap) {
     setTimeout(() => {
       void task.validateHeap().then((r) => {
-        const total = r.badRefs + r.drawTableErrs + r.prefixSumErrs + r.attrAllocsBad;
+        const total = r.badRefs + r.drawTableErrs + r.prefixSumErrs + r.attrAllocsBad + r.tilesBad;
         const summary =
           `validateHeap: arena=${r.arenaBytes}B refs=${r.okRefs}ok/${r.badRefs}bad ` +
           `rows=${r.drawTableRows}/${r.drawTableErrs}err prefix=${r.prefixSumErrs}err ` +
-          `attrAllocs=${r.attrAllocsChecked}/${r.attrAllocsBad}bad` +
+          `attrAllocs=${r.attrAllocsChecked}/${r.attrAllocsBad}bad ` +
+          `tiles=${r.tilesChecked}/${r.tilesBad}bad` +
           (total > 0 ? ` ⚠ ${r.issues.length} issue(s) (see console)` : " ✓");
         console.log("[validateHeap]", summary);
         if (total > 0) {
@@ -643,6 +646,24 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       }).catch((err) => {
         console.error("[validateHeap] failed:", err);
         setStatus("validateHeap failed: " + err.message, true);
+      });
+    }, 2000);
+  }
+
+  if (simulateSamples > 0) {
+    setTimeout(() => {
+      void task.simulateDraws(simulateSamples).then((r) => {
+        const summary =
+          `simulateDraws: emits=${r.emitsChecked} oob=${r.oob}` +
+          (r.oob > 0 ? ` ⚠ ${r.issues.length} issue(s) (see console)` : " ✓");
+        console.log("[simulateDraws]", summary);
+        if (r.oob > 0) {
+          for (const issue of r.issues) console.warn("[simulateDraws]", issue);
+          setStatus(summary, true);
+        }
+      }).catch((err) => {
+        console.error("[simulateDraws] failed:", err);
+        setStatus("simulateDraws failed: " + err.message, true);
       });
     }, 2000);
   }

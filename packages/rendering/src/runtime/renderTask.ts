@@ -128,10 +128,14 @@ class RenderTask implements IRenderTask {
     okRefs: number; badRefs: number;
     drawTableRows: number; drawTableErrs: number; prefixSumErrs: number;
     attrAllocsChecked: number; attrAllocsBad: number;
+    tilesChecked: number; tilesBad: number;
+    vidChecks: number; vidBad: number;
   }> {
     let arenaBytes = 0, okRefs = 0, badRefs = 0;
     let drawTableRows = 0, drawTableErrs = 0, prefixSumErrs = 0;
     let attrAllocsChecked = 0, attrAllocsBad = 0;
+    let tilesChecked = 0, tilesBad = 0;
+    let vidChecks = 0, vidBad = 0;
     const issues: string[] = [];
     for (const s of this._scenes.values()) {
       const r = await s.validateHeap();
@@ -143,13 +147,33 @@ class RenderTask implements IRenderTask {
       prefixSumErrs += r.prefixSumErrs;
       attrAllocsChecked += r.attrAllocsChecked;
       attrAllocsBad += r.attrAllocsBad;
+      tilesChecked += r.tilesChecked;
+      tilesBad += r.tilesBad;
+      vidChecks += r.vidChecks;
+      vidBad += r.vidBad;
       for (const i of r.issues) issues.push(i);
     }
     return {
       arenaBytes, issues, okRefs, badRefs,
       drawTableRows, drawTableErrs, prefixSumErrs,
       attrAllocsChecked, attrAllocsBad,
+      tilesChecked, tilesBad,
+      vidChecks, vidBad,
     };
+  }
+
+  async simulateDraws(samples?: number): Promise<{
+    emitsChecked: number; oob: number; issues: string[];
+  }> {
+    let emitsChecked = 0, oob = 0;
+    const issues: string[] = [];
+    for (const s of this._scenes.values()) {
+      const r = await s.simulateDraws(samples);
+      emitsChecked += r.emitsChecked;
+      oob += r.oob;
+      for (const i of r.issues) issues.push(i);
+    }
+    return { emitsChecked, oob, issues };
   }
 
   dispose(): void {
