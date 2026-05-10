@@ -3646,11 +3646,12 @@ export function buildHeapScene(
           return lo;
         };
 
-        const sampleCount = Math.min(samples - trianglesChecked, totalTris);
-        if (sampleCount <= 0) { bucketIdx++; continue; }
-        const stride = Math.max(1, Math.floor(totalTris / sampleCount));
+        // Exhaustive — walk EVERY triangle. The bug observed visually
+        // could affect any tiny fraction of triangles, so sampling
+        // misses it. With up to ~3M triangles per bucket this is
+        // fine on CPU (linear scan plus a tiny binary search per).
         let here = 0;
-        for (let t = 0; t < totalTris && here < sampleCount; t += stride) {
+        for (let t = 0; t < totalTris; t++) {
           const e0 = t * 3;
           const e1 = e0 + 1;
           const e2 = e0 + 2;
@@ -3669,6 +3670,7 @@ export function buildHeapScene(
         trianglesChecked += here;
         bucketIdx++;
       }
+      void samples;
 
       return { trianglesChecked, crossSlot, issues };
     },
