@@ -58,17 +58,14 @@ export const modelVS = vertex((v: {
 
 // ─── World += InstanceOffset (world-space) ────────────────────────────
 
-// InstanceOffset declared as V4f (.w padding) for 16-byte stride —
-// avoids vec3-tight (12B) storage layout that may interact badly
-// with iOS Safari's MSL backend at certain instanceCount values.
 export const instanceOffsetVS = vertex((v: {
   WorldPositions: V4f;
   Normals:        V3f;
   Colors:         V4f;
-  InstanceOffset: V4f;
+  InstanceOffset: V3f;
 }) => {
   return {
-    WorldPositions: new V4f(v.WorldPositions.xyz.add(v.InstanceOffset.xyz), v.WorldPositions.w),
+    WorldPositions: new V4f(v.WorldPositions.xyz.add(v.InstanceOffset), v.WorldPositions.w),
     Normals:        v.Normals,
     Colors:         v.Colors,
   };

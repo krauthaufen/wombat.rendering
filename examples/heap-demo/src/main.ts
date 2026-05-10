@@ -259,12 +259,10 @@ function makeInstancedTowerRO(
   count: number,
   dz: number,
 ): RenderObject {
-  // One offset per instance, stacked along +Z. V4f stride (16B) so
-  // the storage-side layout has natural vec4 alignment — defensive
-  // against iOS Safari's MSL behavior at small instanceCount values.
-  const offsets = new Float32Array(count * 4);
-  for (let i = 0; i < count; i++) offsets[i * 4 + 2] = i * dz;
-  const offsetView = BufferView.ofArray(offsets, { elementType: ElementType.V4f });
+  // One offset per instance, stacked along +Z. Tight V3f stride.
+  const offsets = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) offsets[i * 3 + 2] = i * dz;
+  const offsetView = BufferView.ofArray(offsets, { elementType: ElementType.V3f });
   const textured = spec.texture !== undefined && spec.sampler !== undefined;
   let vertexAttribs = HashMap.empty<string, BufferView>()
     .add("Positions", spec.geo.positions)
