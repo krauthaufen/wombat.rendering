@@ -81,6 +81,10 @@ export interface CompileHybridSceneOptions {
    * Default false (per-effect buckets).
    */
   readonly enableFamilyMerge?: boolean;
+  /**
+   * §7 derived-uniforms opt-in — pass-through to `BuildHeapSceneOptions`.
+   */
+  readonly enableDerivedUniforms?: boolean;
 }
 
 export interface HybridScene {
@@ -113,6 +117,20 @@ export interface HybridScene {
    * pipelineState. Useful for status / dev-overlay text.
    */
   heapBucketCount(): number;
+  /** Per-frame breakdown of §7 derived-uniforms work (CPU). */
+  heapDerivedTimings(): {
+    pullMs: number; uploadMs: number; encodeMs: number; records: number;
+  };
+  /** Diagnostic: download heap state and verify drawHeader refs land in
+   *  arena, drawTable rows reference valid indices, prefix sum is
+   *  consistent, attribute alloc headers (typeId/length) are sane and
+   *  data is finite. Returns issue strings + counts. */
+  validateHeap(): Promise<{
+    arenaBytes: number; issues: string[];
+    okRefs: number; badRefs: number;
+    drawTableRows: number; drawTableErrs: number; prefixSumErrs: number;
+    attrAllocsChecked: number; attrAllocsBad: number;
+  }>;
   dispose(): void;
 }
 
@@ -185,6 +203,7 @@ export function compileHybridScene(
     fragmentOutputLayout,
     atlasPool,
     ...(opts.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
+    ...(opts.enableDerivedUniforms === true ? { enableDerivedUniforms: true } : {}),
   });
 
   // ─── Legacy subset → RenderTree → ScenePass ──────────────────────
@@ -218,6 +237,23 @@ export function compileHybridScene(
     },
     heapBucketCount(): number {
       return heapScene.stats.groups;
+    },
+    heapDerivedTimings() {
+      const s = heapScene.stats;
+      return {
+        pullMs:   s.derivedPullMs,
+        uploadMs: s.derivedUploadMs,
+        encodeMs: s.derivedEncodeMs,
+        records:  s.derivedRecords,
+      };
+    },
+    validateHeap() {
+      return (heapScene as unknown as { _debug: { validateHeap(): Promise<{
+        arenaBytes: number; issues: string[];
+        okRefs: number; badRefs: number;
+        drawTableRows: number; drawTableErrs: number; prefixSumErrs: number;
+        attrAllocsChecked: number; attrAllocsBad: number;
+      }> } })._debug.validateHeap();
     },
     dispose(): void {
       heapScene.dispose();

@@ -42,6 +42,11 @@ import { buildBox, buildSphere, buildCylinder, type GeometryData } from "./geome
 
 const countParam = new URLSearchParams(location.search).get("count");
 const ROCount = countParam !== null ? Math.max(1, parseInt(countParam, 10) | 0) : 4;
+// `?derived=1` enables §7 derived-uniforms compute pre-pass.
+// Default off — fall back to CPU-computed M44f via spec.inputs.
+const enableDerivedUniforms = new URLSearchParams(location.search).get("derived") === "1";
+const gpuDebug = new URLSearchParams(location.search).get("gpudebug") === "1";
+const validateHeap = new URLSearchParams(location.search).get("validate") === "1";
 
 // ---------------------------------------------------------------------------
 // Status banner
@@ -151,32 +156,31 @@ function trafoInvToM44f(t: Trafo3d): M44f {
 
 function makeUniforms(
   modelTrafo: Trafo3d,
-  viewProj: aval<Trafo3d>,
-  eye: aval<V3d>,
+  viewTrafo: aval<Trafo3d>,
+  projTrafo: aval<Trafo3d>,
+  derived: boolean,
   extras?: { time?: aval<number>; tint?: V4f },
 ): HashMap<string, aval<unknown>> {
-  // Note: addDraw skips drawHeader fields whose name isn't in the RO's
-  // effect schema (`effectFields` filter). So uniforms passed here that
-  // the effect doesn't actually read get silently ignored at pack time.
-  // We can therefore bind every potentially-used uniform unconditionally
-  // — saves the per-effect plumbing decision at the call site.
-  // INTENTIONAL "old trap" demo: every RO maps `viewProj` and `eye`
-  // inline. Without §5d's build-time memoization, this would create
-  // N distinct derived avals → N pool entries → N writeBuffer calls
-  // per frame on camera move. The plugin rewrites both `.map(...)`
-  // calls into __memo with a (tag, body-hash, source) key — since
-  // `viewProj`/`eye`/`trafoToM44f` are module-stable, every call
-  // site shares ONE cached derived aval. 50K ROs collapse to 1
-  // viewProj→M44 derived + 1 eye→V3f derived.
-  const viewProjM44 = viewProj.map(trafoToM44f);
-  const lightLoc = eye.map((e) => new V3f(e.x as number, e.y as number, e.z as number));
-  const m  = AVal.constant(trafoToM44f(modelTrafo));
-  const mi = AVal.constant(trafoInvToM44f(modelTrafo));
-  let map = HashMap.empty<string, aval<unknown>>()
-    .add("ModelTrafo",     m)
-    .add("ModelTrafoInv",  mi)
-    .add("ViewProjTrafo",  viewProjM44)
-    .add("LightLocation",  lightLoc);
+  // §7 ON: ModelTrafo / ViewTrafo / ProjTrafo are CONSTITUENTS;
+  //        the dispatcher derives ModelViewTrafo, ModelViewTrafoInv,
+  //        ModelTrafoInv, ProjTrafo (collapse), etc.
+  // §7 OFF: every uniform the shaders read is CPU-computed.
+  let map = HashMap.empty<string, aval<unknown>>();
+  if (derived) {
+    map = map.add("ModelTrafo", AVal.constant(modelTrafo))
+             .add("ViewTrafo",  viewTrafo)
+             .add("ProjTrafo",  projTrafo);
+  } else {
+    const projM44         = projTrafo.map(trafoToM44f);
+    const modelViewM44    = viewTrafo.map(v => trafoToM44f(modelTrafo.mul(v)));
+    const modelViewInvM44 = viewTrafo.map(v => trafoInvToM44f(modelTrafo.mul(v)));
+    map = map.add("ModelTrafo",        AVal.constant(trafoToM44f(modelTrafo)))
+             .add("ModelTrafoInv",     AVal.constant(trafoInvToM44f(modelTrafo)))
+             .add("ViewTrafo",         viewTrafo.map(trafoToM44f))
+             .add("ProjTrafo",         projM44)
+             .add("ModelViewTrafo",    modelViewM44)
+             .add("ModelViewTrafoInv", modelViewInvM44);
+  }
   if (extras?.time !== undefined) map = map.add("Time", extras.time);
   if (extras?.tint !== undefined) map = map.add("Tint", AVal.constant(extras.tint));
   return map;
@@ -212,7 +216,7 @@ const sharedPipelineState = PipelineState.constant({
   depth: { write: true, compare: "less" },
 });
 
-function makeRO(spec: RoSpec, viewProj: aval<Trafo3d>, eye: aval<V3d>): RenderObject {
+function makeRO(spec: RoSpec, viewTrafo: aval<Trafo3d>, projTrafo: aval<Trafo3d>): RenderObject {
   const textured = spec.texture !== undefined && spec.sampler !== undefined;
   const textures = textured
     ? HashMap.empty<string, aval<ITexture>>().add("albedo", spec.texture!)
@@ -228,7 +232,10 @@ function makeRO(spec: RoSpec, viewProj: aval<Trafo3d>, eye: aval<V3d>): RenderOb
     effect: spec.effect ?? (textured ? texturedSurface : surface),
     pipelineState: sharedPipelineState,
     vertexAttributes: textured ? baseAttribs.add("Uvs", spec.geo.uvs) : baseAttribs,
-    uniforms: makeUniforms(spec.modelTrafo, viewProj, eye, { time: spec.time, tint: spec.tint }),
+    uniforms: makeUniforms(spec.modelTrafo, viewTrafo, projTrafo, enableDerivedUniforms, {
+      ...(spec.time !== undefined ? { time: spec.time } : {}),
+      ...(spec.tint !== undefined ? { tint: spec.tint } : {}),
+    }),
     textures,
     samplers,
     indices: spec.geo.indices,
@@ -245,8 +252,8 @@ function makeRO(spec: RoSpec, viewProj: aval<Trafo3d>, eye: aval<V3d>): RenderOb
 // vertex_index into (drawIdx, instId, vid).
 function makeInstancedTowerRO(
   spec: RoSpec,
-  viewProj: aval<Trafo3d>,
-  eye: aval<V3d>,
+  viewTrafo: aval<Trafo3d>,
+  projTrafo: aval<Trafo3d>,
   count: number,
   dz: number,
 ): RenderObject {
@@ -284,7 +291,10 @@ function makeInstancedTowerRO(
     pipelineState: sharedPipelineState,
     vertexAttributes: vertexAttribs,
     instanceAttributes: instAttribs,
-    uniforms: makeUniforms(spec.modelTrafo, viewProj, eye, { time: spec.time, tint: spec.tint }),
+    uniforms: makeUniforms(spec.modelTrafo, viewTrafo, projTrafo, enableDerivedUniforms, {
+      ...(spec.time !== undefined ? { time: spec.time } : {}),
+      ...(spec.tint !== undefined ? { tint: spec.tint } : {}),
+    }),
     textures,
     samplers,
     indices: spec.geo.indices,
@@ -406,7 +416,10 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   // 10K–30K small ROs across 8 effects.
   const mergeParam = new URLSearchParams(location.search).get("merge");
   const enableFamilyMerge = mergeParam === "1";
-  const runtime = new Runtime({ device, heapEnabled, enableFamilyMerge });
+  const runtime = new Runtime({
+    device, heapEnabled, enableFamilyMerge,
+    enableDerivedUniforms,
+  });
 
   const bBox = bundleOf(rawBox);
   const bSph = bundleOf(rawSph);
@@ -462,20 +475,18 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   const pickTex = (k: number): aval<ITexture> | undefined =>
     atlasMode ? atlasTextures[k % NUM_ATLAS_TEXTURES]! : undefined;
 
-  // viewProj depends on both size and view (= time-driven). Use a
-  // custom aval so a tick on either input recomputes; the runtime's
-  // adaptive system handles the cascade.
-  const viewProj: aval<Trafo3d> = AVal.custom(token => {
+  // §7 derived-uniforms: View and Proj are CONSTITUENTS uploaded as
+  // df32 to the GPU; the renderer's compute pre-pass produces the
+  // products (ModelView, ViewProj, ModelViewProj, …) on demand.
+  // `view` is already aval<Trafo3d>; we only need a separate
+  // aval<Trafo3d> for projection that re-evaluates when canvas size
+  // changes.
+  const projTrafo: aval<Trafo3d> = AVal.custom(token => {
     const { width, height } = attach.size.getValue(token);
     const aspect = Math.max(1e-3, width / Math.max(1, height));
-    const projT  = projFor(aspect);
-    return view.getValue(token).mul(projT);   // view first, then proj
+    return projFor(aspect);
   });
-  // No pre-mapped sharing here — `makeRO` does `viewProj.map(...)`
-  // and `eye.map(...)` PER object. The §5d build-time plugin
-  // rewrites those calls into __memo, so all N ROs end up sharing
-  // ONE derived aval each via the memo trie. Pre-§5d this would
-  // have been the classic per-RO identity-defeat footgun.
+  const viewTrafo = view;
   const ros: RenderObject[] = [];
   // ?inst=N — instance count for instanced-effect cells (default 6).
   // ?fx=N   — force a single effect (0..7); default cycles through all 8.
@@ -532,7 +543,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
         modelTrafo: trafoOf(i, xPositions[i]!),
         color: colors[i]!,
         ...(atlasMode ? { texture: pickTex(i)!, sampler: sharedSampler! } : {}),
-      }, viewProj, eye));
+      }, viewTrafo, projTrafo));
     }
   } else {
     const side = Math.ceil(Math.sqrt(ROCount));
@@ -549,22 +560,24 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
           ? Trafo3d.scaling(0.5, 0.5, 0.5).mul(Trafo3d.translation(new V3d(x, y, 0)))
           : Trafo3d.scaling(0.5, 0.5, 0.8).mul(Trafo3d.translation(new V3d(x, y, -0.4)));
       const fx = fxTable[forcedFx >= 0 ? forcedFx : (k % 8)]!;
-      // Atlas-only effects fall back to non-textured sibling when
-      // ?atlas=0 (no AtlasPool slot picker).
+      // Atlas-only effects fall back to a non-textured sibling when
+      // ?atlas=0 (textured effects need Uvs, which only atlas-bound
+      // ROs supply via spec.geo.uvs).
       const wantTex = fx.textured && atlasMode;
-      // Bind every uniform unconditionally — addDraw filters by
-      // effectFields, so unused ones are silently ignored at pack time.
+      const effect = (fx.textured && !atlasMode)
+        ? (fx.instanced ? instancedSurface : surface)
+        : fx.effect;
       const spec: RoSpec = {
         geo: bundle, modelTrafo: t, color: colors[k % 4]!,
-        effect: fx.effect,
+        effect,
         ...(wantTex ? { texture: pickTex(k)!, sampler: sharedSampler! } : {}),
         time: timeAval,
         tint: tints[(k >> 3) % tints.length]!,
       };
       if (fx.instanced) {
-        ros.push(makeInstancedTowerRO(spec, viewProj, eye, instCount, 0.7));
+        ros.push(makeInstancedTowerRO(spec, viewTrafo, projTrafo, instCount, 0.7));
       } else {
-        ros.push(makeRO(spec, viewProj, eye));
+        ros.push(makeRO(spec, viewTrafo, projTrafo));
       }
     }
   }
@@ -609,6 +622,31 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
   const fpct = (p: number): number => pctOf(frameSamples, frameSampleN, p);
   const gpct = (p: number): number => pctOf(gpuSamples, gpuSampleN, p);
   setStatus(`ready — ${ros.length} render objects${atlasMode ? ` · atlas mode (${NUM_ATLAS_TEXTURES} textures)` : ""}`);
+
+  // ?validate=1 → run the heap-structure check after a few frames so
+  // initial population + first dispatch have settled. Logs to console
+  // and surfaces a one-line summary in status.
+  if (validateHeap) {
+    setTimeout(() => {
+      void task.validateHeap().then((r) => {
+        const total = r.badRefs + r.drawTableErrs + r.prefixSumErrs + r.attrAllocsBad;
+        const summary =
+          `validateHeap: arena=${r.arenaBytes}B refs=${r.okRefs}ok/${r.badRefs}bad ` +
+          `rows=${r.drawTableRows}/${r.drawTableErrs}err prefix=${r.prefixSumErrs}err ` +
+          `attrAllocs=${r.attrAllocsChecked}/${r.attrAllocsBad}bad` +
+          (total > 0 ? ` ⚠ ${r.issues.length} issue(s) (see console)` : " ✓");
+        console.log("[validateHeap]", summary);
+        if (total > 0) {
+          for (const issue of r.issues) console.warn("[validateHeap]", issue);
+          setStatus(summary, true);
+        }
+      }).catch((err) => {
+        console.error("[validateHeap] failed:", err);
+        setStatus("validateHeap failed: " + err.message, true);
+      });
+    }, 2000);
+  }
+
   const fbAval = attach.framebuffer as aval<import("@aardworx/wombat.rendering.experimental/core").IFramebuffer>;
   const startTime = performance.now();
   let churnPool: RenderTree[] = [];
@@ -622,7 +660,28 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     lastRafNow = rafNow;
 
     const t0 = performance.now();
+    // Error scopes around each frame catch validation / out-of-memory /
+    // internal errors that would otherwise only surface via the device
+    // uncapturederror event (which Safari/WebKit sometimes drops).
+    // Set ?gpudebug=1 to enable; off by default for perf.
+    if (gpuDebug) {
+      device.pushErrorScope("validation");
+      device.pushErrorScope("out-of-memory");
+      device.pushErrorScope("internal");
+    }
     task.run(fbAval.getValue(token), token);
+    if (gpuDebug) {
+      // Pop in reverse order. Don't await — fire-and-forget logging.
+      const f = (kind: string) => (e: GPUError | null) => {
+        if (e !== null) {
+          console.error(`[gpudebug ${kind}]`, e.message);
+          setStatus(`gpu ${kind}: ${e.message}`, true);
+        }
+      };
+      device.popErrorScope().then(f("internal"));
+      device.popErrorScope().then(f("oom"));
+      device.popErrorScope().then(f("validation"));
+    }
     const dt = performance.now() - t0;
     samples[sampleI] = dt;
     sampleI = (sampleI + 1) % samples.length;
@@ -636,16 +695,35 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       const elapsed = Math.max(1, now - lastReport);
       const fps = (frames * 1000 / elapsed).toFixed(0);
       const tag = heapEnabled.value ? "heap" : "per-RO";
-      const churnTag = churn > 0 ? ` · churn=${churn}/frame` : "";
-      const atlasTag = atlasMode ? ` · atlas · ${NUM_ATLAS_TEXTURES} textures` : "";
       const buckets = task.heapBucketCount();
-      const bucketsTag = ` · ${buckets} bucket${buckets === 1 ? "" : "s"}`;
-      setStatus(
-        `${tag}${atlasTag} · ${ros.length} draws${bucketsTag}${churnTag} · ${fps} fps · ` +
-        `encode ${pct(0.5).toFixed(2)}/${pct(0.99).toFixed(2)} · ` +
-        `gpu ${gpct(0.5).toFixed(1)}/${gpct(0.99).toFixed(1)} · ` +
-        `frame ${fpct(0.5).toFixed(1)}/${fpct(0.99).toFixed(1)} ms (p50/p99)`,
-      );
+      const path = enableDerivedUniforms ? "§7" : "cpu";
+
+      // Pad helpers so columns line up.
+      const f = (v: number, d = 2) => v.toFixed(d).padStart(d === 0 ? 5 : 6 + d);
+
+      const row1 =
+        `${tag} · ${path} · ${ros.length} draws · ${buckets} buckets` +
+        (atlasMode ? ` · atlas (${NUM_ATLAS_TEXTURES} tex)` : "") +
+        (churn > 0 ? ` · churn=${churn}/f` : "");
+      const row2 =
+        `fps      ${fps.padStart(5)}\n` +
+        `frame ms ${f(fpct(0.5),1)} / ${f(fpct(0.99),1)}   (p50 / p99)\n` +
+        `encode   ${f(pct(0.5))} / ${f(pct(0.99))}\n` +
+        `gpu      ${f(gpct(0.5),1)} / ${f(gpct(0.99),1)}`;
+
+      let row3 = "";
+      if (enableDerivedUniforms) {
+        const t = task.heapDerivedTimings();
+        row3 =
+          `\n§7 records  ${t.records}\n` +
+          `§7 pull     ${f(t.pullMs,   3)} ms\n` +
+          `§7 upload   ${f(t.uploadMs, 3)} ms\n` +
+          `§7 dispatch ${f(t.encodeMs, 3)} ms`;
+      }
+
+      const line = `${row1}\n${row2}${row3}`;
+      setStatus(line);
+      console.log("[STATS]", line);
       frames = 0;
       lastReport = now;
     }

@@ -33,6 +33,14 @@ export interface RuntimeOptions {
    * trace-based auto-trigger lands.
    */
   readonly enableFamilyMerge?: boolean;
+  /**
+   * §7 derived-uniforms opt-in. When true, ModelView / ViewProj /
+   * ModelViewProj / NormalMatrix / *TrafoInv / etc. are produced by a
+   * df32 GPU compute pre-pass instead of being supplied per-RO by the
+   * uniform provider. ROs MUST supply ModelTrafo / ViewTrafo /
+   * ProjTrafo as `aval<Trafo3d>` for any derived they consume.
+   */
+  readonly enableDerivedUniforms?: boolean;
 }
 
 /**
@@ -68,6 +76,7 @@ export class Runtime {
       })),
       ...(opts.heapEnabled !== undefined ? { heapEnabled: opts.heapEnabled } : {}),
       ...(opts.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
+      ...(opts.enableDerivedUniforms === true ? { enableDerivedUniforms: true } : {}),
     };
     // `device.lost` is a real-WebGPU promise; mock devices may not
     // expose it. Treat as "never lost" in that case.

@@ -612,6 +612,23 @@ the v2 trace-based auto-trigger lands — at that point the runtime
 decides per-bucket-population whether to merge based on observed
 draw shape.
 
+**Real-GPU sweep 2026-05-09 (airtop, RTX 5060, Vulkan-via-WebGPU,
+8-effect heap-demo with atlas, post FS-direct-reads):**
+
+| count | merge-off (8 buckets)       | merge-on (1 bucket)         | Δ gpu p50 |
+|------:|:----------------------------|:----------------------------|:---------:|
+|  30K  | 60 fps · gpu  9.2/ 9.7 ms   | 60 fps · gpu 10.6/10.9 ms   | +15%      |
+|  60K  | 60 fps · gpu 15.8/16.2 ms   | ~50 fps · gpu 19.0/19.9 ms  | +20%      |
+| 100K  | ~38 fps · gpu 24.7/25.1 ms  | 30 fps · gpu 30.1/30.5 ms   | +22%      |
+
+Merge is strictly slower on real silicon and the gap **widens with
+workload** — the `switch(layoutId)` branching in both VS and FS
+dominates whatever's saved by collapsing draw count, even after
+FS-direct-reads removed the heap-ref threading varyings (commit
+`6386c6d`). Encode CPU is a flat 0.20/0.30 ms in both modes at all
+scales tested, so there's no encode-side payoff to recover. Confirms
+default-off and the v2 trace-based-opt-in plan.
+
 The original v1 PoC implemented the strong form: **bucket key
 reduces to `(familyId, pipelineState)`**. `effect`, `textureSet`,
 and `perInstanceAttrSet` all fold inside the family via layoutId

@@ -161,16 +161,28 @@ function loadUniformByRef(refIdent: Expr, wgslType: string): Expr {
 }
 
 /**
- * Load a per-vertex attribute value with cyclic addressing. For vec4
- * the source can be V3-tight (12 B, .w = 1.0) or V4-tight (16 B, .w
- * from data); we read the actual stride from the alloc header at
- * offset 8, then use `select` for the .w fill.
+ * Load an attribute value from arena. Two index modes:
+ *   - `cyclic=true` (per-vertex):  `(idx % length) * stride` so a
+ *     length-1 broadcast replicates across all vertices.
+ *   - `cyclic=false` (per-instance): `idx * stride` directly. Length
+ *     is by construction `instanceCount` so the mod is the identity;
+ *     skipping it removes one `heapU32` fetch per attribute load AND
+ *     sidesteps any storage-aliasing/caching surprise on backends that
+ *     handle multi-view buffer reads differently from Dawn (notably
+ *     Apple Safari, which corrupts certain ROs at large scene sizes
+ *     when the cyclic path is used).
+ *
+ * For vec4 the source can be V3-tight (12 B, .w = 1.0) or V4-tight
+ * (16 B, .w from data); we read the actual stride from the alloc
+ * header at offset 8, then use `select` for the .w fill.
  */
-function loadAttributeByRef(refIdent: Expr, vid: Expr, wgslType: string): Expr {
+function loadAttributeByRef(refIdent: Expr, idx: Expr, wgslType: string, cyclic: boolean): Expr {
   const dataF32Base = div(add(refIdent, constU32(16), Tu32), constU32(4), Tu32);
   switch (wgslType) {
     case "vec3<f32>": {
-      const off = cyclicElemIdx(refIdent, vid, 3);
+      const off = cyclic
+        ? cyclicElemIdx(refIdent, idx, 3)
+        : mul(idx, constU32(3), Tu32);
       const base = add(dataF32Base, off, Tu32);
       return newVec([
         item(heapF32, base, Tf32),
@@ -182,8 +194,10 @@ function loadAttributeByRef(refIdent: Expr, vid: Expr, wgslType: string): Expr {
       // strideF = stride_bytes / 4  (header u32 at ref/4 + 2).
       const strideBytes = item(heapU32, add(div(refIdent, constU32(4), Tu32), constU32(2), Tu32), Tu32);
       const strideF = div(strideBytes, constU32(4), Tu32);
-      const cycled = mod(vid, item(heapU32, add(div(refIdent, constU32(4), Tu32), constU32(1), Tu32), Tu32), Tu32);
-      const off = mul(cycled, strideF, Tu32);
+      const elemIdx = cyclic
+        ? mod(idx, item(heapU32, add(div(refIdent, constU32(4), Tu32), constU32(1), Tu32), Tu32), Tu32)
+        : idx;
+      const off = mul(elemIdx, strideF, Tu32);
       const base = add(dataF32Base, off, Tu32);
       const w = select(eqU32(strideF, constU32(4)), item(heapF32, add(base, constU32(3), Tu32), Tf32), constF32(1.0), Tf32);
       return newVec([
@@ -194,7 +208,9 @@ function loadAttributeByRef(refIdent: Expr, vid: Expr, wgslType: string): Expr {
       ], Tvec4);
     }
     case "vec2<f32>": {
-      const off = cyclicElemIdx(refIdent, vid, 2);
+      const off = cyclic
+        ? cyclicElemIdx(refIdent, idx, 2)
+        : mul(idx, constU32(2), Tu32);
       const base = add(dataF32Base, off, Tu32);
       return newVec([
         item(heapF32, base, Tf32),
@@ -297,9 +313,13 @@ function buildVertexAttributeMap(layout: BucketLayout): Map<string, Expr> {
   for (const f of layout.drawHeaderFields) {
     if (f.kind !== "attribute-ref") continue;
     const refExpr = loadHeaderRef(drawIdx, f.byteOffset, stride);
+    // Per-instance attributes use direct (non-cyclic) addressing —
+    // alloc length always equals instanceCount for per-instance avals.
+    // Per-vertex attributes need cyclic addressing to support length-1
+    // broadcast (e.g. a single-color V3f replicated across all vertices).
     const value = layout.perInstanceAttributes.has(f.name)
-      ? loadAttributeByRef(refExpr, iidx, f.attributeWgslType ?? "")
-      : loadAttributeByRef(refExpr, vid, f.attributeWgslType ?? "");
+      ? loadAttributeByRef(refExpr, iidx, f.attributeWgslType ?? "", false)
+      : loadAttributeByRef(refExpr, vid, f.attributeWgslType ?? "", true);
     out.set(f.name, value);
   }
   return out;

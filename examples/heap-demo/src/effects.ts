@@ -1,18 +1,20 @@
-// Minimal trafo + Lambert effect for the heap-demo. Identical
-// shape to `wombat.dom/scene/defaultSurfaces.ts` (trafo + simpleLighting)
-// but trimmed to what the demo's geometry uses (Positions + Normals
-// + Colors). The wombat.shader-vite plugin lifts the inline
-// `vertex(...) / fragment(...)` calls into an `Effect` at build time.
+// Trafo + Lambert effects for the heap-demo.
+//
+// Non-instanced: object → view via ModelViewTrafo (single derived
+//   uniform), normals via ModelViewTrafoInv.transpose() — both
+//   §7-derived in df32 from Model/View constituents.
+// Instanced: object → world via ModelTrafo, world += offset, then
+//   world → view via ViewTrafo (so the per-instance translation is
+//   applied in world-space). Normals: ModelTrafoInv.transpose() then
+//   ViewTrafo (orthonormal) — equivalent to (M·V)⁻ᵀ on view-space.
+//
+// Lighting is in view-space: camera at origin, l = −normalize(viewPos).
 
 import { effect, vertex, fragment } from "@aardworx/wombat.shader";
 import { abs, sin, cos, type Sampler2D, texture } from "@aardworx/wombat.shader/types";
 import { uniform } from "@aardworx/wombat.shader/uniforms";
 import { V2f, V3f, V4f } from "@aardworx/wombat.base";
 
-// Augment the shader DSL's standard uniform namespace with our two
-// app-specific uniforms. The plugin's `uniform.X` classifier looks
-// up names against this interface; without the augmentation the
-// frontend rejects `uniform.Time` / `uniform.Tint` as unknown.
 declare module "@aardworx/wombat.shader/uniforms" {
   interface UniformScope {
     readonly Time: number;
@@ -20,20 +22,25 @@ declare module "@aardworx/wombat.shader/uniforms" {
   }
 }
 
-// Sampler2D capture. The wombat.shader-vite plugin classifies any
-// non-ambient free identifier whose TS type maps to a Sampler IR
-// type as a `uniform-sampler` capture and emits a Sampler ValueDef
-// with the same name into the IR. At draw time the runtime matches
-// the name against `RenderObject.textures` + `RenderObject.samplers`.
-// The runtime value is never read (samplers are opaque texture
-// handles bound by name).
 const albedo: Sampler2D = null as unknown as Sampler2D;
 
-// Split into modelVS (object→world) + clipVS (world→clip) so an
-// instance-offset modifier can be inserted between them without
-// duplicating either piece. Same observable behaviour as the old
-// monolithic `trafoVS`; same-stage fusion (`composeStages`) recombines
-// them via `extractFusedEntry`.
+// ─── Object → View, via ModelViewTrafo (non-instanced) ────────────────
+
+export const modelViewVS = vertex((v: {
+  Positions: V4f;
+  Normals:   V3f;
+  Colors:    V4f;
+}) => {
+  const vp = uniform.ModelViewTrafo.mul(v.Positions);
+  const n4 = uniform.ModelViewTrafoInv.transpose().mul(new V4f(v.Normals.xyz, 0.0));
+  return {
+    ViewPositions: vp,
+    Normals:       n4.xyz,
+    Colors:        v.Colors,
+  };
+});
+
+// ─── Object → World, via ModelTrafo (instanced chain) ─────────────────
 
 export const modelVS = vertex((v: {
   Positions: V4f;
@@ -41,7 +48,7 @@ export const modelVS = vertex((v: {
   Colors:    V4f;
 }) => {
   const wp = uniform.ModelTrafo.mul(v.Positions);
-  const n4 = new V4f(v.Normals.xyz, 0.0);   // raw object-space normal, no matrix
+  const n4 = uniform.ModelTrafoInv.transpose().mul(new V4f(v.Normals.xyz, 0.0));
   return {
     WorldPositions: wp,
     Normals:        n4.xyz,
@@ -49,9 +56,8 @@ export const modelVS = vertex((v: {
   };
 });
 
-// Reads the current `WorldPositions` (whatever upstream stage produced
-// it) and adds the per-instance offset attribute. Pass-through for
-// Normals + Colors — they're untouched by the offset.
+// ─── World += InstanceOffset (world-space) ────────────────────────────
+
 export const instanceOffsetVS = vertex((v: {
   WorldPositions: V4f;
   Normals:        V3f;
@@ -65,28 +71,48 @@ export const instanceOffsetVS = vertex((v: {
   };
 });
 
-export const clipVS = vertex((v: {
+// ─── World → View, via ViewTrafo (instanced chain) ────────────────────
+// ViewTrafo is orthonormal (rotation+translation), so it's its own
+// inverse-transpose for direction vectors.
+
+export const viewVS = vertex((v: {
   WorldPositions: V4f;
   Normals:        V3f;
   Colors:         V4f;
 }) => {
+  const vp = uniform.ViewTrafo.mul(v.WorldPositions);
+  const n4 = uniform.ViewTrafo.mul(new V4f(v.Normals.xyz, 0.0));
   return {
-    gl_Position:    uniform.ViewProjTrafo.mul(v.WorldPositions),
-    WorldPositions: v.WorldPositions,
-    Normals:        v.Normals,
-    Colors:         v.Colors,
+    ViewPositions: vp,
+    Normals:       n4.xyz,
+    Colors:        v.Colors,
   };
 });
 
-export const lambertFS = fragment((v: {
-  Normals:        V3f;
-  Colors:         V4f;
-  WorldPositions: V4f;
+// ─── View → Clip, via ProjTrafo ───────────────────────────────────────
+
+export const clipVS = vertex((v: {
+  ViewPositions: V4f;
+  Normals:       V3f;
+  Colors:        V4f;
 }) => {
-  const n  = v.Normals.normalize();
-  const wp = v.WorldPositions.xyz;
-  // Camera-headlight: light follows the camera.
-  const l  = uniform.LightLocation.sub(wp).normalize();
+  return {
+    gl_Position:   uniform.ProjTrafo.mul(v.ViewPositions),
+    ViewPositions: v.ViewPositions,
+    Normals:       v.Normals,
+    Colors:        v.Colors,
+  };
+});
+
+// ─── View-space Lambert ───────────────────────────────────────────────
+
+export const lambertFS = fragment((v: {
+  Normals:       V3f;
+  Colors:        V4f;
+  ViewPositions: V4f;
+}) => {
+  const n = v.Normals.normalize();
+  const l = v.ViewPositions.xyz.normalize().mul(-1.0);
   const ambient = 0.2;
   const diffuse = abs(l.dot(n));
   const k = ambient + (1.0 - ambient) * diffuse;
@@ -95,40 +121,20 @@ export const lambertFS = fragment((v: {
   };
 });
 
-export const surface = effect(modelVS, clipVS, lambertFS);
+export const surface = effect(modelViewVS, clipVS, lambertFS);
 
 // ─── Textured variant ─────────────────────────────────────────────────
-// Same lambert lighting as `lambertFS`, with the base surface colour
-// modulated by `sample(albedo, Uvs)`. Per-vertex UVs come from the
-// geometry: planar per-face UVs for box, lat/long parameterization
-// for sphere, side wraps + cap projection for cylinder.
 
-export const trafoTexturedVS = vertex((v: {
-  Positions: V4f;
-  Normals:   V3f;
-  Colors:    V4f;
-  Uvs:       V2f;
-}) => {
-  const wp = uniform.ModelTrafo.mul(v.Positions);
-  const n4 = new V4f(v.Normals.xyz, 0.0);
-  return {
-    gl_Position:    uniform.ViewProjTrafo.mul(wp),
-    WorldPositions: wp,
-    Normals:        n4.xyz,
-    Colors:         v.Colors,
-    Uvs:            v.Uvs,
-  };
-});
+export const uvsVS = vertex((v: { Uvs: V2f }) => ({ Uvs: v.Uvs }));
 
 export const lambertTexturedFS = fragment((v: {
-  Normals:        V3f;
-  Colors:         V4f;
-  WorldPositions: V4f;
-  Uvs:            V2f;
+  Normals:       V3f;
+  Colors:        V4f;
+  ViewPositions: V4f;
+  Uvs:           V2f;
 }) => {
-  const n  = v.Normals.normalize();
-  const wp = v.WorldPositions.xyz;
-  const l  = uniform.LightLocation.sub(wp).normalize();
+  const n = v.Normals.normalize();
+  const l = v.ViewPositions.xyz.normalize().mul(-1.0);
   const ambient = 0.2;
   const diffuse = abs(l.dot(n));
   const k = ambient + (1.0 - ambient) * diffuse;
@@ -139,44 +145,19 @@ export const lambertTexturedFS = fragment((v: {
   };
 });
 
-export const texturedSurface = effect(trafoTexturedVS, lambertTexturedFS);
-
-// Tiny passthrough stage that declares `Uvs` as both a vertex input
-// and an inter-stage carrier. Composed-VS chains pick it up and
-// surface Uvs in the merged outputs; the textured FS reads it. No
-// math — the optimizer DCEs it down to a wire when present, and
-// drops it entirely when no FS consumes Uvs.
-export const uvsVS = vertex((v: { Uvs: V2f }) => ({ Uvs: v.Uvs }));
+export const texturedSurface = effect(modelViewVS, uvsVS, clipVS, lambertTexturedFS);
 
 // ─── Instanced variants ───────────────────────────────────────────────
-// Proper composition: model → instanceOffset → clip → lambert. No
-// duplication; `composeStages` fuses the VS stages via
-// `extractFusedEntry`, and the per-stage emit's `pruneToStage` keeps
-// the FS module free of VS-only helper bodies.
 
-export const instancedSurface = effect(modelVS, instanceOffsetVS, clipVS, lambertFS);
+export const instancedSurface = effect(modelVS, instanceOffsetVS, viewVS, clipVS, lambertFS);
 
-// Textured instanced variant — same VS chain plus a `uvsVS` stage
-// that surfaces the per-vertex Uvs into the inter-stage carrier so
-// `lambertTexturedFS` can sample the atlas.
 export const instancedTexturedSurface = effect(
-  modelVS, uvsVS, instanceOffsetVS, clipVS, lambertTexturedFS,
+  modelVS, uvsVS, instanceOffsetVS, viewVS, clipVS, lambertTexturedFS,
 );
 
-// ─── Time-driven and tinted variants — stress the family-merge ────────
-//
-// Goal: 8 distinct effects that exercise different uniform/attribute
-// combinations through the family. With family-merge in v1, all 8
-// collapse into ONE bucket per pipelineState; the family WGSL has 8
-// switch arms, each calling its own composed-stage chain.
+// ─── Time-driven and tinted variants ──────────────────────────────────
 
-// Time-driven Z-wobble. Modifies WorldPositions using uniform.Time
-// before clipVS multiplies by ViewProj. Composes into the chain
-// AFTER modelVS produces WorldPositions.
-//
-// Note: `Time` is in MILLISECONDS (set from performance.now() in
-// main.ts), so multipliers must scale accordingly — `t * 0.002`
-// gives ~2 rad/s ≈ one cycle every 3 seconds.
+// Z-wobble in world-space (between modelVS and viewVS).
 export const wobbleVS = vertex((v: {
   WorldPositions: V4f;
   Normals:        V3f;
@@ -191,18 +172,14 @@ export const wobbleVS = vertex((v: {
       v.WorldPositions.z + wob,
       v.WorldPositions.w,
     ),
-    Normals:        v.Normals,
-    Colors:         v.Colors,
+    Normals: v.Normals,
+    Colors:  v.Colors,
   };
 });
 
-// Time-driven UV swirl. Rotates Uvs around (0.5, 0.5) by Time.
-// `t * 0.0007` ≈ one full rotation every ~9 seconds.
+// UV swirl. Pure UV rewrite.
 export const swirlUvsVS = vertex((v: {
-  Uvs:            V2f;
-  WorldPositions: V4f;
-  Normals:        V3f;
-  Colors:         V4f;
+  Uvs: V2f;
 }) => {
   const t = uniform.Time.mul(0.0007);
   const c = cos(t);
@@ -210,24 +187,14 @@ export const swirlUvsVS = vertex((v: {
   const u = v.Uvs.x - 0.5;
   const w = v.Uvs.y - 0.5;
   return {
-    Uvs:            new V2f(c.mul(u).sub(s.mul(w)).add(0.5), s.mul(u).add(c.mul(w)).add(0.5)),
-    WorldPositions: v.WorldPositions,
-    Normals:        v.Normals,
-    Colors:         v.Colors,
+    Uvs: new V2f(c.mul(u).sub(s.mul(w)).add(0.5), s.mul(u).add(c.mul(w)).add(0.5)),
   };
 });
 
-// FS chain: tint multiplication. Reads `outColor` from the previous
-// FS stage, multiplies by uniform.Tint. Composed AFTER lambertFS so
-// the lit result gets re-tinted. The wombat.shader composer threads
-// the carrier by name.
 export const tintFS = fragment((v: { outColor: V4f }) => ({
   outColor: new V4f(v.outColor.xyz.mul(uniform.Tint.xyz), v.outColor.w),
 }));
 
-// FS chain: Time-driven brightness pulse. Multiplies outColor's xyz
-// by `0.6 + 0.4 * sin(Time*0.003)` so it pulses between 0.2 and 1.0
-// over ~2 seconds.
 export const pulseFS = fragment((v: { outColor: V4f }) => {
   const t = uniform.Time.mul(0.003);
   const k = sin(t).mul(0.4).add(0.6);
@@ -236,12 +203,11 @@ export const pulseFS = fragment((v: { outColor: V4f }) => {
   };
 });
 
-// Effects 5..8 — extra family members.
-export const tintedSurface = effect(modelVS, clipVS, lambertFS, tintFS);
-export const pulsingSurface = effect(modelVS, clipVS, lambertFS, pulseFS);
+export const tintedSurface  = effect(modelViewVS, clipVS, lambertFS, tintFS);
+export const pulsingSurface = effect(modelViewVS, clipVS, lambertFS, pulseFS);
 export const wobblingInstancedSurface = effect(
-  modelVS, wobbleVS, instanceOffsetVS, clipVS, lambertFS,
+  modelVS, wobbleVS, instanceOffsetVS, viewVS, clipVS, lambertFS,
 );
 export const swirlingTexturedSurface = effect(
-  modelVS, uvsVS, swirlUvsVS, clipVS, lambertTexturedFS,
+  modelViewVS, uvsVS, swirlUvsVS, clipVS, lambertTexturedFS,
 );

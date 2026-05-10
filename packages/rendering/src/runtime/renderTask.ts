@@ -49,6 +49,11 @@ export interface RuntimeContext {
    * compiled against this context. Default: merge off.
    */
   readonly enableFamilyMerge?: boolean;
+  /**
+   * §7 derived-uniforms opt-in — propagated to every HybridScene
+   * compiled against this context.
+   */
+  readonly enableDerivedUniforms?: boolean;
 }
 
 class RenderTask implements IRenderTask {
@@ -104,6 +109,49 @@ class RenderTask implements IRenderTask {
     return total;
   }
 
+  heapDerivedTimings(): {
+    pullMs: number; uploadMs: number; encodeMs: number; records: number;
+  } {
+    let pullMs = 0, uploadMs = 0, encodeMs = 0, records = 0;
+    for (const s of this._scenes.values()) {
+      const t = s.heapDerivedTimings();
+      pullMs   += t.pullMs;
+      uploadMs += t.uploadMs;
+      encodeMs += t.encodeMs;
+      records  += t.records;
+    }
+    return { pullMs, uploadMs, encodeMs, records };
+  }
+
+  async validateHeap(): Promise<{
+    arenaBytes: number; issues: string[];
+    okRefs: number; badRefs: number;
+    drawTableRows: number; drawTableErrs: number; prefixSumErrs: number;
+    attrAllocsChecked: number; attrAllocsBad: number;
+  }> {
+    let arenaBytes = 0, okRefs = 0, badRefs = 0;
+    let drawTableRows = 0, drawTableErrs = 0, prefixSumErrs = 0;
+    let attrAllocsChecked = 0, attrAllocsBad = 0;
+    const issues: string[] = [];
+    for (const s of this._scenes.values()) {
+      const r = await s.validateHeap();
+      arenaBytes += r.arenaBytes;
+      okRefs += r.okRefs;
+      badRefs += r.badRefs;
+      drawTableRows += r.drawTableRows;
+      drawTableErrs += r.drawTableErrs;
+      prefixSumErrs += r.prefixSumErrs;
+      attrAllocsChecked += r.attrAllocsChecked;
+      attrAllocsBad += r.attrAllocsBad;
+      for (const i of r.issues) issues.push(i);
+    }
+    return {
+      arenaBytes, issues, okRefs, badRefs,
+      drawTableRows, drawTableErrs, prefixSumErrs,
+      attrAllocsChecked, attrAllocsBad,
+    };
+  }
+
   dispose(): void {
     if (this._disposed) return;
     for (const s of this._scenes.values()) s.dispose();
@@ -151,6 +199,7 @@ class RenderTask implements IRenderTask {
         compileEffect: this.ctx.compileEffect,
         ...(this.ctx.heapEnabled !== undefined ? { heapEnabled: this.ctx.heapEnabled } : {}),
         ...(this.ctx.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
+        ...(this.ctx.enableDerivedUniforms === true ? { enableDerivedUniforms: true } : {}),
       });
       this._scenes.set(cmd, s);
     }

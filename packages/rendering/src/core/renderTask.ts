@@ -31,6 +31,21 @@ export interface IRenderTask {
    */
   heapBucketCount(): number;
 
+  /** Per-frame breakdown of §7 derived-uniforms work (CPU, last frame). */
+  heapDerivedTimings(): {
+    pullMs: number; uploadMs: number; encodeMs: number; records: number;
+  };
+
+  /** Diagnostic: walks heap drawHeaders, drawTables, prefix sums,
+   *  attribute alloc headers; checks refs/indices/instance counts and
+   *  data finiteness. Useful for hunting OOB-corruption bugs. */
+  validateHeap(): Promise<{
+    arenaBytes: number; issues: string[];
+    okRefs: number; badRefs: number;
+    drawTableRows: number; drawTableErrs: number; prefixSumErrs: number;
+    attrAllocsChecked: number; attrAllocsBad: number;
+  }>;
+
   /** Tear down resources owned by the task. Idempotent. */
   dispose(): void;
 }

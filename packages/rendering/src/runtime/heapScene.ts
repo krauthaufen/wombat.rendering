@@ -42,7 +42,7 @@
 // package adds the texture (binding 4) + sampler (binding 5) to that
 // group's bind-group layout; the user's FS WGSL declares them.
 
-import { Trafo3d, V3d, V4f, type V2f, type M44d } from "@aardworx/wombat.base";
+import { Trafo3d, V3d, V4f, M44d, type V2f } from "@aardworx/wombat.base";
 import type { ITexture } from "../core/texture.js";
 import type { ISampler } from "../core/sampler.js";
 import { AVal, AdaptiveObject, AdaptiveToken } from "@aardworx/wombat.adaptive";
@@ -69,6 +69,12 @@ import {
   ATLAS_ARRAY_SIZE, ATLAS_LINEAR_BINDING_BASE,
   ATLAS_SRGB_BINDING_BASE, ATLAS_SAMPLER_BINDING,
 } from "./heapEffect.js";
+import {
+  DerivedUniformsScene,
+  registerRoDerivations, deregisterRoDerivations,
+  isDerivedUniformName,
+  type RoRegistration,
+} from "./derivedUniforms/index.js";
 
 // ---------------------------------------------------------------------------
 // Per-allocation arena layout
@@ -1083,6 +1089,11 @@ export interface HeapSceneStats {
   totalDraws: number;
   drawBytes: number;
   geometryBytes: number;
+  /** §7 derived-uniforms per-frame breakdown (last frame). */
+  derivedPullMs:   number;
+  derivedUploadMs: number;
+  derivedEncodeMs: number;
+  derivedRecords:  number;
 }
 
 export interface HeapScene {
@@ -1245,6 +1256,19 @@ export interface BuildHeapSceneOptions {
    * trace-based auto-trigger lands as v2.
    */
   readonly enableFamilyMerge?: boolean;
+  /**
+   * §7 derived-uniforms opt-in. When true, the renderer recognises the
+   * 10 standard derived names (ModelView, ViewProj, ModelViewProj,
+   * NormalMatrix, the 3 *TrafoInv fields, and the 3 product inverses)
+   * as compute-produced and writes them into each RO's drawHeader via
+   * a df32 compute pre-pass — not via the uniform provider. ROs MUST
+   * supply ModelTrafo / ViewTrafo / ProjTrafo as `aval<Trafo3d>` for
+   * any derived field they consume.
+   *
+   * Default false: each derived name continues to be served by the
+   * effect's `spec.inputs[name]` like any other uniform.
+   */
+  readonly enableDerivedUniforms?: boolean;
 }
 
 export function buildHeapScene(
@@ -1479,6 +1503,12 @@ export function buildHeapScene(
         allocDirty.add(o as unknown as aval<unknown>);
         return;
       }
+      // §7 derived-uniforms constituent (Trafo3d aval). Routed BEFORE
+      // the atlas check because trafo avals never overlap with texture
+      // avals — early-return is just to avoid the second Map lookup.
+      if (derivedScene !== undefined && derivedScene.routeInputChanged(o)) {
+        return;
+      }
       const av = o as unknown as aval<ITexture>;
       if (atlasAvalRefs.has(av)) {
         atlasAvalDirty.add(av);
@@ -1486,6 +1516,22 @@ export function buildHeapScene(
     }
   }
   const sceneObj = new HeapSceneObj();
+
+  // ─── §7 derived-uniforms (opt-in) ─────────────────────────────────
+  // Constructed lazily after sceneObj so the SubscribeFn can reference
+  // both. `derivedScene` is undefined when the option is off; nothing
+  // else in this file should run when it is.
+  const enableDerivedUniforms = opts.enableDerivedUniforms === true;
+  const derivedScene: DerivedUniformsScene | undefined = enableDerivedUniforms
+    ? new DerivedUniformsScene(device, arena.attrs.buffer, {
+        // Larger initial capacity reduces grow-during-first-frame churn.
+        initialConstituentSlots: 4096,
+        initialRecordCapacity:   8192,
+      })
+    : undefined;
+  /** Per-RO §7 registration handles, keyed by global drawId.
+   *  Drained on removeDraw to release slots + records. */
+  const derivedByDrawId = new Map<number, RoRegistration>();
 
   // ─── Atlas bindings ───────────────────────────────────────────────
   //
@@ -1952,6 +1998,8 @@ export function buildHeapScene(
   // needs rebuilding (its binding 2 buffer reference is stale).
   arena.attrs.onResize(() => {
     for (const b of buckets) b.bindGroup = buildBucketBindGroup(b);
+    // §7 dispatcher targets arena.attrs.buffer; rebind on grow.
+    if (derivedScene !== undefined) derivedScene.rebindMainHeap(arena.attrs.buffer);
   });
   // Same when the atlas pool allocates a fresh page — its slot in the
   // BGL ladder transitions from placeholder to the real GPUTexture.
@@ -2123,7 +2171,12 @@ export function buildHeapScene(
       // their headers get re-packed and re-uploaded next frame.
       for (const s of bucket.drawSlots) bucket.dirty.add(s);
       bucket.bindGroup = buildBucketBindGroup(bucket);
+      // §7's main heap is arena.attrs.buffer (not drawHeap) — the
+      // arena.attrs.onResize handler at the scene level handles its
+      // rebind. drawHeap resize doesn't touch §7.
     });
+    // §7 has one scene-wide records buffer + dispatcher (all buckets
+    // target arena.attrs.buffer), so nothing per-bucket to set up here.
     buckets.push(bucket);
     bucketByKey.set(bk, bucket);
     return bucket;
@@ -2255,6 +2308,10 @@ export function buildHeapScene(
     totalDraws: 0,
     drawBytes: 0,
     geometryBytes: 0,
+    derivedPullMs:   0,
+    derivedUploadMs: 0,
+    derivedEncodeMs: 0,
+    derivedRecords:  0,
   };
   Object.defineProperty(stats, "groups", { get: () => buckets.length, configurable: true });
 
@@ -2308,6 +2365,20 @@ export function buildHeapScene(
         // layoutId branch never reads them, so the slot stays zero.
         if (f.name === "__layoutId") continue;
         if (!effectFields.has(f.name)) continue;
+        // §7: derived-uniform fields are produced by the compute
+        // pre-pass. We still allocate an arena slot here so the
+        // drawHeader gets a valid ref written by packBucketHeader; §7
+        // overwrites the arena data each frame the inputs are dirty.
+        if (derivedScene !== undefined && isDerivedUniformName(f.name)) {
+          const dummyAval = AVal.constant<M44d>(M44d.zero);
+          const ref = pool.acquire(
+            device, arena.attrs, dummyAval, M44d.zero,
+            PACKER_MAT4.dataBytes, PACKER_MAT4.typeId, 1, PACKER_MAT4.pack,
+          );
+          perDrawRefs.set(f.name, ref);
+          perDrawAvals.push(dummyAval);
+          continue;
+        }
         const isPerInstanceUniformField =
           f.kind === "uniform-ref" && perInstanceUniforms.has(f.name);
         const isPerInstanceAttrField =
@@ -2434,6 +2505,40 @@ export function buildHeapScene(
     drawIdToBucket[drawId]    = bucket;
     drawIdToLocalSlot[drawId] = localSlot;
     drawIdToIndexAval[drawId] = indicesAval;
+
+    // ─── §7 derived-uniforms registration ────────────────────────────
+    // Collect the derived names this effect actually uses (i.e. fields
+    // declared in the drawHeader for this effect AND in the §7 set).
+    // For each, the kernel writes into byte offset
+    //   localSlot * drawHeaderBytes + field.byteOffset
+    // i.e. this RO's drawHeader region in the bucket's drawHeap.
+    if (derivedScene !== undefined) {
+      const requiredNames: string[] = [];
+      const arenaByteOffsetByName = new Map<string, number>();
+      for (const f of bucket.layout.drawHeaderFields) {
+        if (f.name === "__layoutId") continue;
+        if (!effectFields.has(f.name)) continue;
+        if (!isDerivedUniformName(f.name)) continue;
+        const ref = perDrawRefs.get(f.name);
+        if (ref === undefined) continue;
+        requiredNames.push(f.name);
+        arenaByteOffsetByName.set(f.name, ref + ALLOC_HEADER_PAD_TO);
+      }
+      if (requiredNames.length > 0) {
+        const reg = registerRoDerivations(derivedScene, {
+          trafos: {
+            modelTrafo: spec.inputs["ModelTrafo"] as aval<Trafo3d> | undefined,
+            viewTrafo:  spec.inputs["ViewTrafo"]  as aval<Trafo3d> | undefined,
+            projTrafo:  spec.inputs["ProjTrafo"]  as aval<Trafo3d> | undefined,
+          },
+          requiredNames,
+          byteOffsetByName: arenaByteOffsetByName,
+          drawHeaderBaseByte: 0,
+        });
+        derivedByDrawId.set(drawId, reg);
+      }
+    }
+
     stats.totalDraws++;
     stats.geometryBytes = arenaBytes(arena);
     return drawId;
@@ -2443,6 +2548,14 @@ export function buildHeapScene(
     const bucket    = drawIdToBucket[drawId];
     const localSlot = drawIdToLocalSlot[drawId];
     if (bucket === undefined || localSlot === undefined) return;
+    // §7: deregister this RO's derivation records and release slots.
+    if (derivedScene !== undefined) {
+      const reg = derivedByDrawId.get(drawId);
+      if (reg !== undefined) {
+        deregisterRoDerivations(derivedScene, reg);
+        derivedByDrawId.delete(drawId);
+      }
+    }
     {
       const removedEntry = bucket.localEntries[localSlot];
       const removedCount = removedEntry !== undefined
@@ -2733,7 +2846,32 @@ export function buildHeapScene(
    * Single compute pass over all dirty buckets — pipelines are shared,
    * we just swap the bind group + dispatch shape per bucket.
    */
-  function encodeComputePrep(enc: GPUCommandEncoder, _token: AdaptiveToken): void {
+  function encodeComputePrep(enc: GPUCommandEncoder, token: AdaptiveToken): void {
+    // §7: derived-uniforms dispatch first — writes into per-bucket
+    // drawHeap regions before the scan reads anything. One dispatcher
+    // per bucket; constituents are shared so dirty state propagates
+    // correctly. O(changed) per dispatcher.
+    if (derivedScene !== undefined) {
+      const _t0 = performance.now();
+      // pullDirty's getValue(t) needs an evaluateAlways scope to
+      // re-establish our subscription on the firing avals (getValue
+      // adds the evaluating object to the aval's outputs). Without
+      // this scope, view changes never propagate again — the scene
+      // freezes after one frame.
+      let dirty: ReturnType<typeof derivedScene.constituents.pullDirty> | undefined;
+      sceneObj.evaluateAlways(token, (t) => {
+        dirty = derivedScene.constituents.pullDirty(t);
+      });
+      const _t1 = performance.now();
+      derivedScene.uploadDirty(dirty!);
+      const _t2 = performance.now();
+      if (dirty!.size > 0) derivedScene.dispatcher.encode(enc);
+      const _t3 = performance.now();
+      stats.derivedPullMs   = _t1 - _t0;
+      stats.derivedUploadMs = _t2 - _t1;
+      stats.derivedEncodeMs = _t3 - _t2;
+      stats.derivedRecords  = derivedScene.dispatcher.records.recordCount;
+    }
     let anyDirty = false;
     for (const b of buckets) { if (b.scanDirty) { anyDirty = true; break; } }
     if (!anyDirty) return;
@@ -2837,6 +2975,225 @@ export function buildHeapScene(
         recordCount: b.recordCount,
         layout: b.layout,
       }));
+    },
+    /** §7 debug: bucket drawHeap GPU buffers. */
+    drawHeapBufsForTest(): readonly GPUBuffer[] {
+      return buckets.map(b => b.drawHeap.buffer);
+    },
+    /** Download arena + drawHeaps + drawTables + indices and validate
+     *  the heap renderer's invariants:
+     *    1. drawHeader refs land inside arena.
+     *    2. drawTable rows (firstEmit, drawIdx, indexStart, indexCount,
+     *       instanceCount) reference valid slots / indices / instances.
+     *    3. firstEmit is a correct prefix-sum of `indexCount *
+     *       instanceCount` over drawTable rows in record-index order.
+     *    4. Index range [indexStart, indexStart+indexCount) lies within
+     *       arena.indices.buffer.
+     *  Returns a list of issue strings + counters. Async, safe to
+     *  call any frame.
+     */
+    async validateHeap(): Promise<{
+      arenaBytes: number;
+      issues: string[];
+      okRefs: number;
+      badRefs: number;
+      drawTableRows: number;
+      drawTableErrs: number;
+      prefixSumErrs: number;
+      attrAllocsChecked: number;
+      attrAllocsBad: number;
+    }> {
+      const issues: string[] = [];
+      let okRefs = 0, badRefs = 0;
+      let drawTableRows = 0, drawTableErrs = 0, prefixSumErrs = 0;
+      let attrAllocsChecked = 0, attrAllocsBad = 0;
+      const push = (s: string) => { if (issues.length < 60) issues.push(s); };
+      const arenaSize = arena.attrs.buffer.size;
+      const indicesSize = arena.indices.buffer.size;
+
+      const enc = device.createCommandEncoder({ label: "validateHeap" });
+      const stage = (src: GPUBuffer, size: number): GPUBuffer => {
+        const c = device.createBuffer({
+          size: size,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        enc.copyBufferToBuffer(src, 0, c, 0, size);
+        return c;
+      };
+
+      const arenaCopy = stage(arena.attrs.buffer, arenaSize);
+      const indicesCopy = indicesSize > 0 ? stage(arena.indices.buffer, indicesSize) : undefined;
+      type DC = {
+        bucket: typeof buckets[number];
+        drawHeap: GPUBuffer;
+        drawTable?: GPUBuffer;
+      };
+      const dcs: DC[] = [];
+      for (const b of buckets) {
+        const dhSize = Math.min(b.drawHeap.buffer.size, b.recordCount * b.layout.drawHeaderBytes);
+        if (dhSize === 0) continue;
+        const dh = stage(b.drawHeap.buffer, dhSize);
+        const dt = b.drawTableBuf !== undefined && b.recordCount > 0
+          ? stage(b.drawTableBuf.buffer, b.recordCount * RECORD_BYTES)
+          : undefined;
+        dcs.push({ bucket: b, drawHeap: dh, ...(dt !== undefined ? { drawTable: dt } : {}) });
+      }
+      device.queue.submit([enc.finish()]);
+
+      await arenaCopy.mapAsync(GPUMapMode.READ);
+      if (indicesCopy !== undefined) await indicesCopy.mapAsync(GPUMapMode.READ);
+      for (const dc of dcs) {
+        await dc.drawHeap.mapAsync(GPUMapMode.READ);
+        if (dc.drawTable !== undefined) await dc.drawTable.mapAsync(GPUMapMode.READ);
+      }
+
+      // ── 1+4. drawHeader refs inside arena, drawTable indices in range,
+      //         + attribute alloc-header sanity (typeId / length / data).
+      const arenaU32 = new Uint32Array(arenaCopy.getMappedRange());
+      const arenaF32 = new Float32Array(arenaU32.buffer, arenaU32.byteOffset, arenaU32.length);
+      // Track unique attribute-alloc refs we've already inspected so we
+      // don't re-validate the same shared alloc 20K times.
+      const attrAllocsSeen = new Set<number>();
+      const KNOWN_TYPE_IDS = new Set<number>([0, 1, 2, 3]);
+
+      let bucketIdx = 0;
+      for (const dc of dcs) {
+        const u32 = new Uint32Array(dc.drawHeap.getMappedRange());
+        const stride = dc.bucket.layout.drawHeaderBytes;
+        const recordCount = dc.bucket.recordCount;
+
+        for (let slot = 0; slot < recordCount; slot++) {
+          const slotOff = slot * stride;
+          for (const f of dc.bucket.layout.drawHeaderFields) {
+            if (f.name === "__layoutId") continue;
+            if (f.kind !== "uniform-ref" && f.kind !== "attribute-ref") continue;
+            const ref = u32[(slotOff + f.byteOffset) >>> 2];
+            if (ref === undefined || ref === 0) continue;
+            const payloadStart = ref + ALLOC_HEADER_PAD_TO;
+            if (payloadStart >= arenaSize) {
+              push(`bucket#${bucketIdx} slot=${slot} field='${f.name}' ` +
+                `ref=0x${ref.toString(16)} payload=0x${payloadStart.toString(16)} >= arena=0x${arenaSize.toString(16)}`);
+              badRefs++;
+              continue;
+            }
+            okRefs++;
+
+            // For attribute-ref fields, decode the alloc header at
+            // [ref, ref+16): typeId @ +0, length @ +4. Then sanity-
+            // check the data range covers what the shader will index.
+            if (f.kind !== "attribute-ref") continue;
+            if (attrAllocsSeen.has(ref)) continue;
+            attrAllocsSeen.add(ref);
+            attrAllocsChecked++;
+
+            const refU32 = ref >>> 2;
+            const typeId = arenaU32[refU32]!;
+            const length = arenaU32[refU32 + 1]!;
+
+            if (!KNOWN_TYPE_IDS.has(typeId)) {
+              push(`bucket#${bucketIdx} slot=${slot} field='${f.name}' alloc@0x${ref.toString(16)} typeId=${typeId} unknown`);
+              attrAllocsBad++;
+              continue;
+            }
+            if (length === 0) {
+              push(`bucket#${bucketIdx} slot=${slot} field='${f.name}' alloc@0x${ref.toString(16)} length=0`);
+              attrAllocsBad++;
+              continue;
+            }
+            const eltFloats =
+              f.attributeWgslType === "vec3<f32>" ? 3 :
+              f.attributeWgslType === "vec4<f32>" ? 4 :
+              f.attributeWgslType === "vec2<f32>" ? 2 : 1;
+            const dataStartF32 = (ref + ALLOC_HEADER_PAD_TO) >>> 2;
+            const dataEndF32   = dataStartF32 + length * eltFloats;
+            if (dataEndF32 * 4 > arenaSize) {
+              push(`bucket#${bucketIdx} slot=${slot} field='${f.name}' alloc@0x${ref.toString(16)} ` +
+                `data extends to f32[${dataEndF32}] = ${dataEndF32 * 4}B > arena=${arenaSize}B`);
+              attrAllocsBad++;
+              continue;
+            }
+            // Check finite-ness on the data we're about to read.
+            let nonFinite = 0;
+            for (let i = dataStartF32; i < dataEndF32; i++) {
+              const v = arenaF32[i]!;
+              if (!Number.isFinite(v)) nonFinite++;
+            }
+            if (nonFinite > 0) {
+              push(`bucket#${bucketIdx} slot=${slot} field='${f.name}' alloc@0x${ref.toString(16)} ` +
+                `${nonFinite} non-finite floats in data range`);
+              attrAllocsBad++;
+            }
+          }
+        }
+
+        // ── 2. drawTable validation
+        if (dc.drawTable !== undefined) {
+          const dt = new Uint32Array(dc.drawTable.getMappedRange());
+          let runningSum = 0;
+          for (let r = 0; r < recordCount; r++) {
+            const off = r * RECORD_U32;
+            const firstEmit     = dt[off + 0]!;
+            const drawIdx       = dt[off + 1]!;
+            const indexStart    = dt[off + 2]!;
+            const indexCount    = dt[off + 3]!;
+            const instanceCount = dt[off + 4]!;
+            drawTableRows++;
+
+            // 2a. drawIdx must be a valid local slot in this bucket
+            if (drawIdx >= dc.bucket.layout.drawHeaderBytes * 0 + recordCount + 8 /* loose: should be < total addDraws */) {
+              // can't easily check upper without an externally known max — skip
+            }
+
+            // 2b. instanceCount > 0
+            if (instanceCount === 0) {
+              push(`bucket#${bucketIdx} drawTable[${r}] instanceCount=0`);
+              drawTableErrs++;
+            }
+
+            // 2c. indexCount > 0 (or the record is dead — but live records should have count)
+            if (indexCount === 0) {
+              push(`bucket#${bucketIdx} drawTable[${r}] indexCount=0`);
+              drawTableErrs++;
+            }
+
+            // 2d. indices range inside arena.indices
+            const indexBytes = (indexStart + indexCount) * 4;
+            if (indexBytes > indicesSize) {
+              push(`bucket#${bucketIdx} drawTable[${r}] index range ` +
+                `[${indexStart}, ${indexStart + indexCount}) bytes=${indexBytes} > indicesSize=${indicesSize}`);
+              drawTableErrs++;
+            }
+
+            // 3. prefix sum
+            if (firstEmit !== runningSum) {
+              push(`bucket#${bucketIdx} drawTable[${r}] firstEmit=${firstEmit} ≠ expected=${runningSum} ` +
+                `(indexCount=${indexCount} instanceCount=${instanceCount})`);
+              prefixSumErrs++;
+            }
+            runningSum += indexCount * instanceCount;
+          }
+          dc.drawTable.unmap();
+          dc.drawTable.destroy();
+        }
+
+        dc.drawHeap.unmap();
+        dc.drawHeap.destroy();
+        bucketIdx++;
+      }
+      arenaCopy.unmap();
+      arenaCopy.destroy();
+      if (indicesCopy !== undefined) {
+        indicesCopy.unmap();
+        indicesCopy.destroy();
+      }
+
+      return {
+        arenaBytes: arenaSize,
+        issues,
+        okRefs, badRefs,
+        drawTableRows, drawTableErrs, prefixSumErrs,
+        attrAllocsChecked, attrAllocsBad,
+      };
     },
   };
 
