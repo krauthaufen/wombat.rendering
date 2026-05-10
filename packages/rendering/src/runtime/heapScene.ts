@@ -758,8 +758,12 @@ const SCAN_MAX_RECORDS = SCAN_TILE_SIZE * SCAN_TILE_SIZE; // numBlocks ≤ TILE_
 
 const TILE_K = 64;
 
-/** drawTable record width: (firstEmit, drawIdx, indexStart, indexCount, instanceCount). */
-const RECORD_U32   = 5;
+/** drawTable record width: (firstEmit, drawIdx, indexStart, indexCount,
+ *  instanceCount, _pad). 6 u32 = 24 bytes; the trailing pad lifts the
+ *  storage struct stride to a 16-multiple-friendly size. No semantic
+ *  use — purely a defense against backends that mishandle non-aligned
+ *  storage struct strides. */
+const RECORD_U32   = 6;
 const RECORD_BYTES = RECORD_U32 * 4;
 
 const HEAP_SCAN_WGSL = `
@@ -776,6 +780,7 @@ struct Record {
   indexStart:    u32,
   indexCount:    u32,
   instanceCount: u32,
+  _pad:          u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> drawTable:        array<Record>;
