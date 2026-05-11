@@ -99,28 +99,26 @@ describe("megacall IR WGSL emission", () => {
     // eslint-disable-next-line no-console
     console.log("=== VS ===\n" + ir.vs + "\n=== FS ===\n" + ir.fs);
 
-    // Sanity checks: VS has emitIdx, drawTable binding, indexStorage.
-    expect(ir.vs).toContain("@builtin(vertex_index) emitIdx: u32");
+    // Sanity checks: the decoder VS has the megacall builtin, the
+    // heap arena bindings, and the binary-search-derived locals.
+    expect(ir.vs).toContain("@builtin(vertex_index) vertex_index: u32");
     expect(ir.vs).toMatch(/drawTable:\s+array<u32>/);
     expect(ir.vs).toMatch(/indexStorage:\s+array<u32>/);
-    // Per-RO instancing: header-selector reads bind to a distinct
-    // `heap_drawIdx` identifier declared as a `let` local in the @vertex
-    // body. Helpers that reference it receive it as a u32 parameter
-    // (handled by `threadMegacallParamsThroughHelpers`). `instance_index`
-    // is the in-RO instance index (= instId from the megacall search
-    // prelude). No `var<private>` for the megacall shared values —
-    // module-scope mutable state is rejected by some WGSL parsers
-    // (Safari/WebKit) when read from helper fn bodies, so we thread
-    // the values as parameters instead.
+    // No `var<private>` for the megacall shared values — module-scope
+    // mutable state is rejected by some WGSL parsers (Safari/WebKit)
+    // when read from helper fn bodies.
     expect(ir.vs).not.toMatch(/var<private>\s+heap_drawIdx/);
     expect(ir.vs).not.toMatch(/var<private>\s+instId/);
     expect(ir.vs).not.toMatch(/var<private>\s+vid/);
+    // Per-vertex `vid` is always live (heap attribute loads depend on
+    // it). `heap_drawIdx` is always live (every per-RO load reads
+    // headers via it). `instId` lives iff the effect reads
+    // instance_index; this effect doesn't, so DCE drops it.
     expect(ir.vs).toMatch(/let heap_drawIdx:\s*u32\s*=\s*drawTable\[/);
-    expect(ir.vs).toMatch(/let instId:\s*u32\s*=\s*_local\s*\/\s*_indexCount/);
     expect(ir.vs).toMatch(/let vid:\s*u32\s*=\s*indexStorage\[/);
     expect(ir.vs).not.toMatch(/let __heap_drawIdx\b/);
-    expect(ir.vs).toContain("let instance_index: u32 = instId");
-    // No leftover @builtin(instance_index)
+    // No leftover @builtin(instance_index) — the decoder owns the
+    // megacall search and consumers receive `instId` as a local.
     expect(ir.vs).not.toMatch(/@builtin\(\s*instance_index\s*\)/);
   });
 });

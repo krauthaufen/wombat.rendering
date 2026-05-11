@@ -47,7 +47,7 @@ import type { ITexture } from "../core/texture.js";
 import type { ISampler } from "../core/sampler.js";
 import { AVal, AdaptiveObject, AdaptiveToken } from "@aardworx/wombat.adaptive";
 import type { aval, aset, IAdaptiveObject, IDisposable, IHashSetReader } from "@aardworx/wombat.adaptive";
-import type { Effect } from "@aardworx/wombat.shader";
+import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
 import type { PipelineState } from "../core/pipelineState.js";
 import type { BufferView } from "../core/bufferView.js";
 import type { IBuffer, HostBufferSource } from "../core/buffer.js";
@@ -1338,6 +1338,19 @@ export function buildHeapScene(
     throw new Error("buildHeapScene: framebuffer signature has no color attachment");
   }
   const colorFormat = sig.colors.tryFind(colorAttachmentName)!;
+  // All color targets, ordered by the signature's `colorNames`. Each
+  // entry's format flows into the pipeline's `fragment.targets[i].format`.
+  // The fragmentOutputLayout's `locations` map tells the WGSL emit which
+  // output @location maps to which color attachment; this array is the
+  // matching pipeline-side ordering.
+  const colorTargets: { format: GPUTextureFormat }[] = [];
+  for (const name of sig.colorNames) {
+    const fmt = sig.colors.tryFind(name);
+    if (fmt === undefined) {
+      throw new Error(`buildHeapScene: signature missing format for color '${name}'`);
+    }
+    colorTargets.push({ format: fmt });
+  }
   const depthFormat = sig.depthStencil?.format;
 
   // ─── Global arena (uniform/attribute data + index buffer) ────────
@@ -1778,6 +1791,10 @@ export function buildHeapScene(
     schema: ShaderFamilySchema;
     vsModule: GPUShaderModule;
     fsModule: GPUShaderModule;
+    /** Actual @vertex entry-point name in `vsModule`. */
+    vsEntryName: string;
+    /** Actual @fragment entry-point name in `fsModule`. */
+    fsEntryName: string;
     fieldsForEffect: Map<Effect, Set<string>>;
   }
   const familyByEffect = new Map<Effect, FamilyState>();
@@ -1788,26 +1805,50 @@ export function buildHeapScene(
     effects: readonly Effect[],
     perInstanceByEffect: ReadonlyMap<Effect, { attributes: Set<string>; uniforms: Set<string> }>,
   ): FamilyState {
+    // Family-merge (multi-effect dispatch via layoutId switch) has been
+    // disabled — it was a perf illusion. Every effect compiles to its
+    // own standalone pipeline; the per-bucket WGSL comes from
+    // `compileHeapEffectIR(effect, layout, opts, "standalone")` and is
+    // used directly as the bucket's shader module (no wrapper, no
+    // dispatch). The schema is still derived from the same
+    // `buildShaderFamily` path so the runtime's drawHeader packer,
+    // bind-group layout, etc. don't change shape — `__layoutId`
+    // remains a u32 slot that's written as 0 per RO (harmless).
+    //
+    // `heapShaderFamily.compileShaderFamily` is kept around but
+    // unused; the function and its tests stay disabled.
+    if (effects.length !== 1) {
+      throw new Error(
+        "heapScene: multi-effect family-merge disabled (was a perf illusion). " +
+        "Build one bucket per effect.",
+      );
+    }
+    const effect = effects[0]!;
     const schema = buildShaderFamily(
-      effects, opts.fragmentOutputLayout, undefined,
+      [effect], opts.fragmentOutputLayout, undefined,
       {
         atlasizeAllTextures: atlasPool !== undefined,
         perEffectPerInstance: perInstanceByEffect,
       },
     );
-    const compiled = compileShaderFamily(schema, opts.fragmentOutputLayout);
-    const vsModule = device.createShaderModule({ code: compiled.vs, label: `heapScene/family/${schema.id}/vs` });
-    const fsModule = device.createShaderModule({ code: compiled.fs, label: `heapScene/family/${schema.id}/fs` });
+    const compileOpts: CompileOptions = opts.fragmentOutputLayout !== undefined
+      ? { target: "wgsl", fragmentOutputLayout: opts.fragmentOutputLayout }
+      : { target: "wgsl" };
+    const ir = compileHeapEffectIR(effect, schema.drawHeaderUnion, compileOpts, "standalone");
+    const vsModule = device.createShaderModule({ code: ir.vs, label: `heapScene/standalone/${schema.id}/vs` });
+    const fsModule = device.createShaderModule({ code: ir.fs, label: `heapScene/standalone/${schema.id}/fs` });
     const fieldsForEffect = new Map<Effect, Set<string>>();
-    for (const e of schema.effects) {
-      const s = schema.perEffectSchema.get(e)!;
-      const fields = new Set<string>();
-      for (const a of s.attributes) fields.add(a.name);
-      for (const u of s.uniforms)   fields.add(u.name);
-      for (const t of s.textures)   fields.add(t.name);
-      fieldsForEffect.set(e, fields);
-    }
-    return { schema, vsModule, fsModule, fieldsForEffect };
+    const s = schema.perEffectSchema.get(effect)!;
+    const fields = new Set<string>();
+    for (const a of s.attributes) fields.add(a.name);
+    for (const u of s.uniforms)   fields.add(u.name);
+    for (const t of s.textures)   fields.add(t.name);
+    fieldsForEffect.set(effect, fields);
+    return {
+      schema, vsModule, fsModule, fieldsForEffect,
+      vsEntryName: ir.vsEntry,
+      fsEntryName: ir.fsEntry,
+    };
   }
 
   function buildFamilyFromSpecs(specs: readonly HeapDrawSpec[]): void {
@@ -1839,19 +1880,14 @@ export function buildHeapScene(
       }
       if (!seen.has(e)) { seen.add(e); unique.push(e); }
     }
-    if (enableFamilyMerge) {
-      const merged = compileFamilyFor(unique, perInstanceByEffect);
-      for (const e of unique) familyByEffect.set(e, merged);
-    } else {
-      // Default: one family per effect — no shared layoutId switch.
-      // Per-effect bucketing is at-or-better than merged on tested
-      // workloads; merge stays opt-in pending trace-based v2.
-      for (const e of unique) {
-        const perI = perInstanceByEffect.get(e);
-        const singleMap = new Map<Effect, { attributes: Set<string>; uniforms: Set<string> }>();
-        if (perI !== undefined) singleMap.set(e, perI);
-        familyByEffect.set(e, compileFamilyFor([e], singleMap));
-      }
+    // Family-merge disabled: always one bucket per effect.
+    // `enableFamilyMerge` is ignored.
+    void enableFamilyMerge;
+    for (const e of unique) {
+      const perI = perInstanceByEffect.get(e);
+      const singleMap = new Map<Effect, { attributes: Set<string>; uniforms: Set<string> }>();
+      if (perI !== undefined) singleMap.set(e, perI);
+      familyByEffect.set(e, compileFamilyFor([e], singleMap));
     }
     familyBuilt = true;
   }
@@ -2102,15 +2138,15 @@ export function buildHeapScene(
     const isAtlasBucket = layout.atlasTextureBindings.size > 0;
     const vsModule = fam.vsModule;
     const fsModule = fam.fsModule;
-    const vsEntry = "family_vs_main";
-    const fsEntry = "family_fs_main";
+    const vsEntry = fam.vsEntryName;
+    const fsEntry = fam.fsEntryName;
     const { pipelineLayout } = getBgl(layout, isAtlasBucket);
 
     const pipeline = device.createRenderPipeline({
       label: `heapScene/${bk}/pipeline`,
       layout: pipelineLayout,
       vertex:   { module: vsModule, entryPoint: vsEntry, buffers: [] },
-      fragment: { module: fsModule, entryPoint: fsEntry, targets: [{ format: colorFormat }] },
+      fragment: { module: fsModule, entryPoint: fsEntry, targets: colorTargets },
       primitive: { topology: ps.topology, cullMode: ps.cullMode, frontFace: ps.frontFace },
       ...(depthFormat !== undefined && ps.depth !== undefined
         ? { depthStencil: { format: depthFormat, depthWriteEnabled: ps.depth.write, depthCompare: ps.depth.compare } }

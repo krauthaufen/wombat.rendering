@@ -137,6 +137,25 @@ function wgslTypeToIrType(wgsl: string): Type {
 // ─── Decoder synthesis ───────────────────────────────────────────────
 
 /**
+ * Decoder emission shape.
+ *
+ *   - `"standalone"`: the decoder owns the megacall binary search.
+ *     `@builtin(vertex_index)` is its sole entry input, and the body's
+ *     prelude computes `heap_drawIdx` / `instId` / `vid` as local
+ *     `let`s. Used by the canonical heap path.
+ *
+ *   - `"family-member"`: the family wrapper VS already ran the
+ *     megacall search and dispatches into per-effect helpers passing
+ *     `heap_drawIdx`, `instId`, `vid` as plain `u32` args. The decoder
+ *     consumes those as `EntryParameter`s (non-builtin) and skips the
+ *     prelude entirely. After `extractFusedEntry` collapses the
+ *     decoder + user stages, the per-effect helper exposed to the
+ *     wrapper has exactly three `u32` parameters and one output struct
+ *     return.
+ */
+export type HeapDecoderMode = "standalone" | "family-member";
+
+/**
  * Build a fresh wombat.shader Effect containing exactly one vertex
  * stage — the heap-decoder. Compose it with the user effect's stages
  * via `effect(decoder, ...userEffect.stages)`; let composeStages do
@@ -149,44 +168,83 @@ function wgslTypeToIrType(wgsl: string): Type {
  * Each `attribute-ref` field in the layout produces a per-vertex (or
  * per-instance, depending on `layout.perInstanceAttributes`) load. Each
  * `uniform-ref` field produces a per-draw broadcast load (or per-
- * instance from `layout.perInstanceUniforms`). Texture-ref fields are
- * ignored — they stay in the drawHeader for the FS-side atlas
- * rewrite, but the decoder doesn't touch them.
+ * instance from `layout.perInstanceUniforms`). Atlas texture-ref
+ * fields surface as four flat varyings per binding so the FS-side
+ * atlas-sample rewrite can read them from the carrier.
  */
-export function synthesizeHeapDecoderEffect(layout: BucketLayout): Effect {
-  return makeStage(synthesizeHeapDecoderModule(layout));
+export function synthesizeHeapDecoderEffect(layout: BucketLayout, mode: HeapDecoderMode = "standalone"): Effect {
+  return makeStage(synthesizeHeapDecoderModule(layout, mode));
 }
 
 /**
  * Like `synthesizeHeapDecoderEffect` but returns the raw Module so
  * callers can splice it into an existing module-merge pipeline.
  */
-export function synthesizeHeapDecoderModule(layout: BucketLayout): Module {
-  const storageDecls: ValueDef[] = [
-    ...heapArenaStorageDecls(),
-    ...megacallLookupStorageDecls(),
-  ];
+export function synthesizeHeapDecoderModule(layout: BucketLayout, mode: HeapDecoderMode = "standalone"): Module {
+  // Storage bindings: arena always required; megacall lookup buffers
+  // only when the decoder itself owns the binary search (standalone
+  // mode). Family-member mode receives the resolved triple from the
+  // wrapper VS via plain u32 fn parameters, so it doesn't need the
+  // lookup tables in its own module-scope binding set.
+  const storageDecls: ValueDef[] = mode === "standalone"
+    ? [...heapArenaStorageDecls(), ...megacallLookupStorageDecls()]
+    : [...heapArenaStorageDecls()];
 
-  // The single vertex entry. Input: emitIdx (= @builtin(vertex_index));
-  // outputs: one per surfaced carrier name.
-  const inputs: EntryParameter[] = [{
-    name: "emitIdx",
-    type: Tu32,
-    semantic: "vertex_index",
-    decorations: [{ kind: "Builtin", value: "vertex_index" }],
-  }];
-
+  const inputs: EntryParameter[] = [];
   const outputs: EntryParameter[] = [];
   const stmts: Stmt[] = [];
-  const emitIdxVar: Var = { name: "emitIdx", type: Tu32, mutable: false };
-  const emitIdxExpr: Expr = { kind: "Var", var: emitIdxVar, type: Tu32 };
 
-  // Megacall search → locals heap_drawIdx, instId, vid.
-  const { stmts: megacallStmts, locals } = buildMegacallPrelude(emitIdxExpr);
-  stmts.push(...megacallStmts);
-  const drawIdxExpr: Expr = { kind: "Var", var: locals.heapDrawIdx, type: Tu32 };
-  const instIdExpr:  Expr = { kind: "Var", var: locals.instId,      type: Tu32 };
-  const vidExpr:     Expr = { kind: "Var", var: locals.vid,         type: Tu32 };
+  // Locals (or input params) that downstream WriteOutput stmts pull
+  // from. Populated below depending on `mode`.
+  let drawIdxExpr: Expr;
+  let instIdExpr:  Expr;
+  let vidExpr:     Expr;
+
+  if (mode === "standalone") {
+    // Single vertex entry input: the megacall builtin. WGSL emits
+    // builtin reads as the *semantic* name; `name === semantic`
+    // keeps the @vertex param identifier matching the body.
+    inputs.push({
+      name: "vertex_index",
+      type: Tu32,
+      semantic: "vertex_index",
+      decorations: [{ kind: "Builtin", value: "vertex_index" }],
+    });
+    // Read via ReadInput("Builtin", ...): extractFusedEntry detects
+    // builtin reads through this scope; a bare `Var` reference would
+    // slip past its bodyReads analysis and the fused @vertex
+    // wouldn't surface the builtin at all.
+    const emitIdxExpr: Expr = { kind: "ReadInput", scope: "Builtin", name: "vertex_index", type: Tu32 };
+    // Megacall search → locals heap_drawIdx, instId, vid.
+    const { stmts: megacallStmts, locals } = buildMegacallPrelude(emitIdxExpr);
+    stmts.push(...megacallStmts);
+    drawIdxExpr = { kind: "Var", var: locals.heapDrawIdx, type: Tu32 };
+    instIdExpr  = { kind: "Var", var: locals.instId,      type: Tu32 };
+    vidExpr     = { kind: "Var", var: locals.vid,         type: Tu32 };
+  } else {
+    // Family-member mode: receive the megacall outputs as plain u32
+    // params from the wrapper. Declare them as EntryParameters
+    // (location-decorated so they survive composeStages' attribute
+    // classification), then read them via ReadInput("Input", ...)
+    // inside the body. After composition the fused entry surfaces
+    // them as inputs that the wrapper passes by name.
+    const declParam = (name: string, location: number): EntryParameter => ({
+      name,
+      type: Tu32,
+      semantic: name,
+      decorations: [
+        { kind: "Location", value: location },
+        // u32 inter-stage IO must be flat-interpolated.
+        { kind: "Interpolation", mode: "flat" },
+      ],
+    });
+    inputs.push(declParam("heap_drawIdx", 0));
+    inputs.push(declParam("instId",       1));
+    inputs.push(declParam("vid",          2));
+    drawIdxExpr = { kind: "ReadInput", scope: "Input", name: "heap_drawIdx", type: Tu32 };
+    instIdExpr  = { kind: "ReadInput", scope: "Input", name: "instId",      type: Tu32 };
+    vidExpr     = { kind: "ReadInput", scope: "Input", name: "vid",         type: Tu32 };
+  }
 
   // Walk the bucket layout's drawHeader fields. The order doesn't
   // matter for correctness — every surfaced name becomes a unique
@@ -363,7 +421,13 @@ function addAttributeOutput(
   // are constant across a primitive's vertices but in this fused-stage
   // model they still flow through the carrier, so flat is the safe
   // policy (no semantic difference for genuinely-constant values).
-  const interp: "smooth" | "flat" = layout.perInstanceAttributes.has(f.name) ? "flat" : "smooth";
+  // Integer-typed inter-stage IO MUST be `flat` (WGSL constraint).
+  const isInteger =
+    irType.kind === "Int" || irType.kind === "Bool"
+    || (irType.kind === "Vector"
+        && (irType.element.kind === "Int" || irType.element.kind === "Bool"));
+  const interp: "smooth" | "flat" =
+    layout.perInstanceAttributes.has(f.name) || isInteger ? "flat" : "smooth";
 
   outputs.push({
     name: f.name,

@@ -114,10 +114,14 @@ describe("compileHeapEffectIR family-member mode", () => {
     expect(ir.vs).not.toMatch(/\b_tileIdx\b/);
     expect(ir.vs).not.toMatch(/\bfirstDrawInTile\b/);
 
-    // Body still aliases the legacy builtin names so IR-emitted body
-    // code resolves to the new params.
-    expect(ir.vs).toContain("let instance_index: u32 = instId");
-    expect(ir.vs).toContain("let vertex_index: u32 = vid");
+    // In the decoder-composition path the decoder synthesises the
+    // per-input/uniform loads using `instId`/`vid` directly via Var
+    // expressions; the IR doesn't emit `let vertex_index = vid;`
+    // aliases that the legacy substitute path used. The body's
+    // megacall identifiers ARE `instId` / `vid` (no `vertex_index` /
+    // `instance_index` aliases needed).
+    expect(ir.vs).not.toMatch(/let\s+instance_index\b/);
+    expect(ir.vs).not.toMatch(/let\s+vertex_index\b/);
 
     // Heap arena bindings (0..3) ARE present — the per-effect VS still
     // reads heapU32/headersU32/heapF32/heapV4f directly.
@@ -130,7 +134,7 @@ describe("compileHeapEffectIR family-member mode", () => {
     const ir = compileHeapEffectIR(effect, layout, { target: "wgsl" });
     // Standalone shape: vertex_index builtin renamed to emitIdx, prelude
     // injected, drawTable/indexStorage/firstDrawInTile bindings appended.
-    expect(ir.vs).toContain("@builtin(vertex_index) emitIdx: u32");
+    expect(ir.vs).toContain("@builtin(vertex_index) vertex_index: u32");
     expect(ir.vs).toMatch(/drawTable:\s+array<u32>/);
     expect(ir.vs).toMatch(/firstDrawInTile:\s+array<u32>/);
     expect(ir.vs).toMatch(/let _tileIdx\b/);

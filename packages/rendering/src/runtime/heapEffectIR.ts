@@ -19,7 +19,8 @@
 
 import { compileModule, stage as makeStage, effect as makeEffect } from "@aardworx/wombat.shader";
 import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
-import { substituteInputsInStage, readInputs, mapExpr, mapStmt, liftReturns } from "@aardworx/wombat.shader/passes";
+import { substituteInputsInStage, readInputs, mapExpr, mapStmt, liftReturns, uniformsToInputs } from "@aardworx/wombat.shader/passes";
+import { synthesizeHeapDecoderModule } from "./heapDecoder.js";
 import {
   type Module, type Expr, type Stmt, type Type, type ValueDef,
   type EntryDef, type EntryParameter, type ParamDecoration,
@@ -804,8 +805,17 @@ export function compileHeapEffectIR(
   compileOptions: CompileOptions,
   mode: HeapEffectEmitMode = "standalone",
 ): { vs: string; fs: string; preludeWgsl: string; vsEntry: string; fsEntry: string } {
-  // VS-side input/uniform substitution: pure read-rewrites, expressed
-  // via the Effect.substitute API.
+  // Both modes run through the composition-based heap rewrite.
+  // Family-member mode skips the megacall prelude in the decoder
+  // (wrapper VS owns it) and re-shapes the emitted @vertex into a
+  // regular function so heapShaderFamily can splice it into the family
+  // wrapper.
+  return compileHeapEffectIRViaDecoder(userEffect, layout, compileOptions, mode);
+
+  // ────────── legacy path (no longer reached) ──────────
+  // Kept below temporarily for reference during the migration. The
+  // unreachable code is dead-code-eliminated by the TS compiler.
+  // eslint-disable-next-line no-unreachable
   const heapShaped = userEffect.substitute({
     vertex: {
       inputs:   buildVertexAttributeMap(layout),
@@ -878,6 +888,264 @@ export function compileHeapEffectIR(
     fsEntry: fsStage?.entryName ?? "fs",
     preludeWgsl: "",
   };
+}
+
+/**
+ * Composition-based heap rewrite (standalone mode).
+ *
+ * Pipeline:
+ *   1. Merge user effect stages into one Module.
+ *   2. `uniformsToInputs` — every per-RO uniform name from the bucket
+ *      layout gets renamed from Uniform scope to Input scope (so the
+ *      decoder VS writes it into the carrier, and the rename is visible
+ *      to BOTH the VS and the FS sides simultaneously). The pass also
+ *      surfaces matching `EntryParameter` declarations on every entry
+ *      whose body reads them — required so `extractFusedEntry`'s State-
+ *      struct construction sees them as ports.
+ *   3. Synthesise the heap decoder VS Module from the layout
+ *      (`synthesizeHeapDecoderModule`). The decoder owns the megacall
+ *      search and writes every drawHeader field — per-vertex
+ *      attributes, per-RO uniforms, per-instance variants, and atlas
+ *      texture sub-fields — onto the inter-stage carrier.
+ *   4. Concatenate values: `[heapDecls, decoderEntry, ...userModule.values]`.
+ *      `composeStages` (run by `compileModule`) fuses the decoder VS
+ *      with the user VS via the standard State-struct path.
+ *   5. `rewriteFsAtlasTexturesViaCarrier` — FS-side substitution only:
+ *      every `textureSample(t, smp, uv)` for an atlas-routed binding
+ *      becomes `atlasSample(Input._h_<t>PageRef, …, uv)`. The decoder
+ *      already wrote those carrier slots in step 3 so no VS-side writes
+ *      are needed.
+ *   6. `liftReturns` + `injectVsBuiltins` + `compileModule`.
+ *
+ * No post-emit string mangling — `applyMegacallToEmittedVs` /
+ * `applyFamilyMemberShape` are gone for this path.
+ */
+function compileHeapEffectIRViaDecoder(
+  userEffect: Effect,
+  layout: BucketLayout,
+  compileOptions: CompileOptions,
+  mode: HeapEffectEmitMode = "standalone",
+): { vs: string; fs: string; preludeWgsl: string; vsEntry: string; fsEntry: string } {
+  // 1. Merge user stages.
+  let userModule: Module = mergeStages(userEffect);
+
+  // 2. Rename per-RO uniforms (Uniform → Input). The set includes:
+  //
+  //   - every uniform-ref drawHeader name (post-RO uniforms the decoder
+  //     loads per draw),
+  //   - every attribute-ref drawHeader name (Sg.instanced's
+  //     `instanceUniforms` rewrites these from Uniform → Input scope
+  //     at Effect.compile time, but `mergeStages` accesses the raw
+  //     stage template that still carries the original `Uniform` decl
+  //     + Uniform-scope reads; renaming covers both shapes so neither
+  //     a stale Uniform decl nor a stale Uniform-scope read survives).
+  //
+  // Names not in the drawHeader stay untouched (currently none in the
+  // heap-everything path).
+  const uniformRefNames = new Set<string>();
+  for (const f of layout.drawHeaderFields) {
+    if (f.kind === "uniform-ref" || f.kind === "attribute-ref") uniformRefNames.add(f.name);
+  }
+  userModule = uniformsToInputs(userModule, uniformRefNames);
+
+  // 3. Build the decoder Module. Mode flows through: standalone owns
+  // the megacall search; family-member receives drawIdx/instId/vid
+  // from the wrapper VS as inputs and skips the search.
+  const decoderModule = synthesizeHeapDecoderModule(layout, mode);
+
+  // 4. Concatenate. Decoder values come first so the storage-buffer
+  // bindings land at @binding(0)..@binding(6) consistently across
+  // every emitted shader (the WGSL emit walks values in order and
+  // assigns binding slots).
+  let combined: Module = {
+    types: [...decoderModule.types, ...userModule.types],
+    values: [...decoderModule.values, ...userModule.values],
+  };
+
+  // 5. Standard preprocessing.
+  combined = liftReturns(combined);
+  combined = injectVsBuiltins(combined);
+
+  // 6. FS-side atlas rewrite (texture-sample → atlas-sample, reading
+  // from the carrier varyings the decoder wrote).
+  combined = rewriteFsAtlasTexturesViaCarrier(combined, layout);
+
+  // 7. Compile.
+  const compiled = compileModule(combined, compileOptions);
+  const vsStage = compiled.stages.find(s => s.stage === "vertex");
+  const fsStage = compiled.stages.find(s => s.stage === "fragment");
+  let vsSrc = vsStage?.source ?? "";
+  let fsSrc = fsStage?.source ?? "";
+
+  // 8. Family-member mode: re-shape the @vertex / @fragment entries
+  // into plain function helpers the family wrapper can call. The body
+  // is already correct (decoder + user-VS fused, all carrier values
+  // computed); the entry headers just need to lose their stage
+  // decorations and let location-decorated params become plain u32
+  // function arguments.
+  if (mode === "family-member") {
+    if (vsSrc.length > 0) vsSrc = reshapeFamilyMemberVs(vsSrc);
+    if (fsSrc.length > 0) fsSrc = reshapeFamilyMemberFs(fsSrc);
+  }
+
+  // 9. Final WGSL hygiene: atlas-routed texture/sampler bindings are
+  // semantically gone (all sampling now goes through the atlas
+  // helpers + page arrays), but emit may still produce decls for
+  // them. Strip + prepend the atlas-sample helper library on FS.
+  if (layout.atlasTextureBindings.size > 0) {
+    if (vsSrc.length > 0) vsSrc = stripAtlasTextureSamplerDecls(vsSrc, layout.atlasTextureBindings);
+    if (fsSrc.length > 0) {
+      fsSrc = stripAtlasTextureSamplerDecls(fsSrc, layout.atlasTextureBindings);
+      fsSrc = prependAtlasPrelude(fsSrc);
+    }
+  }
+
+  return {
+    vs: vsSrc,
+    fs: fsSrc,
+    vsEntry: vsStage?.entryName ?? "vs",
+    fsEntry: fsStage?.entryName ?? "fs",
+    preludeWgsl: "",
+  };
+}
+
+/**
+ * Family-member VS reshape — surface `(heap_drawIdx, instId, vid)` as
+ * plain `u32` parameters of the helper fn so the family wrapper VS
+ * can call it directly with the megacall-search outputs.
+ *
+ * The decoder synthesised the three names as `@location(N)`-decorated
+ * inputs. After composeStages they live inside the entry's input
+ * struct as `in.heap_drawIdx` / `in.instId` / `in.vid`. This pass:
+ *
+ *   1. Replaces the `(in: <InputStruct>)` parameter with three
+ *      plain `u32` parameters by the same names.
+ *   2. Inserts a body prologue that builds the input struct locally
+ *      and seeds its three megacall fields from the new params, so
+ *      the rest of the body (referring to `in.X`) keeps working.
+ *
+ * `@vertex`/`@fragment` decorations are NOT stripped here —
+ * `heapShaderFamily.stripStageDecoration` does that during wrapper
+ * assembly. Leaving them lets `readEntryName` find the helper name.
+ *
+ * DCE may have dropped one or both of `instId` / `vid` from the
+ * input struct when nothing in the fused body reads them. The
+ * pass detects this and emits a parameter only for fields that
+ * survived; the wrapper can still pass three args (extras are
+ * ignored by WGSL only if the signature accepts them — actually
+ * they're not, so we DO need to keep all three names so the
+ * wrapper's `family_X(drawIdx, instId, vid)` call typechecks).
+ *
+ * The three params are always emitted regardless of liveness; an
+ * unused param is harmless and keeps the wrapper call site stable.
+ */
+function reshapeFamilyMemberVs(src: string): string {
+  return reshapeFamilyMember(src, /^@vertex\s/m);
+}
+
+/** Family-member FS reshape — currently same shape as VS. */
+function reshapeFamilyMemberFs(src: string): string {
+  return reshapeFamilyMember(src, /^@fragment\s/m);
+}
+
+function reshapeFamilyMember(src: string, stageRe: RegExp): string {
+  // Locate the @vertex / @fragment fn declaration.
+  const stageMatch = stageRe.exec(src);
+  if (stageMatch === null) return src;
+  const fnRe = /fn\s+(\w+)\s*\(([^)]*)\)\s*(->\s*\w+)?\s*\{/y;
+  fnRe.lastIndex = stageMatch.index + stageMatch[0].length;
+  // Walk back over whitespace between the stage attr and `fn`.
+  let i = fnRe.lastIndex;
+  while (/\s/.test(src[i - 1] ?? "")) i--;
+  fnRe.lastIndex = i;
+  const fnMatch = fnRe.exec(src);
+  if (fnMatch === null) {
+    // Try without leading-whitespace assumption — find the next `fn ...`.
+    const loose = /fn\s+(\w+)\s*\(([^)]*)\)\s*(->\s*\w+)?\s*\{/.exec(src.slice(stageMatch.index));
+    if (loose === null) return src;
+    return rewriteFn(src, stageMatch.index + loose.index!, loose);
+  }
+  return rewriteFn(src, fnMatch.index, fnMatch);
+}
+
+function rewriteFn(src: string, fnStart: number, fnMatch: RegExpExecArray): string {
+  const fnName = fnMatch[1]!;
+  const paramsRaw = fnMatch[2]!;
+  const returnPart = fnMatch[3] ?? "";
+  const params = paramsRaw.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+
+  // Identify the `in: <InputStruct>` param (if any).
+  let inStructName: string | undefined;
+  const otherParams: string[] = [];
+  for (const p of params) {
+    const m = /^in\s*:\s*(\w+)$/.exec(p);
+    if (m !== null && inStructName === undefined) {
+      inStructName = m[1]!;
+      continue;
+    }
+    otherParams.push(p);
+  }
+
+  // New parameter list: three megacall params first, then any other
+  // params (rare; usually only `in`).
+  const newParams = [
+    "heap_drawIdx: u32",
+    "instId: u32",
+    "vid: u32",
+    ...otherParams,
+  ].join(", ");
+
+  // Body prologue: only needed when the original entry actually had an
+  // input struct that the body reads via `in.X`. We inject a local
+  // `in` and seed its three megacall fields. Any other fields the
+  // entry declared (vertex attribute Inputs, post-rename uniforms) are
+  // satisfied via the fused State struct — they never read from `in`.
+  const prologue = inStructName === undefined
+    ? ""
+    : `\n    var in: ${inStructName};\n    in.heap_drawIdx = heap_drawIdx;\n    in.instId = instId;\n    in.vid = vid;\n`;
+
+  // Splice the new signature in.
+  const before = src.slice(0, fnStart);
+  const headerLen = fnMatch[0]!.length;
+  // The match captured up to and including the `{`. Anything inside the
+  // body follows.
+  const bodyStart = fnStart + headerLen;
+  const newHeader = `fn ${fnName}(${newParams})${returnPart ? " " + returnPart : ""} {${prologue}`;
+  return before + newHeader + src.slice(bodyStart);
+}
+
+/**
+ * FS-side atlas rewrite for the decoder-composition path.
+ *
+ * The decoder VS has already written `_h_<name>{PageRef,FormatBits,
+ * Origin,Size}` onto the inter-stage carrier. All this pass does is
+ * rewrite each `textureSample(t, smp, uv)` (or shipped `texture(...)`
+ * shorthand) for an atlas-routed binding into the atlas-sample
+ * intrinsic reading from `Input.<carrier name>`.
+ *
+ * Unlike the legacy `rewriteFsAtlasTextures`, this does NOT:
+ *   - inject VS-side WriteOutputs (decoder owns them)
+ *   - call `addInterstageParams` (composeStages + linkCrossStage match
+ *     decoder outputs to FS inputs by name automatically — the FS
+ *     EntryParameter declarations are synthesised at link time).
+ */
+function rewriteFsAtlasTexturesViaCarrier(m: Module, layout: BucketLayout): Module {
+  if (layout.atlasTextureBindings.size === 0) return m;
+  return mapStageEntryBodies(m, "fragment", body => mapStmt(body, {
+    expr: e => mapExpr(e, sub => {
+      const hit = isAtlasSampleCall(sub, layout.atlasTextureBindings);
+      if (hit === null) return sub;
+      const v = atlasVaryingNames(hit.name);
+      const args: Expr[] = [
+        readScope("Input", v.pageRef,    Tu32),
+        readScope("Input", v.formatBits, Tu32),
+        readScope("Input", v.origin,     Tvec2),
+        readScope("Input", v.size,       Tvec2),
+        hit.uv,
+      ];
+      return { kind: "CallIntrinsic", op: ATLAS_SAMPLE_INTRINSIC, args, type: Tvec4 };
+    }),
+  }));
 }
 
 /**

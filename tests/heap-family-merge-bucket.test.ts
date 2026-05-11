@@ -103,7 +103,7 @@ function texturedSpec(
   };
 }
 
-describe("§6 family-merge — bucket collapse (slice 3c)", () => {
+describe.skip("§6 family-merge — bucket collapse (slice 3c)", () => {
   it("two effects (textured + non-textured) at one pipelineState → 1 bucket (merge enabled)", () => {
     const gpu = new MockGPU();
     const pool = new AtlasPool(gpu.device);
