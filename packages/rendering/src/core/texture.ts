@@ -37,9 +37,18 @@ export interface ExternalTextureSource {
 
 export type HostTextureSource = RawTextureSource | ExternalTextureSource;
 
+// `url` is a *deferred* host source — the runtime can't upload until the
+// browser has fetched + decoded the image. Consumers that route textures
+// to the GPU (adaptiveTexture, atlas pool, heap adapter) refuse to handle
+// `url` directly; the wombat.dom Sg layer resolves it asynchronously,
+// swapping in a placeholder until the real bitmap is ready (see
+// `scene/textureResolver.ts`). Keep this variant out of the rendering
+// runtime's hot paths — it exists purely as an authoring shorthand.
 export type ITexture =
   | { readonly kind: "gpu"; readonly texture: GPUTexture }
-  | { readonly kind: "host"; readonly source: HostTextureSource };
+  | { readonly kind: "host"; readonly source: HostTextureSource }
+  | { readonly kind: "url"; readonly url: string;
+      readonly format?: GPUTextureFormat; readonly generateMips?: boolean };
 
 export const ITexture = {
   fromGPU(texture: GPUTexture): ITexture {
@@ -59,5 +68,12 @@ export const ITexture = {
   },
   fromRaw(raw: Omit<RawTextureSource, "kind">): ITexture {
     return { kind: "host", source: { kind: "raw", ...raw } };
+  },
+  fromUrl(url: string, opts: { format?: GPUTextureFormat; generateMips?: boolean } = {}): ITexture {
+    return {
+      kind: "url", url,
+      ...(opts.format !== undefined ? { format: opts.format } : {}),
+      ...(opts.generateMips !== undefined ? { generateMips: opts.generateMips } : {}),
+    };
   },
 } as const;

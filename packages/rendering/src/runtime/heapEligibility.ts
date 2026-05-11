@@ -82,6 +82,8 @@ const isHeapServableSampler = (_s: ISampler): boolean => true;
  */
 function isHeapServableTexture(t: ITexture): boolean {
   if (t.kind === "gpu") return false;
+  // URL-deferred — the Sg layer hands us a placeholder while it loads.
+  if (t.kind === "url") return false;
   const src = t.source;
   if (src.kind === "raw") {
     if ((src.depthOrArrayLayers ?? 1) !== 1) return false;

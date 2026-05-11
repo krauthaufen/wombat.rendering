@@ -127,6 +127,13 @@ class AdaptiveTexture extends AdaptiveResource<GPUTexture> {
       }
       return src.texture;
     }
+    if (src.kind === "url") {
+      // URL textures are an authoring shorthand the wombat.dom Sg layer
+      // resolves before binding. Reaching adaptiveTexture means the
+      // caller bypassed that — give them a clear error instead of a
+      // cryptic TypeError from `src.source.kind`.
+      throw new Error(`adaptiveTexture: ITexture.kind === "url" must be resolved before binding (url: ${src.url})`);
+    }
     const desc = descFor(src.source);
     const usage =
       (this.opts.usage ?? 0)

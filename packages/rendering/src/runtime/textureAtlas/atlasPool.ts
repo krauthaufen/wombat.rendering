@@ -191,6 +191,8 @@ function describeAtlasTexture(t: ITexture): {
       mipLevelCount: tex.mipLevelCount,
     };
   }
+  // URL-deferred textures are resolved at the Sg layer, never atlas-routed.
+  if (t.kind === "url") return null;
   const src = t.source;
   if (src.kind === "raw") {
     return {
@@ -238,7 +240,9 @@ export class AtlasPool {
   private nextRef = 1;
 
   private innerKeyOf(t: ITexture): GPUTexture | HostTextureSource {
-    return t.kind === "gpu" ? t.texture : t.source;
+    if (t.kind === "gpu") return t.texture;
+    if (t.kind === "host") return t.source;
+    throw new Error(`AtlasPool: unsupported ITexture.kind "${t.kind}" (url textures must be resolved by the Sg layer first)`);
   }
 
   constructor(private readonly device: GPUDevice) {

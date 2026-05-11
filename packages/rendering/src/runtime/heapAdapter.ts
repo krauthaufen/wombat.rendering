@@ -120,6 +120,9 @@ function describeTexture(t: ITexture): TextureDescriptor | null {
       mipLevelCount: tex.mipLevelCount,
     };
   }
+  // URL-deferred textures are resolved at the Sg layer (placeholder
+  // checker until ready); they should never reach the heap adapter.
+  if (t.kind === "url") return null;
   const src = t.source;
   if (src.kind === "raw") {
     return {
