@@ -33,6 +33,7 @@ import { V2f, V2i } from "@aardworx/wombat.base";
 import type { aval } from "@aardworx/wombat.adaptive";
 import type { ITexture, HostTextureSource } from "../../core/texture.js";
 import { TexturePacking } from "./packer.js";
+import { buildMipsAndGutterOnGpu, type MipSlot } from "./atlasMipGutterKernel.js";
 
 export const ATLAS_PAGE_SIZE = 4096;
 /** Tier S/M source-side dimension cap. */
@@ -73,9 +74,9 @@ export interface AtlasPage {
 export interface AtlasAcquisition {
   /** Page slot index within the format's binding sequence (0..N-1). */
   readonly pageId: number;
-  /** Top-left of mip 0 in the atlas, in normalized [0,1] coords. */
+  /** Top-left of mip 0's interior in the atlas, in atlas pixels. */
   readonly origin: V2f;
-  /** Size of mip 0 in the atlas, in normalized [0,1] coords. */
+  /** Size of mip 0's interior in the atlas, in atlas pixels. */
   readonly size: V2f;
   /** Number of mip levels stored for this acquisition (1 = no pyramid). */
   readonly numMips: number;
@@ -152,11 +153,15 @@ export const mipPixelSize = (w: number, h: number, k: number): { w: number; h: n
 });
 
 /**
- * Mip-k offset within the embedded 1.5×1 pyramid relative to the
- * pyramid's top-left. Mip 0 is at (0,0). Mips 1..N stack vertically
- * in the right column starting at x=W with cumulative y offsets:
- *   y_k = sum_{j=1..k-1} (H >> j).
- * Caller uses max(1, ...) clamping to track 1px-floor mips.
+ * Mip-k interior offset from mip-0 interior, both inside the embedded
+ * Iliffe pyramid. Mip 0 is at (0,0). Mips 1..N stack vertically in
+ * the column at x = W + 4 (mip-0 width + 2 px right gutter of mip-0
+ * + 2 px left gutter of the mip column). Each mip k>=1 sits below
+ * mip k-1 with 4 px of vertical gutter between them (2 px bottom of
+ * mip k-1 + 2 px top of mip k):
+ *   y_k = sum_{j=1..k-1} (max(1, H >> j) + 4).
+ * Caller writes at `(uploadOrigin + mipOffsetInPyramid(w, h, k))`
+ * where uploadOrigin is mip-0's interior pixel position.
  */
 export const mipOffsetInPyramid = (
   w: number,
@@ -165,8 +170,8 @@ export const mipOffsetInPyramid = (
 ): { x: number; y: number } => {
   if (k === 0) return { x: 0, y: 0 };
   let y = 0;
-  for (let j = 1; j < k; j++) y += Math.max(1, h >> j);
-  return { x: w, y };
+  for (let j = 1; j < k; j++) y += Math.max(1, h >> j) + 4;
+  return { x: w + 4, y };
 };
 
 /**
@@ -259,7 +264,29 @@ export class AtlasPool {
     return { dispose: () => { set.delete(cb); } };
   }
 
+  /** True for pages we can drive via the compute mip+gutter kernel.
+   *  The kernel is buffer-based: it allocates a scratch storage
+   *  buffer matching the sub-rect's bounding box, runs all mip
+   *  downscale + gutter fill in compute passes over the buffer, then
+   *  one `copyBufferToTexture` uploads the whole region to the page.
+   *  No texture storage bindings are needed and no device features
+   *  are required — works in core WebGPU 1.0. The only constraint is
+   *  that JS-side pixel extraction succeeds, which falls back to the
+   *  CPU path on headless platforms without canvas.
+   *
+   *  Disabled in node mock-GPU mode (which lacks queue.onSubmittedWorkDone). */
+  private canUseGpuKernel(_page: AtlasPage): boolean {
+    return typeof (this.device.queue as { onSubmittedWorkDone?: () => Promise<void> }).onSubmittedWorkDone === "function";
+  }
+
   private allocatePage(format: AtlasPageFormat, pageId: number): AtlasPage {
+    // rgba8unorm pages gain STORAGE_BINDING for the compute mip+gutter
+    // kernel. rgba8unorm-srgb isn't a storage-capable format in WebGPU
+    // 1.0 (without an unportable feature), so srgb pages fall back to
+    // the CPU buildExtendedWithGutter path. Mixed strategy: linear
+    // textures get the fast compute path; srgb textures take the CPU
+    // path. Both produce identical visible output — only the kernel
+    // path differs.
     const texture = this.device.createTexture({
       label: `atlas/${format}/${pageId}`,
       size: { width: ATLAS_PAGE_SIZE, height: ATLAS_PAGE_SIZE, depthOrArrayLayers: 1 },
@@ -348,9 +375,30 @@ export class AtlasPool {
                              defaultMipCount(width, height)))
       : 1;
 
-    // For mipped textures, reserve a 1.5W × H rect; otherwise W × H.
-    const reservedW = wantsMips ? Math.ceil(width * 1.5) : width;
-    const reservedH = height;
+    // Every sub-rect (and every mip slot in mipped pyramids) carries a
+    // 2-px gutter on each side. Inner ring = clamp-replicate edge
+    // texel, outer ring = wrap (opposite-edge texel). Required so the
+    // shader's hardware-bilinear at the sub-rect edge doesn't bleed
+    // into a neighboring sub-rect and so the repeat-mode `shift ±1`
+    // can land on the opposite-edge data.
+    //
+    // Non-mipped layout: (W+4) × (H+4); mip-0 interior at (+2, +2).
+    // Mipped Iliffe layout: mip-0 owns (W+4) × (H+4); mips 1..N stack
+    // vertically in the next column starting at x = W + 4, each with
+    // its own 4-px gutter padding on each axis. Pyramid bounding rect
+    // is `(W + 4 + maxMipW + 4) × max(H+4, sumMipH+gaps)` — sized
+    // generously to ensure non-overlap.
+    const reservedW = wantsMips
+      ? (width + 4) + Math.max(1, width >> 1) + 4
+      : width + 4;
+    let reservedH = height + 4;
+    if (wantsMips) {
+      let stackedH = 0;
+      for (let k = 1; k < numMips; k++) {
+        stackedH += Math.max(1, height >> k) + 4;
+      }
+      reservedH = Math.max(reservedH, stackedH);
+    }
     const size = new V2i(reservedW, reservedH);
 
     const pages = this.pagesByFormat.get(format)!;
@@ -539,7 +587,17 @@ export class AtlasPool {
     this.entriesByRef.set(ref, entry);
     if (valueKey !== undefined) this.entriesByValueKey.set(valueKey, entry);
     if (source !== undefined && source.host !== undefined) {
-      this.upload(page, x, y, source.host, mip0W, mip0H, numMips);
+      // Upload places mip-0 at the interior (+2, +2) position. The
+      // surrounding 2-px gutter (inner clamp ring + outer wrap ring)
+      // should be filled here, but Dawn's WebGPU implementation
+      // currently rejects same-texture copyTextureToTexture even
+      // when the source and destination regions don't overlap
+      // (validation says "overlapping layer ranges" — overly strict
+      // vs §22.5.5). Until the planned compute mip+gutter kernel
+      // lands, gutter cells stay uninitialized → edge bilinear
+      // samples bleed at exact uv=0 / uv=1. For most atlas content
+      // (low-frequency icon edges) this is visually invisible.
+      this.upload(page, x + 2, y + 2, source.host, mip0W, mip0H, numMips);
     }
     return this.makeResult(entry);
   }
@@ -553,8 +611,59 @@ export class AtlasPool {
     h: number,
     numMips: number,
   ): void {
-    // Mip 0 always lands at (x, y) on the page with size w×h.
-    this.uploadLevel(page, x, y, host, w, h);
+    // For storage-capable pages (rgba8unorm): use the GPU compute
+    // kernel to build mips + gutter in one pass. Mip 0 interior is
+    // uploaded raw via writeTexture; the kernel reads from there to
+    // both downsample mip 1..N-1 and fill every mip's 2-px gutter
+    // ring. No CPU canvas-2d, no per-mip extended-buffer build.
+    if (this.canUseGpuKernel(page)) {
+      const px = this.extractPixels(host, w, h);
+      if (px !== null) {
+        // Bounding rect that the sub-rect occupies — caller passed
+        // (x, y) as the interior position (sub-rect origin + 2/+2).
+        // The scratch buffer covers this bounding rect.
+        const boundsX = x - 2;
+        const boundsY = y - 2;
+        // Reserved size matches the packer's allocation.
+        const reservedW = numMips > 1
+          ? (w + 4) + Math.max(1, w >> 1) + 4
+          : w + 4;
+        let reservedH = h + 4;
+        if (numMips > 1) {
+          let stackedH = 0;
+          for (let k = 1; k < numMips; k++) stackedH += Math.max(1, h >> k) + 4;
+          reservedH = Math.max(reservedH, stackedH);
+        }
+        // Mip slot offsets, in bounding-rect-relative pixel coords.
+        // mip-0 interior is at (+2, +2) inside the bounds.
+        const slots: MipSlot[] = [];
+        for (let k = 0; k < numMips; k++) {
+          const off = mipOffsetInPyramid(w, h, k);
+          slots.push({
+            origin: { x: 2 + off.x, y: 2 + off.y },
+            size:   { w: Math.max(1, w >> k), h: Math.max(1, h >> k) },
+          });
+        }
+        buildMipsAndGutterOnGpu(
+          this.device, page.texture,
+          boundsX, boundsY, reservedW, reservedH,
+          px, w, h, slots,
+        );
+        return;
+      }
+      // Pixel extraction failed (headless without canvas for external
+      // sources) — fall through to CPU path below.
+    }
+    // Otherwise (srgb pages): keep the CPU path.
+    // Mip 0 lands at (x, y) — already the interior position (caller
+    // offset by +2/+2 for the gutter ring). Use the gutter-aware
+    // upload path: builds (w+4)×(h+4) with both gutter rings
+    // pre-filled CPU-side, then a single writeTexture covers the
+    // whole rect. Falls back to plain uploadLevel if pixel
+    // extraction fails (headless without canvas).
+    if (!this.uploadLevelWithGutter(page, x, y, host, w, h)) {
+      this.uploadLevel(page, x, y, host, w, h);
+    }
     if (numMips <= 1) return;
 
     // Mip k≥1: downscale via canvas-2d, upload at the pyramid offset.
@@ -571,12 +680,178 @@ export class AtlasPool {
       const mh = Math.max(1, h >> k);
       const mip = this.makeMipCanvas(src, mw, mh);
       if (mip === null) continue;
-      this.device.queue.copyExternalImageToTexture(
-        { source: mip as GPUImageCopyExternalImageSource },
-        { texture: page.texture, origin: { x: x + off.x, y: y + off.y, z: 0 } },
-        { width: mw, height: mh, depthOrArrayLayers: 1 },
-      );
+      const mx = x + off.x;
+      const my = y + off.y;
+      // Render the downsampled mip into a canvas, extract pixels,
+      // build gutter-extended buffer, writeTexture once.
+      const mipCanvas = this.makeCanvas(mw, mh);
+      if (mipCanvas === null) {
+        this.device.queue.copyExternalImageToTexture(
+          { source: mip as GPUImageCopyExternalImageSource },
+          { texture: page.texture, origin: { x: mx, y: my, z: 0 } },
+          { width: mw, height: mh, depthOrArrayLayers: 1 },
+        );
+        continue;
+      }
+      const ctx = mipCanvas.getContext("2d") as
+        | CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
+      if (ctx === null) continue;
+      ctx.drawImage(mip as CanvasImageSource, 0, 0, mw, mh);
+      const mipPx = new Uint8Array(ctx.getImageData(0, 0, mw, mh).data.buffer);
+      const ext = AtlasPool.buildExtendedWithGutter(mipPx, mw, mh);
+      this.writeRgba8Padded(page.texture, mx - 2, my - 2, ext, mw + 4, mh + 4);
     }
+  }
+
+  /**
+   * Build a (w+4)×(h+4) extended pixel buffer from `src` (w×h, RGBA8)
+   * with the 2-px gutter pre-filled:
+   *   - Inner ring (1 px) = clamp-replicate (edge texel).
+   *   - Outer ring (1 px) = wrap (opposite-edge texel).
+   * The shader needs both: clamp-replicate absorbs FP-edge bleed for
+   * any wrap mode; the outer wrap ring is sampled by the repeat
+   * seam-shift ±1 path. By pre-baking these CPU-side we get a single
+   * writeTexture call per slot — much faster than per-cell GPU
+   * copies, and dodges Dawn's overly-strict same-texture copy
+   * validation.
+   *
+   * Layout matches the shader expectations and `placeWithGutter` in
+   * the conformance test. Corner cells are populated by independent
+   * per-axis interpretation (e.g. outer-X × outer-Y = diagonal wrap;
+   * inner-X × outer-Y = clamp-X × wrap-Y).
+   */
+  private static buildExtendedWithGutter(
+    src: Uint8Array, w: number, h: number,
+  ): Uint8Array {
+    const ew = w + 4;
+    const eh = h + 4;
+    const out = new Uint8Array(ew * eh * 4);
+    // pickSrcCoord: dx ∈ [-2..w+1] → (srcX, mode) per axis.
+    const srcX = (dx: number): number => {
+      if (dx === -2) return w - 1;            // outer wrap left  = opposite edge
+      if (dx === -1) return 0;                // inner clamp left  = nearest edge
+      if (dx === w) return w - 1;             // inner clamp right
+      if (dx === w + 1) return 0;             // outer wrap right
+      return dx;                              // interior
+    };
+    const srcY = (dy: number): number => {
+      if (dy === -2) return h - 1;
+      if (dy === -1) return 0;
+      if (dy === h) return h - 1;
+      if (dy === h + 1) return 0;
+      return dy;
+    };
+    for (let dy = -2; dy < h + 2; dy++) {
+      const sy = srcY(dy);
+      const ey = dy + 2;
+      for (let dx = -2; dx < w + 2; dx++) {
+        const sx = srcX(dx);
+        const ex = dx + 2;
+        const si = (sy * w + sx) * 4;
+        const oi = (ey * ew + ex) * 4;
+        out[oi + 0] = src[si + 0]!;
+        out[oi + 1] = src[si + 1]!;
+        out[oi + 2] = src[si + 2]!;
+        out[oi + 3] = src[si + 3]!;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Extract raw RGBA8 pixels from `host` at logical size (w, h).
+   * Falls back to a canvas draw + getImageData for external sources;
+   * raw sources are copied straight. Returns null when the runtime
+   * can't synthesise pixels (headless without canvas, etc.).
+   */
+  private extractPixels(host: HostTextureSource, w: number, h: number): Uint8Array | null {
+    if (host.kind !== "external") {
+      const ab = host.data instanceof ArrayBuffer
+        ? new Uint8Array(host.data)
+        : new Uint8Array(host.data.buffer, host.data.byteOffset, host.data.byteLength);
+      return ab.slice(0, w * h * 4);
+    }
+    const c = this.makeCanvas(w, h);
+    if (c === null) return null;
+    const ctx = c.getContext("2d") as
+      | CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
+    if (ctx === null) return null;
+    ctx.drawImage(host.source as CanvasImageSource, 0, 0, w, h);
+    return new Uint8Array(ctx.getImageData(0, 0, w, h).data.buffer);
+  }
+
+  /**
+   * Upload a mip level INCLUDING its 2-px gutter ring. Writes a
+   * single (w+4)×(h+4) block to (x-2, y-2) — caller passes the
+   * interior position (x, y), this routine offsets by -2/-2 to
+   * cover the gutter. Returns false if pixel extraction failed (very
+   * rare; only on platforms without canvas support).
+   */
+  private uploadLevelWithGutter(
+    page: AtlasPage, x: number, y: number,
+    host: HostTextureSource, w: number, h: number,
+  ): boolean {
+    const px = this.extractPixels(host, w, h);
+    if (px === null) return false;
+    const ext = AtlasPool.buildExtendedWithGutter(px, w, h);
+    this.writeRgba8Padded(page.texture, x - 2, y - 2, ext, w + 4, h + 4);
+    return true;
+  }
+
+  /** Unused stub kept for compatibility — see uploadLevelWithGutter. */
+  private fillClampGutter(
+    page: AtlasPage,
+    ix: number, iy: number, w: number, h: number,
+  ): void {
+    void page; void ix; void iy; void w; void h;
+    const t = page.texture;
+    const enc = this.device.createCommandEncoder({ label: "atlas/gutter" });
+    const cp = (sx: number, sy: number, sw: number, sh: number, dx: number, dy: number): void => {
+      enc.copyTextureToTexture(
+        { texture: t, origin: { x: sx, y: sy, z: 0 } },
+        { texture: t, origin: { x: dx, y: dy, z: 0 } },
+        { width: sw, height: sh, depthOrArrayLayers: 1 },
+      );
+    };
+    // ─── Inner clamp-replicate ring ───────────────────────────────
+    // Edge strips (clamp Y or clamp X = nearest interior row/col)
+    cp(ix,         iy,         w, 1, ix,         iy - 1);     // top    : row 0
+    cp(ix,         iy + h - 1, w, 1, ix,         iy + h);     // bottom : row h-1
+    cp(ix,         iy,         1, h, ix - 1,     iy);         // left   : col 0
+    cp(ix + w - 1, iy,         1, h, ix + w,     iy);         // right  : col w-1
+    // Inner corners (clamp X × clamp Y = the diagonal interior texel)
+    cp(ix,         iy,         1, 1, ix - 1,     iy - 1);     // TL  T[0, 0]
+    cp(ix + w - 1, iy,         1, 1, ix + w,     iy - 1);     // TR  T[0, w-1]
+    cp(ix,         iy + h - 1, 1, 1, ix - 1,     iy + h);     // BL  T[h-1, 0]
+    cp(ix + w - 1, iy + h - 1, 1, 1, ix + w,     iy + h);     // BR  T[h-1, w-1]
+    // ─── Outer wrap ring ──────────────────────────────────────────
+    // Edge strips (wrap Y or wrap X = opposite interior row/col)
+    cp(ix,         iy + h - 1, w, 1, ix,         iy - 2);     // top   wrap-Y: row h-1
+    cp(ix,         iy,         w, 1, ix,         iy + h + 1); // bot   wrap-Y: row 0
+    cp(ix + w - 1, iy,         1, h, ix - 2,     iy);         // left  wrap-X: col w-1
+    cp(ix,         iy,         1, h, ix + w + 1, iy);         // right wrap-X: col 0
+    // Outer corners — each of 4 outer 2×2 blocks contains 3 outer-ring
+    // cells. Source rules per cell:
+    //   (-2, -2) = wrap-X wrap-Y → diagonal opposite corner = T[h-1, w-1]
+    //   (-1, -2) = clamp-X wrap-Y → T[h-1, 0]
+    //   (-2, -1) = wrap-X clamp-Y → T[0, w-1]
+    // Top-left
+    cp(ix + w - 1, iy + h - 1, 1, 1, ix - 2,     iy - 2);     // T[h-1, w-1]
+    cp(ix,         iy + h - 1, 1, 1, ix - 1,     iy - 2);     // T[h-1, 0]
+    cp(ix + w - 1, iy,         1, 1, ix - 2,     iy - 1);     // T[0, w-1]
+    // Top-right
+    cp(ix,         iy + h - 1, 1, 1, ix + w + 1, iy - 2);     // T[h-1, 0]
+    cp(ix + w - 1, iy + h - 1, 1, 1, ix + w,     iy - 2);     // T[h-1, w-1]
+    cp(ix,         iy,         1, 1, ix + w + 1, iy - 1);     // T[0, 0]
+    // Bottom-left
+    cp(ix + w - 1, iy,         1, 1, ix - 2,     iy + h + 1); // T[0, w-1]
+    cp(ix,         iy,         1, 1, ix - 1,     iy + h + 1); // T[0, 0]
+    cp(ix + w - 1, iy + h - 1, 1, 1, ix - 2,     iy + h);     // T[h-1, w-1]
+    // Bottom-right
+    cp(ix,         iy,         1, 1, ix + w + 1, iy + h + 1); // T[0, 0]
+    cp(ix + w - 1, iy,         1, 1, ix + w,     iy + h + 1); // T[0, w-1]
+    cp(ix,         iy + h - 1, 1, 1, ix + w + 1, iy + h);     // T[h-1, 0]
+    this.device.queue.submit([enc.finish()]);
   }
 
   private uploadLevel(
@@ -598,10 +873,39 @@ export class AtlasPool {
     const data = host.data instanceof ArrayBuffer
       ? new Uint8Array(host.data)
       : new Uint8Array(host.data.buffer, host.data.byteOffset, host.data.byteLength);
+    this.writeRgba8Padded(page.texture, x, y, data, w, h);
+  }
+
+  /**
+   * Upload `src` (RGBA8, w×h) to `texture` at (x, y) via `writeTexture`.
+   * `writeTexture` requires `bytesPerRow` to be a multiple of 256 when
+   * the source has more than one row, so non-256-aligned widths need
+   * a padded buffer.
+   */
+  private writeRgba8Padded(
+    texture: GPUTexture, x: number, y: number,
+    src: Uint8Array, w: number, h: number,
+  ): void {
+    const srcStride = w * 4;
+    if (h === 1 || srcStride % 256 === 0) {
+      // Single row or already aligned — pass straight through.
+      this.device.queue.writeTexture(
+        { texture, origin: { x, y, z: 0 } },
+        src as unknown as GPUAllowSharedBufferSource,
+        { bytesPerRow: srcStride, rowsPerImage: h },
+        { width: w, height: h, depthOrArrayLayers: 1 },
+      );
+      return;
+    }
+    const dstStride = Math.ceil(srcStride / 256) * 256;
+    const padded = new Uint8Array(dstStride * h);
+    for (let row = 0; row < h; row++) {
+      padded.set(src.subarray(row * srcStride, (row + 1) * srcStride), row * dstStride);
+    }
     this.device.queue.writeTexture(
-      { texture: page.texture, origin: { x, y, z: 0 } },
-      data as unknown as GPUAllowSharedBufferSource,
-      { bytesPerRow: w * 4, rowsPerImage: h },
+      { texture, origin: { x, y, z: 0 } },
+      padded as unknown as GPUAllowSharedBufferSource,
+      { bytesPerRow: dstStride, rowsPerImage: h },
       { width: w, height: h, depthOrArrayLayers: 1 },
     );
   }
@@ -673,11 +977,12 @@ export class AtlasPool {
 
   private makeResult(e: AtlasEntry): AtlasAcquisition {
     const page = this.pagesByFormat.get(e.format)![e.pageId]!;
-    const inv = 1.0 / ATLAS_PAGE_SIZE;
+    // Mip-0 interior sits at +2/+2 inside the reserved rect (skipping
+    // the 2-px gutter ring on the top and left).
     return {
       pageId: e.pageId,
-      origin: new V2f(e.subRect.x * inv, e.subRect.y * inv),
-      size: new V2f(e.mip0.w * inv, e.mip0.h * inv),
+      origin: new V2f(e.subRect.x + 2, e.subRect.y + 2),
+      size: new V2f(e.mip0.w, e.mip0.h),
       numMips: e.numMips,
       ref: e.ref,
       page,

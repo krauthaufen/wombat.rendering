@@ -185,6 +185,12 @@ describe("heap-atlas real-GPU integration", () => {
       await device.queue.onSubmittedWorkDone();
 
       const pixels = await readTexturePixels(device, colorTex);
+      if (errors.length > 0) {
+        const msgs = errors.map(e => (e as { message?: string }).message ?? String(e));
+        // eslint-disable-next-line no-console
+        console.error("GPU errors:", msgs);
+        throw new Error("GPU errors:\n  " + msgs.join("\n  "));
+      }
       expect(errors).toEqual([]);
 
       // Sample 4 representative pixels per half (avoid edges).

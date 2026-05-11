@@ -42,22 +42,31 @@ function packerUsedArea(pool: AtlasPool): number {
   return total;
 }
 
+// Reserved dimensions per acquire (matching atlasPool.acquire layout).
+const reservedSize = (w: number, h: number, wantsMips: boolean, numMips: number): { w: number; h: number } => {
+  if (!wantsMips) return { w: w + 4, h: h + 4 };
+  const rw = (w + 4) + Math.max(1, w >> 1) + 4;
+  let stackedH = 0;
+  for (let k = 1; k < numMips; k++) stackedH += Math.max(1, h >> k) + 4;
+  return { w: rw, h: Math.max(h + 4, stackedH) };
+};
+
 describe("AtlasPool — mip pyramid layout", () => {
-  it("a mipped acquire reserves a 1.5W × H rect", () => {
+  it("a mipped acquire reserves the Iliffe pyramid bounding rect including gutter", () => {
     const gpu = new MockGPU();
     const pool = new AtlasPool(gpu.device);
     const w = 256, h = 256;
     pool.acquire("rgba8unorm", fakeAval(w, h), w, h, { wantsMips: true });
-    // Reserved area: ceil(w * 1.5) * h
-    expect(packerUsedArea(pool)).toBe(Math.ceil(w * 1.5) * h);
+    const r = reservedSize(w, h, true, defaultMipCount(w, h));
+    expect(packerUsedArea(pool)).toBe(r.w * r.h);
   });
 
-  it("non-mipped acquire reserves only W × H", () => {
+  it("non-mipped acquire reserves (W+4) × (H+4)", () => {
     const gpu = new MockGPU();
     const pool = new AtlasPool(gpu.device);
     const w = 200, h = 100;
     pool.acquire("rgba8unorm", fakeAval(w, h), w, h);
-    expect(packerUsedArea(pool)).toBe(w * h);
+    expect(packerUsedArea(pool)).toBe((w + 4) * (h + 4));
   });
 
   it("4 mipped + 2 non-mipped textures fit one page", () => {
@@ -71,16 +80,18 @@ describe("AtlasPool — mip pyramid layout", () => {
       pool.acquire("rgba8unorm", fakeAval(256, 256), 256, 256);
     }
     expect(pool.pagesFor("rgba8unorm").length).toBe(1);
-    // 4 × (256*1.5*256) + 2 × (256*256) = 4*98304 + 2*65536 = 524288
-    expect(packerUsedArea(pool)).toBe(4 * Math.ceil(256 * 1.5) * 256 + 2 * 256 * 256);
+    const rm = reservedSize(256, 256, true, defaultMipCount(256, 256));
+    const rp = reservedSize(256, 256, false, 1);
+    expect(packerUsedArea(pool)).toBe(4 * rm.w * rm.h + 2 * rp.w * rp.h);
   });
 
-  it("releasing a mipped texture frees the full 1.5W × H rect", () => {
+  it("releasing a mipped texture frees its full reserved rect", () => {
     const gpu = new MockGPU();
     const pool = new AtlasPool(gpu.device);
     const w = 128, h = 128;
     const acq = pool.acquire("rgba8unorm", fakeAval(w, h), w, h, { wantsMips: true });
-    expect(packerUsedArea(pool)).toBe(Math.ceil(w * 1.5) * h);
+    const r = reservedSize(w, h, true, defaultMipCount(w, h));
+    expect(packerUsedArea(pool)).toBe(r.w * r.h);
     pool.release(acq.ref);
     expect(packerUsedArea(pool)).toBe(0);
   });
@@ -91,24 +102,23 @@ describe("AtlasPool — mip pyramid layout", () => {
     const w = 256, h = 256;
     const acq = pool.acquire("rgba8unorm", fakeAval(w, h), w, h, { wantsMips: true });
     expect(acq.numMips).toBe(defaultMipCount(w, h));
-    // Size of mip 0 is W/4096, H/4096 (normalized).
-    expect(acq.size.x).toBeCloseTo(w / 4096);
-    expect(acq.size.y).toBeCloseTo(h / 4096);
-    // Origin must lie inside [0,1).
+    // origin/size now in atlas pixels.
+    expect(acq.size.x).toBeCloseTo(w);
+    expect(acq.size.y).toBeCloseTo(h);
     expect(acq.origin.x).toBeGreaterThanOrEqual(0);
     expect(acq.origin.y).toBeGreaterThanOrEqual(0);
-    expect(acq.origin.x).toBeLessThan(1);
-    expect(acq.origin.y).toBeLessThan(1);
+    expect(acq.origin.x).toBeLessThan(4096);
+    expect(acq.origin.y).toBeLessThan(4096);
   });
 
-  it("mipOffsetInPyramid: mip 0 at (0,0); mips 1..N stack vertically at x=W", () => {
+  it("mipOffsetInPyramid: mip 0 at (0,0); mips 1..N stack vertically with 4-px gutter gaps", () => {
     const W = 256, H = 256;
     expect(mipOffsetInPyramid(W, H, 0)).toEqual({ x: 0, y: 0 });
-    expect(mipOffsetInPyramid(W, H, 1)).toEqual({ x: W, y: 0 });
-    // Mip 2 below mip 1 → y = H/2 = 128.
-    expect(mipOffsetInPyramid(W, H, 2)).toEqual({ x: W, y: 128 });
-    // Mip 3 below mip 2 → y = 128 + 64 = 192.
-    expect(mipOffsetInPyramid(W, H, 3)).toEqual({ x: W, y: 192 });
+    expect(mipOffsetInPyramid(W, H, 1)).toEqual({ x: W + 4, y: 0 });
+    // Mip 2 below mip 1 → y = (H/2 + 4).
+    expect(mipOffsetInPyramid(W, H, 2)).toEqual({ x: W + 4, y: 128 + 4 });
+    // Mip 3 below mip 2 → y = (128 + 4) + (64 + 4).
+    expect(mipOffsetInPyramid(W, H, 3)).toEqual({ x: W + 4, y: (128 + 4) + (64 + 4) });
   });
 
   it("identity sharing: same aval returns same ref/origin under wantsMips", () => {

@@ -892,10 +892,15 @@ function buildVsCase(
   const lines: string[] = [];
   lines.push(`    case ${k}u: {`);
   lines.push(`      let r: ${outStruct} = ${vsHelperName}(heap_drawIdx, instId, vid);`);
-  lines.push(`      out.gl_Position = r.gl_Position;`);
-  // Walk the effect's varyings (from schema) to know which fields exist
-  // on the per-effect struct, then place them into slots by slotMap.
+  // The @builtin(position) field on the per-effect VsOut struct is
+  // whatever the user named it (`gl_Position`, `position`, `clipPos`,
+  // …). Discover from the schema rather than hardcoding `gl_Position`
+  // — assuming the legacy spelling silently breaks any effect that
+  // uses a different identifier.
   const schema = family.perEffectSchema.get(effect)!;
+  const positionVarying = schema.varyings.find(v => v.builtin === "position");
+  const positionField = positionVarying?.name ?? "gl_Position";
+  lines.push(`      out.gl_Position = r.${positionField};`);
   for (const v of schema.varyings) {
     if (v.builtin !== undefined) continue;
     const slot = slotMap.get(v.name);

@@ -27,7 +27,7 @@ import {
 } from "@aardworx/wombat.shader/ir";
 import {
   megacallSearchPrelude, atlasVaryingNames,
-  generateAtlasBindings, generateAtlasSwitch,
+  generateAtlasBindings, generateAtlasSwitch, generateAtlasPrelude,
   type BucketLayout,
 } from "./heapEffect.js";
 import type { IntrinsicRef } from "@aardworx/wombat.shader/ir";
@@ -805,13 +805,7 @@ export function compileHeapEffectIR(
   mode: HeapEffectEmitMode = "standalone",
 ): { vs: string; fs: string; preludeWgsl: string; vsEntry: string; fsEntry: string } {
   // VS-side input/uniform substitution: pure read-rewrites, expressed
-  // via the Effect.substitute API. Vertex stages read uniforms and
-  // attributes by name (`uniform.X`, `input.A`); the API replaces
-  // each `ReadInput` with the heap-load Expr produced by the layout-
-  // aware builders. Applied pre-merge — for a multi-stage Effect
-  // this routes per-stage; for a single-stage Effect carrying both
-  // vsMain + fsMain the FS-side reads are unaffected because they
-  // travel through the threaded ref varying machinery below.
+  // via the Effect.substitute API.
   const heapShaped = userEffect.substitute({
     vertex: {
       inputs:   buildVertexAttributeMap(layout),
@@ -923,52 +917,10 @@ function stripAtlasTextureSamplerDecls(src: string, atlasNames: ReadonlySet<stri
  * calls the IR pass produces.
  */
 function prependAtlasPrelude(fs: string): string {
-  const decls = `
-${generateAtlasBindings()}
-
-fn atlasWrap1(u: f32, mode: u32) -> f32 {
-  let r = u - floor(u);
-  let m = 1.0 - abs((u - floor(u * 0.5) * 2.0) - 1.0);
-  let c = clamp(u, 0.0, 1.0);
-  return select(select(c, r, mode == 1u), m, mode == 2u);
-}
-fn atlasApplyWrap(uv: vec2<f32>, addrU: u32, addrV: u32) -> vec2<f32> {
-  return vec2<f32>(atlasWrap1(uv.x, addrU), atlasWrap1(uv.y, addrV));
-}
-fn atlasMipOrigin(origin: vec2<f32>, size: vec2<f32>, k: u32) -> vec2<f32> {
-  if (k == 0u) { return origin; }
-  let x = origin.x + size.x;
-  let y = origin.y + size.y * (1.0 - 1.0 / pow(2.0, f32(k) - 1.0));
-  return vec2<f32>(x, y);
-}
-fn atlasSampleAtMip(pageRef: u32, format: u32, origin: vec2<f32>, size: vec2<f32>, k: u32, uvW: vec2<f32>) -> vec4<f32> {
-  let mipSize = size / pow(2.0, f32(k));
-  let mipO = atlasMipOrigin(origin, size, k);
-  let atlasUv = mipO + uvW * mipSize;
-${generateAtlasSwitch()}
-  return vec4<f32>(0.0);
-}
-fn atlasSample(pageRef: u32, formatBits: u32, origin: vec2<f32>, size: vec2<f32>, uv: vec2<f32>) -> vec4<f32> {
-  let format  = formatBits & 0x1u;
-  let numMips = (formatBits >> 1u) & 0x7u;
-  let addrU   = (formatBits >> 4u) & 0x3u;
-  let addrV   = (formatBits >> 6u) & 0x3u;
-  let uvW = atlasApplyWrap(uv, addrU, addrV);
-  let dx = dpdx(uvW * size);
-  let dy = dpdy(uvW * size);
-  let rho = max(length(dx), length(dy)) * 4096.0;
-  let maxLod = f32(max(numMips, 1u) - 1u);
-  let lod = clamp(log2(max(rho, 1e-6)), 0.0, maxLod);
-  let lo = u32(floor(lod));
-  let hi = min(lo + 1u, max(numMips, 1u) - 1u);
-  let t  = lod - f32(lo);
-  let a = atlasSampleAtMip(pageRef, format, origin, size, lo, uvW);
-  if (numMips <= 1u) { return a; }
-  let b = atlasSampleAtMip(pageRef, format, origin, size, hi, uvW);
-  return mix(a, b, t);
-}
-`;
-  return decls + fs;
+  // Delegate to the VS prelude generator — both stages need the same
+  // atlas-sample helper, and consolidating prevents the two copies
+  // from drifting.
+  return generateAtlasPrelude() + fs;
 }
 
 /**

@@ -507,77 +507,130 @@ ${vsOutBody}
  * WebGPU 1.0.
  *
  * Mip filtering is software (the GPU's mip walk would walk the
- * texture's mip chain, not our embedded 1.5×1 pyramid). LOD is
- * computed from screen-space derivatives in mip-0 atlas-pixel
- * space; the constant 4096 matches `ATLAS_PAGE_SIZE`.
+ * texture's mip chain, not our embedded Iliffe pyramid). LOD is
+ * computed from screen-space derivatives of `uv * size_px` in mip-0
+ * texels-per-screen-pixel.
  *
- * Wrap-mode mirror math: `1 - |((u - floor(u/2)*2) - 1)|` yields a
- * triangle wave with period 2 and amplitude [0,1] — matches WebGPU's
- * `mirror-repeat` address-mode spec. Verified at u={0,0.5,1,1.5,2,-0.5}.
+ * Sample math (verified by `tests-browser/atlas-sampling-conformance.test.ts`
+ * to match native hardware bilinear within 1 LSB across clamp/repeat/
+ * mirror at any uv):
+ *   - Clamp:  atlas_p = origin_px + clamp(uv, 0, 1) * size_px
+ *   - Mirror: atlas_p = origin_px + mirrorUv(uv) * size_px
+ *   - Repeat: atlas_p = origin_px + fract(uv) * size_px, then shift ∓1
+ *             if within 0.5 atlas-pixel of the sub-rect edge, so
+ *             hardware bilinear straddles the outer wrap-gutter ring.
+ * `origin_px` / `size_px` are atlas-pixel coordinates of mip-0, NOT
+ * normalized. Mip-k rect is computed by walking the integer floor-
+ * halving sequence that matches the CPU packer's pyramid layout.
+ * Each sub-rect (incl. every mip slot) carries a 2-px gutter (inner
+ * ring = clamp-replicate edge, outer ring = wrap = opposite edge)
+ * filled by the upload kernel; without it bilinear at the edges
+ * bleeds across sub-rect boundaries.
  */
-function generateAtlasPrelude(): string {
+export function generateAtlasPrelude(): string {
   return /* wgsl */`
 ${generateAtlasBindings()}
 
-fn atlasWrap1(u: f32, mode: u32) -> f32 {
-  let r = u - floor(u);
-  let m = 1.0 - abs((u - floor(u * 0.5) * 2.0) - 1.0);
-  let c = clamp(u, 0.0, 1.0);
-  return select(select(c, r, mode == 1u), m, mode == 2u);
+fn mirrorAtlasUv(u: f32) -> f32 {
+  let t = u - floor(u * 0.5) * 2.0;
+  return 1.0 - abs(t - 1.0);
 }
 
-fn atlasApplyWrap(uv: vec2<f32>, addrU: u32, addrV: u32) -> vec2<f32> {
-  return vec2<f32>(atlasWrap1(uv.x, addrU), atlasWrap1(uv.y, addrV));
+// One axis: produce atlas-pixel coord from logical uv per wrap mode.
+// mip_origin / mip_size are in atlas pixels for the target mip slot.
+fn atlasAxisAt(uv: f32, mip_origin: f32, mip_size: f32, mode: u32) -> f32 {
+  if (mode == 0u) {                       // clamp
+    let c = clamp(uv, 0.0, 1.0);
+    return mip_origin + c * mip_size;
+  }
+  if (mode == 2u) {                       // mirror
+    let m = mirrorAtlasUv(uv);
+    return mip_origin + m * mip_size;
+  }
+  // repeat
+  let f = uv - floor(uv);
+  var p = mip_origin + f * mip_size;
+  let dL = p - mip_origin;
+  let dR = (mip_origin + mip_size) - p;
+  if      (dL < 0.5) { p = p - 1.0; }
+  else if (dR < 0.5) { p = p + 1.0; }
+  return p;
 }
 
-fn atlasMipOrigin(origin: vec2<f32>, size: vec2<f32>, k: u32) -> vec2<f32> {
+// Mip-k rect within the Iliffe pyramid, in atlas pixels. Matches the
+// CPU packer's integer floor-halving (so non-pow2 sources still hit
+// the right texels). 2-px gutter between adjacent mip slots.
+const ATLAS_MIP_GAP: f32 = 4.0;
+
+fn atlasMipOriginPx(origin: vec2<f32>, size: vec2<f32>, k: u32) -> vec2<f32> {
   if (k == 0u) { return origin; }
-  let x = origin.x + size.x;
-  let y = origin.y + size.y * (1.0 - 1.0 / pow(2.0, f32(k) - 1.0));
+  let x = origin.x + size.x + ATLAS_MIP_GAP;
+  var y = origin.y;
+  var j: u32 = 1u;
+  loop {
+    if (j >= k) { break; }
+    let mh = max(1.0, floor(size.y * exp2(-f32(j))));
+    y = y + mh + ATLAS_MIP_GAP;
+    j = j + 1u;
+  }
   return vec2<f32>(x, y);
+}
+
+fn atlasMipSizePx(size: vec2<f32>, k: u32) -> vec2<f32> {
+  return vec2<f32>(
+    max(1.0, floor(size.x * exp2(-f32(k)))),
+    max(1.0, floor(size.y * exp2(-f32(k)))),
+  );
 }
 
 fn atlasSampleAtMip(
   pageRef: u32, format: u32,
-  origin: vec2<f32>, size: vec2<f32>,
+  origin_px: vec2<f32>, size_px: vec2<f32>,
   k: u32,
-  uvW: vec2<f32>,
+  uv: vec2<f32>,
+  addrU: u32, addrV: u32,
 ) -> vec4<f32> {
-  let mipSize = size / pow(2.0, f32(k));
-  let mipO = atlasMipOrigin(origin, size, k);
-  let atlasUv = mipO + uvW * mipSize;
+  let mip_o = atlasMipOriginPx(origin_px, size_px, k);
+  let mip_s = atlasMipSizePx(size_px, k);
+  let px = atlasAxisAt(uv.x, mip_o.x, mip_s.x, addrU);
+  let py = atlasAxisAt(uv.y, mip_o.y, mip_s.y, addrV);
+  let atlasUv = vec2<f32>(px, py) / ${atlasPageSizeConst()}.0;
 ${generateAtlasSwitch()}
   return vec4<f32>(0.0);
 }
 
 fn atlasSample(
   pageRef: u32, formatBits: u32,
-  origin: vec2<f32>, size: vec2<f32>,
+  origin_px: vec2<f32>, size_px: vec2<f32>,
   uv: vec2<f32>,
 ) -> vec4<f32> {
   let format  = formatBits & 0x1u;
   let numMips = (formatBits >> 1u) & 0x7u;
   let addrU   = (formatBits >> 4u) & 0x3u;
   let addrV   = (formatBits >> 6u) & 0x3u;
-  let uvW = atlasApplyWrap(uv, addrU, addrV);
-  // Compute derivatives unconditionally — WGSL forbids dpdx/dpdy in
-  // non-uniform control flow, and the per-page switch in
-  // atlasSampleAtMip taints anything below it. LOD is clamped so the
-  // numMips==1 case still picks mip 0.
-  let dx = dpdx(uvW * size);
-  let dy = dpdy(uvW * size);
-  let rho = max(length(dx), length(dy)) * 4096.0;
+  // LOD on pre-wrap UV. dpdx/dpdy on the wrapped value spikes at the
+  // fract/mirror seam (discontinuity → bogus huge derivative → tiny
+  // mip selected → blurred band). Multiply by size_px to get
+  // texels-per-screen-pixel.
+  let dx = dpdx(uv) * size_px;
+  let dy = dpdy(uv) * size_px;
+  let rho = max(length(dx), length(dy));
   let maxLod = f32(max(numMips, 1u) - 1u);
   let lod = clamp(log2(max(rho, 1e-6)), 0.0, maxLod);
   let lo = u32(floor(lod));
   let hi = min(lo + 1u, max(numMips, 1u) - 1u);
   let t  = lod - f32(lo);
-  let a = atlasSampleAtMip(pageRef, format, origin, size, lo, uvW);
+  let a = atlasSampleAtMip(pageRef, format, origin_px, size_px, lo, uv, addrU, addrV);
   if (numMips <= 1u) { return a; }
-  let b = atlasSampleAtMip(pageRef, format, origin, size, hi, uvW);
+  let b = atlasSampleAtMip(pageRef, format, origin_px, size_px, hi, uv, addrU, addrV);
   return mix(a, b, t);
 }
 `;
+}
+
+function atlasPageSizeConst(): string {
+  // Embedded literal — divisor matches ATLAS_PAGE_SIZE in atlasPool.ts.
+  return "4096";
 }
 
 /**
