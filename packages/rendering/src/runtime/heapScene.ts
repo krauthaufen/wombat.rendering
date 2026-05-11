@@ -174,6 +174,21 @@ const PACKER_F32: WgslPacker = {
   dataBytes: 4, typeId: 0,
   pack: (val, dst, off) => { dst[off] = val as number; },
 };
+// u32 lives in the arena as 4 bytes too — we write through a transient
+// Uint32 view over the same backing buffer so the integer bit-pattern is
+// preserved (Float32Array assignment would lossily truncate `(u32) -> f32`).
+const PACKER_U32: WgslPacker = {
+  dataBytes: 4, typeId: 0,
+  pack: (val, dst, off) => {
+    new Uint32Array(dst.buffer, dst.byteOffset + off * 4, 1)[0] = (val as number) >>> 0;
+  },
+};
+const PACKER_I32: WgslPacker = {
+  dataBytes: 4, typeId: 0,
+  pack: (val, dst, off) => {
+    new Int32Array(dst.buffer, dst.byteOffset + off * 4, 1)[0] = (val as number) | 0;
+  },
+};
 
 function packerForWgslType(wgslType: string): WgslPacker {
   switch (wgslType) {
@@ -182,6 +197,8 @@ function packerForWgslType(wgslType: string): WgslPacker {
     case "vec3<f32>":   return PACKER_VEC3;
     case "vec2<f32>":   return PACKER_VEC2;
     case "f32":         return PACKER_F32;
+    case "u32":         return PACKER_U32;
+    case "i32":         return PACKER_I32;
     default:
       throw new Error(`heapScene: no JS-side packer for WGSL type '${wgslType}'`);
   }
