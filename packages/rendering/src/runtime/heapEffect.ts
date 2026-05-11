@@ -106,9 +106,17 @@ function buildSchema(iface: ProgramInterface): HeapEffectSchema {
     byteSize: a.byteSize,
     location: a.location,
   }));
+  // When `instanceUniforms` (or any other rewrite) converts a uniform
+  // read into a vertex-input fetch, the source module still carries the
+  // original Uniform declaration. The interface extractor surfaces it
+  // here, but the field is now satisfied by the per-instance attribute —
+  // collecting it as a uniform too would double-book the name in the
+  // drawHeader. Drop uniforms shadowed by an attribute of the same name.
+  const attributeNames = new Set(attributes.map(a => a.name));
   const uniforms: HeapEffectInput[] = [];
   for (const block of iface.uniformBlocks) {
     for (const f of block.fields) {
+      if (attributeNames.has(f.name)) continue;
       uniforms.push({
         name: f.name,
         wgslType: irTypeToWgsl(f.type),
@@ -121,6 +129,7 @@ function buildSchema(iface: ProgramInterface): HeapEffectSchema {
   // each `ReadInput("Uniform", name, ...)` with a per-draw heap load before
   // WGSL emit, so the loose decls never reach the final shader.
   for (const u of iface.uniforms) {
+    if (attributeNames.has(u.name)) continue;
     uniforms.push({
       name: u.name,
       wgslType: irTypeToWgsl(u.type),
