@@ -153,6 +153,27 @@ export function writeField(
     view.u32.set(value, offset >> 2);
     return;
   }
+  // Trafo3d: pack its forward matrix. The runtime treats `Trafo3d`
+  // uniforms uniformly as their forward-mat4 — callers who want the
+  // inverse should bind a derived uniform that exposes `.backward`
+  // (or use the derived-uniforms compute pass which handles both).
+  // Recognised via duck-type on `.forward._data` to stay decoupled
+  // from the wombat.base import.
+  if (
+    value !== null && typeof value === "object" &&
+    "forward" in (value as object) &&
+    (value as { forward: unknown }).forward !== null &&
+    typeof (value as { forward: unknown }).forward === "object" &&
+    "_data" in ((value as { forward: object }).forward as object)
+  ) {
+    const data = ((value as { forward: { _data: unknown } }).forward._data);
+    if (data instanceof Float32Array) { view.f32.set(data, offset >> 2); return; }
+    if (data instanceof Float64Array) {
+      const dst = view.f32.subarray(offset >> 2, (offset >> 2) + data.length);
+      for (let i = 0; i < data.length; i++) dst[i] = data[i]!;
+      return;
+    }
+  }
   if (value !== null && typeof value === "object" && "_data" in (value as object)) {
     const data = (value as { _data: unknown })._data;
     if (data instanceof Float32Array) { view.f32.set(data, offset >> 2); return; }
