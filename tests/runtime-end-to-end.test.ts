@@ -95,11 +95,11 @@ describe("Runtime.compile(alist<Command>)", () => {
       colors: HashMap.empty<string, V4f>().add("outColor", new V4f(0, 0, 0, 1)),
     };
     const commands = AList.ofArray<Command>([
-      { kind: "Clear",  output: fbo, values: clearValues },
-      { kind: "Render", output: fbo, tree },
+      { kind: "Clear", values: clearValues },
+      { kind: "Render",tree },
     ]);
-    const task = runtime.compile(commands);
-    task.run(AdaptiveToken.top);
+    const task = runtime.compile(sig, commands);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
 
     // Coalesced: one render pass that both clears and draws.
     expect(gpu.renderPasses).toHaveLength(1);
@@ -119,9 +119,9 @@ describe("Runtime.compile(alist<Command>)", () => {
     const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
     fbo.acquire();
     const tree = RenderTree.ordered(RenderTree.leaf(obj()), RenderTree.leaf(obj()));
-    const cmds = AList.ofArray<Command>([{ kind: "Render", output: fbo, tree }]);
-    const task = runtime.compile(cmds);
-    task.run(AdaptiveToken.top);
+    const cmds = AList.ofArray<Command>([{ kind: "Render",tree }]);
+    const task = runtime.compile(sig, cmds);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
     expect(gpu.renderPasses).toHaveLength(1);
     expect(gpu.renderPasses[0]!.drawCalls).toHaveLength(2);
     task.dispose();

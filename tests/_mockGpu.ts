@@ -2,6 +2,29 @@
 // by unit tests. Records calls so we can assert what the resource
 // + commands layers did without a real WebGPU implementation.
 
+// WebGPU exposes a few `GPU*Usage` enum globals — node has no
+// global GPU* surface, so any code path that references them (heap
+// scene buffer construction, atlas allocator, …) crashes on import.
+// Provide the spec values as a one-time module-load shim.
+if (typeof (globalThis as { GPUBufferUsage?: unknown }).GPUBufferUsage === "undefined") {
+  (globalThis as Record<string, unknown>).GPUBufferUsage = {
+    MAP_READ: 0x0001, MAP_WRITE: 0x0002, COPY_SRC: 0x0004, COPY_DST: 0x0008,
+    INDEX: 0x0010, VERTEX: 0x0020, UNIFORM: 0x0040, STORAGE: 0x0080,
+    INDIRECT: 0x0100, QUERY_RESOLVE: 0x0200,
+  };
+}
+if (typeof (globalThis as { GPUTextureUsage?: unknown }).GPUTextureUsage === "undefined") {
+  (globalThis as Record<string, unknown>).GPUTextureUsage = {
+    COPY_SRC: 0x01, COPY_DST: 0x02, TEXTURE_BINDING: 0x04,
+    STORAGE_BINDING: 0x08, RENDER_ATTACHMENT: 0x10,
+  };
+}
+if (typeof (globalThis as { GPUShaderStage?: unknown }).GPUShaderStage === "undefined") {
+  (globalThis as Record<string, unknown>).GPUShaderStage = {
+    VERTEX: 0x1, FRAGMENT: 0x2, COMPUTE: 0x4,
+  };
+}
+
 export interface MockBuffer {
   __mock: "buffer";
   id: number;

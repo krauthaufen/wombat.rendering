@@ -1,5 +1,5 @@
 {
-  "name": "wombat.rendering.experimental",
+  "name": "wombat.rendering",
   "private": true,
   "type": "module",
   "engines": {
@@ -31,8 +31,8 @@
     "vitest": "^1.4.0"
   },
   "dependencies": {
-    "@aardworx/wombat.adaptive": "^0.2.1",
-    "@aardworx/wombat.base": "^0.3.0",
+    "@aardworx/wombat.adaptive": "^0.2.3",
+    "@aardworx/wombat.base": "^0.4.2",
     "@aardworx/wombat.shader": "^0.5.2",
     "boperators": "^0.3.2"
   }

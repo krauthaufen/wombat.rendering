@@ -47,11 +47,11 @@ describe("window — canvas attach", () => {
     const runtime = new Runtime({ device });
     for (let i = 0; i < 3; i++) {
       window_.markFrame();
-      runtime.compile(AList.ofArray<Command>([
-        { kind: "Clear", output: window_.framebuffer, values: {
+      runtime.compile(window_.signature, AList.ofArray<Command>([
+        { kind: "Clear", values: {
           colors: HashMap.empty<string, V4f>().add("color", new V4f(i / 3, 0, 0, 1)),
         } as ClearValues },
-      ])).run(AdaptiveToken.top);
+      ])).run(window_.framebuffer.getValue(AdaptiveToken.top), AdaptiveToken.top);
     }
     expect(errors).toEqual([]);
     window_.dispose();
@@ -77,11 +77,11 @@ describe("window — canvas attach", () => {
         // never fires and the rAF loop stalls after one frame.
         const t = tickC.getValue(token);
         transact(() => { clearC.value = new V4f(t / 5, 0, 0, 1); });
-        runtime.compile(AList.ofArray<Command>([
-          { kind: "Clear", output: window_.framebuffer, values: {
+        runtime.compile(window_.signature, AList.ofArray<Command>([
+          { kind: "Clear", values: {
             colors: HashMap.empty<string, V4f>().add("color", clearC.value),
           } as ClearValues },
-        ])).run(token);
+        ])).run(window_.framebuffer.getValue(token), token);
         count++;
         if (count >= 5) resolve();
       }, {

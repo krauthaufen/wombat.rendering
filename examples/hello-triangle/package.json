@@ -10,11 +10,11 @@
     "postinstall": "patch-package"
   },
   "dependencies": {
-    "@aardworx/wombat.adaptive": "^0.2.1",
-    "@aardworx/wombat.base": "^0.3.0",
-    "@aardworx/wombat.rendering": "*",
-    "@aardworx/wombat.shader": "*",
-    "@aardworx/wombat.shader-vite": "^0.2.1",
+    "@aardworx/wombat.adaptive": "^0.2.3",
+    "@aardworx/wombat.base": "^0.4.2",
+    "@aardworx/wombat.rendering": "^0.9.0",
+    "@aardworx/wombat.shader": "^0.5.2",
+    "@aardworx/wombat.shader-vite": "^0.3.1",
     "boperators": "^0.3.2"
   },
   "devDependencies": {

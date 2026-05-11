@@ -122,10 +122,10 @@ describe("instancing — real GPU", () => {
 
       const runtime = new Runtime({ device });
       const cmds = AList.ofArray<Command>([
-        { kind: "Clear",  output: fbo, values: { colors: HashMap.empty<string, V4f>().add("outColor", new V4f(0, 0, 0, 1)) } as ClearValues },
-        { kind: "Render", output: fbo, tree: RenderTree.leaf(obj) },
+        { kind: "Clear",  values: { colors: HashMap.empty<string, V4f>().add("outColor", new V4f(0, 0, 0, 1)) } as ClearValues },
+        { kind: "Render", tree: RenderTree.leaf(obj) },
       ]);
-      runtime.compile(cmds).run(AdaptiveToken.top);
+      runtime.compile(sig, cmds).run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
       await device.queue.onSubmittedWorkDone();
 
       const ifb = fbo.getValue(AdaptiveToken.top);

@@ -63,13 +63,13 @@ describe("bind-group cache", () => {
     const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
     fbo.acquire();
     const cmds = AList.ofArray<Command>([
-      { kind: "Render", output: fbo, tree: RenderTree.leaf(obj) },
+      { kind: "Render",tree: RenderTree.leaf(obj) },
     ]);
-    const task = runtime.compile(cmds);
-    task.run(AdaptiveToken.top);
+    const task = runtime.compile(sig, cmds);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
     const after1 = gpu.bindGroups.length;
-    task.run(AdaptiveToken.top);
-    task.run(AdaptiveToken.top);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
     expect(gpu.bindGroups.length).toBe(after1);     // no new bind groups
     task.dispose();
     fbo.release();
@@ -114,10 +114,10 @@ describe("bind-group cache", () => {
       samplers: HashMap.empty(),
       drawCall: cval<DrawCall>({ kind: "non-indexed", vertexCount: 3, instanceCount: 1, firstVertex: 0, firstInstance: 0 }),
     };
-    const task = runtime.compile(AList.ofArray<Command>([
-      { kind: "Render", output: fbo, tree: RenderTree.leaf(obj) },
+    const task = runtime.compile(sig, AList.ofArray<Command>([
+      { kind: "Render",tree: RenderTree.leaf(obj) },
     ]));
-    task.run(AdaptiveToken.top);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
     const before = gpu.bindGroups.length;
 
     // Grow the host data → underlying GPUBuffer reallocates.
@@ -127,7 +127,7 @@ describe("bind-group cache", () => {
         offset: 0, stride: 12, elementType: ElementType.V3f,
       };
     });
-    task.run(AdaptiveToken.top);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
     // Although the bind group has no buffer (this effect has no
     // uniforms / textures / samplers), the cache test for "fresh"
     // here is moot — but this confirms no spurious BG creation.

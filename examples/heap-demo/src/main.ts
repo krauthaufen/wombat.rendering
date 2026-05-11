@@ -1,4 +1,4 @@
-// heap-demo — wombat.rendering.experimental visual smoke test, no
+// heap-demo — wombat.rendering visual smoke test, no
 // scene graph. Hand-builds RenderObjects for box / sphere / cylinder
 // against a static camera + camera-headlight light. As the heap-
 // everything path lands inside the rendering package this demo
@@ -28,9 +28,9 @@ import {
   type DrawCall,
   type Command,
   type ClearValues,
-} from "@aardworx/wombat.rendering.experimental/core";
-import { Runtime } from "@aardworx/wombat.rendering.experimental/runtime";
-import { attachCanvas, runFrame } from "@aardworx/wombat.rendering.experimental/window";
+} from "@aardworx/wombat.rendering/core";
+import { Runtime } from "@aardworx/wombat.rendering/runtime";
+import { attachCanvas, runFrame } from "@aardworx/wombat.rendering/window";
 import {
   surface, texturedSurface,
   instancedSurface, instancedTexturedSurface,
@@ -363,7 +363,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     // one for that tick. Submitting outside rAF targets a texture
     // that's then thrown away, which is what produced the original
     // blank canvas in headless.
-    const fbA = attach.framebuffer as aval<import("@aardworx/wombat.rendering.experimental/core").IFramebuffer>;
+    const fbA = attach.framebuffer as aval<import("@aardworx/wombat.rendering/core").IFramebuffer>;
     const tick = (): void => {
       attach.markFrame();
       const fb = fbA.force(/* allow-force */);
@@ -709,7 +709,7 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
     }, 2000);
   }
 
-  const fbAval = attach.framebuffer as aval<import("@aardworx/wombat.rendering.experimental/core").IFramebuffer>;
+  const fbAval = attach.framebuffer as aval<import("@aardworx/wombat.rendering/core").IFramebuffer>;
   const startTime = performance.now();
   let churnPool: RenderTree[] = [];
   runFrame(attach, (token) => {

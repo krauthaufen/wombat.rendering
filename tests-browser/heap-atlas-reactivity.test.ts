@@ -15,13 +15,13 @@
 
 import { describe, expect, it } from "vitest";
 import { AdaptiveToken, cval, transact } from "@aardworx/wombat.adaptive";
-import { ITexture } from "@aardworx/wombat.rendering.experimental/core";
-import { ISampler } from "@aardworx/wombat.rendering.experimental/core";
+import { ITexture } from "@aardworx/wombat.rendering/core";
+import { ISampler } from "@aardworx/wombat.rendering/core";
 import {
   buildHeapScene, type HeapDrawSpec, type HeapTextureSet,
-} from "@aardworx/wombat.rendering.experimental/runtime";
+} from "@aardworx/wombat.rendering/runtime";
 import { AtlasPool } from "../packages/rendering/src/runtime/textureAtlas/atlasPool.js";
-import { createFramebufferSignature } from "@aardworx/wombat.rendering.experimental/resources";
+import { createFramebufferSignature } from "@aardworx/wombat.rendering/resources";
 import { readTexturePixels, requestRealDevice } from "./_realGpu.js";
 
 import { makeHeapTestEffectTextured } from "../tests/_heapTestEffect.js";

@@ -3,9 +3,15 @@
 
 import { describe, expect, it } from "vitest";
 import { AList, AdaptiveToken } from "@aardworx/wombat.adaptive";
-import type { Command } from "@aardworx/wombat.rendering/core";
+import type { Command, IFramebuffer } from "@aardworx/wombat.rendering/core";
+import { createFramebufferSignature } from "@aardworx/wombat.rendering/resources";
 import { Runtime } from "@aardworx/wombat.rendering/runtime";
 import { requestRealDevice } from "./_realGpu.js";
+
+// Tasks are signature-bound, but Custom/Copy commands don't touch a
+// framebuffer — a dummy sig + stub IFramebuffer is sufficient.
+const dummySig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
+const dummyFB = {} as IFramebuffer;
 
 describe("runtime — Custom and Copy on real GPU", () => {
   it("Custom command receives the active encoder", async () => {
@@ -16,7 +22,7 @@ describe("runtime — Custom and Copy on real GPU", () => {
       const cmds = AList.ofArray<Command>([
         { kind: "Custom", encode: (enc) => { encSeen = enc; } },
       ]);
-      runtime.compile(cmds).run(AdaptiveToken.top);
+      runtime.compile(dummySig, cmds).run(dummyFB, AdaptiveToken.top);
       await device.queue.onSubmittedWorkDone();
       expect(encSeen).not.toBeNull();
       expect(typeof encSeen!.beginRenderPass).toBe("function");
@@ -45,7 +51,7 @@ describe("runtime — Custom and Copy on real GPU", () => {
       const cmds = AList.ofArray<Command>([
         { kind: "Copy", copy: { kind: "buffer", src, dst, range: { srcOffset: 0, dstOffset: 0, size: data.byteLength } } },
       ]);
-      runtime.compile(cmds).run(AdaptiveToken.top);
+      runtime.compile(dummySig, cmds).run(dummyFB, AdaptiveToken.top);
       await device.queue.onSubmittedWorkDone();
 
       // WebGPU forbids MAP_READ together with COPY_SRC on the same

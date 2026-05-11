@@ -176,14 +176,14 @@ describe("ScenePass: delta-driven resolution", () => {
       RenderTree.leaf(makeRO(eff)),
       RenderTree.leaf(makeRO(eff)),
     );
-    const cmds = AList.ofArray<Command>([{ kind: "Render", output: fbo, tree }]);
-    const task = runtime.compile(cmds);
+    const cmds = AList.ofArray<Command>([{ kind: "Render",tree }]);
+    const task = runtime.compile(sig, cmds);
 
-    task.run(AdaptiveToken.top);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
     const pipelinesAfterFirstFrame = gpu.pipelines.length;
-    task.run(AdaptiveToken.top);
-    task.run(AdaptiveToken.top);
-    task.run(AdaptiveToken.top);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
     // Three flat-red leaves with the same effect+sig+state share
     // a pipeline; the cache held it stable across frames.
     expect(gpu.pipelines.length).toBe(pipelinesAfterFirstFrame);

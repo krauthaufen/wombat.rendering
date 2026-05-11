@@ -79,10 +79,10 @@ describe("RenderObject vertexAttributes — per-buffer reactivity", () => {
     const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
     const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
     fbo.acquire();
-    const task = runtime.compile(AList.ofArray<Command>([
-      { kind: "Render", output: fbo, tree: RenderTree.leaf(obj) },
+    const task = runtime.compile(sig, AList.ofArray<Command>([
+      { kind: "Render",tree: RenderTree.leaf(obj) },
     ]));
-    task.run(AdaptiveToken.top);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
     const pipelinesAfter1 = gpu.pipelines.length;
     expect(pipelinesAfter1).toBe(1);
 
@@ -92,7 +92,7 @@ describe("RenderObject vertexAttributes — per-buffer reactivity", () => {
 
     // Flip the inner per-attribute aval — same view, new IBuffer.
     transact(() => { bufferCval.value = bufferB; });
-    task.run(AdaptiveToken.top);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
 
     // Pipeline cache stays at 1 — buffer-identity swaps do not feed
     // the pipeline cache key.

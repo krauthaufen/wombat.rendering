@@ -125,11 +125,11 @@ describe("hello-triangle — real GPU", () => {
 
       const runtime = new Runtime({ device });
       const cmds = AList.ofArray<Command>([
-        { kind: "Clear",  output: fbo, values: clearValues },
-        { kind: "Render", output: fbo, tree: RenderTree.leaf(obj) },
+        { kind: "Clear",  values: clearValues },
+        { kind: "Render", tree: RenderTree.leaf(obj) },
       ]);
-      const task = runtime.compile(cmds);
-      task.run(AdaptiveToken.top);
+      const task = runtime.compile(sig, cmds);
+      task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
       await device.queue.onSubmittedWorkDone();
       expect(errors).toEqual([]);
 

@@ -82,8 +82,8 @@ describe("Unordered: sort by pipeline state", () => {
       RenderTree.leaf(ro("ccw")),
       RenderTree.leaf(ro("cw")),
     );
-    runtime.compile(AList.ofArray<Command>([{ kind: "Render", output: fbo, tree }]))
-           .run(AdaptiveToken.top);
+    runtime.compile(sig, AList.ofArray<Command>([{ kind: "Render",tree }]))
+           .run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
 
     expect(gpu.renderPasses).toHaveLength(1);
     const pipelinesInOrder = gpu.renderPasses[0]!.setPipelineCalls;
@@ -101,23 +101,10 @@ describe("Unordered: sort by pipeline state", () => {
     fbo.release();
   });
 
-  it("Ordered preserves child argument order even with mixed state", () => {
-    const gpu = new MockGPU();
-    const runtime = new Runtime({ device: gpu.device });
-    const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
-    const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
-    fbo.acquire();
-
-    const ros = [ro("ccw"), ro("cw"), ro("ccw")];
-    const tree = RenderTree.ordered(...ros.map(r => RenderTree.leaf(r)));
-    runtime.compile(AList.ofArray<Command>([{ kind: "Render", output: fbo, tree }]))
-           .run(AdaptiveToken.top);
-    const pipes = gpu.renderPasses[0]!.setPipelineCalls;
-    expect(pipes).toHaveLength(3);
-    // Ordered preserves order: pipeline switches CCW → CW → CCW.
-    expect(pipes[0]).not.toBe(pipes[1]);
-    expect(pipes[1]).not.toBe(pipes[2]);
-    expect(pipes[0]).toBe(pipes[2]);
-    fbo.release();
-  });
+  // Note: an earlier test asserted that `RenderTree.ordered` preserved
+  // child order even across mixed state. The contract changed:
+  // flattenRenderTree now collapses Ordered + Unordered into the same
+  // aset (see `flattenTree.ts`), so order inside a single Render
+  // command is no longer load-bearing. Ordering belongs at the
+  // Command-list level.
 });

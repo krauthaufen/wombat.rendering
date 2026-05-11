@@ -32,10 +32,10 @@ describe("clear pass — real GPU", () => {
       const clearValues: ClearValues = {
         colors: HashMap.empty<string, V4f>().add("color", new V4f(1, 0.5, 0.25, 1)),
       };
-      const task = runtime.compile(AList.ofArray<Command>([
-        { kind: "Clear", output: fbo, values: clearValues },
+      const task = runtime.compile(sig, AList.ofArray<Command>([
+        { kind: "Clear", values: clearValues },
       ]));
-      task.run(AdaptiveToken.top);
+      task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
       await device.queue.onSubmittedWorkDone();
 
       const ifb = fbo.getValue(AdaptiveToken.top);

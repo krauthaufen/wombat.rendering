@@ -109,15 +109,18 @@ describe("shader integration: invariants", () => {
     fboA.acquire(); fboB.acquire();
 
     const runtime = new Runtime({ device: gpu.device });
-    const cmds = AList.ofArray<Command>([
-      { kind: "Render", output: fboA, tree: RenderTree.leaf(obj) },
-      { kind: "Render", output: fboB, tree: RenderTree.leaf(obj) },
-    ]);
-    const task = runtime.compile(cmds);
-    task.run(AdaptiveToken.top);
+    // One task per signature: tasks are now signature-bound.
+    const taskA = runtime.compile(sigA, AList.ofArray<Command>([
+      { kind: "Render", tree: RenderTree.leaf(obj) },
+    ]));
+    const taskB = runtime.compile(sigB, AList.ofArray<Command>([
+      { kind: "Render", tree: RenderTree.leaf(obj) },
+    ]));
+    taskA.run(fboA.getValue(AdaptiveToken.top), AdaptiveToken.top);
+    taskB.run(fboB.getValue(AdaptiveToken.top), AdaptiveToken.top);
     expect(gpu.pipelines).toHaveLength(2);
 
-    task.dispose();
+    taskA.dispose(); taskB.dispose();
     fboA.release(); fboB.release();
   });
 
@@ -193,10 +196,10 @@ describe("shader integration: invariants", () => {
     fbo.acquire();
     const runtime = new Runtime({ device: gpu.device });
     const cmds = AList.ofArray<Command>([
-      { kind: "Render", output: fbo, tree: RenderTree.ordered(RenderTree.leaf(mk()), RenderTree.leaf(mk())) },
+      { kind: "Render", tree: RenderTree.ordered(RenderTree.leaf(mk()), RenderTree.leaf(mk())) },
     ]);
-    const task = runtime.compile(cmds);
-    task.run(AdaptiveToken.top);
+    const task = runtime.compile(sig, cmds);
+    task.run(fbo.getValue(AdaptiveToken.top), AdaptiveToken.top);
     expect(gpu.pipelines).toHaveLength(1);    // both ROs share a pipeline
     expect(gpu.renderPasses[0]!.drawCalls).toHaveLength(2);
     task.dispose();

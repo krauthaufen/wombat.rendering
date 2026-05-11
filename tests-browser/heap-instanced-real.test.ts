@@ -12,8 +12,8 @@ import { V2f, V3f, V4f } from "@aardworx/wombat.base";
 import {
   buildHeapScene,
   type HeapDrawSpec,
-} from "@aardworx/wombat.rendering.experimental/runtime";
-import { createFramebufferSignature } from "@aardworx/wombat.rendering.experimental/resources";
+} from "@aardworx/wombat.rendering/runtime";
+import { createFramebufferSignature } from "@aardworx/wombat.rendering/resources";
 import { readTexturePixels, requestRealDevice } from "./_realGpu.js";
 
 const instancedVS = vertex((v: { Position: V2f; Offset: V2f; Tint: V3f }) => ({

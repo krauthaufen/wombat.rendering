@@ -1,6 +1,6 @@
 # Heap renderer design — notes
 
-Personal scratchpad on the wombat.rendering.experimental heap-scene
+Personal scratchpad on the wombat.rendering heap-scene
 runtime as it converges to a render-object pipeline. Captures the
 "why" so it survives a context flip.
 

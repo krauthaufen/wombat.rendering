@@ -159,7 +159,7 @@ inside lines.
 Tests import from one of two namespaces depending on what they need:
 
 - **Public API tests** (e.g. `tests/render-attribute-reactivity.test.ts`):
-  import from `@aardworx/wombat.rendering.experimental` (note the
+  import from `@aardworx/wombat.rendering` (note the
   `.experimental` suffix — this is the workspace alias defined in
   `package.json`'s `dependencies`/`exports` map). Only symbols
   re-exported via the package's subpath exports are reachable.

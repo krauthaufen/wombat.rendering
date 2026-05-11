@@ -9,8 +9,8 @@ import { AdaptiveToken } from "@aardworx/wombat.adaptive";
 import {
   buildHeapScene,
   type HeapDrawSpec,
-} from "@aardworx/wombat.rendering.experimental/runtime";
-import { createFramebufferSignature } from "@aardworx/wombat.rendering.experimental/resources";
+} from "@aardworx/wombat.rendering/runtime";
+import { createFramebufferSignature } from "@aardworx/wombat.rendering/resources";
 import { readTexturePixels, requestRealDevice } from "./_realGpu.js";
 import { makeHeapTestEffect } from "../tests/_heapTestEffect.js";
 
