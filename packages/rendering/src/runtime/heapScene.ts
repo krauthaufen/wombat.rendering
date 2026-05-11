@@ -1795,9 +1795,16 @@ export function buildHeapScene(
     vsEntryName: string;
     /** Actual @fragment entry-point name in `fsModule`. */
     fsEntryName: string;
-    fieldsForEffect: Map<Effect, Set<string>>;
+    fieldsForEffect: Map<string, Set<string>>;
   }
-  const familyByEffect = new Map<Effect, FamilyState>();
+  // Keyed by `effect.id` (content hash), NOT object identity. Two
+  // Effect objects with identical content (e.g. produced by separate
+  // calls to `effect(...)` or the pickChain composer) share one
+  // FamilyState. This is the right correctness/perf knob: building a
+  // family by content means an upstream caller that legitimately
+  // produces different-but-identical Effect objects per leaf still
+  // reuses one pipeline + one bucket.
+  const familyByEffectId = new Map<string, FamilyState>();
   let familyBuilt = false;
   const enableFamilyMerge = opts.enableFamilyMerge === true;
 
@@ -1837,13 +1844,13 @@ export function buildHeapScene(
     const ir = compileHeapEffectIR(effect, schema.drawHeaderUnion, compileOpts, "standalone");
     const vsModule = device.createShaderModule({ code: ir.vs, label: `heapScene/standalone/${schema.id}/vs` });
     const fsModule = device.createShaderModule({ code: ir.fs, label: `heapScene/standalone/${schema.id}/fs` });
-    const fieldsForEffect = new Map<Effect, Set<string>>();
+    const fieldsForEffect = new Map<string, Set<string>>();
     const s = schema.perEffectSchema.get(effect)!;
     const fields = new Set<string>();
     for (const a of s.attributes) fields.add(a.name);
     for (const u of s.uniforms)   fields.add(u.name);
     for (const t of s.textures)   fields.add(t.name);
-    fieldsForEffect.set(effect, fields);
+    fieldsForEffect.set(effect.id, fields);
     return {
       schema, vsModule, fsModule, fieldsForEffect,
       vsEntryName: ir.vsEntry,
@@ -1862,40 +1869,42 @@ export function buildHeapScene(
     // layout to address per-instance attribute reads via `instId`
     // instead of `vertex_index` — without this, instanced effects
     // produce broken geometry.
-    const seen = new Set<Effect>();
+    // De-dupe by effect.id so two Effects with identical content but
+    // distinct object identities collapse to one family + one bucket.
+    const seenIds = new Set<string>();
     const unique: Effect[] = [];
-    const perInstanceByEffect = new Map<Effect, {
+    const perInstanceByEffectId = new Map<string, {
       attributes: Set<string>;
       uniforms: Set<string>;
     }>();
     for (const spec of specs) {
       const e = spec.effect;
-      let entry = perInstanceByEffect.get(e);
+      let entry = perInstanceByEffectId.get(e.id);
       if (entry === undefined) {
         entry = { attributes: new Set<string>(), uniforms: new Set<string>() };
-        perInstanceByEffect.set(e, entry);
+        perInstanceByEffectId.set(e.id, entry);
       }
       if (spec.instanceAttributes !== undefined) {
         for (const name of Object.keys(spec.instanceAttributes)) entry.attributes.add(name);
       }
-      if (!seen.has(e)) { seen.add(e); unique.push(e); }
+      if (!seenIds.has(e.id)) { seenIds.add(e.id); unique.push(e); }
     }
     // Family-merge disabled: always one bucket per effect.
     // `enableFamilyMerge` is ignored.
     void enableFamilyMerge;
     for (const e of unique) {
-      const perI = perInstanceByEffect.get(e);
+      const perI = perInstanceByEffectId.get(e.id);
       const singleMap = new Map<Effect, { attributes: Set<string>; uniforms: Set<string> }>();
       if (perI !== undefined) singleMap.set(e, perI);
-      familyByEffect.set(e, compileFamilyFor([e], singleMap));
+      familyByEffectId.set(e.id, compileFamilyFor([e], singleMap));
     }
     familyBuilt = true;
   }
 
   function familyFor(effect: Effect): FamilyState {
-    const f = familyByEffect.get(effect);
+    const f = familyByEffectId.get(effect.id);
     if (f === undefined) {
-      const known = [...familyByEffect.keys()].map(e => e.id).join(",");
+      const known = [...familyByEffectId.keys()].join(",");
       throw new Error(
         `heapScene: family is frozen; effect ${effect.id} not in {${known}}; ` +
         `reactive family rebuild is v2`,
@@ -1921,13 +1930,89 @@ export function buildHeapScene(
     if (id === undefined) { id = `tex#${texCounter++}`; textureIds.set(t, id); }
     return id;
   };
-  const psIds = new WeakMap<PipelineState, string>();
-  let psCounter = 0;
+  // PipelineState content key. Hashes by the identities of the inner
+  // aval references rather than the wrapper object itself: callers
+  // (notably `wombat.dom`'s `derivePipelineState`) construct a fresh
+  // PipelineState object per leaf even when every contributing aval
+  // is shared — without a content-aware key, every leaf gets its own
+  // bucket and the heap path's drawIndirect coalescing collapses to
+  // one record per bucket. With this key, two leaves that pulled the
+  // same `state.mode` / `state.cullMode` / `state.depthTest` / … avals
+  // bucket together.
+  //
+  // For CONSTANT avals (`isConstant === true`) we key by *value* — two
+  // distinct `AVal.constant(0)` objects produced at different call
+  // sites must collapse to the same bucket. Reactive avals fall back
+  // to reference identity (the right semantic — value can tick).
+  const avalIds = new WeakMap<object, number>();
+  const valueIds = new Map<string, number>();
+  let avalCounter = 0;
+  const avalIdOf = (av: aval<unknown> | undefined): string => {
+    if (av === undefined) return "_";
+    // Reactive aval — key by reference. (`isConstant` is on the
+    // public IAdaptive surface; guard via runtime check so off-spec
+    // duck-types don't blow up.)
+    const isConst = (av as { isConstant?: unknown }).isConstant === true;
+    if (!isConst) {
+      let id = avalIds.get(av);
+      if (id === undefined) { id = avalCounter++; avalIds.set(av, id); }
+      return `a${id}`;
+    }
+    // Constant: key by value. Force is safe (constant: no upstream
+    // dep) and only runs once per distinct aval-object thanks to the
+    // outer avalIds cache below.
+    let id = avalIds.get(av);
+    if (id !== undefined) return `c${id}`;
+    // Constant avals ignore the token; use AdaptiveToken.top to satisfy
+    // the type and traverse a no-op evaluation.
+    const v = av.getValue(AdaptiveToken.top);
+    // Value-typed (`equals` + `getHashCode`)? Try to intern by hash
+    // bucket + equals so two distinct AVal.constant(M44d.identity)
+    // collapse. Falls back to a per-value string key otherwise.
+    let vKey: string;
+    if (
+      v !== null && typeof v === "object" &&
+      typeof (v as { getHashCode?: unknown }).getHashCode === "function" &&
+      typeof (v as { equals?: unknown }).equals === "function"
+    ) {
+      const hc = (v as { getHashCode(): number }).getHashCode() | 0;
+      vKey = `hv:${hc}`;
+    } else if (v === null || typeof v !== "object") {
+      vKey = `pv:${typeof v}:${String(v)}`;
+    } else {
+      // Plain object — fall back to reference identity (matches the
+      // memo runtime's behaviour for unhashable objects).
+      let oid = avalIds.get(v as object);
+      if (oid === undefined) { oid = avalCounter++; avalIds.set(v as object, oid); }
+      vKey = `ov:${oid}`;
+    }
+    let vid = valueIds.get(vKey);
+    if (vid === undefined) { vid = avalCounter++; valueIds.set(vKey, vid); }
+    avalIds.set(av, vid);
+    return `c${vid}`;
+  };
+  const psContentIds = new WeakMap<PipelineState, string>();
   const psIdOf = (ps: PipelineState | undefined): string => {
     if (ps === undefined) return "ps#default";
-    let id = psIds.get(ps);
-    if (id === undefined) { id = `ps#${psCounter++}`; psIds.set(ps, id); }
-    return id;
+    const cached = psContentIds.get(ps);
+    if (cached !== undefined) return cached;
+    const r = ps.rasterizer;
+    const parts: string[] = [
+      avalIdOf(r.topology),
+      avalIdOf(r.cullMode),
+      avalIdOf(r.frontFace),
+      avalIdOf(r.depthBias),
+      ps.depth !== undefined
+        ? `d:${avalIdOf(ps.depth.write)}:${avalIdOf(ps.depth.compare)}:${avalIdOf(ps.depth.clamp)}`
+        : "d:_",
+      ps.stencil !== undefined ? "s:1" : "s:_",
+      avalIdOf(ps.blends),
+      avalIdOf(ps.alphaToCoverage),
+      avalIdOf(ps.blendConstant),
+    ];
+    const key = `ps#${parts.join("|")}`;
+    psContentIds.set(ps, key);
+    return key;
   };
 
   /** Resolved (forced) snapshot of the user's PipelineState. */
@@ -2424,7 +2509,7 @@ export function buildHeapScene(
       : new Set<string>();
     const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState);
     const fam = familyFor(spec.effect);
-    const effectFields = fam.fieldsForEffect.get(spec.effect)!;
+    const effectFields = fam.fieldsForEffect.get(spec.effect.id)!;
 
     // Indices live in their own INDEX-usage buffer (WebGPU constraint).
     // Aval-keyed: 19K instanced clones of the same mesh share one
