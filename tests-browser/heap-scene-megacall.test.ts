@@ -111,12 +111,12 @@ describe("heap-scene megacall integration", () => {
       const expectedTotal = indexCounts.reduce((a, c) => a + c, 0);
       expect(indirect[0]).toBe(expectedTotal);   // total emit count
       expect(indirect[1]).toBe(1);               // instanceCount
-      const drawTable = await readU32(device, b.drawTableBuf!, b.recordCount * 16);
+      const drawTable = await readU32(device, b.drawTableBuf!, b.recordCount * 20);
       let acc = 0;
       for (let i = 0; i < indexCounts.length; i++) {
-        const firstEmit = drawTable[i * 4 + 0]!;
-        const drawIdx   = drawTable[i * 4 + 1]!;
-        const indexCnt  = drawTable[i * 4 + 3]!;
+        const firstEmit = drawTable[i * 5 + 0]!;
+        const drawIdx   = drawTable[i * 5 + 1]!;
+        const indexCnt  = drawTable[i * 5 + 3]!;
         expect(firstEmit).toBe(acc);
         expect(drawIdx).toBe(i);
         expect(indexCnt).toBe(indexCounts[i]!);
@@ -226,11 +226,11 @@ describe("heap-scene megacall integration", () => {
       const indirect = await readU32(device, b.indirectBuf!, 16);
       const expectedTotal = indexCounts.reduce((a, c) => a + c, 0);
       expect(indirect[0]).toBe(expectedTotal);
-      const drawTable = await readU32(device, b.drawTableBuf!, b.recordCount * 16);
+      const drawTable = await readU32(device, b.drawTableBuf!, b.recordCount * 20);
       let acc = 0;
       for (let i = 0; i < indexCounts.length; i++) {
-        expect(drawTable[i * 4 + 0]).toBe(acc);
-        expect(drawTable[i * 4 + 3]).toBe(indexCounts[i]!);
+        expect(drawTable[i * 5 + 0]).toBe(acc);
+        expect(drawTable[i * 5 + 3]).toBe(indexCounts[i]!);
         acc += indexCounts[i]!;
       }
 
@@ -252,9 +252,9 @@ describe("heap-scene megacall integration", () => {
       await device.queue.onSubmittedWorkDone();
       const indirect2 = await readU32(device, b.indirectBuf!, 16);
       expect(indirect2[0]).toBe(expectedTotal + 9);
-      const drawTable2 = await readU32(device, b.drawTableBuf!, (indexCounts.length + 1) * 16);
-      expect(drawTable2[indexCounts.length * 4 + 0]).toBe(expectedTotal);
-      expect(drawTable2[indexCounts.length * 4 + 3]).toBe(9);
+      const drawTable2 = await readU32(device, b.drawTableBuf!, (indexCounts.length + 1) * 20);
+      expect(drawTable2[indexCounts.length * 5 + 0]).toBe(expectedTotal);
+      expect(drawTable2[indexCounts.length * 5 + 3]).toBe(9);
 
       // Render and check non-empty.
       const W = 32, H = 32;
@@ -381,8 +381,10 @@ describe("heap-scene megacall integration", () => {
           expect(firstEmitRef[lo + 1]!).toBeGreaterThan(tileStart);
         }
       }
-      // Sentinel slot.
-      expect(fdt[numTiles]).toBe(numRecords);
+      // Sentinel slot. After the scan-kernel off-by-one fix, the
+      // sentinel is the LAST valid slot (numRecords-1), not numRecords —
+      // the render VS uses it as an inclusive upper bound.
+      expect(fdt[numTiles]).toBe(numRecords - 1);
 
       expect(errors).toEqual([]);
       scene.dispose();

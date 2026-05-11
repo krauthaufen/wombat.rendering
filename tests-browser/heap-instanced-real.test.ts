@@ -7,11 +7,8 @@
 
 import { describe, expect, it } from "vitest";
 import { AVal, AdaptiveToken } from "@aardworx/wombat.adaptive";
-import { parseShader } from "@aardworx/wombat.shader/frontend";
-import { stage, type Effect } from "@aardworx/wombat.shader";
-import {
-  Tf32, Vec, type Module, type Type, type ValueDef,
-} from "@aardworx/wombat.shader/ir";
+import { effect, vertex, fragment, type Effect } from "@aardworx/wombat.shader";
+import { V2f, V3f, V4f } from "@aardworx/wombat.base";
 import {
   buildHeapScene,
   type HeapDrawSpec,
@@ -19,49 +16,17 @@ import {
 import { createFramebufferSignature } from "@aardworx/wombat.rendering.experimental/resources";
 import { readTexturePixels, requestRealDevice } from "./_realGpu.js";
 
-const Tvec2f: Type = Vec(Tf32, 2);
-const Tvec3f: Type = Vec(Tf32, 3);
-const Tvec4f: Type = Vec(Tf32, 4);
+const instancedVS = vertex((v: { Position: V2f; Offset: V2f; Tint: V3f }) => ({
+  gl_Position: new V4f(v.Position.x + v.Offset.x, v.Position.y + v.Offset.y, 0.0, 1.0),
+  v_color: v.Tint,
+}));
+
+const instancedFS = fragment((v: { v_color: V3f }) => ({
+  outColor: new V4f(v.v_color.x, v.v_color.y, v.v_color.z, 1.0),
+}));
 
 function instancedHeapEffect(): Effect {
-  // Per-vertex Position (vec2) + per-instance Offset (vec2) + Tint (vec3).
-  const source = `
-    function vsMain(input: { Position: V2f; Offset: V2f; Tint: V3f }): {
-      gl_Position: V4f; v_color: V3f;
-    } {
-      return {
-        gl_Position: new V4f(input.Position.x + input.Offset.x, input.Position.y + input.Offset.y, 0.0, 1.0),
-        v_color: input.Tint,
-      };
-    }
-    function fsMain(input: { v_color: V3f }): { outColor: V4f } {
-      return { outColor: new V4f(input.v_color.x, input.v_color.y, input.v_color.z, 1.0) };
-    }
-  `;
-  const parsed = parseShader({
-    source,
-    entries: [
-      {
-        name: "vsMain", stage: "vertex",
-        inputs: [
-          { name: "Position", type: Tvec2f, semantic: "Position", decorations: [{ kind: "Location", value: 0 }] },
-          { name: "Offset",   type: Tvec2f, semantic: "Position", decorations: [{ kind: "Location", value: 1 }] },
-          { name: "Tint",     type: Tvec3f, semantic: "Color",    decorations: [{ kind: "Location", value: 2 }] },
-        ],
-        outputs: [
-          { name: "gl_Position", type: Tvec4f, semantic: "Position", decorations: [{ kind: "Builtin", value: "position" }] },
-          { name: "v_color",     type: Tvec3f, semantic: "Color",    decorations: [{ kind: "Location", value: 0 }] },
-        ],
-      },
-      {
-        name: "fsMain", stage: "fragment",
-        inputs:  [{ name: "v_color",  type: Tvec3f, semantic: "Color", decorations: [{ kind: "Location", value: 0 }] }],
-        outputs: [{ name: "outColor", type: Tvec4f, semantic: "Color", decorations: [{ kind: "Location", value: 0 }] }],
-      },
-    ],
-  });
-  const merged: Module = { ...parsed, values: [...([] as ValueDef[]), ...parsed.values] };
-  return stage(merged);
+  return effect(instancedVS, instancedFS);
 }
 
 describe("heap per-RO instancing — real GPU", () => {
@@ -158,6 +123,10 @@ describe("heap per-RO instancing — real GPU", () => {
 
       const px = await readTexturePixels(device, colorTex);
       const at = (x: number, y: number, c: 0 | 1 | 2 | 3) => px[4 * (y * W + x) + c]!;
+      if (errors.length > 0) {
+        const msgs = errors.map(e => (e as { message?: string }).message ?? String(e));
+        throw new Error("GPU errors:\n  " + msgs.join("\n  "));
+      }
 
       // Expected layout (matches `instancing-real.test.ts`):
       //   instance 0 (offset 0,0) → bottom-left, RED

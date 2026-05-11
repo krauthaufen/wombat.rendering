@@ -67,11 +67,16 @@ describe("window — canvas attach", () => {
       colorAttachmentName: "color", format: "rgba8unorm",
     });
     const runtime = new Runtime({ device });
+    const tickC = cval(0);
     const clearC = cval(new V4f(0, 0, 0, 1));
     let count = 0;
     const done = new Promise<void>((resolve) => {
       runFrame(window_, (token) => {
-        transact(() => { clearC.value = new V4f(count / 5, 0, 0, 1); });
+        // Read tickC through the token so the wrapping renderAval
+        // gains a dependency on it — otherwise the marking callback
+        // never fires and the rAF loop stalls after one frame.
+        const t = tickC.getValue(token);
+        transact(() => { clearC.value = new V4f(t / 5, 0, 0, 1); });
         runtime.compile(AList.ofArray<Command>([
           { kind: "Clear", output: window_.framebuffer, values: {
             colors: HashMap.empty<string, V4f>().add("color", clearC.value),
@@ -79,7 +84,10 @@ describe("window — canvas attach", () => {
         ])).run(token);
         count++;
         if (count >= 5) resolve();
-      }, { maxFrames: 5 });
+      }, {
+        maxFrames: 5,
+        onAfterFrame: () => { tickC.value = tickC.value + 1; },
+      });
     });
     await done;
     expect(count).toBe(5);

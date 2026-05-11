@@ -4,8 +4,9 @@
 // vertex color and the corners are the clear color.
 
 import { describe, expect, it } from "vitest";
-import { AList, AdaptiveToken, HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
+import { AList, AdaptiveToken, AVal, HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
 import { V4f } from "@aardworx/wombat.base";
+import { ElementType } from "@aardworx/wombat.rendering/core";
 import { parseShader, type EntryRequest } from "@aardworx/wombat.shader/frontend";
 import { stage, type Effect } from "@aardworx/wombat.shader";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
@@ -65,15 +66,14 @@ function helloTriangleEffect(): Effect {
   return stage(parseShader({ source, entries }));
 }
 
-function f32Buffer(values: number[]): aval<BufferView> {
+function f32Buffer(values: number[]): BufferView {
   const arr = new Float32Array(values);
-  return cval<BufferView>({
-    buffer: IBuffer.fromHost(arr),
+  return {
+    buffer: AVal.constant(IBuffer.fromHost(arr)),
     offset: 0,
-    count: values.length,
-    stride: 0,  // unused for our setup; layout determined by shader format
-    format: "float32",
-  });
+    stride: 0,
+    elementType: ElementType.F32,
+  };
 }
 
 describe("hello-triangle — real GPU", () => {
@@ -101,13 +101,13 @@ describe("hello-triangle — real GPU", () => {
       const obj: RenderObject = {
         effect: helloTriangleEffect(),
         pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-        vertexAttributes: HashMap.empty<string, aval<BufferView>>()
-          .add("a_position", cval<BufferView>({
-            buffer: IBuffer.fromHost(positions), offset: 0, count: 3, stride: 8, format: "float32x2",
-          }))
-          .add("a_color", cval<BufferView>({
-            buffer: IBuffer.fromHost(colors), offset: 0, count: 3, stride: 12, format: "float32x3",
-          })),
+        vertexAttributes: HashMap.empty<string, BufferView>()
+          .add("a_position", {
+            buffer: AVal.constant(IBuffer.fromHost(positions)), offset: 0, stride: 8, elementType: ElementType.V2f,
+          })
+          .add("a_color", {
+            buffer: AVal.constant(IBuffer.fromHost(colors)), offset: 0, stride: 12, elementType: ElementType.V3f,
+          }),
         uniforms: HashMap.empty(),
         textures: HashMap.empty(),
         samplers: HashMap.empty(),

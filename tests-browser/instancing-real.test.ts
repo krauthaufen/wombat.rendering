@@ -6,8 +6,9 @@
 //   - WebGPU consumes it correctly (correct offsets + colors).
 
 import { describe, expect, it } from "vitest";
-import { AList, AdaptiveToken, HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
+import { AList, AdaptiveToken, AVal, HashMap, cval } from "@aardworx/wombat.adaptive";
 import { V4f } from "@aardworx/wombat.base";
+import { ElementType } from "@aardworx/wombat.rendering/core";
 import { parseShader, type EntryRequest } from "@aardworx/wombat.shader/frontend";
 import { stage, type Effect } from "@aardworx/wombat.shader";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
@@ -96,17 +97,17 @@ describe("instancing — real GPU", () => {
       const obj: RenderObject = {
         effect: instancedEffect(),
         pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-        vertexAttributes: HashMap.empty<string, aval<BufferView>>()
-          .add("a_position", cval<BufferView>({
-            buffer: IBuffer.fromHost(positions), offset: 0, count: 6, stride: 8, format: "float32x2",
-          })),
-        instanceAttributes: HashMap.empty<string, aval<BufferView>>()
-          .add("i_offset", cval<BufferView>({
-            buffer: IBuffer.fromHost(offsets), offset: 0, count: 4, stride: 8, format: "float32x2",
-          }))
-          .add("i_tint", cval<BufferView>({
-            buffer: IBuffer.fromHost(tints), offset: 0, count: 4, stride: 12, format: "float32x3",
-          })),
+        vertexAttributes: HashMap.empty<string, BufferView>()
+          .add("a_position", {
+            buffer: AVal.constant(IBuffer.fromHost(positions)), offset: 0, stride: 8, elementType: ElementType.V2f,
+          }),
+        instanceAttributes: HashMap.empty<string, BufferView>()
+          .add("i_offset", {
+            buffer: AVal.constant(IBuffer.fromHost(offsets)), offset: 0, stride: 8, elementType: ElementType.V2f,
+          })
+          .add("i_tint", {
+            buffer: AVal.constant(IBuffer.fromHost(tints)), offset: 0, stride: 12, elementType: ElementType.V3f,
+          }),
         uniforms: HashMap.empty(),
         textures: HashMap.empty(),
         samplers: HashMap.empty(),

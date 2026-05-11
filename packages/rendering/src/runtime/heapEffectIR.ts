@@ -1031,20 +1031,15 @@ function applyFamilyMemberShape(vs: string): string {
   const retType = tailMatch[1]!.trim();
   const headerEnd = tailRe.lastIndex;
   const headerStart = startMatch.index!;
-  const params = paramList.split(",").map(p => p.trim()).filter(p => p.length > 0);
-  // Drop the megacall builtins; user-declared params (carrying
-  // @location/etc decorations) are preserved.
-  const kept: string[] = [];
-  for (const p of params) {
-    if (/@builtin\(\s*instance_index\s*\)/.test(p)) continue;
-    if (/@builtin\(\s*vertex_index\s*\)/.test(p)) continue;
-    kept.push(p);
-  }
-  // The three megacall values arrive as plain u32 parameters from the
-  // wrapper. We list them first so the calling convention is stable
-  // regardless of any user-declared params the IR may have left in
-  // place (in practice there are none for the heap path).
-  const newParamList = ["heap_drawIdx: u32", "instId: u32", "vid: u32", ...kept].join(", ");
+  // Drop ALL @vertex fn params: the megacall builtins
+  // (instance_index, vertex_index) are not needed because we re-bind
+  // them from incoming u32 args below, and any @location(...) attribute
+  // params have already had their body reads substituted with
+  // heap-load expressions by `substituteInputsInStage` — the params
+  // themselves are dead. The wrapper calls the helper with exactly
+  // three megacall args.
+  const newParamList = ["heap_drawIdx: u32", "instId: u32", "vid: u32"].join(", ");
+  void paramList;
   // Body aliases: IR-emitted body code reads `vertex_index` and
   // `instance_index` (the names of the @builtin params standalone mode
   // adds). Re-bind those names to the incoming `vid` / `instId`.

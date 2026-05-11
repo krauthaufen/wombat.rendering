@@ -4,8 +4,9 @@
 // scope), reads the FBO back, asserts pixels.
 
 import { describe, expect, it } from "vitest";
-import { AdaptiveToken, HashMap, cval, type aval } from "@aardworx/wombat.adaptive";
+import { AdaptiveToken, AVal, HashMap, cval } from "@aardworx/wombat.adaptive";
 import { V4f } from "@aardworx/wombat.base";
+import { ElementType } from "@aardworx/wombat.rendering/core";
 import { parseShader, type EntryRequest } from "@aardworx/wombat.shader/frontend";
 import { stage, type Effect } from "@aardworx/wombat.shader";
 import { Tf32, Vec, type Type } from "@aardworx/wombat.shader/ir";
@@ -64,9 +65,9 @@ describe("renderTo — real GPU", () => {
       const obj: RenderObject = {
         effect: fullscreenColorEffect(),
         pipelineState: PipelineState.constant({ rasterizer: { topology: "triangle-list", cullMode: "none", frontFace: "ccw" } }),
-        vertexAttributes: HashMap.empty<string, aval<BufferView>>().add("a_position", cval<BufferView>({
-          buffer: IBuffer.fromHost(positions), offset: 0, count: 3, stride: 8, format: "float32x2",
-        })),
+        vertexAttributes: HashMap.empty<string, BufferView>().add("a_position", {
+          buffer: AVal.constant(IBuffer.fromHost(positions)), offset: 0, stride: 8, elementType: ElementType.V2f,
+        }),
         uniforms: HashMap.empty(),
         textures: HashMap.empty(),
         samplers: HashMap.empty(),

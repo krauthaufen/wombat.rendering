@@ -1004,14 +1004,28 @@ function synthesizeFamilyVs(
 
   const lines: string[] = [];
   lines.push("// Family-merged vertex shader (direct-heap-read FS path).");
-  // Megacall storage-buffer bindings (same shape as standalone path).
-  lines.push("@group(0) @binding(4) var<storage, read> drawTable:       array<u32>;");
-  lines.push("@group(0) @binding(5) var<storage, read> indexStorage:    array<u32>;");
-  lines.push("@group(0) @binding(6) var<storage, read> firstDrawInTile: array<u32>;");
+  // Heap arena + megacall storage-buffer bindings declared explicitly
+  // by the wrapper. The wrapper itself references `headersU32` for
+  // the layoutId lookup, so these MUST be present even when no
+  // per-effect helper happens to reference them (in which case DCE
+  // in the helper compile would otherwise drop them). Hand-declared
+  // strings; per-effect helpers' duplicate decls of the same names
+  // are filtered out of dedupedDecls below.
+  lines.push("@group(0) @binding(0) var<storage, read> heapU32:          array<u32>;");
+  lines.push("@group(0) @binding(1) var<storage, read> headersU32:       array<u32>;");
+  lines.push("@group(0) @binding(2) var<storage, read> heapF32:          array<f32>;");
+  lines.push("@group(0) @binding(3) var<storage, read> heapV4f:          array<vec4<f32>>;");
+  lines.push("@group(0) @binding(4) var<storage, read> drawTable:        array<u32>;");
+  lines.push("@group(0) @binding(5) var<storage, read> indexStorage:     array<u32>;");
+  lines.push("@group(0) @binding(6) var<storage, read> firstDrawInTile:  array<u32>;");
   lines.push("");
-  // Deduped module-scope decls (heap arena, user uniforms, per-effect
-  // structs, per-effect helper fns).
+  // Deduped module-scope decls (user uniforms, per-effect structs,
+  // per-effect helper fns). Filter the heap-arena bindings out since
+  // we hand-declare them above; otherwise they'd appear twice.
+  const heapArenaNames = new Set(["heapU32", "headersU32", "heapF32", "heapV4f"]);
   for (const d of dedupedDecls) {
+    const m = /^\s*@group\(\s*\d+\s*\)\s*@binding\(\s*\d+\s*\)\s*var(?:<[^>]*>)?\s+(\w+)\s*:/.exec(d);
+    if (m !== null && heapArenaNames.has(m[1]!)) continue;
     lines.push(d);
     lines.push("");
   }
