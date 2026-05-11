@@ -972,6 +972,9 @@ function compileHeapEffectIRViaDecoder(
 
   // 7. Compile.
   const compiled = compileModule(combined, compileOptions);
+  if ((globalThis as { __HEAP_DEBUG_FULL__?: boolean }).__HEAP_DEBUG_FULL__) {
+    for (const s of compiled.stages) console.log(`[heap-debug-full] ${s.stage}:\n${s.source}`);
+  }
   const vsStage = compiled.stages.find(s => s.stage === "vertex");
   const fsStage = compiled.stages.find(s => s.stage === "fragment");
   let vsSrc = vsStage?.source ?? "";
@@ -1118,20 +1121,59 @@ function rewriteFn(src: string, fnStart: number, fnMatch: RegExpExecArray): stri
  * FS-side atlas rewrite for the decoder-composition path.
  *
  * The decoder VS has already written `_h_<name>{PageRef,FormatBits,
- * Origin,Size}` onto the inter-stage carrier. All this pass does is
- * rewrite each `textureSample(t, smp, uv)` (or shipped `texture(...)`
- * shorthand) for an atlas-routed binding into the atlas-sample
- * intrinsic reading from `Input.<carrier name>`.
+ * Origin,Size}` onto the inter-stage carrier. This pass:
+ *   1. Rewrites each `textureSample(t, smp, uv)` (or shipped
+ *      `texture(...)` shorthand) for an atlas-routed binding into the
+ *      atlas-sample intrinsic reading from `Input.<carrier name>`.
+ *   2. Adds matching `EntryParameter`s on every FS Entry so the WGSL
+ *      emit produces an Input struct that actually contains the
+ *      `_h_<name><Sub>` fields the body reads.
  *
- * Unlike the legacy `rewriteFsAtlasTextures`, this does NOT:
- *   - inject VS-side WriteOutputs (decoder owns them)
- *   - call `addInterstageParams` (composeStages + linkCrossStage match
- *     decoder outputs to FS inputs by name automatically — the FS
- *     EntryParameter declarations are synthesised at link time).
+ * Unlike the legacy `rewriteFsAtlasTextures`, this does NOT inject
+ * VS-side WriteOutputs (the decoder writes them already).
  */
 function rewriteFsAtlasTexturesViaCarrier(m: Module, layout: BucketLayout): Module {
   if (layout.atlasTextureBindings.size === 0) return m;
-  return mapStageEntryBodies(m, "fragment", body => mapStmt(body, {
+
+  // Find which atlas-routed names the FS actually samples — only those
+  // need carrier declarations and rewrites.
+  const used = new Set<string>();
+  for (const v of m.values) {
+    if (v.kind !== "Entry" || v.entry.stage !== "fragment") continue;
+    visitStmtExprs(v.entry.body, e => {
+      const hit = isAtlasSampleCall(e, layout.atlasTextureBindings);
+      if (hit !== null) used.add(hit.name);
+    });
+  }
+  if (used.size === 0) return m;
+
+  // Build the four carrier inputs per used texture. Flat interpolation
+  // — integer types require it and the floats are constant per draw.
+  const fsExtras: EntryParameter[] = [];
+  for (const name of used) {
+    const v = atlasVaryingNames(name);
+    const flat: ParamDecoration = { kind: "Interpolation", mode: "flat" };
+    fsExtras.push({ name: v.pageRef,    type: Tu32,  semantic: v.pageRef,    decorations: [flat] });
+    fsExtras.push({ name: v.formatBits, type: Tu32,  semantic: v.formatBits, decorations: [flat] });
+    fsExtras.push({ name: v.origin,     type: Tvec2, semantic: v.origin,     decorations: [flat] });
+    fsExtras.push({ name: v.size,       type: Tvec2, semantic: v.size,       decorations: [flat] });
+  }
+
+  // Add the EntryParameter declarations to every FS entry's inputs.
+  let out = m;
+  out = {
+    ...out,
+    values: out.values.map((vv) => {
+      if (vv.kind !== "Entry" || vv.entry.stage !== "fragment") return vv;
+      const haveInput = new Set(vv.entry.inputs.map(p => p.name));
+      const additions = fsExtras.filter(p => !haveInput.has(p.name));
+      if (additions.length === 0) return vv;
+      return { ...vv, entry: { ...vv.entry, inputs: [...vv.entry.inputs, ...additions] } };
+    }),
+  };
+
+  // Body rewrite: textureSample → atlasSample(Input.pageRef, …, uv).
+  out = mapStageEntryBodies(out, "fragment", body => mapStmt(body, {
     expr: e => mapExpr(e, sub => {
       const hit = isAtlasSampleCall(sub, layout.atlasTextureBindings);
       if (hit === null) return sub;
@@ -1146,6 +1188,7 @@ function rewriteFsAtlasTexturesViaCarrier(m: Module, layout: BucketLayout): Modu
       return { kind: "CallIntrinsic", op: ATLAS_SAMPLE_INTRINSIC, args, type: Tvec4 };
     }),
   }));
+  return out;
 }
 
 /**

@@ -86,20 +86,25 @@ export const firstDrawInTile  = readScope("Uniform", "firstDrawInTile", TarrU32)
 // up — both sides walk module ValueDefs in declaration order and increment
 // a slot counter to derive `@binding(N)`.
 
+// `keep: true` on every heap-rendering binding: the host-side
+// BindGroupLayout pins these at slots 0..6, so the WGSL must declare
+// them at the same slots whether or not any code path on the current
+// effect happens to reference each one (e.g. a shader with no mat4
+// uniforms doesn't touch heapV4f, but the BGL still has slot 3).
 export function heapArenaStorageDecls(): ValueDef[] {
   return [
-    { kind: "StorageBuffer", binding: { group: 0, slot: 0 }, name: "heapU32",    layout: TarrU32,  access: "read" },
-    { kind: "StorageBuffer", binding: { group: 0, slot: 1 }, name: "headersU32", layout: TarrU32,  access: "read" },
-    { kind: "StorageBuffer", binding: { group: 0, slot: 2 }, name: "heapF32",    layout: TarrF32,  access: "read" },
-    { kind: "StorageBuffer", binding: { group: 0, slot: 3 }, name: "heapV4f",    layout: TarrVec4, access: "read" },
+    { kind: "StorageBuffer", binding: { group: 0, slot: 0 }, name: "heapU32",    layout: TarrU32,  access: "read", keep: true },
+    { kind: "StorageBuffer", binding: { group: 0, slot: 1 }, name: "headersU32", layout: TarrU32,  access: "read", keep: true },
+    { kind: "StorageBuffer", binding: { group: 0, slot: 2 }, name: "heapF32",    layout: TarrF32,  access: "read", keep: true },
+    { kind: "StorageBuffer", binding: { group: 0, slot: 3 }, name: "heapV4f",    layout: TarrVec4, access: "read", keep: true },
   ];
 }
 
 export function megacallLookupStorageDecls(): ValueDef[] {
   return [
-    { kind: "StorageBuffer", binding: { group: 0, slot: 4 }, name: "drawTable",       layout: TarrU32, access: "read" },
-    { kind: "StorageBuffer", binding: { group: 0, slot: 5 }, name: "indexStorage",    layout: TarrU32, access: "read" },
-    { kind: "StorageBuffer", binding: { group: 0, slot: 6 }, name: "firstDrawInTile", layout: TarrU32, access: "read" },
+    { kind: "StorageBuffer", binding: { group: 0, slot: 4 }, name: "drawTable",       layout: TarrU32, access: "read", keep: true },
+    { kind: "StorageBuffer", binding: { group: 0, slot: 5 }, name: "indexStorage",    layout: TarrU32, access: "read", keep: true },
+    { kind: "StorageBuffer", binding: { group: 0, slot: 6 }, name: "firstDrawInTile", layout: TarrU32, access: "read", keep: true },
   ];
 }
 
