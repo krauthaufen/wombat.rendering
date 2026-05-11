@@ -174,21 +174,43 @@ const PACKER_F32: WgslPacker = {
   dataBytes: 4, typeId: 0,
   pack: (val, dst, off) => { dst[off] = val as number; },
 };
-// u32 lives in the arena as 4 bytes too — we write through a transient
-// Uint32 view over the same backing buffer so the integer bit-pattern is
-// preserved (Float32Array assignment would lossily truncate `(u32) -> f32`).
-const PACKER_U32: WgslPacker = {
-  dataBytes: 4, typeId: 0,
-  pack: (val, dst, off) => {
-    new Uint32Array(dst.buffer, dst.byteOffset + off * 4, 1)[0] = (val as number) >>> 0;
-  },
-};
-const PACKER_I32: WgslPacker = {
-  dataBytes: 4, typeId: 0,
-  pack: (val, dst, off) => {
-    new Int32Array(dst.buffer, dst.byteOffset + off * 4, 1)[0] = (val as number) | 0;
-  },
-};
+// Integer scalars / vectors. The arena is fronted by a `Float32Array`,
+// so writing raw bits has to go through a same-buffer Uint32/Int32 view
+// to avoid the lossy `i32 → f32` coercion you'd get from a direct
+// `dst[off] = ...` assignment.
+function makeIntPacker(
+  ctor: typeof Uint32Array | typeof Int32Array,
+  dim: 1 | 2 | 3 | 4,
+): WgslPacker {
+  const bytes = dim * 4;
+  if (dim === 1) {
+    return {
+      dataBytes: bytes, typeId: 0,
+      pack: (val, dst, off) => {
+        new ctor(dst.buffer as ArrayBuffer, dst.byteOffset + off * 4, 1)[0] = val as number;
+      },
+    };
+  }
+  // Vector: accept {x,y,z,w} components.
+  return {
+    dataBytes: bytes, typeId: 0,
+    pack: (val, dst, off) => {
+      const view = new ctor(dst.buffer as ArrayBuffer, dst.byteOffset + off * 4, dim);
+      const v = val as { x: number; y: number; z?: number; w?: number };
+      view[0] = v.x; view[1] = v.y;
+      if (dim >= 3) view[2] = v.z!;
+      if (dim >= 4) view[3] = v.w!;
+    },
+  };
+}
+const PACKER_U32     = makeIntPacker(Uint32Array, 1);
+const PACKER_UVEC2   = makeIntPacker(Uint32Array, 2);
+const PACKER_UVEC3   = makeIntPacker(Uint32Array, 3);
+const PACKER_UVEC4   = makeIntPacker(Uint32Array, 4);
+const PACKER_I32     = makeIntPacker(Int32Array, 1);
+const PACKER_IVEC2   = makeIntPacker(Int32Array, 2);
+const PACKER_IVEC3   = makeIntPacker(Int32Array, 3);
+const PACKER_IVEC4   = makeIntPacker(Int32Array, 4);
 
 function packerForWgslType(wgslType: string): WgslPacker {
   switch (wgslType) {
@@ -198,7 +220,13 @@ function packerForWgslType(wgslType: string): WgslPacker {
     case "vec2<f32>":   return PACKER_VEC2;
     case "f32":         return PACKER_F32;
     case "u32":         return PACKER_U32;
+    case "vec2<u32>":   return PACKER_UVEC2;
+    case "vec3<u32>":   return PACKER_UVEC3;
+    case "vec4<u32>":   return PACKER_UVEC4;
     case "i32":         return PACKER_I32;
+    case "vec2<i32>":   return PACKER_IVEC2;
+    case "vec3<i32>":   return PACKER_IVEC3;
+    case "vec4<i32>":   return PACKER_IVEC4;
     default:
       throw new Error(`heapScene: no JS-side packer for WGSL type '${wgslType}'`);
   }
