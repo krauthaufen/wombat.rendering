@@ -144,24 +144,37 @@ export class DerivedExpr {
   reflect(n: DerivedExpr): DerivedExpr { return new DerivedExpr(intrinsicExpr("reflect", this.ir.type, [this.ir, n.ir])); }
 }
 
-/** The `u` passed to a `derivedUniform` builder. `u.<Name>` is a mat4 trafo leaf. */
+/** The `u` passed to a `derivedUniform` builder. `u.<Name>` is a uniform leaf — a mat4
+ *  trafo by default; its real type when the wombat-shader-vite plugin supplies one (or
+ *  when you write `u.<Name>.as("vec4")`). */
 export type DerivedScope = { readonly [name: string]: DerivedExpr };
 
-function makeScope(): DerivedScope {
+/** Per-leaf type hints, keyed by uniform name (the build-time marker fills these in). */
+export type DerivedLeafTypes = Readonly<Record<string, LeafTypeName>>;
+
+function makeScope(leafTypes?: DerivedLeafTypes): DerivedScope {
   return new Proxy({} as DerivedScope, {
     get(_t, key): DerivedExpr {
       if (typeof key !== "string") throw new Error("derivedUniform: leaf names must be strings");
-      return new DerivedExpr(uniformRef(key, mat(4)));
+      const hinted = leafTypes?.[key];
+      return new DerivedExpr(uniformRef(key, hinted ? LEAF_TYPES[hinted] : mat(4)));
     },
   });
 }
 
 /**
  * Define a derived uniform. `derivedUniform(u => u.ViewTrafo.mul(u.ModelTrafo))` makes a
- * rule that slots in wherever a uniform value goes — see this module's header.
+ * rule that slots in wherever a uniform value goes — see this module's header. The optional
+ * `leafTypes` map gives `u.<Name>` leaves their real WGSL types (the wombat-shader-vite
+ * `derivedUniform(...)` marker fills it in from your `UniformScope` declarations; without
+ * the plugin, `u.<Name>` defaults to mat4 and you use `.as("vec4")` etc. when you need
+ * another type).
  */
-export function derivedUniform<T = unknown>(build: (u: DerivedScope) => DerivedExpr): DerivedRule<T> {
-  const result = build(makeScope());
+export function derivedUniform<T = unknown>(
+  build: (u: DerivedScope) => DerivedExpr,
+  leafTypes?: DerivedLeafTypes,
+): DerivedRule<T> {
+  const result = build(makeScope(leafTypes));
   if (!(result instanceof DerivedExpr)) {
     throw new Error("derivedUniform: the builder must return a derived expression, e.g. u.ViewTrafo.mul(u.ModelTrafo)");
   }
