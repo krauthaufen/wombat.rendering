@@ -1676,20 +1676,18 @@ export function buildHeapScene(
     const explicit = isDerivedRule(v);
     const rule = explicit ? v : STANDARD_DERIVED_RULES.get(name);
     if (rule === undefined) return undefined;
-    // Check the rule's input leaves are resolvable on this RO. A matrix-typed leaf needs an
-    // aval<Trafo3d> binding (constituent slot). Non-trafo / host-uniform leaves aren't wired
-    // yet — for an explicit user rule that's a hard error; for a standard recipe it just means
-    // "this RO doesn't supply the base trafos", so we fall back to the packed value.
+    // Each input leaf must be a uniform bound on this RO (a value, not another rule): a
+    // matrix-typed leaf resolves to a df32 constituent slot (it's expected to be an
+    // aval<Trafo3d>); anything else reads the packed value from the drawHeader. If a leaf
+    // isn't bound: for an explicit user rule that's a hard error; for a standard recipe it
+    // just means "this RO doesn't supply the base trafos", so the field falls back to its
+    // packed `spec.inputs` value (or errors later if there is none — same as without §7).
     for (const inp of inputsOf(rule.ir)) {
       const specName = STANDARD_TRAFO_LEAVES.get(inp.name) ?? inp.name;
       const lv = spec.inputs[specName];
-      const resolvable = inp.type.kind === "Matrix" && lv !== undefined && !isDerivedRule(lv);
-      if (!resolvable) {
+      if (lv === undefined || isDerivedRule(lv)) {
         if (explicit) {
-          throw new Error(
-            `derivedUniform '${name}': leaf '${inp.name}' is not resolvable on this RO ` +
-              `(need an aval<Trafo3d> binding; non-trafo host-uniform leaves aren't supported yet)`,
-          );
+          throw new Error(`derivedUniform '${name}': leaf '${inp.name}' is not a uniform bound on this RO`);
         }
         return undefined; // standard recipe, base trafos not bound here — use the packed value
       }
@@ -2830,7 +2828,14 @@ export function buildHeapScene(
         const reg = registerRoDerivations(derivedScene, {}, {
           rules: ruleSubset,
           trafoAvals,
-          hostUniformOffset: () => undefined,
+          // A non-trafo rule leaf reads the uniform's data straight from this RO's
+          // drawHeader region in the arena (= its pool ref + the alloc-header pad).
+          // Only resolvable if the uniform was actually packed (i.e. it's a drawHeader
+          // field of the effect too) — undefined otherwise, which `resolveSource` rejects.
+          hostUniformOffset: (n) => {
+            const r = perDrawRefs.get(n);
+            return r === undefined ? undefined : r + ALLOC_HEADER_PAD_TO;
+          },
           outputOffset: (n) => outOffsetByName.get(n),
           drawHeaderBaseByte: 0,
         });

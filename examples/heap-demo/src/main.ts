@@ -182,11 +182,13 @@ function makeUniforms(
              // the heap renderer accepts `aval | DerivedRule` for a uniform binding.)
              //   ModelViewTrafo = View·Model (same IR/hash as the built-in recipe).
              .add("ModelViewTrafo", derivedUniform(u => u.ViewTrafo.mul(u.ModelTrafo)) as unknown as aval<unknown>)
-             //   WorldUpInModel = (ModelTrafo)⁻¹ applied to the world-up direction (0,1,0) —
-             //   a genuinely custom rule (not a built-in recipe); the surface shader uses it
-             //   for a cheap "sky" shade. Goes through the codegen's generic (single-precision)
-             //   arm: load_mat4x4_f32 → rule_K(in0) { return ((in0 * vec4(0,1,0,0)).xyz); } → store_vec3_f32.
-             .add("WorldUpInModel", derivedUniform(u => u.ModelTrafo.inverse().transformDir(0, 1, 0)) as unknown as aval<unknown>);
+             //   WorldUpInModel = normalize((ModelTrafo)⁻¹ · (0,1,0,0)) — world-up in this
+             //   object's model space. A genuinely custom rule (not a built-in recipe); the
+             //   surface shader uses it for a cheap "sky" shade. Goes through the codegen's
+             //   generic (single-precision) arm — load_mat4x4_f32 → store_vec3_f32 with
+             //   rule_K(in0) { return normalize(((in0 * vec4(0,1,0,0)).xyz)); } — exercising
+             //   both the matrix transpose-on-load and a `normalize` intrinsic on the GPU.
+             .add("WorldUpInModel", derivedUniform(u => u.ModelTrafo.inverse().transformDir(0, 1, 0).normalize()) as unknown as aval<unknown>);
   } else {
     const projM44         = projTrafo.map(trafoToM44f);
     const modelViewM44    = viewTrafo.map(v => trafoToM44f(modelTrafo.mul(v)));
