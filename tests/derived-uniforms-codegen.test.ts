@@ -57,12 +57,40 @@ describe("derived-uniforms: codegen", () => {
     expect(wgsl).toContain("write_mat3_entry");
   });
 
-  it("throws on an unsupported rule shape", () => {
+  it("emits a generic arm (loaders/storers + an expr-printed rule fn) for a non-recipe shape", () => {
     const reg = new DerivedUniformRegistry();
-    // vec4 * f32 — not a recognised v0 shape
     const Tvec4: Type = { kind: "Vector", element: Tf32, dim: 4 };
-    const bad: Expr = { kind: "Mul", lhs: uniformRef("Color", Tvec4), rhs: uniformRef("Alpha", Tf32), type: Tvec4 };
-    reg.register(ruleFromIR(bad));
-    expect(() => buildUberKernel(reg, 5)).toThrow(/unsupported/);
+    // vec4 * f32 — not a recognised df32 shape ⇒ generic path
+    const ir: Expr = { kind: "Mul", lhs: uniformRef("Color", Tvec4), rhs: uniformRef("Alpha", Tf32), type: Tvec4 };
+    const id = reg.register(ruleFromIR(ir));
+    const { wgsl } = buildUberKernel(reg, 5);
+    expect(wgsl).toContain("fn load_vec4_f32(");
+    expect(wgsl).toContain("fn load_f32(");
+    expect(wgsl).toContain("fn store_vec4_f32(");
+    expect(wgsl).toContain(`fn rule_${id}(in0: vec4<f32>, in1: f32) -> vec4<f32>`);
+    expect(wgsl).toContain(`return (in0 * in1);`);
+    expect(wgsl).toContain(`fn arm_${id}(in0: u32, in1: u32, out_byte: u32)`);
+    expect(wgsl).toContain(`store_vec4_f32(out_byte, rule_${id}(a0, a1))`);
+  });
+
+  it("a generic mat4 rule loads/stores mat4x4<f32> and Inverse(constituent) becomes a bare param", () => {
+    const reg = new DerivedUniformRegistry();
+    // (View · Model) + Model⁻¹ — a chain plus an extra term ⇒ not a pure matmul chain ⇒ generic.
+    const ir: Expr = { kind: "Add", lhs: mul4(u("View"), u("Model")), rhs: inv4(u("Model")), type: Tmat4 };
+    const id = reg.register(ruleFromIR(ir));
+    const { wgsl } = buildUberKernel(reg, 5);
+    expect(wgsl).toContain("fn load_mat4x4_f32(");
+    expect(wgsl).toContain("fn store_mat4x4_f32(");
+    // inputs: in0 = View (forward), in1 = Model (forward), in2 = Model (inverse) — first-appearance order
+    expect(wgsl).toContain(`fn rule_${id}(in0: mat4x4<f32>, in1: mat4x4<f32>, in2: mat4x4<f32>) -> mat4x4<f32>`);
+    expect(wgsl).toContain(`return ((in0 * in1) + in2);`);
+  });
+
+  it("throws on a matrix inverse in the rule body (no WGSL inverse)", () => {
+    const reg = new DerivedUniformRegistry();
+    // Inverse of a *product* — not a constituent leaf, so it can't be served by reading a stored half.
+    const ir: Expr = inv4(mul4(u("View"), u("Model")));
+    reg.register(ruleFromIR(ir));
+    expect(() => buildUberKernel(reg, 5)).toThrow(/inverse/i);
   });
 });

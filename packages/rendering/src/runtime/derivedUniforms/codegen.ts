@@ -12,7 +12,9 @@
 // Arbitrary IR rules (the wgsl `expr()` lowering path) land in a follow-up;
 // codegen throws on a shape it doesn't recognise. See docs/derived-uniforms-extensible.md.
 
-import type { Expr } from "@aardworx/wombat.shader/ir";
+import type { Expr, Type, Literal } from "@aardworx/wombat.shader/ir";
+import { visitExprChildren } from "@aardworx/wombat.shader/ir";
+import { mapExpr } from "@aardworx/wombat.shader/passes";
 import type { DerivedUniformRegistry, RuleEntry } from "./registry.js";
 
 export interface UberKernel {
@@ -24,9 +26,10 @@ export interface UberKernel {
 // ─── Rule-shape classification ────────────────────────────────────────
 
 type Shape =
-  | { kind: "collapse"; arity: 1 }                 // mat4 in → mat4 out
-  | { kind: "matmulChain"; arity: number }         // L1·…·LN (all mat4) → mat4 out
-  | { kind: "normalMatrix"; arity: 1 };            // mat4 in → mat3 out (upper-3×3 of transpose)
+  | { kind: "collapse"; arity: 1 }                 // mat4 in → mat4 out (df32-precise)
+  | { kind: "matmulChain"; arity: number }         // L1·…·LN (all mat4) → mat4 out (df32-precise)
+  | { kind: "normalMatrix"; arity: 1 }             // mat4 in → mat3 out (upper-3×3 of transpose, df32)
+  | { kind: "generic"; arity: number };            // arbitrary IR, lowered via the wgsl printer (f32)
 
 function isMat4(e: Expr): boolean {
   const t = e.type;
@@ -56,25 +59,19 @@ function matmulChainLeaves(e: Expr): Expr[] | undefined {
 
 function classify(entry: RuleEntry): Shape {
   const ir = entry.ir;
-  if (isMat3(entry.outputType)) {
-    // Only mat4→mat3 rule we support: the normal matrix (upper-3×3 of the transposed input).
-    if (entry.inputs.length === 1) return { kind: "normalMatrix", arity: 1 };
-    throw new Error(`derived rule ${entry.id}: unsupported mat3 output shape`);
-  }
-  const chain = matmulChainLeaves(ir);
-  if (chain !== undefined) {
-    if (chain.length === 1) return { kind: "collapse", arity: 1 };
-    // The arm consumes inputs positionally in chain order; that matches `entry.inputs`
-    // (first-appearance order) only when no leaf is repeated.
-    if (chain.length !== entry.inputs.length) {
-      throw new Error(`derived rule ${entry.id}: a repeated input in a matmul chain is not supported in v0`);
+  // Preferred (df32-precise) shapes for the standard trafo recipes.
+  if (isMat3(entry.outputType) && entry.inputs.length === 1) return { kind: "normalMatrix", arity: 1 };
+  if (!isMat3(entry.outputType)) {
+    const chain = matmulChainLeaves(ir);
+    if (chain !== undefined) {
+      if (chain.length === 1) return { kind: "collapse", arity: 1 };
+      // The arm consumes inputs positionally in chain order; that matches `entry.inputs`
+      // (first-appearance order) only when no leaf is repeated — otherwise fall to generic.
+      if (chain.length === entry.inputs.length) return { kind: "matmulChain", arity: chain.length };
     }
-    return { kind: "matmulChain", arity: chain.length };
   }
-  throw new Error(
-    `derived rule ${entry.id}: unsupported IR shape (v0 supports constituent matmul chains and the normal matrix; ` +
-      `arbitrary-expression rules land in a follow-up)`,
-  );
+  // Anything else: lower the IR via the wgsl printer (single precision).
+  return { kind: "generic", arity: entry.inputs.length };
 }
 
 // ─── WGSL fragments ───────────────────────────────────────────────────
@@ -217,11 +214,222 @@ function emitMatMulChainArm(id: number, n: number): string {
   return `\nfn arm_${id}(${params}, out_byte: u32) {\n${body}}\n`;
 }
 
+// ─── Generic path: arbitrary IR lowered via the wgsl printer (f32) ────
+//
+// The rule's IR is rewritten so each input leaf — `ReadInput("Uniform", x)` or
+// `Inverse(ReadInput("Uniform", x))` (the constituent's stored backward half, already
+// inverted) — becomes a `Var("in<i>")`, then the wgsl `expr()` printer prints the body.
+// Inputs/outputs are f32 (constituents are loaded collapsed); a leftover `Inverse` of a
+// non-leaf throws (WGSL has no matrix inverse). Matrices are stored row-major in the heap
+// and df32-row-major in the constituents, so the loader transposes into a WGSL (column-major)
+// matrix value and the storer transposes back.
+
+interface WgslT { readonly wgsl: string; readonly sym: string; readonly isMat: boolean; readonly dim: number }
+
+function wgslTypeOf(t: Type, where: string): WgslT {
+  switch (t.kind) {
+    case "Float": return { wgsl: "f32", sym: "f32", isMat: false, dim: 1 };
+    case "Bool": throw new Error(`derived rule (${where}): bool is not a heap-storable type`);
+    case "Int": return t.signed
+      ? { wgsl: "i32", sym: "i32", isMat: false, dim: 1 }
+      : { wgsl: "u32", sym: "u32", isMat: false, dim: 1 };
+    case "Vector": {
+      if (t.element.kind !== "Float") throw new Error(`derived rule (${where}): only vecN<f32> supported`);
+      return { wgsl: `vec${t.dim}<f32>`, sym: `vec${t.dim}_f32`, isMat: false, dim: t.dim };
+    }
+    case "Matrix": {
+      if (t.element.kind !== "Float") throw new Error(`derived rule (${where}): only matNxM<f32> supported`);
+      if (t.rows !== t.cols || (t.rows !== 3 && t.rows !== 4)) {
+        throw new Error(`derived rule (${where}): only mat3x3<f32> / mat4x4<f32> supported`);
+      }
+      return { wgsl: `mat${t.cols}x${t.rows}<f32>`, sym: `mat${t.cols}x${t.rows}_f32`, isMat: true, dim: t.rows };
+    }
+    default: throw new Error(`derived rule (${where}): unsupported type kind '${t.kind}'`);
+  }
+}
+
+/** `load_<sym>(h: u32) -> <wgsl>` — from a constituent slot (df32, collapsed) or the main heap. */
+function emitLoader(t: WgslT): string {
+  if (t.isMat) {
+    const n = t.dim;
+    return `
+fn load_${t.sym}(h: u32) -> ${t.wgsl} {
+  var m: ${t.wgsl};
+  for (var r: u32 = 0u; r < ${n}u; r = r + 1u) {
+    for (var c: u32 = 0u; c < ${n}u; c = c + 1u) {
+      let e = load_entry_mat4(h, r, c);
+      m[c][r] = e.x + e.y;
+    }
+  }
+  return m;
+}
+`;
+  }
+  // Scalar / vector: from the main heap only (constituents are mat4 trafos).
+  const b = "let b = slot_payload(h) >> 2u;";
+  if (t.dim === 1) {
+    const conv = t.wgsl === "f32" ? "MainHeap[b]" : `bitcast<${t.wgsl}>(MainHeap[b])`;
+    return `\nfn load_${t.sym}(h: u32) -> ${t.wgsl} { ${b} return ${conv}; }\n`;
+  }
+  const comps = Array.from({ length: t.dim }, (_, i) => (i === 0 ? "MainHeap[b]" : `MainHeap[b + ${i}u]`)).join(", ");
+  return `\nfn load_${t.sym}(h: u32) -> ${t.wgsl} { ${b} return ${t.wgsl}(${comps}); }\n`;
+}
+
+/** `store_<sym>(out_byte: u32, v: <wgsl>)` — into the main heap. */
+function emitStorer(t: WgslT): string {
+  if (t.isMat) {
+    const n = t.dim;
+    const writeFn = n === 3 ? "write_mat3_entry" : "write_mat4_entry";
+    return `
+fn store_${t.sym}(out_byte: u32, v: ${t.wgsl}) {
+  for (var r: u32 = 0u; r < ${n}u; r = r + 1u) {
+    for (var c: u32 = 0u; c < ${n}u; c = c + 1u) { ${writeFn}(out_byte, r, c, v[c][r]); }
+  }
+}
+`;
+  }
+  const b = "let b = out_byte >> 2u;";
+  if (t.dim === 1) {
+    const v = t.wgsl === "f32" ? "v" : "bitcast<f32>(v)";
+    return `\nfn store_${t.sym}(out_byte: u32, v: ${t.wgsl}) { ${b} MainHeap[b] = ${v}; }\n`;
+  }
+  const comp = ["x", "y", "z", "w"];
+  const writes = Array.from({ length: t.dim }, (_, i) => `MainHeap[b + ${i}u] = v.${comp[i]};`).join(" ");
+  return `\nfn store_${t.sym}(out_byte: u32, v: ${t.wgsl}) { ${b} ${writes} }\n`;
+}
+
+function varExpr(idx: number, type: Type): Expr {
+  return { kind: "Var", var: { name: `in${idx}`, type, mutable: false }, type };
+}
+
+// ── Minimal IR → WGSL expression printer (self-contained; covers the subset a
+//    derived-rule body can be). Throws on anything not lowerable to plain WGSL. ──
+
+function wgslScalar(t: Type): string {
+  switch (t.kind) {
+    case "Float": return "f32";
+    case "Bool": return "bool";
+    case "Int": return t.signed ? "i32" : "u32";
+    default: throw new Error(`derived rule: non-scalar type where scalar expected`);
+  }
+}
+function wgslTypeName(t: Type): string {
+  switch (t.kind) {
+    case "Float": return "f32";
+    case "Bool": return "bool";
+    case "Int": return t.signed ? "i32" : "u32";
+    case "Vector": return `vec${t.dim}<${wgslScalar(t.element)}>`;
+    case "Matrix": return `mat${t.cols}x${t.rows}<${wgslScalar(t.element)}>`;
+    default: throw new Error(`derived rule: unsupported type '${t.kind}' in rule body`);
+  }
+}
+function wgslLiteral(l: Literal): string {
+  switch (l.kind) {
+    case "Bool": return l.value ? "true" : "false";
+    case "Int": return l.signed ? `${l.value}i` : `${l.value >>> 0}u`;
+    case "Float": return Number.isFinite(l.value) ? (Number.isInteger(l.value) ? `${l.value}.0` : `${l.value}`) : "0.0";
+    case "Null": return "0";
+  }
+}
+const BIN: Partial<Record<Expr["kind"], string>> = {
+  Add: "+", Sub: "-", Mul: "*", Div: "/", Mod: "%",
+  MulMatMat: "*", MulMatVec: "*", MulVecMat: "*",
+  And: "&&", Or: "||", BitAnd: "&", BitOr: "|", BitXor: "^",
+  Eq: "==", Neq: "!=", Lt: "<", Le: "<=", Gt: ">", Ge: ">=",
+};
+function printExpr(e: Expr): string {
+  switch (e.kind) {
+    case "Var": return e.var.name;
+    case "Const": return wgslLiteral(e.value);
+    case "Neg": return `(-${printExpr(e.value)})`;
+    case "Not": return `(!${printExpr(e.value)})`;
+    case "BitNot": return `(~${printExpr(e.value)})`;
+    case "Add": case "Sub": case "Mul": case "Div": case "Mod":
+    case "MulMatMat": case "MulMatVec": case "MulVecMat":
+    case "And": case "Or": case "BitAnd": case "BitOr": case "BitXor":
+    case "Eq": case "Neq": case "Lt": case "Le": case "Gt": case "Ge":
+      return `(${printExpr(e.lhs)} ${BIN[e.kind]} ${printExpr(e.rhs)})`;
+    case "ShiftLeft": case "ShiftRight": {
+      const op = e.kind === "ShiftLeft" ? "<<" : ">>";
+      const r = e.rhs.type.kind === "Int" && !e.rhs.type.signed ? printExpr(e.rhs) : `u32(${printExpr(e.rhs)})`;
+      return `(${printExpr(e.lhs)} ${op} ${r})`;
+    }
+    case "Transpose": return `transpose(${printExpr(e.value)})`;
+    case "Determinant": return `determinant(${printExpr(e.value)})`;
+    case "Dot": return `dot(${printExpr(e.lhs)}, ${printExpr(e.rhs)})`;
+    case "Cross": return `cross(${printExpr(e.lhs)}, ${printExpr(e.rhs)})`;
+    case "Length": return `length(${printExpr(e.value)})`;
+    case "VecSwizzle": return `${printExpr(e.value)}.${e.comps.join("")}`;
+    case "VecItem": return `${printExpr(e.value)}[${printExpr(e.index)}]`;
+    case "MatrixCol": return `${printExpr(e.matrix)}[${printExpr(e.col)}]`;
+    case "MatrixElement": return `${printExpr(e.matrix)}[${printExpr(e.col)}][${printExpr(e.row)}]`;
+    case "NewVector": return `${wgslTypeName(e.type)}(${e.components.map(printExpr).join(", ")})`;
+    case "Conditional": return `select(${printExpr(e.ifFalse)}, ${printExpr(e.ifTrue)}, ${printExpr(e.cond)})`;
+    case "Convert": case "ConvertMatrix": return `${wgslTypeName(e.type)}(${printExpr(e.value)})`;
+    case "Field": return `${printExpr(e.target)}.${e.name}`;
+    case "Item": return `${printExpr(e.target)}[${printExpr(e.index)}]`;
+    case "CallIntrinsic": return `${e.op.emit.wgsl}(${e.args.map(printExpr).join(", ")})`;
+    default:
+      throw new Error(`derived rule: IR node '${e.kind}' is not supported in a rule body`);
+  }
+}
+
+const INV_SUFFIX = "inv"; // names a synthetic "inverted constituent" leaf during rewriting
+
+/** Rewrite `entry.ir` so input leaves become `Var("in<i>")`, then print the body via wgsl `expr()`. */
+function emitGenericRuleFn(entry: RuleEntry): string {
+  const byName = new Map<string, number>();
+  entry.inputs.forEach((inp, i) => byName.set(inp.inverse ? inp.name + INV_SUFFIX : inp.name, i));
+  // Pass 1: collapse `Inverse(ReadInput("Uniform", x))` → `ReadInput("Uniform", xinv)`.
+  const collapsed = mapExpr(entry.ir, (e) =>
+    e.kind === "Inverse" && e.value.kind === "ReadInput" && e.value.scope === "Uniform"
+      ? ({ kind: "ReadInput", scope: "Uniform", name: e.value.name + INV_SUFFIX, type: e.type } as Expr)
+      : e,
+  );
+  // Pass 2: every `ReadInput("Uniform", n)` → `Var("in<i>")`.
+  const body = mapExpr(collapsed, (e) => {
+    if (e.kind === "ReadInput" && e.scope === "Uniform") {
+      const idx = byName.get(e.name);
+      if (idx === undefined) throw new Error(`derived rule ${entry.id}: input leaf '${e.name}' not in the rule's input list`);
+      return varExpr(idx, e.type);
+    }
+    return e;
+  });
+  // Anything not lowerable to plain WGSL?
+  const walk = (e: Expr): void => {
+    if (e.kind === "Inverse") {
+      throw new Error(`derived rule ${entry.id}: a matrix inverse in the rule body is not supported (WGSL has no inverse — only Inverse of a constituent input is, which reads its stored backward half)`);
+    }
+    if (e.kind === "ReadInput") throw new Error(`derived rule ${entry.id}: unresolved input leaf '${e.name}'`);
+    visitExprChildren(e, walk);
+  };
+  walk(body);
+  const params = entry.inputs.map((inp, i) => `in${i}: ${wgslTypeOf(inp.type, `rule ${entry.id} input ${i}`).wgsl}`).join(", ");
+  const ret = wgslTypeOf(entry.outputType, `rule ${entry.id} output`).wgsl;
+  return `\nfn rule_${entry.id}(${params}) -> ${ret} {\n  return ${printExpr(body)};\n}\n`;
+}
+
+function emitGenericArm(entry: RuleEntry): string {
+  const inTs = entry.inputs.map((inp, i) => wgslTypeOf(inp.type, `rule ${entry.id} input ${i}`));
+  const outT = wgslTypeOf(entry.outputType, `rule ${entry.id} output`);
+  const params = inTs.map((_, i) => `in${i}: u32`).join(", ");
+  let body = "";
+  inTs.forEach((t, i) => { body += `  let a${i} = load_${t.sym}(in${i});\n`; });
+  const callArgs = inTs.map((_, i) => `a${i}`).join(", ");
+  body += `  store_${outT.sym}(out_byte, rule_${entry.id}(${callArgs}));\n`;
+  return `${emitGenericRuleFn(entry)}\nfn arm_${entry.id}(${params}, out_byte: u32) {\n${body}}\n`;
+}
+
+function genericTypes(entry: RuleEntry): WgslT[] {
+  return [...entry.inputs.map((inp, i) => wgslTypeOf(inp.type, `rule ${entry.id} input ${i}`)), wgslTypeOf(entry.outputType, `rule ${entry.id} output`)];
+}
+
 function emitArm(entry: RuleEntry, shape: Shape): string {
   switch (shape.kind) {
     case "collapse": return emitCollapseArm(entry.id);
     case "normalMatrix": return emitNormalMatrixArm(entry.id);
     case "matmulChain": return emitMatMulChainArm(entry.id, shape.arity);
+    case "generic": return emitGenericArm(entry);
   }
 }
 
@@ -237,6 +445,13 @@ export function buildUberKernel(registry: DerivedUniformRegistry, strideU32: num
   const entries = registry.entries();
   const shapes = entries.map((e) => classify(e));
 
+  // Loaders / storers needed by the generic-path rules, deduped by WGSL type symbol.
+  const ioTypes = new Map<string, WgslT>();
+  entries.forEach((e, i) => {
+    if (shapes[i]!.kind === "generic") for (const t of genericTypes(e)) ioTypes.set(t.sym, t);
+  });
+  const loadersStorers = [...ioTypes.values()].map((t) => emitLoader(t) + emitStorer(t)).join("");
+
   const arms = entries.map((e, i) => emitArm(e, shapes[i]!)).join("");
   const cases = entries.map((e, i) => emitCase(e, shapes[i]!)).join("\n");
   const needsDf32 = shapes.some((s) => s.kind === "matmulChain");
@@ -244,6 +459,7 @@ export function buildUberKernel(registry: DerivedUniformRegistry, strideU32: num
   const wgsl = `${bindings(strideU32)}
 ${needsDf32 ? DF32_LIB : ""}
 ${HANDLE_HELPERS}
+${loadersStorers}
 ${arms}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
