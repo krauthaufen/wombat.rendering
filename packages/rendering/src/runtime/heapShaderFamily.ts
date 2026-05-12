@@ -18,6 +18,7 @@ import { combineHashes } from "@aardworx/wombat.shader/ir";
 import {
   compileHeapEffect,
   buildBucketLayout,
+  bucketLayoutId,
   megacallSearchPrelude,
   type HeapEffectSchema,
   type HeapVarying,
@@ -480,7 +481,7 @@ function unionDrawHeaders(
   // descriptor-only purpose of this slice, the per-effect-allocated
   // numbers are retained as-is on each entry.
 
-  return {
+  const base = {
     drawHeaderFields: fields,
     drawHeaderBytes,
     preludeWgsl: "", // Family-level prelude is a future slice; not produced here.
@@ -491,6 +492,7 @@ function unionDrawHeaders(
     samplerBindings: orderedSamplers,
     atlasTextureBindings: atlasUnion,
   };
+  return { id: bucketLayoutId(base), ...base };
 }
 
 function checkVaryingTypeAgreement(

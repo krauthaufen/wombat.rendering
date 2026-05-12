@@ -799,18 +799,88 @@ function byteOffsetOf(byteOffset: number): { u32: number } {
  */
 export type HeapEffectEmitMode = "standalone" | "family-member";
 
+export interface HeapEffectIR { vs: string; fs: string; preludeWgsl: string; vsEntry: string; fsEntry: string }
+
+// ─── Compiled-heap-effect cache (in-memory tier 1 + localStorage tier 2)
+//
+// `compileHeapEffectIRViaDecoder` is the IR-rewrite + WGSL-emit step —
+// the ~15% of cold boot in the profile. Its output is fully determined
+// by `(userEffect.id, layout.id, mode, compileOptions)`, all stable
+// content hashes/values, and is plain JSON (five WGSL strings). So:
+//   tier 1 — module-level Map: zero re-walks within a run.
+//   tier 2 — localStorage: zero re-walks across reloads. The persisted
+//            key is stamped with HEAP_PERSIST_VERSION (bump it whenever
+//            this rewrite, the WGSL emitter, or wombat.shader codegen
+//            changes — it's the "all participating repos" stamp) so an
+//            upgrade can never serve stale WGSL. Cold start (empty
+//            storage) is unchanged.
+// All `localStorage` access is wrapped — it throws in private-browsing,
+// when disabled, and on quota; any failure just degrades to "recompute".
+
+/** Cache-generation stamp for the localStorage tier. **Bump on any
+ *  change to the heap IR rewrite / WGSL emitter / wombat.shader codegen.**
+ *  (Encodes the participating-package state; a manual stamp rather than
+ *  build-injected versions, but the invalidation guarantee is the same.) */
+const HEAP_PERSIST_VERSION = "h1";
+const HEAP_PERSIST_PREFIX = "wbt.heapfx.";
+
+function compileOptionsKey(o: CompileOptions): string {
+  return o.target +
+    (o.skipOptimisations ? ":raw" : "") +
+    (o.fragmentOutputLayout !== undefined
+      ? ":fbo[" + [...o.fragmentOutputLayout.locations.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([n, l]) => `${n}=${l}`).join("|") + "]"
+      : "") +
+    (o.instanceAttributes && o.instanceAttributes.size > 0 ? ":inst[" + [...o.instanceAttributes].sort().join(",") + "]" : "");
+}
+
+const _heapIrMemCache = new Map<string, HeapEffectIR>();
+
+function lsGet(key: string): HeapEffectIR | undefined {
+  try {
+    const raw = globalThis.localStorage?.getItem(key);
+    if (raw == null) return undefined;
+    const v = JSON.parse(raw) as HeapEffectIR;
+    if (typeof v?.vs === "string" && typeof v?.fs === "string") return v;
+    return undefined;
+  } catch { return undefined; }
+}
+function lsSet(key: string, value: HeapEffectIR): void {
+  try {
+    const ls = globalThis.localStorage;
+    if (ls == null) return;
+    try { ls.setItem(key, JSON.stringify(value)); }
+    catch {
+      // Likely quota — drop everything under our prefix and retry once.
+      try {
+        for (let i = ls.length - 1; i >= 0; i--) { const k = ls.key(i); if (k != null && k.startsWith(HEAP_PERSIST_PREFIX)) ls.removeItem(k); }
+        ls.setItem(key, JSON.stringify(value));
+      } catch { /* give up — recompute next time */ }
+    }
+  } catch { /* no storage */ }
+}
+
 export function compileHeapEffectIR(
   userEffect: Effect,
   layout: BucketLayout,
   compileOptions: CompileOptions,
   mode: HeapEffectEmitMode = "standalone",
-): { vs: string; fs: string; preludeWgsl: string; vsEntry: string; fsEntry: string } {
+): HeapEffectIR {
+  const cacheKey = `${userEffect.id}|${layout.id}|${mode}|${compileOptionsKey(compileOptions)}`;
+  const mem = _heapIrMemCache.get(cacheKey);
+  if (mem !== undefined) return mem;
+  const lsKey = HEAP_PERSIST_PREFIX + HEAP_PERSIST_VERSION + "." + cacheKey;
+  const persisted = lsGet(lsKey);
+  if (persisted !== undefined) { _heapIrMemCache.set(cacheKey, persisted); return persisted; }
+
   // Both modes run through the composition-based heap rewrite.
   // Family-member mode skips the megacall prelude in the decoder
   // (wrapper VS owns it) and re-shapes the emitted @vertex into a
   // regular function so heapShaderFamily can splice it into the family
   // wrapper.
-  return compileHeapEffectIRViaDecoder(userEffect, layout, compileOptions, mode);
+  const result = compileHeapEffectIRViaDecoder(userEffect, layout, compileOptions, mode);
+  _heapIrMemCache.set(cacheKey, result);
+  lsSet(lsKey, result);
+  return result;
 
   // ────────── legacy path (no longer reached) ──────────
   // Kept below temporarily for reference during the migration. The

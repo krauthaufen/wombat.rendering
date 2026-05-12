@@ -258,6 +258,15 @@ export interface DrawHeaderField {
 }
 
 export interface BucketLayout {
+  /**
+   * Stable content hash of everything in this layout that the IR
+   * rewriter (`compileHeapEffectIR`) reads — drawHeader fields, the
+   * per-instance sets, texture/sampler bindings, the atlas set, and the
+   * prelude. Two `buildBucketLayout` calls with equivalent inputs
+   * produce the same `id`, so downstream compiles can cache on
+   * `(effect.id, layout.id, …)` instead of re-walking the IR.
+   */
+  readonly id: string;
   readonly drawHeaderFields: readonly DrawHeaderField[];
   readonly drawHeaderBytes: number;
   /** Generated WGSL prelude — bindings + per-effect VsOut struct. No helper fns, no DrawHeader struct. */
@@ -438,13 +447,42 @@ export function buildBucketLayout(
     isAtlasBucket,
   );
 
-  return {
+  const base = {
     drawHeaderFields, drawHeaderBytes, preludeWgsl, strideU32,
-    perInstanceUniforms,
-    perInstanceAttributes,
-    textureBindings, samplerBindings,
-    atlasTextureBindings,
+    perInstanceUniforms, perInstanceAttributes,
+    textureBindings, samplerBindings, atlasTextureBindings,
   };
+  return { id: bucketLayoutId(base), ...base };
+}
+
+/** FNV-1a (32-bit) over a string — self-contained, no deps. Good enough
+ *  for cache keys (a collision only ever costs a redundant recompile,
+ *  never correctness, since these keys are always paired with `effect.id`). */
+export function fnv1a32(s: string): number {
+  let h = 0x811c9dc5 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h >>> 0;
+}
+
+/** Deterministic content hash of a {@link BucketLayout}'s rewriter-visible
+ *  fields. Same inputs ⇒ same id; used by `compileHeapEffectIR`'s cache. */
+export function bucketLayoutId(l: Omit<BucketLayout, "id">): string {
+  const parts: string[] = [`dhBytes=${l.drawHeaderBytes}`];
+  for (const f of l.drawHeaderFields) {
+    parts.push(`F:${f.name}|${f.wgslName}|${f.wgslType}|${f.byteOffset}|${f.byteSize}|${f.kind}|${f.uniformWgslType ?? ""}|${f.attributeWgslType ?? ""}|${f.textureSub ?? ""}|${f.textureBindingName ?? ""}`);
+  }
+  parts.push("PIU:" + [...l.perInstanceUniforms].sort().join(","));
+  parts.push("PIA:" + [...l.perInstanceAttributes].sort().join(","));
+  for (const t of l.textureBindings) parts.push(`T:${t.name}|${t.wgslType}|${t.binding}`);
+  for (const s of l.samplerBindings) parts.push(`S:${s.name}|${s.wgslType}|${s.binding}`);
+  parts.push("ATB:" + [...l.atlasTextureBindings].sort().join(","));
+  // The prelude is derived from the above, but fold its hash in too —
+  // cheap insurance against any generator path the field list misses.
+  parts.push("PRE:" + fnv1a32(l.preludeWgsl).toString(36));
+  return "bl_" + fnv1a32(parts.join("\n")).toString(36);
 }
 
 /**
