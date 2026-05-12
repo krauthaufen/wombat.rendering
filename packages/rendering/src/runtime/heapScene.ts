@@ -72,7 +72,7 @@ import {
 import {
   DerivedUniformsScene,
   registerRoDerivations, deregisterRoDerivations,
-  isStandardDerivedName, STANDARD_DERIVED_RULES, STANDARD_TRAFO_LEAVES,
+  isDerivedRule, STANDARD_DERIVED_RULES, STANDARD_TRAFO_LEAVES,
   type RoRegistration, type DerivedRule,
 } from "./derivedUniforms/index.js";
 
@@ -1664,6 +1664,15 @@ export function buildHeapScene(
    *  Drained on removeDraw to release slots + records. */
   const derivedByDrawId = new Map<number, RoRegistration>();
 
+  /** The derived-uniform rule for a uniform binding on this RO, if any: an explicit
+   *  `derivedUniform(...)` value in `spec.inputs`, or a standard trafo recipe by name.
+   *  (A uniform binding is either a value — an aval/constant — or a rule.) */
+  const ruleForUniform = (spec: HeapDrawSpec, name: string): DerivedRule | undefined => {
+    if (derivedScene === undefined) return undefined;
+    const v = spec.inputs[name];
+    return isDerivedRule(v) ? v : STANDARD_DERIVED_RULES.get(name);
+  };
+
   // ─── Atlas bindings ───────────────────────────────────────────────
   //
   // A bucket whose textures live in the atlas binds N consecutive
@@ -2624,7 +2633,7 @@ export function buildHeapScene(
         // pre-pass. We still allocate an arena slot here so the
         // drawHeader gets a valid ref written by packBucketHeader; §7
         // overwrites the arena data each frame the inputs are dirty.
-        if (derivedScene !== undefined && isStandardDerivedName(f.name)) {
+        if (ruleForUniform(spec, f.name) !== undefined) {
           const dummyAval = AVal.constant<M44d>(M44d.zero);
           const ref = pool.acquire(
             device, arena.attrs, dummyAval, M44d.zero,
@@ -2761,18 +2770,17 @@ export function buildHeapScene(
     drawIdToIndexAval[drawId] = indicesAval;
 
     // ─── §7 derived-uniforms registration ────────────────────────────
-    // Collect the derived names this effect actually uses (i.e. fields
-    // declared in the drawHeader for this effect AND in the §7 set).
-    // For each, the kernel writes into byte offset
-    //   localSlot * drawHeaderBytes + field.byteOffset
-    // i.e. this RO's drawHeader region in the bucket's drawHeap.
+    // A uniform binding on this RO is either a value (aval/constant) or a rule —
+    // collect the rules (explicit `derivedUniform(...)` values + standard trafo
+    // recipes) for fields the effect declares. The kernel writes each result into
+    // this RO's drawHeader region in the bucket's drawHeap (its arena slot).
     if (derivedScene !== undefined) {
       const ruleSubset = new Map<string, DerivedRule>();
       const outOffsetByName = new Map<string, number>();
       for (const f of bucket.layout.drawHeaderFields) {
         if (f.name === "__layoutId") continue;
         if (!effectFields.has(f.name)) continue;
-        const rule = STANDARD_DERIVED_RULES.get(f.name);
+        const rule = ruleForUniform(spec, f.name);
         if (rule === undefined) continue;
         const ref = perDrawRefs.get(f.name);
         if (ref === undefined) continue;
@@ -2780,10 +2788,20 @@ export function buildHeapScene(
         outOffsetByName.set(f.name, ref + ALLOC_HEADER_PAD_TO);
       }
       if (ruleSubset.size > 0) {
+        // Trafo avals a rule leaf may reference: the standard `Model`/`View`/`Proj`
+        // leaf names (mapped to their `*Trafo` bindings), plus every aval-valued input
+        // by its own name (so a `derivedUniform(u => u.ViewTrafo.mul(u.ModelTrafo))`
+        // resolves `u.ViewTrafo` to that binding). resolveSource only uses these for
+        // matrix-typed leaves; a non-matrix leaf falls through to the (unsupported-in-v0)
+        // host path.
         const trafoAvals = new Map<string, aval<Trafo3d>>();
         for (const [leaf, specName] of STANDARD_TRAFO_LEAVES) {
-          const av = spec.inputs[specName] as aval<Trafo3d> | undefined;
-          if (av !== undefined) trafoAvals.set(leaf, av);
+          const av = spec.inputs[specName];
+          if (av !== undefined && !isDerivedRule(av)) trafoAvals.set(leaf, av as aval<Trafo3d>);
+        }
+        for (const n of Object.keys(spec.inputs)) {
+          const v = spec.inputs[n];
+          if (v !== undefined && !isDerivedRule(v) && !trafoAvals.has(n)) trafoAvals.set(n, v as aval<Trafo3d>);
         }
         const reg = registerRoDerivations(derivedScene, {}, {
           rules: ruleSubset,

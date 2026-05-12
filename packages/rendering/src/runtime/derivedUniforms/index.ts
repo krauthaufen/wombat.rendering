@@ -21,8 +21,12 @@
 
 export {
   type DerivedRule, type IRFragment,
-  ruleFromIR, uniformRef, sameType, hashIR,
+  ruleFromIR, uniformRef, sameType, hashIR, isDerivedRule,
 } from "./rule.js";
+
+export {
+  derivedUniform, DerivedExpr, type DerivedScope,
+} from "./marker.js";
 
 export {
   type RuleInput,

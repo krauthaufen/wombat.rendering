@@ -16,6 +16,8 @@ import { hashValue, stableStringify } from "@aardworx/wombat.shader/ir";
 export type IRFragment = Expr;
 
 export interface DerivedRule<T = unknown> {
+  /** Brand — lets `isDerivedRule` recognise a rule among uniform binding values. */
+  readonly __derivedRule: true;
   /** Output WGSL type (`=== ir.type`). Drives the storer codegen and the drawHeader byte budget. */
   readonly outputType: Type;
   /** Pure IR computing the output; every leaf input is a `ReadInput("Uniform", name)`. */
@@ -24,6 +26,11 @@ export interface DerivedRule<T = unknown> {
   readonly hash: string;
   /** Phantom — carries the TS result type through `derivedUniform<T>`. Never read. */
   readonly __t?: T;
+}
+
+/** True iff `x` is a derived-uniform rule (vs. an `aval` / constant value). */
+export function isDerivedRule(x: unknown): x is DerivedRule {
+  return typeof x === "object" && x !== null && (x as { __derivedRule?: unknown }).__derivedRule === true;
 }
 
 /** True iff two IR `Type`s are structurally identical. */
@@ -43,7 +50,7 @@ export function ruleFromIR<T = unknown>(ir: Expr, outputType: Type = ir.type): D
       `derived rule: declared outputType ${stableStringify(outputType)} != ir type ${stableStringify(ir.type)}`,
     );
   }
-  return { outputType, ir, hash: hashIR(ir) };
+  return { __derivedRule: true, outputType, ir, hash: hashIR(ir) };
 }
 
 /** A `ReadInput("Uniform", name)` leaf of the given type — the only leaf kind a rule may use. */

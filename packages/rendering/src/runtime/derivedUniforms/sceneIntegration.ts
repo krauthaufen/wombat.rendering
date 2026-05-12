@@ -159,19 +159,22 @@ export function registerRoDerivations(
     return p;
   };
   const resolve = (inp: RuleInput): number => {
-    if (req.trafoAvals.has(inp.name)) {
+    // A matrix-typed leaf bound as an aval is a `Trafo3d` ⇒ a df32 constituent slot
+    // (its `Inverse` reads the stored backward half — free).
+    if (inp.type.kind === "Matrix" && req.trafoAvals.has(inp.name)) {
       const p = acquireTrafo(inp.name);
       return makeHandle(SlotTag.Constituent, inp.inverse ? p.inv : p.fwd);
     }
-    // Anything that isn't a constituent trafo is a plain host uniform — whatever
-    // value reached this RO (the sg already collapsed any subtree overrides).
+    // Anything else is a plain host uniform — whatever value reached this RO (the sg
+    // already collapsed any subtree overrides).
     if (inp.inverse) {
-      throw new Error(`derivedUniforms: Inverse of a non-constituent input '${inp.name}' is not supported in v0`);
+      throw new Error(`derivedUniforms: Inverse of a non-constituent input '${inp.name}' is not supported`);
     }
     const off = req.hostUniformOffset(inp.name);
     if (off !== undefined) return makeHandle(SlotTag.HostHeap, req.drawHeaderBaseByte + off);
     throw new Error(
-      `derivedUniforms: rule input '${inp.name}' cannot be resolved on this RO (not a trafo nor a host uniform)`,
+      `derivedUniforms: rule input '${inp.name}' cannot be resolved on this RO ` +
+        `(not a Trafo3d binding, and non-trafo host-uniform leaves aren't supported yet)`,
     );
   };
 
