@@ -34,6 +34,7 @@ import { ISampler } from "../core/sampler.js";
 import type { RenderObject } from "../core/renderObject.js";
 import { asAttributeProvider, asUniformProvider } from "../core/provider.js";
 import type { HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
+import { compileHeapEffect } from "./heapEffect.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
 
 /**
@@ -187,9 +188,14 @@ export function renderObjectToHeapSpec(
   //    is harmless (no drawHeader field → ignored).
   const vAttr = asAttributeProvider(ro.vertexAttributes);
   const uProv = asUniformProvider(ro.uniforms);
-  const iface = ro.effect.compile({ target: "wgsl" }).interface;
+  // The names this effect declares (post link + DCE) — via the
+  // localStorage-backed `compileHeapEffect` cache rather than a raw
+  // `effect.compile()`, so a warm reload skips the optimiser pipeline
+  // here too. `schema.uniforms` already merges uniform-block fields +
+  // loose uniforms and drops names shadowed by an attribute.
+  const schema = compileHeapEffect(ro.effect).schema;
   const inputs: { [name: string]: aval<unknown> | unknown } = {};
-  for (const a of iface.attributes) {
+  for (const a of schema.attributes) {
     const bv = vAttr.tryGet(a.name);
     if (bv !== undefined) inputs[a.name] = bv;
   }
@@ -198,8 +204,7 @@ export function renderObjectToHeapSpec(
     const av = uProv.tryGet(name);
     if (av !== undefined) inputs[name] = av;
   };
-  for (const b of iface.uniformBlocks) for (const f of b.fields) pullUniform(f.name);
-  for (const u of iface.uniforms) pullUniform(u.name);
+  for (const u of schema.uniforms) pullUniform(u.name);
   // §7 derived-uniforms constituents — cheap (these are the raw
   // `state.model/view/proj` avals, no `compose`/`inverse`) and the
   // compute pre-pass needs them even when the effect itself doesn't
