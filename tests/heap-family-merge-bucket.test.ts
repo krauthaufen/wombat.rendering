@@ -40,7 +40,13 @@ if (typeof (globalThis as { GPUShaderStage?: unknown }).GPUShaderStage === "unde
 }
 
 const IDENTITY44 = (() => { const a = new Float64Array(16); a[0]=1; a[5]=1; a[10]=1; a[15]=1; return a; })();
-const trafoIdentity = { forward: { toArray: () => IDENTITY44 } } as unknown;
+const trafoIdentity = { forward: {
+  toArray: () => IDENTITY44,
+  copyTo: (dst: Float32Array | Float64Array | number[], off = 0): void => {
+    if (Array.isArray(dst)) { for (let i = 0; i < 16; i++) dst[off + i] = IDENTITY44[i]!; }
+    else dst.set(IDENTITY44, off);
+  },
+} } as unknown;
 const v3 = (x: number, y: number, z: number) => ({ x, y, z }) as unknown;
 const v4 = (x: number, y: number, z: number, w: number) => ({ x, y, z, w }) as unknown;
 

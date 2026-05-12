@@ -98,11 +98,10 @@ const SEM_NORMALS   = 2;
 const ALIGN16 = (n: number) => (n + 15) & ~15;
 
 function packMat44(m: M44d, dst: Float32Array, off: number): void {
-  // M44d._data is the row-major Float64Array; not part of the public
-  // type surface. toArray() round-trips through a fresh number[] which
-  // we copy into the f32 staging buffer below.
-  const r = m.toArray();
-  for (let i = 0; i < 16; i++) dst[off + i] = r[i]!;
+  // Zero-alloc flat copy (row-major) straight into the f32 staging
+  // buffer — `copyTo` does `dst.set(m._data, off)` which narrows f64→f32
+  // on store, no throwaway `number[]` per call.
+  m.copyTo(dst, off);
 }
 
 // ─── Layout-driven value packing ────────────────────────────────────
