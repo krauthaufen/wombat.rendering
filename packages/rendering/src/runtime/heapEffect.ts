@@ -79,7 +79,25 @@ export interface FragmentOutputLayout {
   readonly locations: ReadonlyMap<string, number>;
 }
 
+// `effect.compile()` is itself id-keyed, but `buildSchema(interface)`
+// walks the interface every call — and `compileHeapEffect` is invoked
+// once per family build, so two builds of the same `(effect, fbo)` (a
+// re-mounted `<RenderControl>`, a second scene compile) would re-walk.
+// Cache the whole `CompiledHeapEffect` on the effect's content id plus
+// the fragment-output-layout. Module-level, never evicted (bounded by
+// distinct effects × distinct fbo layouts). The result is plain data
+// (WGSL strings + a schema object) — directly persistable later.
+const _compiledHeapEffectCache = new Map<string, CompiledHeapEffect>();
+
+function fboLayoutKey(layout: FragmentOutputLayout | undefined): string {
+  if (layout === undefined) return "";
+  return ":fbo[" + [...layout.locations.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([n, l]) => `${n}=${l}`).join("|") + "]";
+}
+
 export function compileHeapEffect(effect: Effect, fragmentOutputLayout?: FragmentOutputLayout): CompiledHeapEffect {
+  const key = effect.id + fboLayoutKey(fragmentOutputLayout);
+  const cached = _compiledHeapEffectCache.get(key);
+  if (cached !== undefined) return cached;
   const compiled = effect.compile(
     fragmentOutputLayout !== undefined
       ? { target: "wgsl", fragmentOutputLayout }
@@ -87,11 +105,13 @@ export function compileHeapEffect(effect: Effect, fragmentOutputLayout?: Fragmen
   );
   const vsStage = compiled.stages.find(s => s.stage === "vertex");
   const fsStage = compiled.stages.find(s => s.stage === "fragment");
-  return {
+  const result: CompiledHeapEffect = {
     rawVs: vsStage?.source ?? "",
     rawFs: fsStage?.source ?? "",
     schema: buildSchema(compiled.interface),
   };
+  _compiledHeapEffectCache.set(key, result);
+  return result;
 }
 
 // ─── IR-Type → WGSL-string + packed-size helpers ────────────────────
