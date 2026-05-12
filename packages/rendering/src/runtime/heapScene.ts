@@ -72,8 +72,8 @@ import {
 import {
   DerivedUniformsScene,
   registerRoDerivations, deregisterRoDerivations,
-  isDerivedUniformName,
-  type RoRegistration,
+  isStandardDerivedName, STANDARD_DERIVED_RULES, STANDARD_TRAFO_LEAVES,
+  type RoRegistration, type DerivedRule,
 } from "./derivedUniforms/index.js";
 
 // ---------------------------------------------------------------------------
@@ -1658,7 +1658,6 @@ export function buildHeapScene(
     ? new DerivedUniformsScene(device, arena.attrs.buffer, {
         // Larger initial capacity reduces grow-during-first-frame churn.
         initialConstituentSlots: 4096,
-        initialRecordCapacity:   8192,
       })
     : undefined;
   /** Per-RO §7 registration handles, keyed by global drawId.
@@ -2625,7 +2624,7 @@ export function buildHeapScene(
         // pre-pass. We still allocate an arena slot here so the
         // drawHeader gets a valid ref written by packBucketHeader; §7
         // overwrites the arena data each frame the inputs are dirty.
-        if (derivedScene !== undefined && isDerivedUniformName(f.name)) {
+        if (derivedScene !== undefined && isStandardDerivedName(f.name)) {
           const dummyAval = AVal.constant<M44d>(M44d.zero);
           const ref = pool.acquire(
             device, arena.attrs, dummyAval, M44d.zero,
@@ -2768,26 +2767,29 @@ export function buildHeapScene(
     //   localSlot * drawHeaderBytes + field.byteOffset
     // i.e. this RO's drawHeader region in the bucket's drawHeap.
     if (derivedScene !== undefined) {
-      const requiredNames: string[] = [];
-      const arenaByteOffsetByName = new Map<string, number>();
+      const ruleSubset = new Map<string, DerivedRule>();
+      const outOffsetByName = new Map<string, number>();
       for (const f of bucket.layout.drawHeaderFields) {
         if (f.name === "__layoutId") continue;
         if (!effectFields.has(f.name)) continue;
-        if (!isDerivedUniformName(f.name)) continue;
+        const rule = STANDARD_DERIVED_RULES.get(f.name);
+        if (rule === undefined) continue;
         const ref = perDrawRefs.get(f.name);
         if (ref === undefined) continue;
-        requiredNames.push(f.name);
-        arenaByteOffsetByName.set(f.name, ref + ALLOC_HEADER_PAD_TO);
+        ruleSubset.set(f.name, rule);
+        outOffsetByName.set(f.name, ref + ALLOC_HEADER_PAD_TO);
       }
-      if (requiredNames.length > 0) {
-        const reg = registerRoDerivations(derivedScene, {
-          trafos: {
-            modelTrafo: spec.inputs["ModelTrafo"] as aval<Trafo3d> | undefined,
-            viewTrafo:  spec.inputs["ViewTrafo"]  as aval<Trafo3d> | undefined,
-            projTrafo:  spec.inputs["ProjTrafo"]  as aval<Trafo3d> | undefined,
-          },
-          requiredNames,
-          byteOffsetByName: arenaByteOffsetByName,
+      if (ruleSubset.size > 0) {
+        const trafoAvals = new Map<string, aval<Trafo3d>>();
+        for (const [leaf, specName] of STANDARD_TRAFO_LEAVES) {
+          const av = spec.inputs[specName] as aval<Trafo3d> | undefined;
+          if (av !== undefined) trafoAvals.set(leaf, av);
+        }
+        const reg = registerRoDerivations(derivedScene, {}, {
+          rules: ruleSubset,
+          trafoAvals,
+          hostUniformOffset: () => undefined,
+          outputOffset: (n) => outOffsetByName.get(n),
           drawHeaderBaseByte: 0,
         });
         derivedByDrawId.set(drawId, reg);
@@ -3126,19 +3128,19 @@ export function buildHeapScene(
       // adds the evaluating object to the aval's outputs). Without
       // this scope, view changes never propagate again — the scene
       // freezes after one frame.
-      let dirty: ReturnType<typeof derivedScene.constituents.pullDirty> | undefined;
+      let dirty: ReturnType<typeof derivedScene.pullDirty> | undefined;
       sceneObj.evaluateAlways(token, (t) => {
-        dirty = derivedScene.constituents.pullDirty(t);
+        dirty = derivedScene.pullDirty(t);
       });
       const _t1 = performance.now();
       derivedScene.uploadDirty(dirty!);
       const _t2 = performance.now();
-      if (dirty!.size > 0) derivedScene.dispatcher.encode(enc);
+      if (dirty!.size > 0) derivedScene.encode(enc);
       const _t3 = performance.now();
       stats.derivedPullMs   = _t1 - _t0;
       stats.derivedUploadMs = _t2 - _t1;
       stats.derivedEncodeMs = _t3 - _t2;
-      stats.derivedRecords  = derivedScene.dispatcher.records.recordCount;
+      stats.derivedRecords  = derivedScene.records.recordCount;
     }
     let anyDirty = false;
     for (const b of buckets) { if (b.scanDirty) { anyDirty = true; break; } }

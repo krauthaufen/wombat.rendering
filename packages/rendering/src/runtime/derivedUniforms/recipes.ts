@@ -1,159 +1,67 @@
-// §7 derived-uniform recipe table — leaf-only flavour.
+// §7 v2 — the standard trafo recipes, as DerivedRule constants.
 //
-// Every recipe is a self-contained leaf: reads constituents directly,
-// computes inline (one or two df32 muls + collapse), writes the final
-// f32 mat4/mat3 to the main heap drawHeader. No intermediates, no
-// layering, no dependents graph.
+// These replace the hardcoded RecipeId table. Each rule reads BASE-trafo leaves
+// (`Model` / `View` / `Proj` — the raw `aval<Trafo3d>`s the RO binds as
+// `ModelTrafo` / `ViewTrafo` / `ProjTrafo` uniforms) and produces the derived
+// uniform the shader reads (`ModelViewProjTrafo`, `NormalMatrix`, …). A leaf
+// wrapped in `Inverse(...)` selects that trafo's stored backward half (free).
 //
-// Two consumers of the same df32 product (e.g. ModelViewTrafo and
-// ModelViewProjTrafo for the same RO) recompute Model·View twice —
-// trivial vs the encode-time savings of one flat dispatch.
+// `Inverse`-of-a-product (e.g. `ModelViewProjTrafoInv`) is written as the product
+// of the inverted factors in reverse order — `(P·V·M)⁻¹ = M⁻¹·V⁻¹·P⁻¹` — so it
+// stays a constituent matmul chain the codegen recognizes.
 //
-// All df32 math runs through the verified primitives in
-// uberKernel.wgsl.ts; the final consumer-facing values are f32.
+// `NormalMatrix` is `(Model⁻¹)ᵀ` truncated to its upper-3×3 — declared as a mat3
+// output; the codegen's normal-matrix arm does the transpose + truncation.
 
-/** Recipe IDs. Numeric values are stable — the kernel switches on them. */
-export const enum RecipeId {
-  /** Model.fwd → f32 mat4. */
-  ModelTrafo            = 0,
-  /** Model.bwd → f32 mat4. */
-  ModelTrafoInv         = 1,
-  /** (Model.bwd)ᵀ upper-3×3 → f32 mat3. */
-  NormalMatrix          = 2,
+import type { Expr, Type } from "@aardworx/wombat.shader/ir";
+import { ruleFromIR, uniformRef, type DerivedRule } from "./rule.js";
 
-  /** View.fwd · Model.fwd → f32 mat4. */
-  ModelViewTrafo        = 3,
-  /** Model.bwd · View.bwd → f32 mat4. */
-  ModelViewTrafoInv     = 4,
-  /** Proj.fwd · View.fwd · Model.fwd → f32 mat4. */
-  ModelViewProjTrafo    = 5,
-  /** Model.bwd · View.bwd · Proj.bwd → f32 mat4. */
-  ModelViewProjTrafoInv = 6,
+const Tf32: Type = { kind: "Float", width: 32 };
+const Tmat4: Type = { kind: "Matrix", element: Tf32, rows: 4, cols: 4 };
+const Tmat3: Type = { kind: "Matrix", element: Tf32, rows: 3, cols: 3 };
 
-  /** View.fwd → f32 mat4. */
-  ViewTrafo             = 7,
-  /** View.bwd → f32 mat4. */
-  ViewTrafoInv          = 8,
-  /** Proj.fwd · View.fwd → f32 mat4. */
-  ViewProjTrafo         = 9,
-  /** View.bwd · Proj.bwd → f32 mat4. */
-  ViewProjTrafoInv      = 10,
-  /** Proj.fwd → f32 mat4. */
-  ProjTrafo             = 11,
-  /** Proj.bwd → f32 mat4. */
-  ProjTrafoInv          = 12,
-}
+const mat4 = (name: string): Expr => uniformRef(name, Tmat4);
+const inv = (v: Expr): Expr => ({ kind: "Inverse", value: v, type: Tmat4 });
+const mul = (lhs: Expr, rhs: Expr): Expr => ({ kind: "MulMatMat", lhs, rhs, type: Tmat4 });
+/** Left-fold `A·B·C·…` (multiplication order). */
+const chain = (...fs: Expr[]): Expr => fs.reduce((acc, f) => mul(acc, f));
+/** mat4 → mat3 truncation (upper-left 3×3). */
+const upper3 = (v: Expr): Expr => ({ kind: "ConvertMatrix", value: v, type: Tmat3 });
+const transpose = (v: Expr): Expr => ({ kind: "Transpose", value: v, type: Tmat4 });
 
-/** Number of constituent inputs each recipe consumes (1, 2, or 3). */
-const INPUT_COUNT: Record<RecipeId, 1 | 2 | 3> = {
-  [RecipeId.ModelTrafo]:            1,
-  [RecipeId.ModelTrafoInv]:         1,
-  [RecipeId.NormalMatrix]:          1,
-  [RecipeId.ModelViewTrafo]:        2,
-  [RecipeId.ModelViewTrafoInv]:     2,
-  [RecipeId.ModelViewProjTrafo]:    3,
-  [RecipeId.ModelViewProjTrafoInv]: 3,
-  [RecipeId.ViewTrafo]:             1,
-  [RecipeId.ViewTrafoInv]:          1,
-  [RecipeId.ViewProjTrafo]:         2,
-  [RecipeId.ViewProjTrafoInv]:      2,
-  [RecipeId.ProjTrafo]:             1,
-  [RecipeId.ProjTrafoInv]:          1,
-};
+const Model = mat4("Model");
+const View = mat4("View");
+const Proj = mat4("Proj");
 
-export function recipeInputCount(id: RecipeId): 1 | 2 | 3 {
-  return INPUT_COUNT[id];
-}
+/** Standard derived rules, keyed by the drawHeader uniform name each produces. */
+export const STANDARD_DERIVED_RULES: ReadonlyMap<string, DerivedRule> = new Map<string, DerivedRule>([
+  // Trafo passthroughs (collapse the df32 fwd/bwd half to an f32 mat4).
+  ["ModelTrafo", ruleFromIR(Model)],
+  ["ModelTrafoInv", ruleFromIR(inv(Model))],
+  ["ViewTrafo", ruleFromIR(View)],
+  ["ViewTrafoInv", ruleFromIR(inv(View))],
+  ["ProjTrafo", ruleFromIR(Proj)],
+  ["ProjTrafoInv", ruleFromIR(inv(Proj))],
 
-/** Output shape — drives drawHeader byte allocation. */
-export type RecipeOutput = "mat4" | "mat3";
+  // Composites. `mul(a,b)` ⇒ matrix product `a · b`.
+  ["ModelViewTrafo", ruleFromIR(chain(View, Model))],
+  ["ModelViewTrafoInv", ruleFromIR(chain(inv(Model), inv(View)))],
+  ["ModelViewProjTrafo", ruleFromIR(chain(Proj, View, Model))],
+  ["ModelViewProjTrafoInv", ruleFromIR(chain(inv(Model), inv(View), inv(Proj)))],
+  ["ViewProjTrafo", ruleFromIR(chain(Proj, View))],
+  ["ViewProjTrafoInv", ruleFromIR(chain(inv(View), inv(Proj)))],
 
-const OUTPUT: Record<RecipeId, RecipeOutput> = {
-  [RecipeId.ModelTrafo]:            "mat4",
-  [RecipeId.ModelTrafoInv]:         "mat4",
-  [RecipeId.NormalMatrix]:          "mat3",
-  [RecipeId.ModelViewTrafo]:        "mat4",
-  [RecipeId.ModelViewTrafoInv]:     "mat4",
-  [RecipeId.ModelViewProjTrafo]:    "mat4",
-  [RecipeId.ModelViewProjTrafoInv]: "mat4",
-  [RecipeId.ViewTrafo]:             "mat4",
-  [RecipeId.ViewTrafoInv]:          "mat4",
-  [RecipeId.ViewProjTrafo]:         "mat4",
-  [RecipeId.ViewProjTrafoInv]:      "mat4",
-  [RecipeId.ProjTrafo]:             "mat4",
-  [RecipeId.ProjTrafoInv]:          "mat4",
-};
+  // NormalMatrix = (Model⁻¹)ᵀ, upper-3×3.
+  ["NormalMatrix", ruleFromIR(upper3(transpose(inv(Model))), Tmat3)],
+]);
 
-export function recipeOutput(id: RecipeId): RecipeOutput {
-  return OUTPUT[id];
-}
+/** Leaf name → the RO uniform (`spec.inputs[…]`) that supplies its `aval<Trafo3d>`. */
+export const STANDARD_TRAFO_LEAVES: ReadonlyMap<string, string> = new Map([
+  ["Model", "ModelTrafo"],
+  ["View", "ViewTrafo"],
+  ["Proj", "ProjTrafo"],
+]);
 
-/** Which side (forward/backward) of which Trafo3d each input slot draws from. */
-export type ConstituentRef =
-  | "Model.fwd" | "Model.bwd"
-  | "View.fwd"  | "View.bwd"
-  | "Proj.fwd"  | "Proj.bwd";
-
-const INPUTS: Record<RecipeId, readonly ConstituentRef[]> = {
-  [RecipeId.ModelTrafo]:            ["Model.fwd"],
-  [RecipeId.ModelTrafoInv]:         ["Model.bwd"],
-  [RecipeId.NormalMatrix]:          ["Model.bwd"],
-  // df_mul args are ordered (outer, inner) so the math product
-  // matches Aardvark's `View.mul(Model).forward = View.fwd · Model.fwd`.
-  [RecipeId.ModelViewTrafo]:        ["View.fwd",  "Model.fwd"],
-  [RecipeId.ModelViewTrafoInv]:     ["Model.bwd", "View.bwd"],
-  [RecipeId.ModelViewProjTrafo]:    ["Proj.fwd",  "View.fwd", "Model.fwd"],
-  [RecipeId.ModelViewProjTrafoInv]: ["Model.bwd", "View.bwd", "Proj.bwd"],
-  [RecipeId.ViewTrafo]:             ["View.fwd"],
-  [RecipeId.ViewTrafoInv]:          ["View.bwd"],
-  [RecipeId.ViewProjTrafo]:         ["Proj.fwd",  "View.fwd"],
-  [RecipeId.ViewProjTrafoInv]:      ["View.bwd",  "Proj.bwd"],
-  [RecipeId.ProjTrafo]:             ["Proj.fwd"],
-  [RecipeId.ProjTrafoInv]:          ["Proj.bwd"],
-};
-
-export function recipeInputs(id: RecipeId): readonly ConstituentRef[] {
-  return INPUTS[id];
-}
-
-/** Public uniform name (one per recipe). */
-const NAME: Record<RecipeId, string> = {
-  [RecipeId.ModelTrafo]:            "ModelTrafo",
-  [RecipeId.ModelTrafoInv]:         "ModelTrafoInv",
-  [RecipeId.NormalMatrix]:          "NormalMatrix",
-  [RecipeId.ModelViewTrafo]:        "ModelViewTrafo",
-  [RecipeId.ModelViewTrafoInv]:     "ModelViewTrafoInv",
-  [RecipeId.ModelViewProjTrafo]:    "ModelViewProjTrafo",
-  [RecipeId.ModelViewProjTrafoInv]: "ModelViewProjTrafoInv",
-  [RecipeId.ViewTrafo]:             "ViewTrafo",
-  [RecipeId.ViewTrafoInv]:          "ViewTrafoInv",
-  [RecipeId.ViewProjTrafo]:         "ViewProjTrafo",
-  [RecipeId.ViewProjTrafoInv]:      "ViewProjTrafoInv",
-  [RecipeId.ProjTrafo]:             "ProjTrafo",
-  [RecipeId.ProjTrafoInv]:          "ProjTrafoInv",
-};
-
-/** All recipe IDs in switch order. */
-export const ALL_RECIPES: readonly RecipeId[] = [
-  RecipeId.ModelTrafo, RecipeId.ModelTrafoInv, RecipeId.NormalMatrix,
-  RecipeId.ModelViewTrafo, RecipeId.ModelViewTrafoInv,
-  RecipeId.ModelViewProjTrafo, RecipeId.ModelViewProjTrafoInv,
-  RecipeId.ViewTrafo, RecipeId.ViewTrafoInv,
-  RecipeId.ViewProjTrafo, RecipeId.ViewProjTrafoInv,
-  RecipeId.ProjTrafo, RecipeId.ProjTrafoInv,
-];
-
-const BY_NAME: ReadonlyMap<string, RecipeId> = new Map(
-  ALL_RECIPES.map(id => [NAME[id], id] as const),
-);
-
-export const DERIVED_UNIFORM_NAMES: ReadonlySet<string> =
-  new Set(ALL_RECIPES.map(id => NAME[id]));
-
-export function recipeIdByName(name: string): RecipeId | undefined {
-  return BY_NAME.get(name);
-}
-
-export function recipeName(id: RecipeId): string {
-  return NAME[id];
+export function isStandardDerivedName(name: string): boolean {
+  return STANDARD_DERIVED_RULES.has(name);
 }
