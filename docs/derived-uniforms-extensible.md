@@ -1,27 +1,25 @@
 # Extensible derived uniforms (§7 v2)
 
-Replace the hardcoded recipe table in `packages/rendering/src/runtime/derivedUniforms/` with a per-RO, content-keyed rule registry. Each `RenderObject` carries an arbitrary map `name → DerivedRule`; rules are inline-marker closures over other uniforms; the dispatcher generates one fat compute kernel that switches on `rule_id` and recompiles when the rule set changes.
+Replaces the hardcoded recipe table in `packages/rendering/src/runtime/derivedUniforms/` with a content-keyed rule registry. A uniform binding is now **either a value (an `aval`/constant) or a rule** (`DerivedRule`): rules are pure IR fragments over other uniforms; per RO they're flattened (chained references substituted away), registered with content-hash dedup, and each input leaf resolved to a tagged slot handle; the dispatcher codegen-emits one compute kernel that switches on `rule_id` and recompiles when the rule set (or record stride) changes.
 
-This document is the design only — no code yet.
-
-**End state: arbitrary input count, arbitrary WGSL input/output types, arbitrary chaining.** A `DerivedRule` may read any number of inputs of any type (scalars, vectors, matrices, integer/bool, df32 doubles, the constituent `Trafo3d` halves) and produce any WGSL type. Rules may consume the outputs of other rules to any depth. The phased plan below ships the common trafo derivations first, but every data-structure choice here is sized for the general case — no fixed `MAX_INPUTS`, no "mat4-only" loaders, no "one dispatch, hope the ordering works out" for chains. Double precision is a first-class input/output type, not a special case hand-coded into one kernel.
+**Status (as built).** Steps 1–11 of the plan below are done; `heap-demo?derived=1` runs through this path and matches `?derived=0`. The codegen has two tiers: **df32-precise** arms for the recognized trafo shapes (collapse / N-matmul chain / normal-matrix), and a **single-precision generic** path for any other IR (rewrite leaves → params, print the body, type-parametrised `load_<T>`/`store_<T>` for f32/i32/u32/vecN<f32>/mat3/mat4). The records buffer is **fixed-stride** (`2 + maxArity` u32s, grows + recompiles if a higher-arity rule appears) — not the variable-length+offsets design sketched in older revisions of this doc. There are **no dependency levels** — chains are flattened (see "Chain flattening"). There is **no "globals" concept** — whether a uniform is "global" is a per-RO fact (see the slot-tag table). df32 is *not* a first-class IR type; it lives in the constituent storage + the recognized trafo arms only. The author-facing `derivedUniform((u) => …)` is a runtime tracing builder (mat4 trafo leaves); a build-time vite marker with full type inference is still TODO.
 
 ---
 
 ## What stays from current §7
 
-- The scene-wide records buffer model (one dispatch per dependency level — usually one level; see "Chained rules").
+- The scene-wide records buffer model — **one dispatch per frame**, no dependency levels (chains flattened).
 - The `_debug.{validateHeap, simulateDraws, probeBinarySearch, checkTriangleCoherence}` infrastructure.
-- The constituent slots heap (per-aval `Trafo3d` storage in df32).
-- The integration with `heapScene.addDraw` / `removeDraw`.
+- The constituent slots heap (`ConstituentSlots` — per-aval `Trafo3d` fwd/bwd storage in df32).
+- The integration with `heapScene.addDraw` / `removeDraw` (the per-RO `registerRoDerivations` / `deregisterRoDerivations` shape; the per-frame `pullDirty`/`uploadDirty`/`encode`).
 
 ## What changes
 
-- `RecipeId` enum and the static `RECIPES` table → **runtime rule registry** keyed by IR-hash.
-- The fat hand-written WGSL kernel with 13 hardcoded arms → **codegen-emitted kernel**, recompiled on registry version bump. Codegen handles any rule arity and any WGSL input/output type, df32 included.
-- `RoDerivedRequest.requiredNames` (a list of recipe names) → **`HashMap<string, DerivedRule>`** carried directly on the `RenderObject`.
-- Fixed-width `Record` struct with `MAX_INPUTS` → **variable-length packed records** + a `recordOffsets` index, so a rule can read N inputs.
-- Single dispatch → **one dispatch per dependency level**, so a rule may read another rule's output (the common case stays a single level).
+- `RecipeId` enum + the static `RECIPES` table → **content-hash–keyed `DerivedUniformRegistry`** over flattened IR; the 13 recipes are ported to `DerivedRule` constants (`STANDARD_DERIVED_RULES`).
+- The hand-written WGSL uber-kernel → **codegen-emitted** (`buildUberKernel`), recompiled on `registry.version` / record-stride change.
+- A uniform binding was implicitly "always a value (an aval)" → now **value | `DerivedRule`** everywhere a uniform goes; `isDerivedRule(v)` routes rules to §7.
+- `RoDerivedRequest.requiredNames` (a list of recipe names) → **`{ rules: Map<string, DerivedRule>, trafoAvals, hostUniformOffset, outputOffset, drawHeaderBaseByte }`**.
+- The fixed-`MAX_INPUTS` `Record` struct → **fixed-stride packed records** at `2 + maxArity` u32s (grows + recompiles, rare).
 
 ---
 
@@ -29,46 +27,35 @@ This document is the design only — no code yet.
 
 ```ts
 interface DerivedRule<T = unknown> {
-  /** Output WGSL type — any of: f32 f16 i32 u32 bool, vecN of those,
-   *  matNxM<f32>, the df32 "double" forms (df32, df32 vecN, df32 matNxM).
-   *  Drives the storer codegen and the drawHeader byte budget for `name`. */
-  readonly outputType: WgslType;
-  /** IR fragment. The IR's `ReadInput("Uniform", <name>, <type>)` nodes
-   *  enumerate this rule's inputs — ANY count, ANY of the types above.
-   *  Sources are resolved per-RO at registration time. */
-  readonly ir: IRFragment;
-  /** Stable content hash of `ir` (post-CSE/DCE canonical form). Covers
-   *  structure + the (name, type) of every ReadInput, not slot identity. */
-  readonly hash: string;
+  readonly __derivedRule: true;          // brand — `isDerivedRule` recognises a rule among uniform values
+  readonly outputType: Type;             // `=== ir.type`; drives the storer + drawHeader byte budget
+  readonly ir: Expr;                     // pure IR; every leaf input is `ReadInput("Uniform", name)` (or `Inverse(…)` of one)
+  readonly hash: string;                 // structural content hash of `ir` — the registry dedup key
 }
 
-function derivedUniform<T>(closure: (u: UniformScope) => T): DerivedRule<T>;
+function isDerivedRule(x: unknown): x is DerivedRule;
+
+// Author-facing builder (runtime tracing). `u.<Name>` is a mat4 trafo leaf; the
+// DerivedExpr methods compose, and the result type follows from the ops.
+function derivedUniform<T>(build: (u: DerivedScope) => DerivedExpr): DerivedRule<T>;
+
+// Lower level: build a rule directly from hand-constructed IR.
+function ruleFromIR<T>(ir: Expr, outputType?: Type): DerivedRule<T>;
 ```
 
-`derivedUniform(...)` is an inline-marker (analogous to `vertex(...)` / `compute(...)`) that the wombat-shader-vite plugin lowers at build time. Each captured `u.<Name>` becomes a `ReadInput` node; the closure body becomes a function body that returns the IR expression. Whatever types the closure's arithmetic implies (including df32 — `u.View` is a `Trafo3d`, i.e. a df32 mat4) flow through to `inputs[i].wgslType` / `outputType`.
+`DerivedExpr` methods: `.mul` (matrix·matrix / matrix·vector by operand types), `.add` / `.sub` / `.neg`, `.inverse` (of a constituent trafo: reads its stored backward half — free), `.transpose`, `.upperLeft3x3` (→ mat3), `.transformOrigin` (matrix translation as vec3), `.swizzle("xyz")`. Examples:
 
-Examples — note the spread of arities and types:
 ```ts
-const ModelView    = derivedUniform(u => u.View.mul(u.Model));                 // 2× df32 mat4 → df32 mat4
-const ModelViewProj = derivedUniform(u => u.Proj.mul(u.View).mul(u.Model));     // 3× df32 mat4 → df32 mat4 (or one inline triple-product rule)
-const NormalMatrix = derivedUniform(u => u.Model.inverse().transpose().upperLeft3x3()); // 1× mat4 → mat3x3<f32>
-const CameraInWorld = derivedUniform(u => u.View.inverse().transformPos(vec3(0.0))); // 1× df32 mat4 → vec3<f32>
-const HasLighting  = derivedUniform(u => u.LightLocation.z > 0.0);              // 1× vec3<f32> → bool
-const TexelSize    = derivedUniform(u => 1.0 / f32(u.AtlasResolution));         // 1× u32 → f32
-const Tinted       = derivedUniform(u => u.BaseColor * u.TintFactor);           // vec4<f32> × f32 → vec4<f32>  (host-supplied inputs, not trafos)
+const ModelViewTrafo     = derivedUniform(u => u.ViewTrafo.mul(u.ModelTrafo));
+const ModelViewProjTrafo = derivedUniform(u => u.ProjTrafo.mul(u.ViewTrafo).mul(u.ModelTrafo));
+const ModelViewTrafoInv  = derivedUniform(u => u.ModelTrafo.inverse().mul(u.ViewTrafo.inverse()));
+const NormalMatrix       = derivedUniform(u => u.ModelTrafo.inverse().transpose().upperLeft3x3());   // → mat3
+const CameraInWorld      = derivedUniform(u => u.ViewTrafo.inverse().transformOrigin());             // → vec3
 ```
 
-`UniformScope` is structurally typed so any `u.<Name>` is legal; the marker emits a `ReadInput(name, inferredType)` and the type checker on the recipe side validates the closure. No registry of "known" uniform names — sources are resolved per-RO (see Records).
+Non-mat4-leaf rules (reading a `vec4` host uniform, a scalar, etc.) — and rules whose leaves are non-trafo host uniforms — aren't expressible through the runtime builder yet (it only mints mat4 leaves) and the codegen's host-uniform-leaf path isn't wired; use `ruleFromIR` with hand-built IR, or wait for the build-time vite marker (which will read leaf types from the program, à la `vertex(...)` / `fragment(...)`).
 
-`RenderObject` gains:
-```ts
-interface RenderObject {
-  // ... existing fields ...
-  readonly derivedUniforms?: HashMap<string, DerivedRule<unknown>>;
-}
-```
-
-The heap renderer cross-references the effect's required-uniforms list against `ro.derivedUniforms` — names present here are produced by the §7 dispatcher; names absent are served by the standard `spec.inputs` path. Same routing logic that exists in current §7, just the source is dynamic per-RO instead of a fixed name set.
+**Where rules slot in.** Anywhere a uniform value goes: the heap `spec.inputs[name]` (`aval<unknown> | DerivedRule`); a drawHeader field whose binding is a `DerivedRule` is produced by the §7 dispatcher instead of packed. *(Wiring the same into wombat.dom's `<Sg uniforms={…}>` / `TraversalState` / `IUniformProvider` is TODO — the value type there is still aval-only.)* A rule's leaves are resolved per RO: a matrix-typed leaf bound as an `aval<Trafo3d>` ⇒ a df32 constituent slot; anything else ⇒ a host uniform on that RO (host-leaf resolution not wired in v0).
 
 ---
 
@@ -154,22 +141,9 @@ The "expensive shared producer, compute once" alternative (keep levels, opt in p
 
 ## Records buffer (per scene)
 
-A rule has arbitrary arity (and every record is independent — see "Chain flattening"), so records are **variable length, packed into a flat `u32` blob** with a parallel offsets index:
+**As built:** one scene-wide `RecordData: array<u32>` at a **fixed stride** of `2 + maxArity` u32s (`maxArity` = the largest input count of any registered rule; min stride 5 covers the 13 trafo recipes). Each record is `[ rule_id, out_slot, in_slot[0], …, in_slot[maxArity-1] ]` with the unused tail slots zero. No offsets array — the kernel does `let base = gid.x * STRIDE;`. If a higher-arity rule registers, the stride grows, `RecordData` is re-packed once, and the kernel recompiles (the registry-version bump triggers it anyway) — rare. Swap-remove keeps the array dense (move the tail record into the hole, patch its owner's index set).
 
-```
-RecordOffsets : array<u32>          // recordOffsets[i] = start of record i in RecordData (one entry per derived-uniform instance)
-RecordData    : array<u32>          // packed: [ rule_id, out_slot, in_slot[0], in_slot[1], … ]  — arity known from rule_id
-```
-
-A single record is `2 + arity(rule_id)` u32s. The kernel for invocation `gid.x` does:
-```wgsl
-let off     = RecordOffsets[gid.x];
-let rule_id = RecordData[off];
-let out_slot = RecordData[off + 1u];
-// arity is baked into the switch arm for rule_id; it reads RecordData[off + 2u .. off + 2u + arity]
-```
-
-(If `array<u32>` indexing chains hurt, the alternative is sorting records by `rule_id` and emitting one fixed-stride sub-dispatch per rule — codegen knows every rule's stride. Start with the offsets blob; it's simpler and the indirection is one extra load.)
+> Older revisions of this doc described a variable-length blob + a `RecordOffsets` index (so a rule could read N inputs without a global `MAX_INPUTS`). The fixed-growable-stride form gets the same "no MAX_INPUTS" property — the stride is exactly `2 + maxArity` — with no offsets indirection and a trivial swap-remove, at the cost of a one-time re-pack + recompile when `maxArity` grows (which for the trafo recipes never happens). The sections below describe the records semantics; mentally substitute `gid.x * STRIDE` for `RecordOffsets[gid.x]`.
 
 **Slot tagging** — `out_slot` and every `in_slot` is a tagged 32-bit handle; top 3 bits select the binding, low 29 bits are the payload:
 
@@ -363,7 +337,7 @@ packages/rendering/src/runtime/derivedUniforms/
   flatten.ts           ← `flatten(ir, derivedNames)`, `hashIR`, CSE, cycle detection (memoised)
   registry.ts          ← `DerivedUniformRegistry`, content-hash dedup over flattened IR
   codegen.ts           ← `emitKernel(registry)`, type-parametrised loaders/storers, df32 prelude
-  records.ts           ← variable-length `RecordsBuffer` (packed blob + offsets, per-RO spans, tail-swap)
+  records.ts           ← fixed-growable-stride `RecordsBuffer` (packed u32 blob, per-RO index sets, tail-swap)
   slots.ts             ← `ConstituentSlots` (existing, df32 trafo storage)
   dispatch.ts          ← `DerivedUniformsDispatcher`, recompile-on-version, single dispatch
   sceneIntegration.ts  ← `DerivedUniformsScene`, `registerRoDerivations`
@@ -384,7 +358,7 @@ The current `recipes.ts` and the hardcoded `uberKernel.wgsl.ts` go away.
    - df32 helper library (`df32_add/mul/mat4_mul/to_f32/…`) emitted into the prelude when any rule uses df32 — the math the current §7 hand-codes, factored out.
    - per-rule `fn rule_k(...)` from the IR emitter (with df32-aware lowering).
    - the `main` loop: read `RecordOffsets`/`RecordData`, switch over rule ids, one dispatch.
-5. Variable-length `records.ts`: packed `RecordData` u32 blob + `RecordOffsets`, per-RO span tracking, tail-swap removal. No levels.
+5. `records.ts`: fixed-stride (`2 + maxArity`) packed `RecordData` u32 blob, per-RO index sets, tail-swap removal, stride growth bumps a layout version. No levels.
 6. `dispatch.ts`: recompile-on-version, one `dispatchWorkgroups` per frame.
 7. `sceneIntegration.registerRoDerivations` takes `HashMap<string, DerivedRule>`; flattens each rule against the RO's derived-name set, registers the flattened entry, implements `resolveSource` (constituent → host); bumps the constituent interning for `Trafo3d` inputs as today.
 8. `buildBucketLayout` / `HeapEffectSchema`: size derived-uniform drawHeader slots for their `outputType` (df32 mat4 = 32 words, bool = 1, …) — currently moot, the arena slots are `PACKER_MAT4`-sized which fits mat4 and mat3. Vertex/fragment shaders read them unchanged.
