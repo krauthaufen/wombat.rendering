@@ -55,3 +55,15 @@ describe("derivedUniform marker", () => {
     expect(() => derivedUniform(() => 42)).toThrow();
   });
 });
+
+describe("derivedUniform: leafTypes hint (the build-time marker's output)", () => {
+  it("u.<Name> mints a leaf of the hinted type", () => {
+    const r = derivedUniform((u) => u.Tint.swizzle("xyz"), { Tint: "vec4" });
+    expect(r.outputType).toEqual({ kind: "Vector", element: { kind: "Float", width: 32 }, dim: 3 });
+    expect(inputsOf(r.ir)).toEqual([{ name: "Tint", type: { kind: "Vector", element: { kind: "Float", width: 32 }, dim: 4 }, inverse: false }]);
+  });
+  it("un-hinted names still default to mat4", () => {
+    const r = derivedUniform((u) => u.A.mul(u.B), { A: "mat4" });
+    expect(r.outputType).toEqual({ kind: "Matrix", element: { kind: "Float", width: 32 }, rows: 4, cols: 4 });
+  });
+});
