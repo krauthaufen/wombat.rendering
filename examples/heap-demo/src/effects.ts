@@ -19,6 +19,10 @@ declare module "@aardworx/wombat.shader/uniforms" {
   interface UniformScope {
     readonly Time: number;
     readonly Tint: V4f;
+    /** Custom §7-derived uniform: world "up" (0,1,0) expressed in this object's model
+     *  space — `derivedUniform(u => u.ModelTrafo.inverse().transformDir(0,1,0))`. Drives
+     *  a cheap "sky" shade in the VS below (faces pointing up get a touch brighter). */
+    readonly WorldUpInModel: V3f;
   }
 }
 
@@ -33,10 +37,13 @@ export const modelViewVS = vertex((v: {
 }) => {
   const vp = uniform.ModelViewTrafo.mul(v.Positions);
   const n4 = uniform.ModelViewTrafoInv.transpose().mul(new V4f(v.Normals.xyz, 0.0));
+  // Cheap "sky" term: |n · upInModel| in model space (rigid-invariant), so top/bottom
+  // faces get a small boost. `WorldUpInModel` is a user-defined §7 derived uniform.
+  const sky = abs(v.Normals.normalize().dot(uniform.WorldUpInModel.normalize()));
   return {
     ViewPositions: vp,
     Normals:       n4.xyz,
-    Colors:        v.Colors,
+    Colors:        new V4f(v.Colors.xyz.mul(sky.mul(0.35).add(0.65)), v.Colors.w),
   };
 });
 

@@ -176,12 +176,17 @@ function makeUniforms(
     map = map.add("ModelTrafo", AVal.constant(modelTrafo))
              .add("ViewTrafo",  viewTrafo)
              .add("ProjTrafo",  projTrafo)
-             // A user-specified derived uniform: a rule, not a value. ModelView = View·Model.
-             // (Shaders that read ModelViewTrafo get it from the §7 compute pre-pass; this rule
-             // resolves `u.ViewTrafo` / `u.ModelTrafo` to the constituent slots above. The cast
-             // is just because this demo's map is still typed aval-only; the heap renderer
-             // accepts `aval | DerivedRule` for a uniform binding.)
-             .add("ModelViewTrafo", derivedUniform(u => u.ViewTrafo.mul(u.ModelTrafo)) as unknown as aval<unknown>);
+             // User-specified derived uniforms: rules, not values. (Shaders read these from the
+             // §7 compute pre-pass; the rule's `u.<Name>` leaves resolve to the constituent
+             // slots above. The cast is just because this demo's map is still typed aval-only;
+             // the heap renderer accepts `aval | DerivedRule` for a uniform binding.)
+             //   ModelViewTrafo = View·Model (same IR/hash as the built-in recipe).
+             .add("ModelViewTrafo", derivedUniform(u => u.ViewTrafo.mul(u.ModelTrafo)) as unknown as aval<unknown>)
+             //   WorldUpInModel = (ModelTrafo)⁻¹ applied to the world-up direction (0,1,0) —
+             //   a genuinely custom rule (not a built-in recipe); the surface shader uses it
+             //   for a cheap "sky" shade. Goes through the codegen's generic (single-precision)
+             //   arm: load_mat4x4_f32 → rule_K(in0) { return ((in0 * vec4(0,1,0,0)).xyz); } → store_vec3_f32.
+             .add("WorldUpInModel", derivedUniform(u => u.ModelTrafo.inverse().transformDir(0, 1, 0)) as unknown as aval<unknown>);
   } else {
     const projM44         = projTrafo.map(trafoToM44f);
     const modelViewM44    = viewTrafo.map(v => trafoToM44f(modelTrafo.mul(v)));

@@ -59,6 +59,11 @@ export class DerivedExpr {
     const v4: Expr = { kind: "MulMatVec", lhs: this.ir, rhs: constVec4(0, 0, 0, 1), type: vec(4) };
     return new DerivedExpr({ kind: "VecSwizzle", value: v4, comps: ["x", "y", "z"], type: vec(3) });
   }
+  /** This mat4 applied to the direction `(x,y,z,0)` (no translation), returning the result (xyz). */
+  transformDir(x: number, y: number, z: number): DerivedExpr {
+    const v4: Expr = { kind: "MulMatVec", lhs: this.ir, rhs: constVec4(x, y, z, 0), type: vec(4) };
+    return new DerivedExpr({ kind: "VecSwizzle", value: v4, comps: ["x", "y", "z"], type: vec(3) });
+  }
   /** vecN swizzle, e.g. `.swizzle("xyz")`. */
   swizzle(comps: string): DerivedExpr {
     const c = comps.split("") as ("x" | "y" | "z" | "w")[];
