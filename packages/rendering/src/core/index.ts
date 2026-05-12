@@ -74,6 +74,17 @@ export type {
   RenderObject,
 } from "./renderObject.js";
 
+export type {
+  IUniformProvider,
+  IAttributeProvider,
+} from "./provider.js";
+export {
+  UniformProvider,
+  AttributeProvider,
+  asUniformProvider,
+  asAttributeProvider,
+} from "./provider.js";
+
 export {
   RenderTree,
 } from "./renderTree.js";

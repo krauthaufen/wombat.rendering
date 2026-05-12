@@ -40,6 +40,7 @@ import type { BufferView } from "../core/bufferView.js";
 import type { ITexture } from "../core/texture.js";
 import type { ISampler } from "../core/sampler.js";
 import type { RenderObject } from "../core/renderObject.js";
+import { asAttributeProvider } from "../core/provider.js";
 
 /**
  * Maximum texture extent (per side) the heap path is willing to
@@ -109,11 +110,21 @@ function isHeapServableTexture(t: ITexture): boolean {
   return true;
 }
 
+// Materialise every attribute view a provider knows about. Eligibility
+// is decided before any shader is compiled, so we can't pull
+// shader-driven here — we enumerate. Attribute providers are map-backed
+// in practice, so `names()` is the full set and `tryGet` is a map hit.
+function attrViews(p: { names(): Iterable<string>; tryGet(n: string): BufferView | undefined }): BufferView[] {
+  const out: BufferView[] = [];
+  for (const n of p.names()) { const v = p.tryGet(n); if (v !== undefined) out.push(v); }
+  return out;
+}
+
 function bufferAvals(ro: RenderObject): aval<IBuffer>[] {
   const out: aval<IBuffer>[] = [];
-  ro.vertexAttributes.iter((_k, v: BufferView) => { out.push(v.buffer); });
+  for (const v of attrViews(asAttributeProvider(ro.vertexAttributes))) out.push(v.buffer);
   if (ro.instanceAttributes !== undefined) {
-    ro.instanceAttributes.iter((_k, v: BufferView) => { out.push(v.buffer); });
+    for (const v of attrViews(asAttributeProvider(ro.instanceAttributes))) out.push(v.buffer);
   }
   if (ro.indices !== undefined) out.push(ro.indices.buffer);
   return out;
@@ -141,7 +152,23 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
   if (ro.storageBuffers !== undefined && ro.storageBuffers.count > 0) {
     return AVal.constant(false);
   }
-  if (ro.textures.count > 1 || ro.samplers.count > 1) {
+  // Heap path serves at most one distinct texture + sampler per bucket
+  // (the megacall draw has one bind group). The Sg compile layer
+  // over-binds each texture under both `name` and `${name}_view` (so
+  // whichever name the WGSL schema lands on resolves), so dedupe by
+  // aval identity before applying the single-binding rule — otherwise
+  // every textured leaf would be `count > 1` and fall to the legacy
+  // per-RO path, which at scale (thousands of textured ROs ⇒ thousands
+  // of draw calls + bind-group switches) is far slower than the heap
+  // megacall sampling one shared atlas page.
+  const distinctTextureAvals = new Set<aval<ITexture>>();
+  ro.textures.iter((_n, av) => { distinctTextureAvals.add(av); });
+  if (distinctTextureAvals.size > 1) {
+    return AVal.constant(false);
+  }
+  const distinctSamplerAvals = new Set<aval<ISampler>>();
+  ro.samplers.iter((_n, av) => { distinctSamplerAvals.add(av); });
+  if (distinctSamplerAvals.size > 1) {
     return AVal.constant(false);
   }
 
@@ -157,9 +184,9 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
     const isBroadcast = v.singleValue !== undefined || stride === 0;
     if (!isBroadcast && stride !== v.elementType.byteSize) strideBlocked = true;
   };
-  ro.vertexAttributes.iter((_k, v: BufferView) => checkStride(v));
+  for (const v of attrViews(asAttributeProvider(ro.vertexAttributes))) checkStride(v);
   if (ro.instanceAttributes !== undefined) {
-    ro.instanceAttributes.iter((_k, v: BufferView) => checkStride(v));
+    for (const v of attrViews(asAttributeProvider(ro.instanceAttributes))) checkStride(v);
   }
   if (strideBlocked) return AVal.constant(false);
 

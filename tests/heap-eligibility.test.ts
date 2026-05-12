@@ -15,6 +15,7 @@ import { ITexture } from "../packages/rendering/src/core/texture.js";
 import { ISampler } from "../packages/rendering/src/core/sampler.js";
 import { PipelineState } from "../packages/rendering/src/core/pipelineState.js";
 import { ElementType } from "../packages/rendering/src/core/elementType.js";
+import { AttributeProvider, UniformProvider } from "../packages/rendering/src/core/provider.js";
 import type { BufferView } from "../packages/rendering/src/core/bufferView.js";
 import type { DrawCall } from "../packages/rendering/src/core/drawCall.js";
 import type { Effect } from "../packages/rendering/src/core/shader.js";
@@ -44,8 +45,8 @@ function baseRO(extras: Partial<RenderObject> = {}): RenderObject {
   return {
     effect: fakeEffect,
     pipelineState: fakePipeline,
-    vertexAttributes: HashMap.empty<string, BufferView>().add("position", view),
-    uniforms: HashMap.empty(),
+    vertexAttributes: AttributeProvider.ofObject({ position: view }),
+    uniforms: UniformProvider.empty,
     textures: HashMap.empty(),
     samplers: HashMap.empty(),
     indices,
@@ -140,7 +141,7 @@ describe("isHeapEligible — per-RO instancing", () => {
       buffer: ibuf, offset: 0, stride: 12, elementType: ElementType.V3f,
     };
     const ro = baseRO({
-      instanceAttributes: HashMap.empty<string, BufferView>().add("offset", view),
+      instanceAttributes: AttributeProvider.ofObject({ offset: view }),
       drawCall: cval<DrawCall>({
         kind: "indexed", indexCount: 3, instanceCount: 4,
         firstIndex: 0, baseVertex: 0, firstInstance: 0,
@@ -166,7 +167,7 @@ describe("isHeapEligible — per-RO instancing", () => {
       buffer: ibuf, offset: 0, stride: 16, elementType: ElementType.V3f,
     };
     const ro = baseRO({
-      instanceAttributes: HashMap.empty<string, BufferView>().add("offset", view),
+      instanceAttributes: AttributeProvider.ofObject({ offset: view }),
       drawCall: cval<DrawCall>({
         kind: "indexed", indexCount: 3, instanceCount: 4,
         firstIndex: 0, baseVertex: 0, firstInstance: 0,

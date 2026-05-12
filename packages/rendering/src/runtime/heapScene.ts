@@ -45,7 +45,7 @@
 import { Trafo3d, V3d, V4f, M44d, type V2f } from "@aardworx/wombat.base";
 import type { ITexture } from "../core/texture.js";
 import type { ISampler } from "../core/sampler.js";
-import { AVal, AdaptiveObject, AdaptiveToken } from "@aardworx/wombat.adaptive";
+import { AVal, AdaptiveObject, AdaptiveToken, HashTable } from "@aardworx/wombat.adaptive";
 import type { aval, aset, IAdaptiveObject, IDisposable, IHashSetReader } from "@aardworx/wombat.adaptive";
 import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
 import type { PipelineState } from "../core/pipelineState.js";
@@ -358,6 +358,17 @@ interface PoolEntry {
  * Same code path either way.
  */
 class UniformPool {
+  // Keyed by `aval<unknown>` *by reference* (a plain JS `Map`). These
+  // keys are overwhelmingly reactive `cval`s (per-object trafos,
+  // colours, …) and the hot path is `acquire`/`release` ~once per
+  // drawHeader field per RO. A content-keyed `HashTable` would buy
+  // nothing here — reactive avals never compare content-equal — and
+  // would cost: reactive avals have no `equals`/`getHashCode`, so a
+  // `HashTable` falls back to a WeakMap-counter identity hash per
+  // lookup, measurably slower than `Map`'s native hashing. (Constant-
+  // aval dedup matters where keys are *texture* avals — there the
+  // `AtlasPool` is content-keyed; constant avals there carry a cached
+  // hash and a fast `equals`.)
   private readonly byAval = new Map<aval<unknown>, PoolEntry>();
 
   has(aval: aval<unknown>): boolean { return this.byAval.has(aval); }
@@ -631,17 +642,60 @@ class AttributeArena {
   }
   release(ref: number, dataBytes: number): void {
     const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
-    this.freeList.push({ off: ref, size: allocBytes });
-    // Coalesce adjacent free entries for cleanliness.
-    this.freeList.sort((a, b) => a.off - b.off);
-    for (let i = 0; i < this.freeList.length - 1; ) {
-      const a = this.freeList[i]!, b = this.freeList[i + 1]!;
-      if (a.off + a.size === b.off) { a.size += b.size; this.freeList.splice(i + 1, 1); }
-      else i++;
-    }
+    insertSortedFreeBlock(this.freeList, ref, allocBytes);
   }
   onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
   destroy(): void { this.buf.destroy(); }
+}
+
+/**
+ * Insert `{off, size}` into a free-list kept sorted by `off`, then
+ * coalesce with the two immediate neighbours.
+ *
+ * The list invariant — sorted, non-overlapping, never-adjacent — is
+ * preserved across allocs (which take from the front or split a
+ * block) and releases (this function). The previous implementation
+ * did `push + Array.prototype.sort + linear coalesce scan`, which is
+ * O(N log N) per release. Under a 500-RO bulk-remove the sort
+ * dominated `removeDraw` (~41 ms of self-time in the heap-demo-sg
+ * toggle profile). Binary-search insert + 2-neighbour merge collapses
+ * that to O(log N + N-shift), and is principled — the sort never
+ * actually mattered since we already had the sorted prefix as an
+ * invariant.
+ */
+function insertSortedFreeBlock(
+  freeList: { off: number; size: number }[],
+  off: number,
+  size: number,
+): void {
+  // Binary-search for the insertion index (first entry whose off > new).
+  let lo = 0, hi = freeList.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (freeList[mid]!.off <= off) lo = mid + 1;
+    else hi = mid;
+  }
+  // lo is the index where the new entry would be inserted.
+  // Try merging with the predecessor first; if successful, the merged
+  // block may now be adjacent to its (former) successor too.
+  const prev = lo > 0 ? freeList[lo - 1] : undefined;
+  if (prev !== undefined && prev.off + prev.size === off) {
+    prev.size += size;
+    // Check forward-merge with what was freeList[lo].
+    const next = freeList[lo];
+    if (next !== undefined && prev.off + prev.size === next.off) {
+      prev.size += next.size;
+      freeList.splice(lo, 1);
+    }
+    return;
+  }
+  const next = freeList[lo];
+  if (next !== undefined && off + size === next.off) {
+    next.off = off;
+    next.size += size;
+    return;
+  }
+  freeList.splice(lo, 0, { off, size });
 }
 
 /**
@@ -702,13 +756,7 @@ class IndexAllocator {
     return off;
   }
   release(off: number, elements: number): void {
-    this.freeList.push({ off, size: elements });
-    this.freeList.sort((a, b) => a.off - b.off);
-    for (let i = 0; i < this.freeList.length - 1; ) {
-      const a = this.freeList[i]!, b = this.freeList[i + 1]!;
-      if (a.off + a.size === b.off) { a.size += b.size; this.freeList.splice(i + 1, 1); }
-      else i++;
-    }
+    insertSortedFreeBlock(this.freeList, off, elements);
   }
   onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
   destroy(): void { this.buf.destroy(); }
@@ -1023,8 +1071,15 @@ interface Bucket {
    */
   readonly localLayoutIds: (number | undefined)[];
 
-  /** Live local slots (drives the render loop). */
-  readonly drawSlots: number[];
+  /**
+   * Live local slots. A Set rather than an array so addDraw/removeDraw
+   * are both O(1): a 500-element bulk-remove on a 1000-element bucket
+   * would otherwise burn 250K shifts in the linear-array splice path.
+   * The render loop iterates this once per frame; iteration order
+   * isn't load-bearing (slot→record indirection happens via
+   * `slotToRecord` / `recordToSlot`).
+   */
+  readonly drawSlots: Set<number>;
   /** Local slots whose DrawHeader needs re-pack + writeBuffer next frame. */
   readonly dirty: Set<number>;
 
@@ -1067,6 +1122,12 @@ interface Bucket {
    * GrowBuffer reallocation. Standalone-only buckets keep this empty.
    */
   readonly localAtlasTextures: ((HeapTextureSet & { kind: "atlas" }) | undefined)[];
+  /**
+   * Per-local-slot index into `atlasAvalRefs[sourceAval]` — lets
+   * removeDraw do swap-pop without an O(N) findIndex scan. `undefined`
+   * for slots without an atlas source aval.
+   */
+  readonly localAtlasArrIdx: (number | undefined)[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1554,7 +1615,11 @@ export function buildHeapScene(
     readonly repack: (newTex: ITexture) => import("./textureAtlas/atlasPool.js").AtlasAcquisition;
     readonly sampler: ISampler;
   }
-  const atlasAvalRefs = new Map<aval<ITexture>, AtlasAvalRef[]>();
+  // Content-keyed (`HashTable`, not a JS `Map`) so distinct
+  // `AVal.constant(tex)` wrappers sharing the same texture collapse to
+  // one `(bucket, slot)` ref-list — matching `AtlasPool.entriesByAval`,
+  // which is now content-keyed too. Reactive avals key by reference.
+  const atlasAvalRefs = new HashTable<aval<ITexture>, AtlasAvalRef[]>();
   /**
    * Per-draw bucket dirty (rare in steady state — only fires when
    * something forces a header rewrite, e.g. a drawHeap GrowBuffer
@@ -2263,7 +2328,7 @@ export function buildHeapScene(
       localPosRefs: [], localNorRefs: [],
       localEntries: [], localToDrawId: [],
       localPerDrawAvals: [], localPerDrawRefs: [], localLayoutIds: [],
-      drawSlots: [], dirty: new Set<number>(),
+      drawSlots: new Set<number>(), dirty: new Set<number>(),
       drawTableDirtyMin: Infinity, drawTableDirtyMax: 0,
       recordCount: 0, slotToRecord: [], recordToSlot: [],
       totalEmitEstimate: 0,
@@ -2271,6 +2336,7 @@ export function buildHeapScene(
       isAtlasBucket,
       localAtlasReleases: [],
       localAtlasTextures: [],
+      localAtlasArrIdx: [],
     };
     {
       const dtBuf = new GrowBuffer(
@@ -2492,7 +2558,21 @@ export function buildHeapScene(
   Object.defineProperty(stats, "groups", { get: () => buckets.length, configurable: true });
 
   // ─── addDraw / removeDraw ─────────────────────────────────────────
+  // Public addDraw wrapper. Establishes a sceneObj.evaluateAlways
+  // scope so external callers (no batched outer eval) still register
+  // sceneObj as an output of any aval the spec touches. Internal call
+  // sites (drainAsetWith, batched initial-population) already run
+  // inside a single outer evaluateAlways and invoke addDrawImpl
+  // directly with their token — collapsing 1000× nested
+  // evaluateAlways into 1× outer.
   function addDraw(spec: HeapDrawSpec): number {
+    let id = -1;
+    sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
+      id = addDrawImpl(spec, tok);
+    });
+    return id;
+  }
+  function addDrawImpl(spec: HeapDrawSpec, outerTok: AdaptiveToken): number {
     const drawId = nextDrawId++;
     // Family-merge (slice 3c): build the family lazily from this
     // single spec when no batched lazy-build occurred earlier (e.g.
@@ -2531,7 +2611,8 @@ export function buildHeapScene(
     // emerges from aval identity either way.
     const perDrawAvals: aval<unknown>[] = [];
     const perDrawRefs = new Map<string, number>();
-    sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
+    {
+      const tok = outerTok;
       for (const f of bucket.layout.drawHeaderFields) {
         // Atlas-variant texture bindings carry inline values rather than
         // pool refs; packAtlasTextureFields fills them after this loop.
@@ -2603,7 +2684,7 @@ export function buildHeapScene(
         perDrawRefs.set(f.name, ref);
         perDrawAvals.push(av);
       }
-    });
+    }
 
     bucket.localPosRefs[localSlot] = perDrawRefs.get("Positions");
     bucket.localNorRefs[localSlot] = perDrawRefs.get("Normals");
@@ -2611,7 +2692,7 @@ export function buildHeapScene(
       indexCount: idxAlloc.count, firstIndex: idxAlloc.firstIndex, instanceCount,
     };
     bucket.localToDrawId[localSlot] = drawId;
-    bucket.drawSlots.push(localSlot);
+    bucket.drawSlots.add(localSlot);
     bucket.localPerDrawAvals[localSlot] = perDrawAvals;
     bucket.localPerDrawRefs[localSlot]  = perDrawRefs;
     const layoutId = fam.schema.layoutIdOf.get(spec.effect)!;
@@ -2627,15 +2708,14 @@ export function buildHeapScene(
       const sourceAval = spec.textures.sourceAval;
       const repackFn = spec.textures.repack;
       if (sourceAval !== undefined && repackFn !== undefined) {
-        sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
-          // touch — registers sceneObj as an output of sourceAval.
-          sourceAval.getValue(tok);
-        });
+        // touch — registers sceneObj as an output of sourceAval.
+        sourceAval.getValue(outerTok);
         let arr = atlasAvalRefs.get(sourceAval);
         if (arr === undefined) {
           arr = [];
           atlasAvalRefs.set(sourceAval, arr);
         }
+        bucket.localAtlasArrIdx[localSlot] = arr.length;
         arr.push({ bucket, localSlot, repack: repackFn, sampler: spec.textures.sampler });
       }
     }
@@ -2778,11 +2858,18 @@ export function buildHeapScene(
     const atlasTex = bucket.localAtlasTextures[localSlot];
     if (atlasTex !== undefined) {
       const sourceAval = atlasTex.sourceAval;
-      if (sourceAval !== undefined) {
+      const i = bucket.localAtlasArrIdx[localSlot];
+      if (sourceAval !== undefined && i !== undefined) {
         const arr = atlasAvalRefs.get(sourceAval);
         if (arr !== undefined) {
-          const i = arr.findIndex(r => r.bucket === bucket && r.localSlot === localSlot);
-          if (i >= 0) arr.splice(i, 1);
+          // Swap-pop: O(1) regardless of array length.
+          const last = arr.length - 1;
+          if (i !== last) {
+            const moved = arr[last]!;
+            arr[i] = moved;
+            moved.bucket.localAtlasArrIdx[moved.localSlot] = i;
+          }
+          arr.pop();
           if (arr.length === 0) {
             atlasAvalRefs.delete(sourceAval);
             atlasAvalDirty.delete(sourceAval);
@@ -2792,6 +2879,7 @@ export function buildHeapScene(
     }
     bucket.localAtlasReleases[localSlot] = undefined;
     bucket.localAtlasTextures[localSlot] = undefined;
+    bucket.localAtlasArrIdx[localSlot] = undefined;
 
     bucket.localPerDrawAvals[localSlot] = undefined;
     bucket.localPerDrawRefs[localSlot]  = undefined;
@@ -2800,8 +2888,7 @@ export function buildHeapScene(
     bucket.localNorRefs[localSlot]  = undefined;
     bucket.localEntries[localSlot]  = undefined;
     bucket.localToDrawId[localSlot] = undefined;
-    const idx = bucket.drawSlots.indexOf(localSlot);
-    if (idx >= 0) bucket.drawSlots.splice(idx, 1);
+    bucket.drawSlots.delete(localSlot);
     bucket.dirty.delete(localSlot);
     bucket.drawHeap.release(localSlot);
 
@@ -2821,7 +2908,11 @@ export function buildHeapScene(
     const delta = asetReader.getChanges(tok);
     delta.iter((op: { value: HeapDrawSpec; count: number }) => {
       if (op.count > 0) {
-        const id = addDraw(op.value);
+        // Re-use the outer evaluateAlways scope's token (caller is
+        // already sceneObj) — collapses N nested evaluateAlways into
+        // one for a bulk add. Saves a per-RO setUnsafeEvaluationDepth
+        // + outputs.add(sceneObj) round trip.
+        const id = addDrawImpl(op.value, tok);
         specToDrawId.set(op.value, id);
       } else {
         const id = specToDrawId.get(op.value);
@@ -2840,7 +2931,9 @@ export function buildHeapScene(
     // array is empty (family will build lazily when an addDraw fires).
     const arr = initialDraws as readonly HeapDrawSpec[];
     if (arr.length > 0) buildFamilyFromSpecs(arr);
-    for (const d of arr) addDraw(d);
+    sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
+      for (const d of arr) addDrawImpl(d, tok);
+    });
   } else {
     asetReader = (initialDraws as aset<HeapDrawSpec>).getReader();
     sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
@@ -2860,7 +2953,7 @@ export function buildHeapScene(
         if (adds.length > 0) buildFamilyFromSpecs(adds);
         for (const op of remaining) {
           if (op.count > 0) {
-            const id = addDraw(op.value);
+            const id = addDrawImpl(op.value, tok);
             specToDrawId.set(op.value, id);
           } else {
             const id = specToDrawId.get(op.value);

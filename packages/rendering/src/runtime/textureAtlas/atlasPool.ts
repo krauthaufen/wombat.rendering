@@ -30,7 +30,7 @@
 // mip generation (canvas-2d) for v1; compute-shader path is future.
 
 import { V2f, V2i } from "@aardworx/wombat.base";
-import type { aval } from "@aardworx/wombat.adaptive";
+import { type aval, HashTable } from "@aardworx/wombat.adaptive";
 import type { ITexture, HostTextureSource } from "../../core/texture.js";
 import { TexturePacking } from "./packer.js";
 import { buildMipsAndGutterOnGpu, type MipSlot } from "./atlasMipGutterKernel.js";
@@ -227,7 +227,17 @@ function describeAtlasTexture(t: ITexture): {
 export class AtlasPool {
   private readonly pagesByFormat = new Map<AtlasPageFormat, AtlasPage[]>();
   private readonly pageAddedListeners = new Map<AtlasPageFormat, Set<(pageId: number) => void>>();
-  private readonly entriesByAval = new Map<aval<ITexture>, AtlasEntry>();
+  /**
+   * Keyed by `aval<ITexture>` under the aval equality protocol: a
+   * `HashTable` (not a JS `Map`) so two distinct `AVal.constant(tex)`
+   * built at different call sites — including ones wrapping
+   * structurally-equal `ITexture` values, e.g. `ITexture.fromUrl("X")`
+   * twice (which are in fact the *same* interned object) — collapse to
+   * one entry. Reactive (non-constant) avals key by reference, which is
+   * correct since their value can change. This subsumes the old `§5b`
+   * value-key side-table entirely.
+   */
+  private readonly entriesByAval = new HashTable<aval<ITexture>, AtlasEntry>();
   private readonly entriesByRef = new Map<number, AtlasEntry>();
   /**
    * §5b value-equality dedup map. Constant avals (`isConstant ===
@@ -235,8 +245,33 @@ export class AtlasPool {
    * HostTextureSource (kind:"host") collapse to one sub-rect.
    * Reactive avals fall through to identity-only since their
    * content can change.
+   *
+   * NOTE: now mostly vestigial — `entriesByAval` being a content-keyed
+   * `HashTable` already collapses constant-aval siblings. Kept for the
+   * (rare) case where two constant avals wrap *different* `ITexture`
+   * wrapper objects that nevertheless reference the same inner GPU
+   * resource AND don't compare equal under the ITexture protocol
+   * (shouldn't happen with the factory functions, but a hand-built
+   * `{kind:"gpu", texture}` literal wouldn't carry the protocol).
    */
   private readonly entriesByValueKey = new Map<GPUTexture | HostTextureSource, AtlasEntry>();
+  /**
+   * LRU of refcount-0 entries. Insertion order = age (oldest first).
+   * Released entries land here instead of being freed immediately —
+   * this lets a re-`acquire` of the same `aval<ITexture>` (or value-
+   * keyed sibling) resurrect the sub-rect in O(1) with no GPU upload.
+   * Entries leave the LRU when (a) `acquire` resurrects them, or
+   * (b) a fresh acquire can't fit in any existing page and we need
+   * to evict oldest-first to make room.
+   *
+   * Why we don't free on refcount → 0: a cset-driven workload (e.g.
+   * the heap-demo-sg toggle) cycles the same texture's atlas slot
+   * through 0-refs → fresh-acquire many times per second. The
+   * eager-free path repeatedly upload-and-pack the same image; the
+   * profiler showed `copyExternalImageToTexture` firing during every
+   * toggle. With the LRU it fires only on first acquire.
+   */
+  private readonly lru = new Map<number, AtlasEntry>();
   private nextRef = 1;
 
   private innerKeyOf(t: ITexture): GPUTexture | HostTextureSource {
@@ -341,7 +376,9 @@ export class AtlasPool {
   ): AtlasAcquisition {
     const existing = this.entriesByAval.get(sourceAval);
     if (existing !== undefined) {
+      const wasIdle = existing.refcount === 0;
       existing.refcount++;
+      if (wasIdle) this.lru.delete(existing.ref);
       return this.makeResult(existing);
     }
 
@@ -365,9 +402,11 @@ export class AtlasPool {
       if (valueKey !== undefined) {
         const shared = this.entriesByValueKey.get(valueKey);
         if (shared !== undefined) {
+          const wasIdle = shared.refcount === 0;
           shared.refcount++;
           shared.aliases.push(sourceAval);
           this.entriesByAval.set(sourceAval, shared);
+          if (wasIdle) this.lru.delete(shared.ref);
           return this.makeResult(shared);
         }
       }
@@ -407,14 +446,36 @@ export class AtlasPool {
 
     const pages = this.pagesByFormat.get(format)!;
 
-    // Try fitting into existing pages first.
-    for (let i = 0; i < pages.length; i++) {
-      const page = pages[i]!;
-      const next = page.packing.tryAdd(this.nextRef, size);
-      if (next !== null) {
-        page.packing = next;
-        return this.finalize(sourceAval, format, i, page, opts.source, width, height, numMips, valueKey);
+    const tryFitInExisting = (): AtlasAcquisition | null => {
+      for (let i = 0; i < pages.length; i++) {
+        const page = pages[i]!;
+        const next = page.packing.tryAdd(this.nextRef, size);
+        if (next !== null) {
+          page.packing = next;
+          return this.finalize(sourceAval, format, i, page, opts.source, width, height, numMips, valueKey);
+        }
       }
+      return null;
+    };
+
+    // Try fitting into existing pages first.
+    {
+      const fit = tryFitInExisting();
+      if (fit !== null) return fit;
+    }
+
+    // Page-fit failed. Try evicting LRU entries (oldest first) on this
+    // format's pages until either the new size fits or the LRU is
+    // empty. Each evicted entry frees its packer slot; we retry the
+    // packer after every eviction since the freed slot may bridge two
+    // existing gaps. Only entries with `format` matching the request
+    // can help — wrong-format entries live on different pages.
+    for (const [ref, entry] of this.lru) {
+      if (entry.format !== format) continue;
+      this.actuallyFree(entry);
+      void ref;
+      const fit = tryFitInExisting();
+      if (fit !== null) return fit;
     }
 
     // Allocate a fresh page if we haven't hit the max.
@@ -528,12 +589,31 @@ export class AtlasPool {
     return acq;
   }
 
-  /** Decrement the refcount; on zero, free the sub-rect. */
+  /**
+   * Decrement the refcount. On zero we *don't* eagerly free — the entry
+   * moves to the LRU instead, so a re-acquire of the same aval (or a
+   * value-keyed sibling) can resurrect it without re-uploading the
+   * texture. Eviction (actual `actuallyFree`) happens lazily when a
+   * fresh acquire can't fit and we need to reclaim packer space.
+   */
   release(ref: number): void {
     const e = this.entriesByRef.get(ref);
     if (e === undefined) return;
     e.refcount--;
     if (e.refcount > 0) return;
+    // Hold the entry idle in the LRU. Move-to-end (Map insertion-order
+    // semantics): delete + set re-positions a key that was already
+    // present, but the refcount-0 path shouldn't see one here — guard
+    // anyway in case of double-release.
+    this.lru.delete(e.ref);
+    this.lru.set(e.ref, e);
+  }
+
+  /**
+   * Drop an LRU entry for real: remove its packer slot, drop the entry
+   * from every lookup map. Caller must guarantee `refcount === 0`.
+   */
+  private actuallyFree(e: AtlasEntry): void {
     const pages = this.pagesByFormat.get(e.format)!;
     const page = pages[e.pageId];
     if (page !== undefined) {
@@ -542,6 +622,23 @@ export class AtlasPool {
     this.entriesByRef.delete(e.ref);
     for (const a of e.aliases) this.entriesByAval.delete(a);
     if (e.valueKey !== undefined) this.entriesByValueKey.delete(e.valueKey);
+    this.lru.delete(e.ref);
+  }
+
+  /**
+   * Free every refcount-0 entry held by the LRU. Used by tests that
+   * want to assert packer-empty after a release, and by callers that
+   * want to release atlas memory pressure on demand. Returns the
+   * number of entries freed. Outside of tests, eviction normally
+   * happens lazily on packer pressure during a subsequent `acquire`.
+   */
+  evictIdle(): number {
+    let n = 0;
+    for (const [, entry] of this.lru) {
+      this.actuallyFree(entry);
+      n++;
+    }
+    return n;
   }
 
   /** Destroy every page texture. The pool becomes unusable. */
@@ -554,6 +651,7 @@ export class AtlasPool {
     this.entriesByAval.clear();
     this.entriesByRef.clear();
     this.entriesByValueKey.clear();
+    this.lru.clear();
   }
 
   private finalize(
@@ -615,6 +713,33 @@ export class AtlasPool {
     h: number,
     numMips: number,
   ): void {
+    // Fast path — `external` source, no mips: upload mip-0 straight to
+    // the page with `copyExternalImageToTexture` (decode happens on the
+    // GPU/compositor side, not the main thread) and fill the 2-px
+    // gutter ring with tiny intra-page `copyTextureToTexture` ops. This
+    // skips `extractPixels`, whose canvas-2d `drawImage`+`getImageData`
+    // round-trip per texture was ~8% of cold-boot CPU on the main
+    // thread (the heap-demo-sg profile). If the platform rejects
+    // same-texture copies (the original reason this path didn't exist —
+    // older Dawn) the gutter cells just stay as-is; per the existing
+    // tolerance that's "visually invisible" for typical atlas content,
+    // and mip-0 itself is correct either way. `numMips > 1` and `raw`
+    // sources keep the kernel / CPU path (mip downsampling genuinely
+    // needs the pixels; for `raw` `extractPixels` is a free slice).
+    if (host.kind === "external" && numMips <= 1) {
+      try {
+        this.device.queue.copyExternalImageToTexture(
+          { source: host.source as GPUImageCopyExternalImageSource },
+          { texture: page.texture, origin: { x, y, z: 0 } },
+          { width: w, height: h, depthOrArrayLayers: 1 },
+        );
+        this.fillGutterRing(page.texture, x, y, w, h);
+        return;
+      } catch {
+        // Source not in a copyable state (e.g. a not-ready video) —
+        // fall through to the CPU/kernel path below.
+      }
+    }
     // For storage-capable pages (rgba8unorm): use the GPU compute
     // kernel to build mips + gutter in one pass. Mip 0 interior is
     // uploaded raw via writeTexture; the kernel reads from there to
@@ -802,13 +927,20 @@ export class AtlasPool {
     return true;
   }
 
-  /** Unused stub kept for compatibility — see uploadLevelWithGutter. */
-  private fillClampGutter(
-    page: AtlasPage,
+  /**
+   * Fill a sub-rect's 2-px gutter ring (inner clamp-replicate ring +
+   * outer wrap ring) from the already-uploaded interior pixels, using
+   * ~24 tiny intra-page `copyTextureToTexture` ops. `(ix, iy)` is the
+   * interior origin (= sub-rect origin + 2,+2), `w×h` the interior
+   * size. Used by the `copyExternalImageToTexture` fast path. If the
+   * platform rejects same-texture copies these become no-ops (validation
+   * errors don't throw synchronously) and the gutter cells stay as-is —
+   * which is the documented "visually invisible" tolerance.
+   */
+  private fillGutterRing(
+    t: GPUTexture,
     ix: number, iy: number, w: number, h: number,
   ): void {
-    void page; void ix; void iy; void w; void h;
-    const t = page.texture;
     const enc = this.device.createCommandEncoder({ label: "atlas/gutter" });
     const cp = (sx: number, sy: number, sw: number, sh: number, dx: number, dy: number): void => {
       enc.copyTextureToTexture(

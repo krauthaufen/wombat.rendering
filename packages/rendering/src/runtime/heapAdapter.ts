@@ -32,6 +32,7 @@ import type { BufferView } from "../core/bufferView.js";
 import { ITexture, type HostTextureSource } from "../core/texture.js";
 import { ISampler } from "../core/sampler.js";
 import type { RenderObject } from "../core/renderObject.js";
+import { asAttributeProvider, asUniformProvider } from "../core/provider.js";
 import type { HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
 
@@ -173,21 +174,52 @@ export function renderObjectToHeapSpec(
   token: AdaptiveToken,
   pool?: AtlasPool,
 ): HeapDrawSpec {
-  // 1. Inputs map: vertex attributes (BufferView) + uniforms.
+  // 1. Inputs map: vertex attributes (BufferView) + uniforms, pulled
+  //    SHADER-DRIVEN from the providers. We compile `ro.effect` (cached
+  //    per Effect by the module-level compile cache) to discover the
+  //    names it declares, then `tryGet` exactly those — so a lazy
+  //    uniform provider (the Sg layer's auto-injected derived trafos)
+  //    only ever materialises the ~2-4 trafos an effect actually reads,
+  //    not all ~15. Compiling without a `fragmentOutputLayout` yields
+  //    the *unreduced* interface — a superset of what the heap
+  //    drawHeader ends up with — so we never under-provide; the
+  //    over-provided handful (uniforms that feed only pruned outputs)
+  //    is harmless (no drawHeader field → ignored).
+  const vAttr = asAttributeProvider(ro.vertexAttributes);
+  const uProv = asUniformProvider(ro.uniforms);
+  const iface = ro.effect.compile({ target: "wgsl" }).interface;
   const inputs: { [name: string]: aval<unknown> | unknown } = {};
-  ro.vertexAttributes.iter((name, bv: BufferView) => { inputs[name] = bv; });
-  ro.uniforms.iter((name, av) => { inputs[name] = av; });
+  for (const a of iface.attributes) {
+    const bv = vAttr.tryGet(a.name);
+    if (bv !== undefined) inputs[a.name] = bv;
+  }
+  const pullUniform = (name: string): void => {
+    if (Object.prototype.hasOwnProperty.call(inputs, name)) return;
+    const av = uProv.tryGet(name);
+    if (av !== undefined) inputs[name] = av;
+  };
+  for (const b of iface.uniformBlocks) for (const f of b.fields) pullUniform(f.name);
+  for (const u of iface.uniforms) pullUniform(u.name);
+  // §7 derived-uniforms constituents — cheap (these are the raw
+  // `state.model/view/proj` avals, no `compose`/`inverse`) and the
+  // compute pre-pass needs them even when the effect itself doesn't
+  // declare them. No-ops if the provider doesn't carry them.
+  for (const n of ["ModelTrafo", "ViewTrafo", "ProjTrafo"]) pullUniform(n);
 
-  // 1b. Instance attributes — same shape, threaded via the heap path's
-  //     per-RO instancing fast path (one record / one drawIndirect for
-  //     `instanceCount > 1`, with per-instance attribute reads indexed
-  //     by the in-RO instance idx).
+  // 1b. Instance attributes — provider is map-backed (user-supplied via
+  //     `Sg.instanced({attributes})`), so enumerate its names. Threaded
+  //     via the heap path's per-RO instancing fast path.
   let instanceAttributes: { [name: string]: aval<unknown> | unknown } | undefined;
-  if (ro.instanceAttributes !== undefined && ro.instanceAttributes.count > 0) {
-    instanceAttributes = {};
-    ro.instanceAttributes.iter((name, bv: BufferView) => {
-      instanceAttributes![name] = bv;
-    });
+  if (ro.instanceAttributes !== undefined) {
+    const iAttr = asAttributeProvider(ro.instanceAttributes);
+    const names = [...iAttr.names()];
+    if (names.length > 0) {
+      instanceAttributes = {};
+      for (const n of names) {
+        const bv = iAttr.tryGet(n);
+        if (bv !== undefined) instanceAttributes[n] = bv;
+      }
+    }
   }
 
   // 2. Indices: BufferView → aval<Uint32Array>. Map the underlying
@@ -197,22 +229,21 @@ export function renderObjectToHeapSpec(
   }
   const indices: aval<Uint32Array> = indicesAvalFor(ro.indices.buffer);
 
-  // 3. Texture/sampler: single-pair v1. Classifier already capped
-  //    counts at 1 each.
+  // 3. Texture/sampler: single-pair v1. The Sg compile layer binds
+  //    each texture aval under both `name` and `${name}_view` so the
+  //    WGSL schema's binding shape doesn't matter at scene time — that
+  //    leaves us with two HashMap entries pointing at the same aval.
+  //    Dedupe by identity before applying the single-pair rule.
+  const distinctTexAvals = new Set<aval<ITexture>>();
+  ro.textures.iter((_n, av) => { distinctTexAvals.add(av as aval<ITexture>); });
+  const distinctSamplerAvals = new Set<aval<ISampler>>();
+  ro.samplers.iter((_n, av) => { distinctSamplerAvals.add(av as aval<ISampler>); });
   let textures: HeapTextureSet | undefined;
-  if (ro.textures.count === 1 && ro.samplers.count === 1) {
-    let texAval: aval<unknown> | undefined;
-    let texVal: ITexture | undefined;
-    let samplerAval: aval<unknown> | undefined;
-    let samplerVal: ISampler | undefined;
-    ro.textures.iter((_n, av) => {
-      texAval = av;
-      texVal = av.getValue(token) as ITexture;
-    });
-    ro.samplers.iter((_n, av) => {
-      samplerAval = av;
-      samplerVal = av.getValue(token) as ISampler;
-    });
+  if (distinctTexAvals.size === 1 && distinctSamplerAvals.size === 1) {
+    const texAval = [...distinctTexAvals][0]!;
+    const samplerAval = [...distinctSamplerAvals][0]!;
+    const texVal = texAval.getValue(token);
+    const samplerVal = samplerAval.getValue(token);
     void samplerAval;
     if (texVal === undefined || samplerVal === undefined) {
       throw new Error("heapAdapter: missing texture/sampler value");
@@ -291,9 +322,9 @@ export function renderObjectToHeapSpec(
         sampler: ISampler.fromGPU(samplerVal.sampler),
       };
     }
-  } else if (ro.textures.count > 0 || ro.samplers.count > 0) {
+  } else if (distinctTexAvals.size > 0 || distinctSamplerAvals.size > 0) {
     throw new Error(
-      `heapAdapter: RO has ${ro.textures.count} texture(s) and ${ro.samplers.count} sampler(s); ` +
+      `heapAdapter: RO has ${distinctTexAvals.size} distinct texture aval(s) and ${distinctSamplerAvals.size} distinct sampler aval(s); ` +
       `single-pair only in v1 (classifier should have caught this)`,
     );
   }

@@ -16,6 +16,7 @@ import type { ISampler } from "./sampler.js";
 import type { ITexture } from "./texture.js";
 import type { PipelineState } from "./pipelineState.js";
 import type { Effect } from "./shader.js";
+import type { IAttributeProvider, IUniformProvider } from "./provider.js";
 
 export interface RenderObject {
   /**
@@ -39,17 +40,23 @@ export interface RenderObject {
   readonly pipelineState: PipelineState;
 
   /**
-   * name → vertex buffer view; e.g. "position", "normal", "uv".
-   *
-   * The set of attribute names is fixed structurally; only the
-   * individual buffer values are reactive. The shader's required-input
-   * set is fixed at compile; the map must contain at least those names.
+   * Vertex attributes, looked up by name. The binding layer pulls
+   * shader-driven (one `tryGet(name)` per declared vertex input), so a
+   * provider may compute views lazily — though in practice attribute
+   * providers are map-backed. `undefined` from `tryGet` for a name the
+   * shader requires is an error at prepare time.
    */
-  readonly vertexAttributes: HashMap<string, BufferView>;
-  /** name → instance buffer view; e.g. "modelMatrix", "instanceColor". */
-  readonly instanceAttributes?: HashMap<string, BufferView>;
-  /** name → uniform value; runtime packs into UBO based on shader layout. */
-  readonly uniforms: HashMap<string, aval<unknown>>;
+  readonly vertexAttributes: IAttributeProvider;
+  /** Instance attributes, looked up by name (same contract). */
+  readonly instanceAttributes?: IAttributeProvider;
+  /**
+   * Uniform values, looked up by name. The runtime packs the UBO from
+   * the shader's declared layout — for each declared uniform it calls
+   * `uniforms.tryGet(name)`. Names no shader reads are never pulled, so
+   * a lazy provider (e.g. the Sg layer's auto-injected derived trafos)
+   * never builds their aval chains.
+   */
+  readonly uniforms: IUniformProvider;
   /** name → texture source (CPU image or pre-built GPUTexture). */
   readonly textures: HashMap<string, aval<ITexture>>;
   /** name → sampler source (descriptor or pre-built GPUSampler). */

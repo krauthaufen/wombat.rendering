@@ -85,7 +85,7 @@ describe("AtlasPool — mip pyramid layout", () => {
     expect(packerUsedArea(pool)).toBe(4 * rm.w * rm.h + 2 * rp.w * rp.h);
   });
 
-  it("releasing a mipped texture frees its full reserved rect", () => {
+  it("releasing a mipped texture frees its full reserved rect after eviction", () => {
     const gpu = new MockGPU();
     const pool = new AtlasPool(gpu.device);
     const w = 128, h = 128;
@@ -93,6 +93,11 @@ describe("AtlasPool — mip pyramid layout", () => {
     const r = reservedSize(w, h, true, defaultMipCount(w, h));
     expect(packerUsedArea(pool)).toBe(r.w * r.h);
     pool.release(acq.ref);
+    // Released entries stay in the LRU (so a re-acquire can resurrect
+    // without re-uploading). Eviction is lazy on packer pressure —
+    // tests force it explicitly to verify the underlying free path.
+    expect(packerUsedArea(pool)).toBe(r.w * r.h);
+    pool.evictIdle();
     expect(packerUsedArea(pool)).toBe(0);
   });
 
@@ -130,10 +135,12 @@ describe("AtlasPool — mip pyramid layout", () => {
     expect(a.ref).toBe(b.ref);
     expect(a.origin.x).toBe(b.origin.x);
     expect(a.origin.y).toBe(b.origin.y);
-    // First release decrements; second frees.
+    // First release decrements; second drops to idle in the LRU.
     pool.release(a.ref);
     expect(packerUsedArea(pool)).toBeGreaterThan(0);
     pool.release(b.ref);
+    expect(packerUsedArea(pool)).toBeGreaterThan(0); // still resident, idle
+    pool.evictIdle();
     expect(packerUsedArea(pool)).toBe(0);
   });
 });

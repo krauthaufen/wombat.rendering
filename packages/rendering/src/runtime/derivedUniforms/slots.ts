@@ -73,6 +73,10 @@ function packMat4ToSlot(mirror: Float32Array, slotIdx: number, m: M44d): void {
 
 export class ConstituentSlots {
   private readonly pool = new IndexPool();
+  // Keyed by `aval<Trafo3d>` *by reference* (plain JS `Map`). Keys
+  // here are per-object `cval<Trafo3d>`s in practice; content-keying
+  // would buy nothing and cost the reactive-aval identity-hash detour
+  // (see the note on `UniformPool.byAval`).
   private readonly byAval = new Map<aval<Trafo3d>, ConstituentEntry>();
   private readonly dirtyAvals = new Set<aval<Trafo3d>>();
   private mirror: Float32Array;

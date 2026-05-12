@@ -50,10 +50,13 @@ describe("[plugin/behavioural] AtlasPool §5b dedup", () => {
     expect(b.ref).toBe(a.ref);
     expect(b.pageId).toBe(a.pageId);
 
-    // Both releases must drop the entry.
+    // Both releases must drop the entry — but only after eviction,
+    // since released entries stay in the LRU for resurrection.
     pool.release(a.ref);
     expect(pool.entry(av1)).toBeDefined();
     pool.release(b.ref);
+    expect(pool.entry(av1)).toBeDefined();
+    pool.evictIdle();
     expect(pool.entry(av1)).toBeUndefined();
     expect(pool.entry(av2)).toBeUndefined();
   });

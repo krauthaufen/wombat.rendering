@@ -14,8 +14,11 @@
 
 import {
   AdaptiveResource,
+  AttributeProvider,
   BufferView,
   ElementType,
+  asAttributeProvider,
+  asUniformProvider,
   type CompiledEffect,
   type FramebufferSignature,
   type ProgramInterface,
@@ -508,8 +511,10 @@ export function prepareRenderObject(
   // The set of attribute names is fixed structurally; only the
   // per-attribute BufferView avals are reactive. We resolve names →
   // step-mode now (vertex vs instance) from the maps directly.
-  const vertexMap = obj.vertexAttributes;
-  const instanceMap = obj.instanceAttributes ?? emptyAttrMap();
+  const vertexMap = asAttributeProvider(obj.vertexAttributes);
+  const instanceMap = obj.instanceAttributes !== undefined
+    ? asAttributeProvider(obj.instanceAttributes)
+    : AttributeProvider.empty;
 
   // Per-attribute resolution + grouping. Multiple attributes can
   // share one underlying GPUBuffer slot when they all point at the
@@ -534,8 +539,8 @@ export function prepareRenderObject(
   }
   const resolved: ResolvedBinding[] = [];
   for (const vb of vertexBindings) {
-    const fromVertex = vertexMap.tryFind(vb.name);
-    const fromInstance = instanceMap.tryFind(vb.name);
+    const fromVertex = vertexMap.tryGet(vb.name);
+    const fromInstance = instanceMap.tryGet(vb.name);
     if (fromVertex === undefined && fromInstance === undefined) {
       throw new Error(`prepareRenderObject: missing vertex attribute "${vb.name}"`);
     }
@@ -665,7 +670,7 @@ export function prepareRenderObject(
   for (let g = 0; g <= maxGroup; g++) perGroup.push([]);
 
   for (const ub of iface.uniformBlocks) {
-    const merged = mergeUniformInputs(obj.uniforms, effect.avalBindings, ub);
+    const merged = mergeUniformInputs(asUniformProvider(obj.uniforms), effect.avalBindings, ub);
     const block = ubAsBlock(ub);
     const res = prepareUniformBuffer(device, block, merged, {
       ...(opts.label !== undefined ? { label: `${opts.label}.${ub.name}` } : {}),
@@ -739,10 +744,6 @@ export function prepareRenderObject(
   );
 }
 
-function emptyAttrMap(): HashMap<string, BufferView> {
-  return HashMap.empty<string, BufferView>();
-}
-
 /**
  * Sentinel pipeline placeholder. PreparedRenderObject's `pipeline`
  * field is non-null for ergonomic typing; before the first
@@ -757,19 +758,23 @@ const SENTINEL_PIPELINE = { __sentinel: "PreparedRenderObject.pipeline" } as unk
 // ---------------------------------------------------------------------------
 
 function mergeUniformInputs(
-  user: HashMap<string, aval<unknown>>,
+  user: import("../core/index.js").IUniformProvider,
   bindings: Readonly<Record<string, () => unknown>> | undefined,
   block: import("../core/index.js").UniformBlockInfo,
 ): HashMap<string, aval<unknown>> {
-  let merged = user;
-  if (bindings === undefined) return merged;
+  // Shader-driven: walk the block's declared fields and pull each from
+  // the user provider (lazy providers materialise only the names a
+  // shader actually declares), falling back to the effect's
+  // closure-captured `avalBindings` default. Uniforms the user provides
+  // but the shader doesn't declare are correctly dropped.
+  let merged = HashMap.empty<string, aval<unknown>>();
   for (const f of block.fields) {
-    if (merged.tryFind(f.name) !== undefined) continue;
-    const getter = bindings[f.name];
+    const u = user.tryGet(f.name);
+    if (u !== undefined) { merged = merged.add(f.name, u); continue; }
+    const getter = bindings?.[f.name];
     if (getter === undefined) continue;
     const v = getter();
-    if (isAval(v)) merged = merged.add(f.name, v as aval<unknown>);
-    else merged = merged.add(f.name, cval(v));
+    merged = merged.add(f.name, isAval(v) ? (v as aval<unknown>) : cval(v));
   }
   return merged;
 }
