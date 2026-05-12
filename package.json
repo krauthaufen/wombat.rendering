@@ -32,7 +32,7 @@
   },
   "dependencies": {
     "@aardworx/wombat.adaptive": "^0.2.5",
-    "@aardworx/wombat.base": "^0.4.2",
+    "@aardworx/wombat.base": "^0.4.3",
     "@aardworx/wombat.shader": "^0.5.2",
     "boperators": "^0.3.2"
   }
