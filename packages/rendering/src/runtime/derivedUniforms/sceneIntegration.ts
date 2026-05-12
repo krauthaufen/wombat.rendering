@@ -176,7 +176,11 @@ export function registerRoDerivations(
   };
 
   for (const [outName, rule] of req.rules) {
-    const flat = ruleFromIR(flatten(outName, rule.ir, req.rules), rule.outputType);
+    // `flatten` returns the same Expr object when nothing was substituted (the common case —
+    // the standard recipes reference no derived names), so we can reuse `rule` (it already
+    // carries a precomputed `.hash`) and skip a redundant IR hash walk per RO.
+    const flatIr = flatten(outName, rule.ir, req.rules);
+    const flat = flatIr === rule.ir ? rule : ruleFromIR(flatIr, rule.outputType);
     const id = scene.registry.register(flat);
     ruleHashes.push(flat.hash);
     const entry = scene.registry.get(id)!;
