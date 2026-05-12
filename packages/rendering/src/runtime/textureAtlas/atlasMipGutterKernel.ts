@@ -45,6 +45,11 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read_write> buf: array<u32>;
 @group(0) @binding(1) var<uniform> P: Params;
+// Optional mip-0 source — bound only by the interiorFromTexture
+// entry point (the staging-texture upload path). The buffer-only
+// entry points (interior, gutter) don't reference it, so their
+// pipeline layouts omit it.
+@group(0) @binding(2) var srcTex: texture_2d<f32>;
 
 fn loadRgba(x: u32, y: u32) -> vec4<f32> {
   let idx = y * P.buf_stride_u32 + x;
@@ -54,6 +59,18 @@ fn loadRgba(x: u32, y: u32) -> vec4<f32> {
 fn storeRgba(x: u32, y: u32, v: vec4<f32>) {
   let idx = y * P.buf_stride_u32 + x;
   buf[idx] = pack4x8unorm(v);
+}
+
+// Copy the staging texture's pixels into the buffer at mip-0's
+// interior offset (dst_origin_in_buf). src_size = staging size.
+// Used by the external-source upload path so the source decode
+// happens GPU-side (copyExternalImageToTexture -> staging) instead
+// of via a main-thread canvas-2d getImageData round-trip.
+@compute @workgroup_size(8, 8, 1)
+fn interiorFromTexture(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= P.src_size.x || gid.y >= P.src_size.y) { return; }
+  let v = textureLoad(srcTex, vec2<i32>(i32(gid.x), i32(gid.y)), 0);
+  storeRgba(P.dst_origin_in_buf.x + gid.x, P.dst_origin_in_buf.y + gid.y, v);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -104,9 +121,13 @@ fn gutter(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
 
 interface KernelCache {
-  bindGroupLayout: GPUBindGroupLayout;
-  interiorPipeline: GPUComputePipeline;
-  gutterPipeline:   GPUComputePipeline;
+  /** bindings 0 (storage buf) + 1 (uniform params) — buffer-only passes. */
+  bufBindGroupLayout: GPUBindGroupLayout;
+  /** bindings 0 + 1 + 2 (texture_2d src) — the mip-0-from-texture pass. */
+  texBindGroupLayout: GPUBindGroupLayout;
+  interiorPipeline:           GPUComputePipeline;
+  gutterPipeline:             GPUComputePipeline;
+  interiorFromTexturePipeline: GPUComputePipeline;
 }
 
 const caches = new WeakMap<GPUDevice, KernelCache>();
@@ -115,23 +136,39 @@ function getKernel(device: GPUDevice): KernelCache {
   const cached = caches.get(device);
   if (cached !== undefined) return cached;
   const module = device.createShaderModule({ code: WGSL, label: "atlas/mipGutterKernel" });
-  const bindGroupLayout = device.createBindGroupLayout({
-    label: "atlas/mipGutterKernel/bgl",
+  const bufBindGroupLayout = device.createBindGroupLayout({
+    label: "atlas/mipGutterKernel/bgl.buf",
     entries: [
       { binding: 0, visibility: 0x4 /* COMPUTE */, buffer: { type: "storage" } },
       { binding: 1, visibility: 0x4 /* COMPUTE */, buffer: { type: "uniform" } },
     ],
   });
-  const layout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+  const texBindGroupLayout = device.createBindGroupLayout({
+    label: "atlas/mipGutterKernel/bgl.tex",
+    entries: [
+      { binding: 0, visibility: 0x4 /* COMPUTE */, buffer: { type: "storage" } },
+      { binding: 1, visibility: 0x4 /* COMPUTE */, buffer: { type: "uniform" } },
+      { binding: 2, visibility: 0x4 /* COMPUTE */, texture: { sampleType: "float", viewDimension: "2d" } },
+    ],
+  });
+  const bufLayout = device.createPipelineLayout({ bindGroupLayouts: [bufBindGroupLayout] });
+  const texLayout = device.createPipelineLayout({ bindGroupLayouts: [texBindGroupLayout] });
   const interiorPipeline = device.createComputePipeline({
-    layout, compute: { module, entryPoint: "interior" },
+    layout: bufLayout, compute: { module, entryPoint: "interior" },
     label: "atlas/mipGutterKernel/interior",
   });
   const gutterPipeline = device.createComputePipeline({
-    layout, compute: { module, entryPoint: "gutter" },
+    layout: bufLayout, compute: { module, entryPoint: "gutter" },
     label: "atlas/mipGutterKernel/gutter",
   });
-  const entry: KernelCache = { bindGroupLayout, interiorPipeline, gutterPipeline };
+  const interiorFromTexturePipeline = device.createComputePipeline({
+    layout: texLayout, compute: { module, entryPoint: "interiorFromTexture" },
+    label: "atlas/mipGutterKernel/interiorFromTexture",
+  });
+  const entry: KernelCache = {
+    bufBindGroupLayout, texBindGroupLayout,
+    interiorPipeline, gutterPipeline, interiorFromTexturePipeline,
+  };
   caches.set(device, entry);
   return entry;
 }
@@ -148,21 +185,160 @@ export interface MipSlot {
   readonly size:   { w: number; h: number };
 }
 
+/** How mip-0's interior pixels get into the scratch buffer. */
+type Mip0Source =
+  // The caller already filled the buffer's mip-0 region at creation
+  // (via `mappedAtCreation`) — no extra pass needed.
+  | { readonly kind: "prefilled" }
+  // Add an `interiorFromTexture` compute pass that reads the staging
+  // texture and writes mip-0's interior into the buffer.
+  | { readonly kind: "texture"; readonly tex: GPUTexture };
+
 /**
- * Build the mip pyramid + gutters on GPU and upload the result to a
- * sub-rect of `page`. `srcPixels` is the raw RGBA8 source for mip 0
- * (`srcW × srcH` pixels). The kernel:
- *   - Allocates a per-acquire scratch buffer.
- *   - Initialises the buffer at creation with mip-0 source pixels at
- *     the mip-0 interior offset.
- *   - Dispatches per-mip interior + gutter compute passes.
- *   - copyBufferToTexture into the page at (subRectX, subRectY).
+ * Shared orchestration: allocate a scratch buffer laid out as the
+ * sub-rect's bounding box, initialise mip-0 (per `mip0Src`), run the
+ * per-mip interior-downscale + gutter compute passes over the buffer,
+ * then `copyBufferToTexture` into `page` at (subRectX, subRectY). The
+ * scratch buffer + per-pass UBOs are freed once the submission
+ * completes. Caller owns `mip0Src.tex` (if any) and its lifetime.
  *
- * Caller must ensure the page has COPY_DST usage (atlas pages
- * always do).
- *
- * Buffer is destroyed once submitted work completes (fire-and-forget
- * via `onSubmittedWorkDone`).
+ * `makeScratch` lets the `prefilled` path create the buffer with
+ * `mappedAtCreation` and fill it before we run; the `texture` path
+ * passes a plain (already-created) buffer.
+ */
+function runMipGutter(
+  device: GPUDevice,
+  page: GPUTexture,
+  subRectX: number, subRectY: number,
+  boundsW: number, boundsH: number,
+  rowBytes: number,
+  scratch: GPUBuffer,
+  srcW: number, srcH: number,
+  mips: readonly MipSlot[],
+  mip0Src: Mip0Source,
+): void {
+  const k = getKernel(device);
+  const bufStrideU32 = rowBytes / 4;
+  const mip0 = mips[0]!;
+
+  const enc = device.createCommandEncoder({ label: "atlas/mipGutterKernel" });
+
+  const ubos: GPUBuffer[] = [];
+  const makeUbo = (
+    srcO: { x: number; y: number }, srcS: { w: number; h: number },
+    dstO: { x: number; y: number }, dstS: { w: number; h: number },
+  ): GPUBuffer => {
+    const buf = device.createBuffer({
+      size: 48, // 12 u32, padded
+      usage: 0x40 /* UNIFORM */ | 0x08 /* COPY_DST */,
+      label: "atlas/mipGutter/params",
+    });
+    const u = new Uint32Array(12);
+    u[0] = bufStrideU32;
+    u[1] = 0;
+    u[2] = srcO.x; u[3] = srcO.y;
+    u[4] = srcS.w; u[5] = srcS.h;
+    u[6] = dstO.x; u[7] = dstO.y;
+    u[8] = dstS.w; u[9] = dstS.h;
+    device.queue.writeBuffer(buf, 0, u);
+    ubos.push(buf);
+    return buf;
+  };
+  const makeBufBg = (ubo: GPUBuffer): GPUBindGroup =>
+    device.createBindGroup({
+      layout: k.bufBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: scratch } },
+        { binding: 1, resource: { buffer: ubo } },
+      ],
+    });
+
+  // Mip-0 init pass — only the staging-texture path needs one. Reads
+  // `srcTex[gid]` for gid in [0,srcW)×[0,srcH), writes into the buffer
+  // at mip0.origin. Its own pass so the write is visible to the
+  // downstream interior/gutter passes (the pass boundary is a barrier).
+  if (mip0Src.kind === "texture") {
+    const ubo = makeUbo(mip0.origin, { w: srcW, h: srcH }, mip0.origin, { w: srcW, h: srcH });
+    const bg = device.createBindGroup({
+      layout: k.texBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: scratch } },
+        { binding: 1, resource: { buffer: ubo } },
+        { binding: 2, resource: mip0Src.tex.createView() },
+      ],
+    });
+    const pass = enc.beginComputePass({ label: "atlas/mipGutter/interiorFromTexture" });
+    pass.setPipeline(k.interiorFromTexturePipeline);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(Math.ceil(srcW / 8), Math.ceil(srcH / 8), 1);
+    pass.end();
+  }
+
+  // Interior passes: one compute pass per mip > 0 (pass boundary
+  // gives us the barrier ensuring mip-(k-1) is fully written before
+  // mip-k reads it).
+  for (let m = 1; m < mips.length; m++) {
+    const src = mips[m - 1]!;
+    const dst = mips[m]!;
+    const ubo = makeUbo(src.origin, src.size, dst.origin, dst.size);
+    const pass = enc.beginComputePass({ label: `atlas/mipGutter/interior/${m}` });
+    pass.setPipeline(k.interiorPipeline);
+    pass.setBindGroup(0, makeBufBg(ubo));
+    pass.dispatchWorkgroups(Math.ceil(dst.size.w / 8), Math.ceil(dst.size.h / 8), 1);
+    pass.end();
+  }
+
+  // Gutter passes: one per mip (each pass reads mip-m interior, which
+  // was either filled at buffer creation / by the texture pass for
+  // m=0, or by the interior pass for m>0).
+  for (let m = 0; m < mips.length; m++) {
+    const dst = mips[m]!;
+    const ubo = makeUbo(dst.origin, dst.size, dst.origin, dst.size);
+    const pass = enc.beginComputePass({ label: `atlas/mipGutter/gutter/${m}` });
+    pass.setPipeline(k.gutterPipeline);
+    pass.setBindGroup(0, makeBufBg(ubo));
+    pass.dispatchWorkgroups(
+      Math.ceil((dst.size.w + 4) / 8),
+      Math.ceil((dst.size.h + 4) / 8),
+      1,
+    );
+    pass.end();
+  }
+
+  // Final upload: buffer → page.
+  enc.copyBufferToTexture(
+    { buffer: scratch, bytesPerRow: rowBytes, rowsPerImage: boundsH },
+    { texture: page, origin: { x: subRectX, y: subRectY, z: 0 } },
+    { width: boundsW, height: boundsH, depthOrArrayLayers: 1 },
+  );
+
+  device.queue.submit([enc.finish()]);
+
+  // Lifetime: destroy scratch + per-pass UBOs once submitted work is
+  // done. The submit holds a ref until completion.
+  void device.queue.onSubmittedWorkDone().then(() => {
+    scratch.destroy();
+    for (const b of ubos) b.destroy();
+  });
+}
+
+/** Scratch-buffer geometry for a sub-rect's bounding box. Rows are
+ *  padded to 256 bytes for the final `copyBufferToTexture`. */
+function scratchGeom(boundsW: number, boundsH: number): { rowBytes: number; bufSize: number } {
+  const rowBytes = Math.max(256, Math.ceil(boundsW * 4 / 256) * 256);
+  return { rowBytes, bufSize: rowBytes * boundsH };
+}
+
+/**
+ * Build the mip pyramid + gutters on GPU from a **CPU pixel array**
+ * and upload the result to a sub-rect of `page`. `srcPixels` is the
+ * raw RGBA8 source for mip 0 (`srcW × srcH` pixels). The scratch
+ * buffer's mip-0 region is filled at creation (`mappedAtCreation`),
+ * then the compute passes downscale the remaining mips and fill every
+ * mip's 2-px gutter ring. Used for `raw` host sources (where the
+ * pixels are already in memory — no extraction cost) and as the
+ * fallback for `external` sources when the GPU staging path is
+ * unavailable. Caller must ensure `page` has COPY_DST usage.
  */
 export function buildMipsAndGutterOnGpu(
   device: GPUDevice,
@@ -174,14 +350,8 @@ export function buildMipsAndGutterOnGpu(
   mips: readonly MipSlot[],
 ): void {
   if (mips.length === 0) return;
-  const { bindGroupLayout, interiorPipeline, gutterPipeline } = getKernel(device);
-
-  // Buffer layout: rows padded to 256 bytes for the final
-  // copyBufferToTexture. Stride in u32: 256 / 4 = 64 minimum, or
-  // ceil(boundsW * 4 / 256) * 256 / 4.
-  const rowBytes = Math.max(256, Math.ceil(boundsW * 4 / 256) * 256);
+  const { rowBytes, bufSize } = scratchGeom(boundsW, boundsH);
   const bufStrideU32 = rowBytes / 4;
-  const bufSize = rowBytes * boundsH;
 
   const scratch = device.createBuffer({
     label: `atlas/mipGutter/scratch(${boundsW}x${boundsH})`,
@@ -210,82 +380,44 @@ export function buildMipsAndGutterOnGpu(
   }
   scratch.unmap();
 
-  const enc = device.createCommandEncoder({ label: "atlas/mipGutterKernel" });
-
-  const ubos: GPUBuffer[] = [];
-  const makeUbo = (
-    srcO: { x: number; y: number }, srcS: { w: number; h: number },
-    dstO: { x: number; y: number }, dstS: { w: number; h: number },
-  ): GPUBuffer => {
-    const buf = device.createBuffer({
-      size: 48, // 12 u32, padded
-      usage: 0x40 /* UNIFORM */ | 0x08 /* COPY_DST */,
-      label: "atlas/mipGutter/params",
-    });
-    const u = new Uint32Array(12);
-    u[0] = bufStrideU32;
-    u[1] = 0;
-    u[2] = srcO.x; u[3] = srcO.y;
-    u[4] = srcS.w; u[5] = srcS.h;
-    u[6] = dstO.x; u[7] = dstO.y;
-    u[8] = dstS.w; u[9] = dstS.h;
-    device.queue.writeBuffer(buf, 0, u);
-    ubos.push(buf);
-    return buf;
-  };
-  const makeBg = (ubo: GPUBuffer): GPUBindGroup =>
-    device.createBindGroup({
-      layout: bindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: scratch } },
-        { binding: 1, resource: { buffer: ubo } },
-      ],
-    });
-
-  // Interior passes: one compute pass per mip > 0 (pass boundary
-  // gives us the barrier ensuring mip-(k-1) is fully written before
-  // mip-k reads it).
-  for (let k = 1; k < mips.length; k++) {
-    const src = mips[k - 1]!;
-    const dst = mips[k]!;
-    const ubo = makeUbo(src.origin, src.size, dst.origin, dst.size);
-    const pass = enc.beginComputePass({ label: `atlas/mipGutter/interior/${k}` });
-    pass.setPipeline(interiorPipeline);
-    pass.setBindGroup(0, makeBg(ubo));
-    pass.dispatchWorkgroups(Math.ceil(dst.size.w / 8), Math.ceil(dst.size.h / 8), 1);
-    pass.end();
-  }
-
-  // Gutter passes: one per mip (each pass reads mip-k interior,
-  // which was either CPU-uploaded for k=0 or written by the interior
-  // pass for k>0).
-  for (let k = 0; k < mips.length; k++) {
-    const dst = mips[k]!;
-    const ubo = makeUbo(dst.origin, dst.size, dst.origin, dst.size);
-    const pass = enc.beginComputePass({ label: `atlas/mipGutter/gutter/${k}` });
-    pass.setPipeline(gutterPipeline);
-    pass.setBindGroup(0, makeBg(ubo));
-    pass.dispatchWorkgroups(
-      Math.ceil((dst.size.w + 4) / 8),
-      Math.ceil((dst.size.h + 4) / 8),
-      1,
-    );
-    pass.end();
-  }
-
-  // Final upload: buffer → page.
-  enc.copyBufferToTexture(
-    { buffer: scratch, bytesPerRow: rowBytes, rowsPerImage: boundsH },
-    { texture: page, origin: { x: subRectX, y: subRectY, z: 0 } },
-    { width: boundsW, height: boundsH, depthOrArrayLayers: 1 },
+  runMipGutter(
+    device, page, subRectX, subRectY, boundsW, boundsH,
+    rowBytes, scratch, srcW, srcH, mips, { kind: "prefilled" },
   );
+}
 
-  device.queue.submit([enc.finish()]);
-
-  // Lifetime: destroy scratch + per-pass UBOs once submitted work is
-  // done. The submit holds a ref until completion.
-  void device.queue.onSubmittedWorkDone().then(() => {
-    scratch.destroy();
-    for (const b of ubos) b.destroy();
+/**
+ * Build the mip pyramid + gutters on GPU from a **staging texture**
+ * and upload the result to a sub-rect of `page`. `srcTex` holds the
+ * decoded mip-0 pixels (`srcW × srcH`) — typically just filled by
+ * `copyExternalImageToTexture`, so no main-thread pixel readback is
+ * involved. An `interiorFromTexture` compute pass copies `srcTex` into
+ * the scratch buffer; the rest is identical to `buildMipsAndGutterOnGpu`
+ * (downscale every further mip, fill every mip's 2-px gutter ring,
+ * single `copyBufferToTexture` into the page).
+ *
+ * Caller owns `srcTex` and is responsible for destroying it after the
+ * submission completes (`device.queue.onSubmittedWorkDone()`); this
+ * function only reads it. `srcTex` must have TEXTURE_BINDING usage.
+ */
+export function buildMipsAndGutterFromTexture(
+  device: GPUDevice,
+  page: GPUTexture,
+  subRectX: number, subRectY: number,
+  boundsW: number, boundsH: number,
+  srcTex: GPUTexture,
+  srcW: number, srcH: number,
+  mips: readonly MipSlot[],
+): void {
+  if (mips.length === 0) return;
+  const { rowBytes, bufSize } = scratchGeom(boundsW, boundsH);
+  const scratch = device.createBuffer({
+    label: `atlas/mipGutter/scratch(${boundsW}x${boundsH})`,
+    size: bufSize,
+    usage: 0x80 /* STORAGE */ | 0x04 /* COPY_SRC */ | 0x08 /* COPY_DST */,
   });
+  runMipGutter(
+    device, page, subRectX, subRectY, boundsW, boundsH,
+    rowBytes, scratch, srcW, srcH, mips, { kind: "texture", tex: srcTex },
+  );
 }

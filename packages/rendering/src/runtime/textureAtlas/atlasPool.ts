@@ -33,7 +33,7 @@ import { V2f, V2i } from "@aardworx/wombat.base";
 import { type aval, HashTable } from "@aardworx/wombat.adaptive";
 import type { ITexture, HostTextureSource } from "../../core/texture.js";
 import { TexturePacking } from "./packer.js";
-import { buildMipsAndGutterOnGpu, type MipSlot } from "./atlasMipGutterKernel.js";
+import { buildMipsAndGutterOnGpu, buildMipsAndGutterFromTexture, type MipSlot } from "./atlasMipGutterKernel.js";
 
 export const ATLAS_PAGE_SIZE = 4096;
 /** Tier S/M source-side dimension cap. */
@@ -319,13 +319,15 @@ export class AtlasPool {
   }
 
   private allocatePage(format: AtlasPageFormat, pageId: number): AtlasPage {
-    // rgba8unorm pages gain STORAGE_BINDING for the compute mip+gutter
-    // kernel. rgba8unorm-srgb isn't a storage-capable format in WebGPU
-    // 1.0 (without an unportable feature), so srgb pages fall back to
-    // the CPU buildExtendedWithGutter path. Mixed strategy: linear
-    // textures get the fast compute path; srgb textures take the CPU
-    // path. Both produce identical visible output — only the kernel
-    // path differs.
+    // The compute mip+gutter kernel works for *all* page formats: it
+    // builds the pyramid + gutters in a scratch storage *buffer* (rgba8
+    // u32s) and finishes with `copyBufferToTexture` into the page, so
+    // the page itself never needs to be a storage texture — srgb pages
+    // included (the copy reinterprets the bytes; no colour conversion).
+    // Pages therefore only need TEXTURE_BINDING | COPY_DST | COPY_SRC |
+    // RENDER_ATTACHMENT (no STORAGE_BINDING). The CPU `buildExtended-
+    // WithGutter` path remains only as a fallback for the node mock-GPU
+    // device and headless-without-canvas edge cases.
     const texture = this.device.createTexture({
       label: `atlas/${format}/${pageId}`,
       size: { width: ATLAS_PAGE_SIZE, height: ATLAS_PAGE_SIZE, depthOrArrayLayers: 1 },
@@ -713,83 +715,102 @@ export class AtlasPool {
     h: number,
     numMips: number,
   ): void {
-    // Fast path — `external` source, no mips: upload mip-0 straight to
-    // the page with `copyExternalImageToTexture` (decode happens on the
-    // GPU/compositor side, not the main thread) and fill the 2-px
-    // gutter ring with tiny intra-page `copyTextureToTexture` ops. This
-    // skips `extractPixels`, whose canvas-2d `drawImage`+`getImageData`
-    // round-trip per texture was ~8% of cold-boot CPU on the main
-    // thread (the heap-demo-sg profile). If the platform rejects
-    // same-texture copies (the original reason this path didn't exist —
-    // older Dawn) the gutter cells just stay as-is; per the existing
-    // tolerance that's "visually invisible" for typical atlas content,
-    // and mip-0 itself is correct either way. `numMips > 1` and `raw`
-    // sources keep the kernel / CPU path (mip downsampling genuinely
-    // needs the pixels; for `raw` `extractPixels` is a free slice).
-    if (host.kind === "external" && numMips <= 1) {
-      try {
-        this.device.queue.copyExternalImageToTexture(
-          { source: host.source as GPUImageCopyExternalImageSource },
-          { texture: page.texture, origin: { x, y, z: 0 } },
-          { width: w, height: h, depthOrArrayLayers: 1 },
-        );
-        this.fillGutterRing(page.texture, x, y, w, h);
-        return;
-      } catch {
-        // Source not in a copyable state (e.g. a not-ready video) —
-        // fall through to the CPU/kernel path below.
-      }
-    }
-    // For storage-capable pages (rgba8unorm): use the GPU compute
-    // kernel to build mips + gutter in one pass. Mip 0 interior is
-    // uploaded raw via writeTexture; the kernel reads from there to
-    // both downsample mip 1..N-1 and fill every mip's 2-px gutter
-    // ring. No CPU canvas-2d, no per-mip extended-buffer build.
+    // GPU mip+gutter kernel path (the normal, real-device path).
+    //
+    // Builds the full Iliffe pyramid for the sub-rect — every mip,
+    // each surrounded by the proper 2-px gutter ring (inner ring =
+    // clamp-replicate of the nearest edge texel, outer ring = wrap of
+    // the opposite edge) — entirely on the GPU, in a scratch storage
+    // buffer, then a single `copyBufferToTexture` lands the real
+    // texture (interior + gutter, all mips) in the atlas page. No
+    // canvas-2d, no per-mip CPU buffer build. (`copyTextureToTexture`
+    // can't be used for the gutter — WebGPU forbids same-(sub)resource
+    // texture copies, §22.5.5 — which is why this goes through a
+    // buffer.)
+    //
+    // Mip-0 source:
+    //  · `external` host (ImageBitmap / <img> / <canvas> / …):
+    //    `copyExternalImageToTexture` decodes it into a transient
+    //    staging texture (decode happens GPU/compositor-side, off the
+    //    main thread) and an `interiorFromTexture` compute pass copies
+    //    that into the buffer — no `getImageData` round-trip (that
+    //    canvas-2d path was ~8% of cold-boot CPU in the heap-demo-sg
+    //    profile). The staging texture is freed once the work submits.
+    //  · `raw` host: the pixels are already in memory; `extractPixels`
+    //    is a free slice — write them straight into the buffer.
     if (this.canUseGpuKernel(page)) {
-      const px = this.extractPixels(host, w, h);
-      if (px !== null) {
-        // Bounding rect that the sub-rect occupies — caller passed
-        // (x, y) as the interior position (sub-rect origin + 2/+2).
-        // The scratch buffer covers this bounding rect.
-        const boundsX = x - 2;
-        const boundsY = y - 2;
-        // Reserved size matches the packer's allocation.
-        const reservedW = numMips > 1
-          ? (w + 4) + Math.max(1, w >> 1) + 4
-          : w + 4;
-        let reservedH = h + 4;
-        if (numMips > 1) {
-          let stackedH = 0;
-          for (let k = 1; k < numMips; k++) stackedH += Math.max(1, h >> k) + 4;
-          reservedH = Math.max(reservedH, stackedH);
-        }
-        // Mip slot offsets, in bounding-rect-relative pixel coords.
-        // mip-0 interior is at (+2, +2) inside the bounds.
-        const slots: MipSlot[] = [];
-        for (let k = 0; k < numMips; k++) {
-          const off = mipOffsetInPyramid(w, h, k);
-          slots.push({
-            origin: { x: 2 + off.x, y: 2 + off.y },
-            size:   { w: Math.max(1, w >> k), h: Math.max(1, h >> k) },
-          });
-        }
-        buildMipsAndGutterOnGpu(
-          this.device, page.texture,
-          boundsX, boundsY, reservedW, reservedH,
-          px, w, h, slots,
-        );
-        return;
+      // Bounding rect the sub-rect occupies: caller passed (x, y) as
+      // the mip-0 interior position (sub-rect origin + 2/+2). Reserved
+      // size matches the packer's allocation.
+      const boundsX = x - 2;
+      const boundsY = y - 2;
+      const reservedW = numMips > 1
+        ? (w + 4) + Math.max(1, w >> 1) + 4
+        : w + 4;
+      let reservedH = h + 4;
+      if (numMips > 1) {
+        let stackedH = 0;
+        for (let k = 1; k < numMips; k++) stackedH += Math.max(1, h >> k) + 4;
+        reservedH = Math.max(reservedH, stackedH);
       }
-      // Pixel extraction failed (headless without canvas for external
-      // sources) — fall through to CPU path below.
+      // Mip slot offsets, in bounding-rect-relative pixel coords.
+      // mip-0 interior is at (+2, +2) inside the bounds.
+      const slots: MipSlot[] = [];
+      for (let k = 0; k < numMips; k++) {
+        const off = mipOffsetInPyramid(w, h, k);
+        slots.push({
+          origin: { x: 2 + off.x, y: 2 + off.y },
+          size:   { w: Math.max(1, w >> k), h: Math.max(1, h >> k) },
+        });
+      }
+      if (host.kind === "external") {
+        try {
+          const staging = this.device.createTexture({
+            label: `atlas/staging(${w}x${h})`,
+            size: { width: w, height: h, depthOrArrayLayers: 1 },
+            format: "rgba8unorm",
+            // copyExternalImageToTexture requires COPY_DST | RENDER_ATTACHMENT
+            // on the destination; TEXTURE_BINDING for the kernel's read.
+            usage:
+              GPUTextureUsage.TEXTURE_BINDING |
+              GPUTextureUsage.COPY_DST |
+              GPUTextureUsage.RENDER_ATTACHMENT,
+          });
+          this.device.queue.copyExternalImageToTexture(
+            { source: host.source as GPUImageCopyExternalImageSource },
+            { texture: staging },
+            { width: w, height: h, depthOrArrayLayers: 1 },
+          );
+          buildMipsAndGutterFromTexture(
+            this.device, page.texture,
+            boundsX, boundsY, reservedW, reservedH,
+            staging, w, h, slots,
+          );
+          void this.device.queue.onSubmittedWorkDone().then(() => staging.destroy());
+          return;
+        } catch {
+          // Source not in a copyable state (e.g. a not-ready video) —
+          // fall through to the CPU path below.
+        }
+      } else {
+        const px = this.extractPixels(host, w, h);
+        if (px !== null) {
+          buildMipsAndGutterOnGpu(
+            this.device, page.texture,
+            boundsX, boundsY, reservedW, reservedH,
+            px, w, h, slots,
+          );
+          return;
+        }
+        // `raw` extraction shouldn't fail; if it somehow does, fall
+        // through to the CPU path.
+      }
     }
-    // Otherwise (srgb pages): keep the CPU path.
-    // Mip 0 lands at (x, y) — already the interior position (caller
-    // offset by +2/+2 for the gutter ring). Use the gutter-aware
-    // upload path: builds (w+4)×(h+4) with both gutter rings
-    // pre-filled CPU-side, then a single writeTexture covers the
-    // whole rect. Falls back to plain uploadLevel if pixel
-    // extraction fails (headless without canvas).
+    // Fallback: node mock-GPU device (no compute kernel) or the kernel
+    // path above threw. CPU gutter-extended upload — same visible
+    // result. Mip 0 lands at (x, y) — already the interior position
+    // (caller offset by +2/+2 for the gutter ring). Falls back to
+    // plain uploadLevel if pixel extraction fails (headless w/o canvas).
     if (!this.uploadLevelWithGutter(page, x, y, host, w, h)) {
       this.uploadLevel(page, x, y, host, w, h);
     }
@@ -925,69 +946,6 @@ export class AtlasPool {
     const ext = AtlasPool.buildExtendedWithGutter(px, w, h);
     this.writeRgba8Padded(page.texture, x - 2, y - 2, ext, w + 4, h + 4);
     return true;
-  }
-
-  /**
-   * Fill a sub-rect's 2-px gutter ring (inner clamp-replicate ring +
-   * outer wrap ring) from the already-uploaded interior pixels, using
-   * ~24 tiny intra-page `copyTextureToTexture` ops. `(ix, iy)` is the
-   * interior origin (= sub-rect origin + 2,+2), `w×h` the interior
-   * size. Used by the `copyExternalImageToTexture` fast path. If the
-   * platform rejects same-texture copies these become no-ops (validation
-   * errors don't throw synchronously) and the gutter cells stay as-is —
-   * which is the documented "visually invisible" tolerance.
-   */
-  private fillGutterRing(
-    t: GPUTexture,
-    ix: number, iy: number, w: number, h: number,
-  ): void {
-    const enc = this.device.createCommandEncoder({ label: "atlas/gutter" });
-    const cp = (sx: number, sy: number, sw: number, sh: number, dx: number, dy: number): void => {
-      enc.copyTextureToTexture(
-        { texture: t, origin: { x: sx, y: sy, z: 0 } },
-        { texture: t, origin: { x: dx, y: dy, z: 0 } },
-        { width: sw, height: sh, depthOrArrayLayers: 1 },
-      );
-    };
-    // ─── Inner clamp-replicate ring ───────────────────────────────
-    // Edge strips (clamp Y or clamp X = nearest interior row/col)
-    cp(ix,         iy,         w, 1, ix,         iy - 1);     // top    : row 0
-    cp(ix,         iy + h - 1, w, 1, ix,         iy + h);     // bottom : row h-1
-    cp(ix,         iy,         1, h, ix - 1,     iy);         // left   : col 0
-    cp(ix + w - 1, iy,         1, h, ix + w,     iy);         // right  : col w-1
-    // Inner corners (clamp X × clamp Y = the diagonal interior texel)
-    cp(ix,         iy,         1, 1, ix - 1,     iy - 1);     // TL  T[0, 0]
-    cp(ix + w - 1, iy,         1, 1, ix + w,     iy - 1);     // TR  T[0, w-1]
-    cp(ix,         iy + h - 1, 1, 1, ix - 1,     iy + h);     // BL  T[h-1, 0]
-    cp(ix + w - 1, iy + h - 1, 1, 1, ix + w,     iy + h);     // BR  T[h-1, w-1]
-    // ─── Outer wrap ring ──────────────────────────────────────────
-    // Edge strips (wrap Y or wrap X = opposite interior row/col)
-    cp(ix,         iy + h - 1, w, 1, ix,         iy - 2);     // top   wrap-Y: row h-1
-    cp(ix,         iy,         w, 1, ix,         iy + h + 1); // bot   wrap-Y: row 0
-    cp(ix + w - 1, iy,         1, h, ix - 2,     iy);         // left  wrap-X: col w-1
-    cp(ix,         iy,         1, h, ix + w + 1, iy);         // right wrap-X: col 0
-    // Outer corners — each of 4 outer 2×2 blocks contains 3 outer-ring
-    // cells. Source rules per cell:
-    //   (-2, -2) = wrap-X wrap-Y → diagonal opposite corner = T[h-1, w-1]
-    //   (-1, -2) = clamp-X wrap-Y → T[h-1, 0]
-    //   (-2, -1) = wrap-X clamp-Y → T[0, w-1]
-    // Top-left
-    cp(ix + w - 1, iy + h - 1, 1, 1, ix - 2,     iy - 2);     // T[h-1, w-1]
-    cp(ix,         iy + h - 1, 1, 1, ix - 1,     iy - 2);     // T[h-1, 0]
-    cp(ix + w - 1, iy,         1, 1, ix - 2,     iy - 1);     // T[0, w-1]
-    // Top-right
-    cp(ix,         iy + h - 1, 1, 1, ix + w + 1, iy - 2);     // T[h-1, 0]
-    cp(ix + w - 1, iy + h - 1, 1, 1, ix + w,     iy - 2);     // T[h-1, w-1]
-    cp(ix,         iy,         1, 1, ix + w + 1, iy - 1);     // T[0, 0]
-    // Bottom-left
-    cp(ix + w - 1, iy,         1, 1, ix - 2,     iy + h + 1); // T[0, w-1]
-    cp(ix,         iy,         1, 1, ix - 1,     iy + h + 1); // T[0, 0]
-    cp(ix + w - 1, iy + h - 1, 1, 1, ix - 2,     iy + h);     // T[h-1, w-1]
-    // Bottom-right
-    cp(ix,         iy,         1, 1, ix + w + 1, iy + h + 1); // T[0, 0]
-    cp(ix + w - 1, iy,         1, 1, ix + w,     iy + h + 1); // T[0, w-1]
-    cp(ix,         iy + h - 1, 1, 1, ix + w + 1, iy + h);     // T[h-1, 0]
-    this.device.queue.submit([enc.finish()]);
   }
 
   private uploadLevel(
