@@ -76,7 +76,7 @@ export class Runtime {
       })),
       ...(opts.heapEnabled !== undefined ? { heapEnabled: opts.heapEnabled } : {}),
       ...(opts.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
-      ...(opts.enableDerivedUniforms === true ? { enableDerivedUniforms: true } : {}),
+      ...(opts.enableDerivedUniforms === false ? { enableDerivedUniforms: false } : {}),
     };
     // `device.lost` is a real-WebGPU promise; mock devices may not
     // expose it. Treat as "never lost" in that case.

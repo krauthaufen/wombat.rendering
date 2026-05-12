@@ -29,7 +29,7 @@ import {
   type Command,
   type ClearValues,
 } from "@aardworx/wombat.rendering/core";
-import { Runtime } from "@aardworx/wombat.rendering/runtime";
+import { Runtime, derivedUniform } from "@aardworx/wombat.rendering/runtime";
 import { attachCanvas, runFrame } from "@aardworx/wombat.rendering/window";
 import {
   surface, texturedSurface,
@@ -175,7 +175,13 @@ function makeUniforms(
   if (derived) {
     map = map.add("ModelTrafo", AVal.constant(modelTrafo))
              .add("ViewTrafo",  viewTrafo)
-             .add("ProjTrafo",  projTrafo);
+             .add("ProjTrafo",  projTrafo)
+             // A user-specified derived uniform: a rule, not a value. ModelView = View·Model.
+             // (Shaders that read ModelViewTrafo get it from the §7 compute pre-pass; this rule
+             // resolves `u.ViewTrafo` / `u.ModelTrafo` to the constituent slots above. The cast
+             // is just because this demo's map is still typed aval-only; the heap renderer
+             // accepts `aval | DerivedRule` for a uniform binding.)
+             .add("ModelViewTrafo", derivedUniform(u => u.ViewTrafo.mul(u.ModelTrafo)) as unknown as aval<unknown>);
   } else {
     const projM44         = projTrafo.map(trafoToM44f);
     const modelViewM44    = viewTrafo.map(v => trafoToM44f(modelTrafo.mul(v)));

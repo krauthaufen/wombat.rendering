@@ -255,7 +255,7 @@ class RenderTask implements IRenderTask {
         compileEffect: this.ctx.compileEffect,
         ...(this.ctx.heapEnabled !== undefined ? { heapEnabled: this.ctx.heapEnabled } : {}),
         ...(this.ctx.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
-        ...(this.ctx.enableDerivedUniforms === true ? { enableDerivedUniforms: true } : {}),
+        ...(this.ctx.enableDerivedUniforms === false ? { enableDerivedUniforms: false } : {}),
       });
       this._scenes.set(cmd, s);
     }

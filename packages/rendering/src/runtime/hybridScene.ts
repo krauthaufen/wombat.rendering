@@ -225,7 +225,7 @@ export function compileHybridScene(
     fragmentOutputLayout,
     atlasPool,
     ...(opts.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
-    ...(opts.enableDerivedUniforms === true ? { enableDerivedUniforms: true } : {}),
+    ...(opts.enableDerivedUniforms === false ? { enableDerivedUniforms: false } : {}),
   });
 
   // ─── Legacy subset → RenderTree → ScenePass ──────────────────────

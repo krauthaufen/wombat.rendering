@@ -43,6 +43,14 @@ export { flattenRenderTree } from "./flattenTree.js";
 export { isHeapEligible } from "./heapEligibility.js";
 export { renderObjectToHeapSpec } from "./heapAdapter.js";
 
+// ─── Derived uniforms (§7): a uniform binding is a value (aval/constant) OR a rule ──
+export {
+  derivedUniform, DerivedExpr, type DerivedScope,
+  ruleFromIR, uniformRef, isDerivedRule, hashIR,
+  type DerivedRule, type IRFragment,
+  STANDARD_DERIVED_RULES, isStandardDerivedName,
+} from "./derivedUniforms/index.js";
+
 export {
   compileHybridScene,
   type CompileHybridSceneOptions,

@@ -72,7 +72,7 @@ import {
 import {
   DerivedUniformsScene,
   registerRoDerivations, deregisterRoDerivations,
-  isDerivedRule, STANDARD_DERIVED_RULES, STANDARD_TRAFO_LEAVES,
+  isDerivedRule, STANDARD_DERIVED_RULES, STANDARD_TRAFO_LEAVES, inputsOf,
   type RoRegistration, type DerivedRule,
 } from "./derivedUniforms/index.js";
 
@@ -1652,8 +1652,9 @@ export function buildHeapScene(
   // ─── §7 derived-uniforms (opt-in) ─────────────────────────────────
   // Constructed lazily after sceneObj so the SubscribeFn can reference
   // both. `derivedScene` is undefined when the option is off; nothing
-  // else in this file should run when it is.
-  const enableDerivedUniforms = opts.enableDerivedUniforms === true;
+  // else in this file should run when it is. On by default — pass
+  // `enableDerivedUniforms: false` to opt out.
+  const enableDerivedUniforms = opts.enableDerivedUniforms !== false;
   const derivedScene: DerivedUniformsScene | undefined = enableDerivedUniforms
     ? new DerivedUniformsScene(device, arena.attrs.buffer, {
         // Larger initial capacity reduces grow-during-first-frame churn.
@@ -1665,12 +1666,35 @@ export function buildHeapScene(
   const derivedByDrawId = new Map<number, RoRegistration>();
 
   /** The derived-uniform rule for a uniform binding on this RO, if any: an explicit
-   *  `derivedUniform(...)` value in `spec.inputs`, or a standard trafo recipe by name.
+   *  `derivedUniform(...)` value in `spec.inputs`, or a standard trafo recipe by name
+   *  (recipes apply only when their base-trafo leaves are actually bound on this RO —
+   *  otherwise the field falls back to its `spec.inputs` value, if any).
    *  (A uniform binding is either a value — an aval/constant — or a rule.) */
   const ruleForUniform = (spec: HeapDrawSpec, name: string): DerivedRule | undefined => {
     if (derivedScene === undefined) return undefined;
     const v = spec.inputs[name];
-    return isDerivedRule(v) ? v : STANDARD_DERIVED_RULES.get(name);
+    const explicit = isDerivedRule(v);
+    const rule = explicit ? v : STANDARD_DERIVED_RULES.get(name);
+    if (rule === undefined) return undefined;
+    // Check the rule's input leaves are resolvable on this RO. A matrix-typed leaf needs an
+    // aval<Trafo3d> binding (constituent slot). Non-trafo / host-uniform leaves aren't wired
+    // yet — for an explicit user rule that's a hard error; for a standard recipe it just means
+    // "this RO doesn't supply the base trafos", so we fall back to the packed value.
+    for (const inp of inputsOf(rule.ir)) {
+      const specName = STANDARD_TRAFO_LEAVES.get(inp.name) ?? inp.name;
+      const lv = spec.inputs[specName];
+      const resolvable = inp.type.kind === "Matrix" && lv !== undefined && !isDerivedRule(lv);
+      if (!resolvable) {
+        if (explicit) {
+          throw new Error(
+            `derivedUniform '${name}': leaf '${inp.name}' is not resolvable on this RO ` +
+              `(need an aval<Trafo3d> binding; non-trafo host-uniform leaves aren't supported yet)`,
+          );
+        }
+        return undefined; // standard recipe, base trafos not bound here — use the packed value
+      }
+    }
+    return rule;
   };
 
   // ─── Atlas bindings ───────────────────────────────────────────────
