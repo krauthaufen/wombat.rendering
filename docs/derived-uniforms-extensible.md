@@ -129,7 +129,7 @@ interface RuleEntry {
 
 ## Chain flattening (no levels, ever)
 
-A rule whose closure mentions another derived name — `derivedUniform(u => u.ViewProj.mul(u.Model))` where `ViewProj` is itself a `DerivedRule` — is **flattened at registration time**: the producer's IR is substituted in place of the `ReadInput("ViewProj")` node (its own `ReadInput`s renamed into the consumer's namespace), recursively, until the consumer's IR reads only *non-derived* inputs (constituents / host uniforms / globals). The flattened IR is then CSE'd and content-hashed → that hash is the registry key.
+A rule whose closure mentions another derived name — `derivedUniform(u => u.ViewProj.mul(u.Model))` where `ViewProj` is itself a `DerivedRule` — is **flattened at registration time**: the producer's IR is substituted in place of the `ReadInput("ViewProj")` node (its own `ReadInput`s renamed into the consumer's namespace), recursively, until the consumer's IR reads only *non-derived* inputs (constituents / host uniforms). The flattened IR is then CSE'd and content-hashed → that hash is the registry key.
 
 Consequences:
 - **Every record is independent.** No `RecordLevels`, no `maxLevel`, no inter-dispatch barrier, no `010` "reads another rule's output" tag. One dispatch per frame, full stop.
@@ -171,16 +171,15 @@ let out_slot = RecordData[off + 1u];
 
 (If `array<u32>` indexing chains hurt, the alternative is sorting records by `rule_id` and emitting one fixed-stride sub-dispatch per rule — codegen knows every rule's stride. Start with the offsets blob; it's simpler and the indirection is one extra load.)
 
-**Slot tagging** — `out_slot` and every `in_slot` is a tagged 32-bit handle; top 3 bits select the binding, low 29 bits are the payload (byte offset, slot index, or sub-record index):
+**Slot tagging** — `out_slot` and every `in_slot` is a tagged 32-bit handle; top 3 bits select the binding, low 29 bits are the payload:
 
 | tag | meaning | payload |
 |----|---------|---------|
 | `000` | constituent slot — a `Trafo3d` half (`View.fwd`, `Model.bwd`, …) in df32 storage | slot index into `Constituents` |
-| `001` | drawHeader byte offset of a **host-supplied** uniform on the same RO (`u.BaseColor`, `u.AtlasResolution`, …) | byte offset into `MainHeap` |
-| `010` | a **shared/global** uniform (camera, viewport, time…) in the global uniform buffer | byte offset into `Globals` |
-| `011`–`111` | reserved (future: per-instance attribute arena, indirect double-precision pair, opt-in "shared producer" link, …) | — |
+| `001` | a host uniform — its data byte offset in the main heap. **This is whatever value reached this RO**: the scene-graph traversal already collapsed any subtree overrides, so there is nothing "global" to special-case. A uniform set once at the sg root and never overridden is the *same `aval`* on every RO ⇒ the UniformPool interns it to one heap slot; the only per-RO cost is the 4-byte ref. Same for trafos on the constituent side — `ConstituentSlots` keys by aval identity, so a shared `ViewTrafo` aval is one df32 slot pair shared by every RO that reads it. | byte offset into `MainHeap` |
+| `010`–`111` | reserved (future: per-instance attribute arena, indirect double-precision pair, opt-in "shared producer" link, …) | — |
 
-(There is no "reads another rule's output" tag — chains are flattened away at registration, so every input is a constituent / host uniform / global.)
+(No "reads another rule's output" tag — chains are flattened away at registration, so every input is a constituent or a host uniform. And **no "global" tag**: "is this uniform global?" is a per-RO question, not a property of the name — the sg can override `LightLocation`, `ViewportSize`, anything, anywhere — so it's resolved per RO like everything else. Conceptually *every* uniform (`ViewTrafo` included) lives per-RO and just happens to collapse to one shared slot via aval interning.)
 
 The loader for input `i` is chosen by **two** things: the tag (which binding) and `rule.inputs[i].wgslType` (how many components, what bit-layout, df32 or not). Codegen emits `loadAs_<wgslType>(tag, payload)` per arm. Likewise the storer is `storeAs_<outputType>(out_slot_tag, out_payload, value)`.
 
@@ -198,10 +197,9 @@ for (const [name, rule] of ro.derivedUniforms) {
 ```
 
 `resolveSource(ro, name, wgslType)` (post-flatten, so `name` is never another derived uniform):
-1. `name` resolves to a `Trafo3d` aval (`View`, `Model`, `Proj`, `ViewProj`, …) → tag `000`, allocate/find the constituent slot for that aval (the existing per-aval interning), payload = slot index.
-2. `ro.uniforms.tryFind(name)` is one of the global auto-uniforms (camera/viewport/time/…) → tag `010`, payload = field byte offset in `GlobalsUbo`.
-3. `ro.uniforms.tryFind(name)` is a host-supplied constant/value → tag `001`, payload = its drawHeader byte offset.
-4. otherwise → error: rule references an input the RO can't supply.
+1. `name` resolves to a `Trafo3d` aval (`Model`, `View`, `Proj`, …) → tag `000`, allocate/find the constituent slot for that aval (the existing per-aval interning), payload = slot index.
+2. `ro.uniforms` (the RO's resolved uniform set — sg overrides already collapsed) has `name` → tag `001`, payload = its data byte offset in the main heap. This covers everything else, "auto-uniforms" included; there is no separate global path.
+3. otherwise → error: the rule references an input this RO can't supply.
 
 Two ROs with the same rule but different `View` avals get records pointing to different constituent slots; same `View` aval ⇒ same slot (interned).
 
@@ -222,13 +220,11 @@ The kernel is emitted from the registry every time `version` changes — **one d
 ```wgsl
 @group(0) @binding(0) var<storage, read>       Constituents:  array<u32>;   // df32 trafo halves, raw words
 @group(0) @binding(1) var<storage, read_write> MainHeap:      array<u32>;   // drawHeaders, raw words (host uniforms + rule outputs)
-@group(0) @binding(2) var<uniform>             Globals:       GlobalsUbo;    // camera/viewport/time/…
-@group(0) @binding(3) var<storage, read>       RecordOffsets: array<u32>;
-@group(0) @binding(4) var<storage, read>       RecordData:    array<u32>;
-@group(0) @binding(5) var<uniform>             Dispatch:      DispatchUbo;   // { count: u32 }
+@group(0) @binding(2) var<storage, read>       RecordData:    array<u32>;   // packed records (fixed stride)
+@group(0) @binding(3) var<uniform>             Dispatch:      DispatchUbo;   // { count: u32 }
 
 // ---- generic typed loaders/storers, emitted once for each (wgslType) actually used ----
-// each decodes the 3-bit tag (constituent / host-heap / rule-output-heap / globals) and reads
+// each decodes the 3-bit tag (constituent / host-heap) and reads
 // the right number of words with the right bit layout. df32 forms read 2× words and reassemble.
 fn load_mat4x4_f32(h: u32) -> mat4x4<f32> { /* tag-switch → words → mat4 (df32 → collapse to f32) */ }
 fn load_df32_mat4(h: u32) -> Df32Mat4    { /* tag-switch → 2× words → {hi, lo} */ }
@@ -278,7 +274,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 **drawHeader byte budget.** `name`'s slot in the RO's drawHeader must be sized for `outputType` (a df32 mat4 needs 32 words, a `bool` needs 1, a `mat3x3<f32>` needs 12 with std430 padding). `buildBucketLayout` already knows each uniform's type; it just needs to accept derived-uniform names with their `outputType` as part of the schema. No change to how the *vertex/fragment* shader reads them — they read `name` from the drawHeader the same way they read any host uniform.
 
-**Globals binding.** Shared uniforms (camera location, viewport, frame time, …) live in one UBO the kernel binds read-only. A rule that reads `u.ViewportSize` gets a tag-`011` handle whose payload is the field's byte offset in `GlobalsUbo`. (These are the same auto-uniforms `TraversalState` already exposes; the heap renderer just needs to mirror them into a GPU UBO, which it largely does already for the per-frame block.)
+**No globals binding.** There's nothing "global" to bind: `u.ViewportSize`, `u.LightLocation`, the camera matrices — these are all just uniforms that reached the RO (the sg traversal can override any of them, anywhere), so they're resolved per RO like everything else (tag `001`, their byte offset in the main heap). A uniform that genuinely is the same for every RO is the same `aval` everywhere ⇒ the UniformPool already interns it to one heap slot; the only per-RO cost is the 4-byte ref. Trafos get the same treatment on the constituent side via `ConstituentSlots`'s aval-identity keying.
 
 ---
 
@@ -349,7 +345,7 @@ Ship v0. Add v1 when someone profiles the kernel size and finds it embarrassing.
 
 **End state: proper per-value tracking.** The granularity that matters is per-input-aval, not per-object and not per-semantic-name (a moving camera dirties `View`/`Proj` → most rules anyway, so coarse masks barely help). §7 already tracks aval dirtiness on the input side (`dirtyAvals` set + `pullDirty`); the pieces to add:
 
-- **Reverse index** `constituentSlot → [recordIndex…]` (and the same for host-uniform / globals sources), maintained on `addRO` / `removeDraw`. A record subscribes to every slot its flattened rule reads.
+- **Reverse index** `constituentSlot → [recordIndex…]` (and the same for host-uniform sources), maintained on `addRO` / `removeDraw`. A record subscribes to every slot its flattened rule reads.
 - **Compaction kernel** (GPU-side, runs each frame *before* the uber-kernel): walk the dirty-slot list → for each, walk its records → `atomicAdd` a counter and append the record index to a `DirtyRecords: array<u32>` buffer. A trailing 1-thread step writes `(ceil(count/64), 1u, 1u)` into a small `indirectArgs` buffer (`usage: INDIRECT | STORAGE`).
 - **Indirect dispatch**: `pass.dispatchWorkgroupsIndirect(indirectArgs, 0)` runs the uber-kernel; `main` indexes through `RecordOffsets[DirtyRecords[gid.x]]` instead of `RecordOffsets[gid.x]`, guarded by `gid.x >= count` read from the same counter buffer. No CPU round-trip, no fixed upper bound on dirty count.
 - Fully-static frame ⇒ dirty count 0 ⇒ `dispatchWorkgroupsIndirect` with `(0,1,1)` ⇒ nothing runs.
@@ -384,17 +380,16 @@ The current `recipes.ts` and the hardcoded `uberKernel.wgsl.ts` go away.
 2. `flatten(ir, derivedNames)` + `hashIR` + CSE on the flattened form; memoised on producer hash. Cycle detection. This is what makes "no levels" true; do it early so everything downstream only ever sees flattened rules.
 3. Build `DerivedUniformRegistry` with content-hash dedup over flattened IR (`extractInputs`, `emitWgslFn`).
 4. Write `codegen.ts`:
-   - **generic typed loaders/storers**, generated per `WgslType` used across the registry — handle all three source tags (constituent / host-heap / globals) and all of: f32/f16/i32/u32/bool, vecN, matNxM<f32>, df32 forms (df32 reads/writes 2× words and reassembles). One emitter parametrised by type; not a fixed menu.
+   - **generic typed loaders/storers**, generated per `WgslType` used across the registry — handle the source tags (constituent / host-heap) and all of: f32/f16/i32/u32/bool, vecN, matNxM<f32>, df32 forms (df32 reads/writes 2× words and reassembles). One emitter parametrised by type; not a fixed menu.
    - df32 helper library (`df32_add/mul/mat4_mul/to_f32/…`) emitted into the prelude when any rule uses df32 — the math the current §7 hand-codes, factored out.
    - per-rule `fn rule_k(...)` from the IR emitter (with df32-aware lowering).
    - the `main` loop: read `RecordOffsets`/`RecordData`, switch over rule ids, one dispatch.
 5. Variable-length `records.ts`: packed `RecordData` u32 blob + `RecordOffsets`, per-RO span tracking, tail-swap removal. No levels.
 6. `dispatch.ts`: recompile-on-version, one `dispatchWorkgroups` per frame.
-7. `sceneIntegration.registerRoDerivations` takes `HashMap<string, DerivedRule>`; flattens each rule against the RO's derived-name set, registers the flattened entry, implements `resolveSource` (constituent → globals → host); bumps the constituent interning for `Trafo3d` inputs as today.
-8. `buildBucketLayout` / `HeapEffectSchema`: accept derived-uniform names with their `outputType` so the drawHeader reserves the right byte budget (df32 mat4 = 32 words, bool = 1, …). Vertex/fragment shaders read them unchanged.
-9. In `heapScene.addDraw`, iterate `ro.derivedUniforms` instead of a hardcoded name set.
-10. Mirror the shared auto-uniforms into a GPU `GlobalsUbo` the kernel binds (mostly exists as the per-frame block); wire tag-`010` resolution.
-11. Port the existing 13 hardcoded recipes to standalone `DerivedRule` constants exported alongside `derivedUniform` for back-compat. Eventually demos define their own.
-12. Wire wombat-shader-vite plugin to recognize `derivedUniform(...)` markers and emit IR (last; can ship without if the user accepts hand-built fragments).
+7. `sceneIntegration.registerRoDerivations` takes `HashMap<string, DerivedRule>`; flattens each rule against the RO's derived-name set, registers the flattened entry, implements `resolveSource` (constituent → host); bumps the constituent interning for `Trafo3d` inputs as today.
+8. `buildBucketLayout` / `HeapEffectSchema`: size derived-uniform drawHeader slots for their `outputType` (df32 mat4 = 32 words, bool = 1, …) — currently moot, the arena slots are `PACKER_MAT4`-sized which fits mat4 and mat3. Vertex/fragment shaders read them unchanged.
+9. In `heapScene.addDraw`, iterate the RO's derived rules instead of a hardcoded name set; wire `hostUniformOffset` against the RO's already-packed uniform refs.
+10. Port the existing 13 hardcoded recipes to standalone `DerivedRule` constants (`STANDARD_DERIVED_RULES`); heapScene installs them. *(done)*
+11. Wire wombat-shader-vite plugin to recognize `derivedUniform(...)` markers and emit IR (last; can ship without — hand-built IR fragments work today).
 
-Each step is independently testable. A useful intermediate milestone: steps 1–9 with the loader/storer emitter restricted to df32-mat4 + f32-mat4 + f32-mat3 types proves the architecture end-to-end on the standard recipes; widening the type set in step 4 is then purely additive (no structural change), arity is unbounded from step 5, and there were never any levels to retrofit. Steps 10–12 are reach and polish.
+Status: steps 1–10 done — the standard trafo recipes run end-to-end through the new path (`heap-demo?derived=1` matches `?derived=0`), with the codegen restricted to the recipe shapes (collapse / N-matmul chain / normal-matrix). Widening the codegen to arbitrary IR (the `expr()`-lowered path) and step 11 are the remaining work; there were never any levels to retrofit.

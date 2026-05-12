@@ -3,7 +3,7 @@
 // A DerivedRule is a closure-shaped value: an output WGSL type plus an IR
 // expression ("ir") that computes it from `ReadInput("Uniform", name)` leaves.
 // The names are resolved per-RenderObject at registration time (constituent
-// slot / host uniform / global). See docs/derived-uniforms-extensible.md.
+// slot / host uniform). See docs/derived-uniforms-extensible.md.
 //
 // This is the pre-plugin surface: rules are hand-built from IR exprs. The
 // inline `derivedUniform(u => …)` marker (lowered by the wombat-shader-vite

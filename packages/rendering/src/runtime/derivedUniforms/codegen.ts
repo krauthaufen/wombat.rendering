@@ -3,7 +3,7 @@
 // Emits the single compute kernel from the rule registry. One thread per
 // record; each thread switches on `rule_id` and runs the matching arm:
 // load the inputs (df32 from a constituent slot, or plain f32 from the
-// drawHeader / globals), do the math, write the result to MainHeap.
+// drawHeader), do the math, write the result to MainHeap.
 //
 // v0 supports the rule shapes the standard trafo recipes need:
 //   • a single mat4 input, output mat4  → collapse

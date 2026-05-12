@@ -2,7 +2,7 @@
 //
 // A rule whose IR mentions another derived-uniform name has that producer's
 // IR substituted in place (recursively) until the rule reads only non-derived
-// inputs (constituents / host uniforms / globals). After flattening every
+// inputs (constituents / host uniforms). After flattening every
 // record is independent ⇒ one compute dispatch, no levels, no barriers.
 // See docs/derived-uniforms-extensible.md § "Chain flattening".
 

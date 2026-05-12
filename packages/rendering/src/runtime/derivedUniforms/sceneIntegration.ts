@@ -4,7 +4,7 @@
 // scene-wide) records buffer, the constituent-slots heap (df32 trafo halves), the
 // constituents GPU buffer, and the dispatcher. Per RO: flatten each rule against the
 // RO's rule set, register it, resolve every input leaf to a tagged slot handle
-// (constituent fwd/bwd / host drawHeader byte / global UBO), and push one record.
+// (constituent fwd/bwd / host drawHeader byte), and push one record.
 //
 // Per frame, inside the heap scene's `evaluateAlways(token, …)` scope:
 //   const dirty = scene.pullDirty(token);   // drains changed trafo avals (re-subscribes)
@@ -163,14 +163,15 @@ export function registerRoDerivations(
       const p = acquireTrafo(inp.name);
       return makeHandle(SlotTag.Constituent, inp.inverse ? p.inv : p.fwd);
     }
-    // (globals — tag SlotTag.Globals — land in step 10)
+    // Anything that isn't a constituent trafo is a plain host uniform — whatever
+    // value reached this RO (the sg already collapsed any subtree overrides).
     if (inp.inverse) {
-      throw new Error(`derivedUniforms: Inverse of non-constituent input '${inp.name}' is not supported in v0`);
+      throw new Error(`derivedUniforms: Inverse of a non-constituent input '${inp.name}' is not supported in v0`);
     }
     const off = req.hostUniformOffset(inp.name);
     if (off !== undefined) return makeHandle(SlotTag.HostHeap, req.drawHeaderBaseByte + off);
     throw new Error(
-      `derivedUniforms: rule input '${inp.name}' cannot be resolved on this RO (not a trafo, global, or host uniform)`,
+      `derivedUniforms: rule input '${inp.name}' cannot be resolved on this RO (not a trafo nor a host uniform)`,
     );
   };
 

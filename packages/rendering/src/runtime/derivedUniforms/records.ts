@@ -4,7 +4,7 @@
 //   [ rule_id, out_slot, in_slot[0], in_slot[1], … ]
 // `out_slot` / each `in_slot` is a tagged 32-bit handle (see resolveSource):
 //   top 3 bits = source binding, low 29 = payload (constituent slot index / drawHeader
-//   byte offset / GlobalsUbo byte offset).
+//   byte offset).
 //
 // Records are flattened (chains substituted away) ⇒ every record is independent ⇒ the
 // uber-kernel runs one thread per record, no levels. Layout is fixed-stride: STRIDE_U32 =
@@ -16,11 +16,12 @@
 export const enum SlotTag {
   /** Constituent slot — a Trafo3d half in df32 storage. Payload = slot index. */
   Constituent = 0,
-  /** drawHeader byte offset of a host-supplied uniform on the same RO (also used for the output). */
+  /** A host uniform on the same RO — payload = its data byte offset in the main heap. Also used for the output.
+   *  There is no separate "global" tag: whether a uniform is global is a per-RO fact (the sg can override it
+   *  anywhere), so anything that isn't a constituent trafo resolves to this; a uniform that's the same on every
+   *  RO is the same aval ⇒ the UniformPool interns it to one heap slot anyway. */
   HostHeap = 1,
-  /** A shared/global uniform (camera, viewport, …). Payload = byte offset in GlobalsUbo. */
-  Globals = 2,
-  // 3..7 reserved
+  // 2..7 reserved (per-instance attribute arena, indirect df32 pair, …)
 }
 
 const TAG_SHIFT = 29;

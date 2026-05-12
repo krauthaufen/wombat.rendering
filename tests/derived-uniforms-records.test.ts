@@ -23,10 +23,13 @@ describe("derived-uniforms: records buffer", () => {
     expect(recordAt(rb, 1)).toEqual([7, H(128), C(2), 0, 0]);
   });
 
-  it("handle pack/unpack round-trips", () => {
-    const h = makeHandle(SlotTag.Globals, 12345);
-    expect(handleTag(h)).toBe(SlotTag.Globals);
+  it("handle pack/unpack round-trips (incl. a reserved tag)", () => {
+    const h = makeHandle(7 as SlotTag, 12345);
+    expect(handleTag(h)).toBe(7);
     expect(handlePayload(h)).toBe(12345);
+    const c = makeHandle(SlotTag.Constituent, 42);
+    expect(handleTag(c)).toBe(SlotTag.Constituent);
+    expect(handlePayload(c)).toBe(42);
     expect(() => makeHandle(SlotTag.HostHeap, (1 << 29))).toThrow();
   });
 
