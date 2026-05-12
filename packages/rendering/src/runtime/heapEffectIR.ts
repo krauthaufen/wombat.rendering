@@ -29,6 +29,7 @@ import {
 import {
   megacallSearchPrelude, atlasVaryingNames,
   generateAtlasBindings, generateAtlasSwitch, generateAtlasPrelude,
+  HEAP_PERSIST_VERSION, persistKey, lsLoad, lsStore,
   type BucketLayout,
 } from "./heapEffect.js";
 import type { IntrinsicRef } from "@aardworx/wombat.shader/ir";
@@ -801,28 +802,15 @@ export type HeapEffectEmitMode = "standalone" | "family-member";
 
 export interface HeapEffectIR { vs: string; fs: string; preludeWgsl: string; vsEntry: string; fsEntry: string }
 
-// ─── Compiled-heap-effect cache (in-memory tier 1 + localStorage tier 2)
+// ─── Compiled-heap-effect-IR cache (in-memory tier 1 + localStorage tier 2)
 //
 // `compileHeapEffectIRViaDecoder` is the IR-rewrite + WGSL-emit step —
 // the ~15% of cold boot in the profile. Its output is fully determined
 // by `(userEffect.id, layout.id, mode, compileOptions)`, all stable
-// content hashes/values, and is plain JSON (five WGSL strings). So:
-//   tier 1 — module-level Map: zero re-walks within a run.
-//   tier 2 — localStorage: zero re-walks across reloads. The persisted
-//            key is stamped with HEAP_PERSIST_VERSION (bump it whenever
-//            this rewrite, the WGSL emitter, or wombat.shader codegen
-//            changes — it's the "all participating repos" stamp) so an
-//            upgrade can never serve stale WGSL. Cold start (empty
-//            storage) is unchanged.
-// All `localStorage` access is wrapped — it throws in private-browsing,
-// when disabled, and on quota; any failure just degrades to "recompute".
-
-/** Cache-generation stamp for the localStorage tier. **Bump on any
- *  change to the heap IR rewrite / WGSL emitter / wombat.shader codegen.**
- *  (Encodes the participating-package state; a manual stamp rather than
- *  build-injected versions, but the invalidation guarantee is the same.) */
-const HEAP_PERSIST_VERSION = "h1";
-const HEAP_PERSIST_PREFIX = "wbt.heapfx.";
+// content hashes/values, and is plain JSON (five WGSL strings). tier 1 =
+// module Map (no re-walk within a run); tier 2 = localStorage (no
+// re-walk across reloads, keyed under `HEAP_PERSIST_VERSION` — see
+// heapEffect.ts; cold start unchanged).
 
 function compileOptionsKey(o: CompileOptions): string {
   return o.target +
@@ -835,28 +823,11 @@ function compileOptionsKey(o: CompileOptions): string {
 
 const _heapIrMemCache = new Map<string, HeapEffectIR>();
 
-function lsGet(key: string): HeapEffectIR | undefined {
-  try {
-    const raw = globalThis.localStorage?.getItem(key);
-    if (raw == null) return undefined;
-    const v = JSON.parse(raw) as HeapEffectIR;
-    if (typeof v?.vs === "string" && typeof v?.fs === "string") return v;
-    return undefined;
-  } catch { return undefined; }
-}
-function lsSet(key: string, value: HeapEffectIR): void {
-  try {
-    const ls = globalThis.localStorage;
-    if (ls == null) return;
-    try { ls.setItem(key, JSON.stringify(value)); }
-    catch {
-      // Likely quota — drop everything under our prefix and retry once.
-      try {
-        for (let i = ls.length - 1; i >= 0; i--) { const k = ls.key(i); if (k != null && k.startsWith(HEAP_PERSIST_PREFIX)) ls.removeItem(k); }
-        ls.setItem(key, JSON.stringify(value));
-      } catch { /* give up — recompute next time */ }
-    }
-  } catch { /* no storage */ }
+function isHeapEffectIR(v: unknown): v is HeapEffectIR {
+  return typeof v === "object" && v !== null
+    && typeof (v as HeapEffectIR).vs === "string" && typeof (v as HeapEffectIR).fs === "string"
+    && typeof (v as HeapEffectIR).preludeWgsl === "string"
+    && typeof (v as HeapEffectIR).vsEntry === "string" && typeof (v as HeapEffectIR).fsEntry === "string";
 }
 
 export function compileHeapEffectIR(
@@ -865,12 +836,12 @@ export function compileHeapEffectIR(
   compileOptions: CompileOptions,
   mode: HeapEffectEmitMode = "standalone",
 ): HeapEffectIR {
-  const cacheKey = `${userEffect.id}|${layout.id}|${mode}|${compileOptionsKey(compileOptions)}`;
-  const mem = _heapIrMemCache.get(cacheKey);
+  const contentKey = `${userEffect.id}|${layout.id}|${mode}|${compileOptionsKey(compileOptions)}`;
+  const mem = _heapIrMemCache.get(contentKey);
   if (mem !== undefined) return mem;
-  const lsKey = HEAP_PERSIST_PREFIX + HEAP_PERSIST_VERSION + "." + cacheKey;
-  const persisted = lsGet(lsKey);
-  if (persisted !== undefined) { _heapIrMemCache.set(cacheKey, persisted); return persisted; }
+  const lsKey = persistKey(HEAP_PERSIST_VERSION, "ir", contentKey);
+  const persisted = lsLoad(lsKey, isHeapEffectIR);
+  if (persisted !== undefined) { _heapIrMemCache.set(contentKey, persisted); return persisted; }
 
   // Both modes run through the composition-based heap rewrite.
   // Family-member mode skips the megacall prelude in the decoder
@@ -878,8 +849,8 @@ export function compileHeapEffectIR(
   // regular function so heapShaderFamily can splice it into the family
   // wrapper.
   const result = compileHeapEffectIRViaDecoder(userEffect, layout, compileOptions, mode);
-  _heapIrMemCache.set(cacheKey, result);
-  lsSet(lsKey, result);
+  _heapIrMemCache.set(contentKey, result);
+  lsStore(lsKey, result);
   return result;
 
   // ────────── legacy path (no longer reached) ──────────

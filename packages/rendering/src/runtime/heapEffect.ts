@@ -79,25 +79,81 @@ export interface FragmentOutputLayout {
   readonly locations: ReadonlyMap<string, number>;
 }
 
-// `effect.compile()` is itself id-keyed, but `buildSchema(interface)`
-// walks the interface every call — and `compileHeapEffect` is invoked
-// once per family build, so two builds of the same `(effect, fbo)` (a
-// re-mounted `<RenderControl>`, a second scene compile) would re-walk.
-// Cache the whole `CompiledHeapEffect` on the effect's content id plus
-// the fragment-output-layout. Module-level, never evicted (bounded by
-// distinct effects × distinct fbo layouts). The result is plain data
-// (WGSL strings + a schema object) — directly persistable later.
-const _compiledHeapEffectCache = new Map<string, CompiledHeapEffect>();
+// ─── Persistence helpers (localStorage, defensive) ──────────────────
+//
+// Used by the heap-effect compile caches (here + heapEffectIR). The
+// persisted key embeds HEAP_PERSIST_VERSION — the "all participating
+// repos" invalidation stamp: **bump it on any change to the heap IR
+// rewrite, the WGSL emitter, wombat.shader's codegen, or anything else
+// that makes a given effect id compile to different WGSL.** All access
+// is wrapped — `localStorage` throws in private-browsing, when disabled,
+// and on quota; every failure simply degrades to "recompute".
+
+/** Cache-generation stamp for the persistent (localStorage) tier. */
+export const HEAP_PERSIST_VERSION = "h1";
+export const HEAP_PERSIST_PREFIX = "wbt.heapfx.";
+
+export function persistKey(version: string, kind: string, contentKey: string): string {
+  return HEAP_PERSIST_PREFIX + version + "." + kind + "." + contentKey;
+}
+
+export function lsLoad<T>(key: string, isValid: (v: unknown) => v is T): T | undefined {
+  try {
+    const raw = globalThis.localStorage?.getItem(key);
+    if (raw == null) return undefined;
+    const v: unknown = JSON.parse(raw);
+    return isValid(v) ? v : undefined;
+  } catch { return undefined; }
+}
+
+export function lsStore(key: string, value: unknown): void {
+  try {
+    const ls = globalThis.localStorage;
+    if (ls == null) return;
+    const json = JSON.stringify(value);
+    try { ls.setItem(key, json); }
+    catch {
+      // Likely quota — drop everything under our prefix and retry once.
+      try {
+        for (let i = ls.length - 1; i >= 0; i--) {
+          const k = ls.key(i);
+          if (k != null && k.startsWith(HEAP_PERSIST_PREFIX)) ls.removeItem(k);
+        }
+        ls.setItem(key, json);
+      } catch { /* give up — recompute next time */ }
+    }
+  } catch { /* no storage */ }
+}
+
+// `effect.compile()` is itself id-keyed, but it runs the full optimiser
+// pipeline on the first call for a given id, and `buildSchema(interface)`
+// re-walks the interface every call — and `compileHeapEffect` is invoked
+// once per family build. So:
+//   tier 1 — module-level Map: no re-walk within a run.
+//   tier 2 — localStorage: no re-walk across reloads. `CompiledHeapEffect`
+//            is plain data (the post-optimisation WGSL strings + a schema
+//            object), so it persists directly.
+const _compiledHeapEffectMemCache = new Map<string, CompiledHeapEffect>();
 
 function fboLayoutKey(layout: FragmentOutputLayout | undefined): string {
   if (layout === undefined) return "";
   return ":fbo[" + [...layout.locations.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([n, l]) => `${n}=${l}`).join("|") + "]";
 }
 
+function isCompiledHeapEffect(v: unknown): v is CompiledHeapEffect {
+  return typeof v === "object" && v !== null
+    && typeof (v as CompiledHeapEffect).rawVs === "string"
+    && typeof (v as CompiledHeapEffect).rawFs === "string"
+    && typeof (v as CompiledHeapEffect).schema === "object";
+}
+
 export function compileHeapEffect(effect: Effect, fragmentOutputLayout?: FragmentOutputLayout): CompiledHeapEffect {
-  const key = effect.id + fboLayoutKey(fragmentOutputLayout);
-  const cached = _compiledHeapEffectCache.get(key);
-  if (cached !== undefined) return cached;
+  const contentKey = effect.id + fboLayoutKey(fragmentOutputLayout);
+  const mem = _compiledHeapEffectMemCache.get(contentKey);
+  if (mem !== undefined) return mem;
+  const lsKey = persistKey(HEAP_PERSIST_VERSION, "che", contentKey);
+  const persisted = lsLoad(lsKey, isCompiledHeapEffect);
+  if (persisted !== undefined) { _compiledHeapEffectMemCache.set(contentKey, persisted); return persisted; }
   const compiled = effect.compile(
     fragmentOutputLayout !== undefined
       ? { target: "wgsl", fragmentOutputLayout }
@@ -110,7 +166,8 @@ export function compileHeapEffect(effect: Effect, fragmentOutputLayout?: Fragmen
     rawFs: fsStage?.source ?? "",
     schema: buildSchema(compiled.interface),
   };
-  _compiledHeapEffectCache.set(key, result);
+  _compiledHeapEffectMemCache.set(contentKey, result);
+  lsStore(lsKey, result);
   return result;
 }
 
