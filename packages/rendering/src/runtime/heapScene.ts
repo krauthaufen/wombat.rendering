@@ -94,8 +94,6 @@ import {
 } from "./heapScene/pools.js";
 import { encodeModeKey, type PipelineStateDescriptor } from "./pipelineCache/index.js";
 import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
-import { GpuDerivedModesScene } from "./derivedModes/gpuDispatcher.js";
-import { U32_TO_CULL } from "./derivedModes/gpuKernel.js";
 import { addMarkingCallback } from "@aardworx/wombat.adaptive";
 
 // GrowBuffer + ALIGN16 + MIN_BUFFER_BYTES + POW2 live in ./heapScene/growBuffer.
@@ -651,12 +649,6 @@ export function buildHeapScene(
       modeAvalToDrawIds.set(av, set);
       modeAvalCallbacks.set(av, addMarkingCallback(av, () => {
         for (const id of set!) dirtyModeKeyDrawIds.add(id);
-        // Mark the GPU mode-rules dispatcher dirty too — at least one
-        // of those drawIds may carry a GPU rule whose input changed.
-        // The dispatch path checks consumeDirty() before encoding, so
-        // an unrelated aval mark (e.g. Color change on hover) leaves
-        // the kernel quiet.
-        gpuModesScene?.markDirty();
       }));
     }
     set.add(drawId);
@@ -909,13 +901,12 @@ export function buildHeapScene(
    *  Drained on removeDraw to release slots + records. */
   const derivedByDrawId = new Map<number, RoRegistration>();
 
-  // ─── GPU-eval mode rules (Task 2 Phase 5, narrow) ─────────────────
-  // Lazily allocated on first registration; one dispatcher per scene.
-  let gpuModesScene: GpuDerivedModesScene | undefined;
-  /** Last per-RO GPU output we routed to a bucket. Diff against
-   *  newly-readback values to decide rebuckets without re-bucketing
-   *  un-changed ROs. */
-  const gpuModesLastKey = new Map<number, number>();
+  // (Phase 5c.2: the per-RO routing decision is CPU-driven via
+  // tracker.recompute(). The previous GpuDerivedModesScene dispatch +
+  // mapAsync readback path is gone — its output was never consumed
+  // after the rebucket-via-spec-patch approach was removed. If a
+  // future rule's inputs only exist GPU-side, a partition-kernel-
+  // driven scatter would put routing on the GPU; see Phase 5c.3.)
 
   /** The derived-uniform rule for a uniform binding on this RO, if any: an explicit
    *  `derivedUniform(...)` value in `spec.inputs`, or a standard trafo recipe by name
@@ -1945,9 +1936,6 @@ export function buildHeapScene(
     const roDescriptor = precomputedDescriptor ?? snapshotDescriptor(spec.pipelineState, sig);
     const roSlot       = ensureSlot(bucket, roDescriptor);
     const roSlotIdx    = bucket.slots.indexOf(roSlot);
-    if (spec.modeRules !== undefined && drawId < 8) {
-      console.debug(`[heapScene] addDraw drawId=${drawId} bucket=${bucket.label} slotIdx=${roSlotIdx}/${bucket.slots.length} cullMode=${roDescriptor.cullMode} recordCount=${roSlot.recordCount}`);
-    }
     const fam = familyFor(spec.effect);
     const effectFields = fam.fieldsForEffect.get(spec.effect.id)!;
 
@@ -2163,22 +2151,12 @@ export function buildHeapScene(
     {
       const cullRule = spec.modeRules?.cull;
       const gpuRule = cullRule?.gpu;
-      if (gpuRule !== undefined && gpuRule.kernel === "flipCullByDeterminant") {
-        const inputRef = perDrawRefs.get(gpuRule.inputUniform);
-        if (inputRef !== undefined) {
-          if (gpuModesScene === undefined) gpuModesScene = new GpuDerivedModesScene(device);
-          gpuModesScene.registerRo(drawId, inputRef, gpuRule.declared);
-          // If declared is reactive (e.g. a shared cullModeC cval),
-          // subscribe so flipping it marks the dispatcher dirty.
-          // Plain values: no subscription needed.
-          if (typeof gpuRule.declared !== "string") {
-            subscribeModeLeaf(gpuRule.declared as aval<unknown>, drawId);
-          }
-          if (drawId < 3 || drawId % 20 === 0) {
-            console.debug(`[heapScene] GPU rule registered drawId=${drawId} input='${gpuRule.inputUniform}' ref=${inputRef} declared=${typeof gpuRule.declared === "string" ? gpuRule.declared : "<aval>"}`);
-          }
-        } else {
-          console.warn(`[heapScene] GPU rule input '${gpuRule.inputUniform}' not in spec.inputs for drawId=${drawId}; rule disabled`);
+      if (gpuRule !== undefined) {
+        // Subscribe to the declared aval (if reactive) so the cull-
+        // mode flip propagates through the rule's CPU fallback
+        // recompute path.
+        if (typeof gpuRule.declared !== "string") {
+          subscribeModeLeaf(gpuRule.declared as aval<unknown>, drawId);
         }
       }
 
@@ -2361,10 +2339,6 @@ export function buildHeapScene(
     }
     drawIdToModeTracker[drawId] = undefined;
     dirtyModeKeyDrawIds.delete(drawId);
-    if (gpuModesScene !== undefined) {
-      gpuModesScene.deregisterRo(drawId);
-      gpuModesLastKey.delete(drawId);
-    }
 
     stats.totalDraws--;
     stats.geometryBytes = arenaBytes(arena);
@@ -2671,25 +2645,22 @@ export function buildHeapScene(
    * begin/end — caller owns the pass. Used by both the convenience
    * `frame()` below and (eventually) the hybrid render task.
    */
-  let _encodeLogged = false;
   function encodeIntoPass(pass: GPURenderPassEncoder): void {
     let curBg: GPUBindGroup | null = null;
-    let drawCount = 0;
-    const slotInfo: string[] = [];
     for (const b of buckets) {
-      for (let i = 0; i < b.slots.length; i++) {
-        const slot = b.slots[i]!;
-        slotInfo.push(`b=${b.label.slice(7, 15)} s=${i} rc=${slot.recordCount} bg=${slot.bindGroup !== undefined ? 'Y' : 'N'} ib=${slot.indirectBuf !== undefined ? 'Y' : 'N'}`);
+      // Phase 5c.2: iterate the bucket's slots, drawIndirect per
+      // non-empty slot. Empty slots draw zero (skipped to save the
+      // setPipeline/setBindGroup overhead).
+      for (const slot of b.slots) {
         if (slot.recordCount === 0) continue;
         const bg = slot.bindGroup;
-        if (bg !== undefined && bg !== curBg) { pass.setBindGroup(0, bg); curBg = bg; }
+        if (bg !== undefined && bg !== curBg) {
+          pass.setBindGroup(0, bg);
+          curBg = bg;
+        }
         pass.setPipeline(slot.pipeline);
-        if (slot.indirectBuf !== undefined) { pass.drawIndirect(slot.indirectBuf, 0); drawCount++; }
+        if (slot.indirectBuf !== undefined) pass.drawIndirect(slot.indirectBuf, 0);
       }
-    }
-    if (!_encodeLogged) {
-      console.debug(`[heapScene] encode: ${drawCount} drawIndirect; slots:`, slotInfo);
-      _encodeLogged = true;
     }
   }
 
@@ -2704,41 +2675,6 @@ export function buildHeapScene(
    * we just swap the bind group + dispatch shape per bucket.
    */
   function encodeComputePrep(enc: GPUCommandEncoder, token: AdaptiveToken): void {
-    // GPU-eval derived-mode rules (Task 2 Phase 5): dispatch the
-    // hardcoded determinant-flip-cull kernel + start readback.
-    // Resolved on the next frame's update() — one-frame lag for the
-    // first appearance of a state transition. CPU fallback runs at
-    // addDraw time so the initial bucket assignment is still correct.
-    if (gpuModesScene !== undefined
-        && gpuModesScene.registered > 0
-        && gpuModesScene.consumeDirty()) {
-      // Dirty-gate: skip the kernel + readback when no rule input
-      // changed since the last dispatch. Unrelated avals (Color on
-      // hover, etc.) don't trigger dirty, so steady state has zero
-      // GPU mode-rule work per frame.
-      const numROs = nextDrawId; // upper bound; sparse entries are skipped via 0xFFFFFFFF sentinel
-      gpuModesScene.dispatch(arena.attrs.buffer, numROs, enc);
-      // mapAsync the staging buffer AFTER the caller's submit. The
-      // microtask queued by Promise.resolve() runs after the current
-      // synchronous block — by which time `frame()` has already
-      // submitted the enc. Without this deferral, mapAsync fires
-      // before submit and WebGPU rejects the next dispatch's
-      // copy-to-staging with "buffer used in submit while mapped".
-      // No readback: v1's patch-spec.modeRules approach broke
-      // reactivity (a second cullModeC flip stopped re-bucketing
-      // because the patched constant closure never produces a new
-      // modeKey). The CPU fallback is authoritative for now —
-      // tracker.recompute drives the rebucket flow correctly.
-      //
-      // Phase 5c.2 (no-readback by design): pre-warm all slot
-      // pipelines at scene-build via static analysis; kernel writes
-      // per-RO slot index; partition kernel produces per-slot
-      // indirect args; encode iterates fixed slots. The
-      // GpuDerivedModesScene kernel dispatch stays here as a
-      // demonstration of the GPU path — its output is currently
-      // unused but proves the kernel runs against arena data.
-    }
-
     // §7: derived-uniforms dispatch first — writes into per-bucket
     // drawHeap regions before the scan reads anything. One dispatcher
     // per bucket; constituents are shared so dirty state propagates
@@ -2870,7 +2806,6 @@ export function buildHeapScene(
     arena.attrs.destroy();
     arena.indices.destroy();
     for (const b of buckets) destroyBucketResources(b);
-    gpuModesScene?.dispose();
   }
 
   // Test-only escape hatch for inspecting megacall bucket state. Not
