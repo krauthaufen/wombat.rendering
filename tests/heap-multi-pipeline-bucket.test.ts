@@ -119,6 +119,25 @@ describe("Phase 5b — bucket key uses modeKey VALUE, not aval identity", () => 
     expect(scene.stats.groups).toBe(2);
   });
 
+  it("createRenderPipeline is called with the right cullMode value (not aval identity)", () => {
+    const gpu = new MockGPU();
+    const eff = makeHeapTestEffect();
+    // 5 ROs, fresh cval per RO, all valued 'back'. Pre-5b each would
+    // have triggered its own createRenderPipeline call with cull
+    // 'back'. Post-5b: ONE pipeline created.
+    const specs: HeapDrawSpec[] = [];
+    for (let i = 0; i < 5; i++) specs.push(spec(eff, pipelineStateWith("back")));
+    const beforeBuild = gpu.pipelines.length;
+    buildHeapScene(gpu.device, sig(), specs);
+    const created = gpu.pipelines.length - beforeBuild;
+    // Exactly one heap-render pipeline (the bucket's). The scan
+    // pipelines are compute, tracked in `computePipelines` not
+    // `pipelines`, so they don't count.
+    expect(created).toBe(1);
+    const cull = (gpu.pipelines[gpu.pipelines.length - 1]!.primitive!).cullMode;
+    expect(cull).toBe("back");
+  });
+
   it("reactive cullMode flip: cval mutation moves the RO to a different bucket", () => {
     const gpu = new MockGPU();
     const eff = makeHeapTestEffect();
