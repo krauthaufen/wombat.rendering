@@ -4,7 +4,7 @@
 // 20k buckets. Post-5b, identical value collapses into ONE bucket.
 
 import { describe, expect, it } from "vitest";
-import { AVal, AdaptiveToken, cval } from "@aardworx/wombat.adaptive";
+import { AVal, AdaptiveToken, cval, transact } from "@aardworx/wombat.adaptive";
 import {
   buildHeapScene, type HeapDrawSpec,
 } from "../packages/rendering/src/runtime/heapScene.js";
@@ -117,5 +117,45 @@ describe("Phase 5b — bucket key uses modeKey VALUE, not aval identity", () => 
     const scene = buildHeapScene(gpu.device, sig(), specs);
     scene.update(AdaptiveToken.top);
     expect(scene.stats.groups).toBe(2);
+  });
+
+  it("reactive cullMode flip: cval mutation moves the RO to a different bucket", () => {
+    const gpu = new MockGPU();
+    const eff = makeHeapTestEffect();
+    // Two ROs, both initially "back" — should share one bucket.
+    const cullA = cval<CullMode>("back");
+    const cullB = cval<CullMode>("back");
+    const psA: PipelineState = {
+      rasterizer: {
+        topology:  cval<GPUPrimitiveTopology>("triangle-list"),
+        cullMode:  cullA,
+        frontFace: cval<"ccw" | "cw">("ccw"),
+      },
+    };
+    const psB: PipelineState = {
+      rasterizer: {
+        topology:  cval<GPUPrimitiveTopology>("triangle-list"),
+        cullMode:  cullB,
+        frontFace: cval<"ccw" | "cw">("ccw"),
+      },
+    };
+    const scene = buildHeapScene(gpu.device, sig(), [spec(eff, psA), spec(eff, psB)]);
+    scene.update(AdaptiveToken.top);
+    expect(scene.stats.groups).toBe(1); // collapse — both back.
+
+    // Flip A's cullMode value. Pre-5b.2, this was silently ignored
+    // (bucket key was identity-based; aval identity unchanged).
+    // With reactive rebucket, the modeKey changes -> RO A moves
+    // to a fresh bucket with cullMode='front'.
+    transact(() => { cullA.value = "front"; });
+    scene.update(AdaptiveToken.top);
+    expect(scene.stats.groups).toBe(2); // A and B now in distinct buckets.
+
+    // Flip B to also front; both end up in the same bucket again.
+    transact(() => { cullB.value = "front"; });
+    scene.update(AdaptiveToken.top);
+    expect(scene.stats.groups).toBe(2); // 'back' bucket lingers but empty
+    // (v1 doesn't yet GC empty buckets — stats.groups counts the
+    // bucket list verbatim. The non-empty count would be 1.)
   });
 });

@@ -93,7 +93,7 @@ import {
   type ArenaState,
 } from "./heapScene/pools.js";
 import { encodeModeKey } from "./pipelineCache/index.js";
-import { snapshotDescriptor } from "./derivedModes/modeKeyCpu.js";
+import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
 
 // GrowBuffer + ALIGN16 + MIN_BUFFER_BYTES + POW2 live in ./heapScene/growBuffer.
 // Packers (WGSL-type → JS-value → arena bytes) live in ./heapScene/packers.
@@ -571,6 +571,18 @@ export function buildHeapScene(
   const drawIdToLocalSlot: (number | undefined)[] = [];
   /** Per-draw index aval — for `indexPool.release` on removeDraw. */
   const drawIdToIndexAval: (aval<Uint32Array> | undefined)[] = [];
+  /**
+   * Original spec retained per drawId so we can re-add the RO into a
+   * new bucket when its PipelineState modeKey changes (reactive
+   * cullmode flip, etc.). Cheap to retain — specs are mostly aval
+   * references.
+   */
+  const drawIdToSpec:        (HeapDrawSpec | undefined)[] = [];
+  /** Per-draw ModeKeyTracker — subscribes to PS aval marks, recomputes
+   *  the modeKey, schedules a rebucket if it changed. */
+  const drawIdToModeTracker: (ModeKeyTracker | undefined)[] = [];
+  /** drawIds whose PS marked since last update; drained by `update`. */
+  const dirtyModeKeyDrawIds = new Set<number>();
   let nextDrawId = 0;
 
   /**
@@ -1928,6 +1940,18 @@ export function buildHeapScene(
     drawIdToLocalSlot[drawId] = localSlot;
     drawIdToIndexAval[drawId] = indicesAval;
 
+    // ─── Reactive rebucket: track PS-modeKey changes ────────────────
+    // When any mode-axis aval marks (e.g. cullCval.value = 'front'),
+    // schedule this RO for rebucket on the next update(). Today's
+    // bucket key is the modeKey VALUE (Phase 5b), so changing the
+    // value must move the RO to a different bucket. Without this
+    // tracker the cval flip would be silently ignored.
+    drawIdToSpec[drawId] = spec;
+    const tracker = new ModeKeyTracker(spec.pipelineState, sig, () => {
+      dirtyModeKeyDrawIds.add(drawId);
+    });
+    drawIdToModeTracker[drawId] = tracker;
+
     // ─── §7 derived-uniforms registration ────────────────────────────
     // A uniform binding on this RO is either a value (aval/constant) or a rule —
     // collect the rules (explicit `derivedUniform(...)` values + standard trafo
@@ -2080,6 +2104,11 @@ export function buildHeapScene(
     drawIdToBucket[drawId]    = undefined;
     drawIdToLocalSlot[drawId] = undefined;
     drawIdToIndexAval[drawId] = undefined;
+    drawIdToSpec[drawId]      = undefined;
+    const oldTracker = drawIdToModeTracker[drawId];
+    if (oldTracker !== undefined) oldTracker.dispose();
+    drawIdToModeTracker[drawId] = undefined;
+    dirtyModeKeyDrawIds.delete(drawId);
 
     stats.totalDraws--;
     stats.geometryBytes = arenaBytes(arena);
@@ -2166,6 +2195,35 @@ export function buildHeapScene(
     let totalDirtyBytes = 0;
     sceneObj.evaluateAlways(token, (tok) => {
       drainAsetWith(tok);
+
+      // 0. Reactive rebucket: any RO whose PipelineState modeKey
+      //    changed since last frame moves to its new bucket.
+      //    `dirtyModeKeyDrawIds` was populated by ModeKeyTracker's
+      //    onDirty callbacks (one per leaf aval per RO). Calling
+      //    `recompute()` here re-snapshots the descriptor and tells
+      //    us whether the modeKey actually changed (vs the aval just
+      //    being marked-but-equal). If the key changed, we remove +
+      //    re-add the RO via the retained spec; addDraw routes it to
+      //    the correct (new) bucket via the value-keyed lookup.
+      if (dirtyModeKeyDrawIds.size > 0) {
+        const dirty = [...dirtyModeKeyDrawIds];
+        dirtyModeKeyDrawIds.clear();
+        for (const drawId of dirty) {
+          const tracker = drawIdToModeTracker[drawId];
+          if (tracker === undefined) continue;          // RO removed since mark
+          const oldKey  = tracker.modeKey;
+          if (!tracker.recompute()) continue;            // value unchanged
+          if (tracker.modeKey === oldKey) continue;      // belt + braces
+          const spec    = drawIdToSpec[drawId];
+          if (spec === undefined) continue;
+          removeDraw(drawId);
+          const newId  = addDrawImpl(spec, tok);
+          // The drawId returned by addDraw is a fresh slot; we don't
+          // attempt to preserve the caller's id mapping in v1. v2
+          // could thread the original id through if needed.
+          void newId;
+        }
+      }
 
       // 1. Pool: re-pack any aval whose value changed since last frame.
       //    One writeBuffer per dirty aval, regardless of how many draws
