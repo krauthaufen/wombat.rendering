@@ -1760,6 +1760,16 @@ export function buildHeapScene(
           ? { ...base, depth: { ...base.depth, write: value as boolean } }
           : base;
       case "alphaToCoverage": return { ...base, alphaToCoverage: value as boolean };
+      case "blend": {
+        // Blend is per-attachment; apply the resolved AttachmentBlend
+        // to attachment 0 (the main color target). Multi-attachment
+        // structured rules can extend this when needed.
+        const blend = value as import("./pipelineCache/index.js").AttachmentBlend;
+        const atts = base.attachments.slice();
+        if (atts.length === 0) atts.push(blend);
+        else atts[0] = blend;
+        return { ...base, attachments: atts };
+      }
       default: return base;
     }
   }
@@ -1779,16 +1789,49 @@ export function buildHeapScene(
     depthCompare:    ["never", "less", "equal", "less-equal", "greater", "not-equal", "greater-equal", "always"],
     depthWrite:      [false, true],
     alphaToCoverage: [false, true],
+    // Blend has no canonical enum table — the rule's `resolve` /
+    // `values` callback MUST be supplied so the heap renderer knows
+    // how to map u32 outputs to AttachmentBlend objects.
+    blend:           [],
   };
 
-  /** Resolve an axis's `declared` value (string / boolean / aval)
-   *  to a u32 index in the axis's enum table. */
+  /** Look up the axis value for a given u32 enum output. Uses the
+   *  rule's `resolve` callback if supplied (mandatory for axes with
+   *  structured values like blend); falls back to the canonical
+   *  axis-enum table for enum axes. */
+  function resolveAxisValue<A extends ModeAxis>(
+    rule: DerivedModeRule<A>,
+    u32: number,
+  ): unknown {
+    if (rule.resolve !== undefined) return rule.resolve(u32);
+    const table = AXIS_ENUM_TABLE[rule.axis];
+    if (table.length === 0) {
+      throw new Error(
+        `heapScene/gpuRouting: axis '${rule.axis}' has no canonical enum table; ` +
+        `supply \`resolve\` or \`values\` in derivedMode options`,
+      );
+    }
+    return table[u32];
+  }
+
+  /** Resolve an axis's `declared` value to a u32 index. For enum
+   *  axes (cull etc.), looks up the canonical enum table. For
+   *  structured axes (blend), the declared value is expected to be
+   *  a u32 directly (the index that the rule's resolve() maps back
+   *  to a full mode object). */
   function resolveDeclaredU32<A extends ModeAxis>(rule: DerivedModeRule<A>, tok: AdaptiveToken): number {
     const d = rule.declared;
     const v = (typeof d === "object" && d !== null && "getValue" in (d as object))
       ? (d as aval<unknown>).getValue(tok)
       : d;
+    if (typeof v === "number") return v >>> 0;
     const table = AXIS_ENUM_TABLE[rule.axis];
+    if (table.length === 0) {
+      throw new Error(
+        `heapScene/gpuRouting: axis '${rule.axis}' has no canonical enum table; ` +
+        `pass \`declared\` as a u32 index that aligns with the rule's resolve callback`,
+      );
+    }
     const i = table.indexOf(v);
     if (i < 0) {
       throw new Error(
@@ -1832,10 +1875,23 @@ export function buildHeapScene(
     );
     let outputs = resolved.slice();
     if (unresolvedCount > 0) {
-      // Fall back: the axis's full enum table is the conservative
-      // ceiling. The bucket pays for unused slots but renders
-      // correctly.
-      outputs = AXIS_ENUM_TABLE[rule.axis].map((_, i) => i);
+      // Fall back: the axis's full enum table (for enum axes) is
+      // the conservative ceiling. For structured axes (blend) the
+      // user's `resolve`/`values` must enumerate the possibilities
+      // — we use [0..N-1] of resolve's domain via... ugh, we don't
+      // know N at this level. So for structured axes we error out
+      // here: the user's rule MUST be analyseable.
+      const table = AXIS_ENUM_TABLE[rule.axis];
+      if (table.length > 0) {
+        outputs = table.map((_, i) => i);
+      } else if (outputs.length === 0) {
+        throw new Error(
+          `heapScene/gpuRouting: rule on axis '${rule.axis}' could not be ` +
+          `statically resolved AND the axis has no canonical enum table. ` +
+          `Simplify the rule body so analyseOutputSet can fold each branch ` +
+          `to a u32 const.`,
+        );
+      }
     }
     if (outputs.length === 0) {
       // Defensive: at least one slot needed (rule that never
@@ -1869,7 +1925,7 @@ export function buildHeapScene(
     const base = bucket.baseDescriptor!;
     for (let slotIdx = 0; slotIdx < resolved.length; slotIdx++) {
       const enumValue = resolved[slotIdx]!;
-      const axisValue = AXIS_ENUM_TABLE[rule.axis][enumValue];
+      const axisValue = resolveAxisValue(rule, enumValue);
       const desc = patchDescriptor(base, rule.axis, axisValue);
       const key = encodeModeKey(desc);
       if (slotIdx < bucket.slots.length) {

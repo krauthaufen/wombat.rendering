@@ -43,4 +43,50 @@ describe("derivedMode (RuleExpr-based)", () => {
     derivedMode("alphaToCoverage", fakeRuleExpr(), { declared: false });
     expect(true).toBe(true);
   });
+
+  test("blend axis: full AttachmentBlend object via `resolve` callback", () => {
+    const STRAIGHT = {
+      enabled: true,
+      color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+      alpha: { srcFactor: "one",       dstFactor: "one-minus-src-alpha", operation: "add" },
+      writeMask: 0xF,
+    } as const;
+    const PREMULT = {
+      enabled: true,
+      color: { srcFactor: "one",       dstFactor: "one-minus-src-alpha", operation: "add" },
+      alpha: { srcFactor: "one",       dstFactor: "one-minus-src-alpha", operation: "add" },
+      writeMask: 0xF,
+    } as const;
+    const r = derivedMode("blend", fakeRuleExpr(), {
+      declared: 0,
+      resolve: (i: number) => (i === 1 ? PREMULT : STRAIGHT),
+    });
+    expect(r.axis).toBe("blend");
+    expect(r.resolve).toBeDefined();
+    expect(r.resolve!(0)).toBe(STRAIGHT);
+    expect(r.resolve!(1)).toBe(PREMULT);
+  });
+
+  test("blend axis: `values` array shorthand desugars to `resolve`", () => {
+    const STRAIGHT = {
+      enabled: true,
+      color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+      alpha: { srcFactor: "one",       dstFactor: "one-minus-src-alpha", operation: "add" },
+      writeMask: 0xF,
+    } as const;
+    const PREMULT = {
+      enabled: true,
+      color: { srcFactor: "one",       dstFactor: "one-minus-src-alpha", operation: "add" },
+      alpha: { srcFactor: "one",       dstFactor: "one-minus-src-alpha", operation: "add" },
+      writeMask: 0xF,
+    } as const;
+    const r = derivedMode("blend", fakeRuleExpr(), {
+      declared: 0,
+      values: [STRAIGHT, PREMULT],
+    });
+    expect(r.resolve!(0)).toBe(STRAIGHT);
+    expect(r.resolve!(1)).toBe(PREMULT);
+    // Out-of-range u32 errors cleanly.
+    expect(() => r.resolve!(2)).toThrow(/u32=2.+only has 2 entries/);
+  });
 });
