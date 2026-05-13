@@ -94,6 +94,7 @@ import {
 } from "./heapScene/pools.js";
 import { encodeModeKey } from "./pipelineCache/index.js";
 import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
+import { addMarkingCallback } from "@aardworx/wombat.adaptive";
 
 // GrowBuffer + ALIGN16 + MIN_BUFFER_BYTES + POW2 live in ./heapScene/growBuffer.
 // Packers (WGSL-type → JS-value → arena bytes) live in ./heapScene/packers.
@@ -578,11 +579,45 @@ export function buildHeapScene(
    * references.
    */
   const drawIdToSpec:        (HeapDrawSpec | undefined)[] = [];
-  /** Per-draw ModeKeyTracker — subscribes to PS aval marks, recomputes
-   *  the modeKey, schedules a rebucket if it changed. */
+  /** Per-draw ModeKeyTracker — recomputes the modeKey on demand. Does
+   *  NOT install per-instance marking callbacks; subscriptions are
+   *  scene-level (deduped by aval identity below). */
   const drawIdToModeTracker: (ModeKeyTracker | undefined)[] = [];
   /** drawIds whose PS marked since last update; drained by `update`. */
   const dirtyModeKeyDrawIds = new Set<number>();
+  /**
+   * Scene-level mode-aval subscription dedupe. One IDisposable per
+   * unique leaf aval, plus a Set of dependent drawIds. When the aval
+   * marks, all drawIds in the set become dirty in O(1) per RO instead
+   * of installing N separate addMarkingCallbacks. The big win for the
+   * shared-cullCval case (20k ROs subscribing to one cval → 1 callback
+   * instead of 20k).
+   */
+  const modeAvalToDrawIds  = new Map<aval<unknown>, Set<number>>();
+  const modeAvalCallbacks  = new Map<aval<unknown>, IDisposable>();
+
+  function subscribeModeLeaf(av: aval<unknown>, drawId: number): void {
+    let set = modeAvalToDrawIds.get(av);
+    if (set === undefined) {
+      set = new Set<number>();
+      modeAvalToDrawIds.set(av, set);
+      modeAvalCallbacks.set(av, addMarkingCallback(av, () => {
+        for (const id of set!) dirtyModeKeyDrawIds.add(id);
+      }));
+    }
+    set.add(drawId);
+  }
+
+  function unsubscribeModeLeaf(av: aval<unknown>, drawId: number): void {
+    const set = modeAvalToDrawIds.get(av);
+    if (set === undefined) return;
+    set.delete(drawId);
+    if (set.size === 0) {
+      modeAvalToDrawIds.delete(av);
+      const cb = modeAvalCallbacks.get(av);
+      if (cb !== undefined) { cb.dispose(); modeAvalCallbacks.delete(av); }
+    }
+  }
   let nextDrawId = 0;
 
   /**
@@ -1947,10 +1982,16 @@ export function buildHeapScene(
     // value must move the RO to a different bucket. Without this
     // tracker the cval flip would be silently ignored.
     drawIdToSpec[drawId] = spec;
-    const tracker = new ModeKeyTracker(spec.pipelineState, sig, () => {
-      dirtyModeKeyDrawIds.add(drawId);
-    });
+    // skipSubscribe: this tracker doesn't install its own callbacks.
+    // The scene-level `modeAvalToDrawIds` does it once per unique aval
+    // (the 20k-ROs-share-one-cullCval optimization).
+    const tracker = new ModeKeyTracker(
+      spec.pipelineState, sig,
+      () => { dirtyModeKeyDrawIds.add(drawId); },
+      { skipSubscribe: true },
+    );
     drawIdToModeTracker[drawId] = tracker;
+    tracker.forEachLeaf((av) => subscribeModeLeaf(av, drawId));
 
     // ─── §7 derived-uniforms registration ────────────────────────────
     // A uniform binding on this RO is either a value (aval/constant) or a rule —
@@ -2106,7 +2147,10 @@ export function buildHeapScene(
     drawIdToIndexAval[drawId] = undefined;
     drawIdToSpec[drawId]      = undefined;
     const oldTracker = drawIdToModeTracker[drawId];
-    if (oldTracker !== undefined) oldTracker.dispose();
+    if (oldTracker !== undefined) {
+      oldTracker.forEachLeaf((av) => unsubscribeModeLeaf(av, drawId));
+      oldTracker.dispose();
+    }
     drawIdToModeTracker[drawId] = undefined;
     dirtyModeKeyDrawIds.delete(drawId);
 
@@ -2212,20 +2256,90 @@ export function buildHeapScene(
       if (dirtyModeKeyDrawIds.size > 0) {
         const dirty = [...dirtyModeKeyDrawIds];
         dirtyModeKeyDrawIds.clear();
+
+        // Bucket-level fast path: group dirty drawIds by bucket. If
+        // ALL of a bucket's ROs are dirty (typical SG case where one
+        // shared aval drives every leaf — e.g. <Sg CullMode={cullC}>
+        // wrapping 20k leaves), the whole bucket transitions together.
+        // Rebuild the bucket's pipeline + rename in bucketByKey,
+        // O(1) work instead of N remove+add cycles.
+        const byBucket = new Map<Bucket, number[]>();
         for (const drawId of dirty) {
-          const tracker = drawIdToModeTracker[drawId];
-          if (tracker === undefined) continue;          // RO removed since mark
-          const oldKey  = tracker.modeKey;
-          if (!tracker.recompute()) continue;            // value unchanged
-          if (tracker.modeKey === oldKey) continue;      // belt + braces
-          const spec    = drawIdToSpec[drawId];
-          if (spec === undefined) continue;
-          removeDraw(drawId);
-          const newId  = addDrawImpl(spec, tok);
-          // The drawId returned by addDraw is a fresh slot; we don't
-          // attempt to preserve the caller's id mapping in v1. v2
-          // could thread the original id through if needed.
-          void newId;
+          const b = drawIdToBucket[drawId];
+          if (b === undefined) continue; // RO removed since mark
+          let arr = byBucket.get(b);
+          if (arr === undefined) { arr = []; byBucket.set(b, arr); }
+          arr.push(drawId);
+        }
+
+        for (const [bucket, ids] of byBucket) {
+          // First recompute every dirty tracker so .modeKey is fresh.
+          // Filter out ones whose value didn't actually change.
+          const changed: number[] = [];
+          for (const drawId of ids) {
+            const tracker = drawIdToModeTracker[drawId];
+            if (tracker === undefined) continue;
+            const oldKey = tracker.modeKey;
+            if (!tracker.recompute()) continue;
+            if (tracker.modeKey === oldKey) continue;
+            changed.push(drawId);
+          }
+          if (changed.length === 0) continue;
+
+          // Try the all-together fast path.
+          const wholeBucket = changed.length === bucket.drawSlots.size;
+          if (wholeBucket) {
+            const repId = changed[0]!;
+            const repTracker = drawIdToModeTracker[repId]!;
+            const newKey  = repTracker.modeKey;
+            // Compute the new bucketByKey string; we need the family.
+            const sample = drawIdToSpec[repId]!;
+            const fam = familyFor(sample.effect);
+            const newBk = `family#${fam.schema.id}|mk#${newKey.toString(16)}`;
+            const existing = bucketByKey.get(newBk);
+            if (existing === undefined) {
+              // No conflict — rename + rebuild pipeline in place.
+              // Find this bucket's current key by linear scan
+              // (buckets ≤ ~100 typically, so this is cheap).
+              let oldBk: string | undefined;
+              for (const [k, v] of bucketByKey) {
+                if (v === bucket) { oldBk = k; break; }
+              }
+              if (oldBk !== undefined) bucketByKey.delete(oldBk);
+              bucketByKey.set(newBk, bucket);
+              // Build the new pipeline with the snapshotted PS.
+              const desc = repTracker.descriptor;
+              const { pipelineLayout } = getBgl(bucket.layout, bucket.isAtlasBucket);
+              const newPipeline = device.createRenderPipeline({
+                label: `heapScene/${newBk}/pipeline`,
+                layout: pipelineLayout,
+                vertex:   { module: familyFor(sample.effect).vsModule, entryPoint: familyFor(sample.effect).vsEntryName, buffers: [] },
+                fragment: { module: familyFor(sample.effect).fsModule, entryPoint: familyFor(sample.effect).fsEntryName, targets: colorTargets },
+                primitive: { topology: desc.topology, cullMode: desc.cullMode, frontFace: desc.frontFace },
+                ...(depthFormat !== undefined && desc.depth !== undefined
+                  ? { depthStencil: { format: depthFormat, depthWriteEnabled: desc.depth.write, depthCompare: desc.depth.compare } }
+                  : depthFormat !== undefined
+                    ? { depthStencil: { format: depthFormat, depthWriteEnabled: false, depthCompare: "always" as GPUCompareFunction } }
+                    : {}),
+              });
+              // Swap pipeline reference on the bucket's single slot.
+              // (Multi-slot Phase 5c would update one slot at a time.)
+              (bucket.slots[0] as { pipeline: GPURenderPipeline }).pipeline = newPipeline;
+              continue; // done with this bucket
+            }
+            // Conflict: another bucket already owns newBk. Fall through
+            // to per-RO rebucket below, which will merge into `existing`.
+          }
+          // Slow path — per-RO rebucket (used when partial transition
+          // OR when a merge with an existing destination bucket is
+          // required).
+          for (const drawId of changed) {
+            const spec = drawIdToSpec[drawId];
+            if (spec === undefined) continue;
+            removeDraw(drawId);
+            const newId = addDrawImpl(spec, tok);
+            void newId;
+          }
         }
       }
 

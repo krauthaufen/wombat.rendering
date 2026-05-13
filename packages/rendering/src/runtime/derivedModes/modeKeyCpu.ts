@@ -136,13 +136,51 @@ export class ModeKeyTracker implements IDisposable {
     ps: PipelineState | undefined,
     signature: FramebufferSignature,
     onDirty: () => void,
+    /**
+     * Skip the per-instance addMarkingCallback subscriptions. The caller
+     * is responsible for invoking `onDirty` (or recomputing directly)
+     * when an input aval marks. Use this when the heap scene shares one
+     * subscription across N tracker instances (the 20k-ROs-share-one-
+     * cullCval case) — saves N subscriptions and N callback dispatches
+     * per mark.
+     */
+    options: { skipSubscribe?: boolean } = {},
   ) {
     this.ps        = ps;
     this.signature = signature;
     this.onDirty   = onDirty;
     this.cachedDescriptor = snapshotDescriptor(ps, signature);
     this.cachedModeKey    = encodeModeKey(this.cachedDescriptor);
-    this.subscribeAll();
+    if (options.skipSubscribe !== true) this.subscribeAll();
+  }
+
+  /**
+   * Walk every leaf aval in this tracker's PipelineState and invoke
+   * `visit(aval)`. Used by the heap scene to register ONE
+   * addMarkingCallback per unique aval across many trackers.
+   */
+  forEachLeaf(visit: (a: aval<unknown>) => void): void {
+    if (this.ps === undefined) return;
+    const ps = this.ps;
+    visit(ps.rasterizer.topology);
+    visit(ps.rasterizer.cullMode);
+    visit(ps.rasterizer.frontFace);
+    if (ps.rasterizer.depthBias !== undefined) visit(ps.rasterizer.depthBias);
+    if (ps.depth !== undefined) {
+      visit(ps.depth.write);
+      visit(ps.depth.compare);
+      if (ps.depth.clamp !== undefined) visit(ps.depth.clamp);
+    }
+    if (ps.blends !== undefined) {
+      visit(ps.blends);
+      const map = ps.blends.force(/* allow-force */);
+      for (const [, bs] of map) {
+        visit(bs.color.srcFactor); visit(bs.color.dstFactor); visit(bs.color.operation);
+        visit(bs.alpha.srcFactor); visit(bs.alpha.dstFactor); visit(bs.alpha.operation);
+        visit(bs.writeMask);
+      }
+    }
+    if (ps.alphaToCoverage !== undefined) visit(ps.alphaToCoverage);
   }
 
   get descriptor(): PipelineStateDescriptor { return this.cachedDescriptor; }

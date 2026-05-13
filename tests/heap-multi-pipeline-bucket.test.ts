@@ -176,4 +176,38 @@ describe("Phase 5b — bucket key uses modeKey VALUE, not aval identity", () => 
     scene.update(AdaptiveToken.top);
     expect(scene.stats.groups).toBe(1);
   });
+
+  it("bucket-level fast path: 100 ROs sharing one cullCval rebuild a single pipeline (not 100)", () => {
+    const gpu = new MockGPU();
+    const eff = makeHeapTestEffect();
+    // ALL ROs share the same cullCval. Pre-fast-path: flipping it
+    // would trigger 100 remove+add cycles, creating 100 fresh
+    // pipelines (each addDraw + findOrCreateBucket runs create).
+    // With the bucket-level fast path, the whole bucket transitions
+    // as a unit -> ONE new pipeline.
+    const cullShared = cval<CullMode>("back");
+    const ps: PipelineState = {
+      rasterizer: {
+        topology:  cval<GPUPrimitiveTopology>("triangle-list"),
+        cullMode:  cullShared,
+        frontFace: cval<"ccw" | "cw">("ccw"),
+      },
+    };
+    const specs: HeapDrawSpec[] = [];
+    for (let i = 0; i < 100; i++) specs.push(spec(eff, ps));
+    const scene = buildHeapScene(gpu.device, sig(), specs);
+    scene.update(AdaptiveToken.top);
+    const renderPipelinesBefore = gpu.pipelines.length;
+
+    transact(() => { cullShared.value = "front"; });
+    scene.update(AdaptiveToken.top);
+
+    const newPipelines = gpu.pipelines.length - renderPipelinesBefore;
+    // Exactly one new pipeline for 'front'; not 100.
+    expect(newPipelines).toBe(1);
+    // Still one bucket — the existing one was renamed in-place.
+    expect(scene.stats.groups).toBe(1);
+    const lastDesc = gpu.pipelines[gpu.pipelines.length - 1]!;
+    expect(lastDesc.primitive!.cullMode).toBe("front");
+  });
 });
