@@ -46,27 +46,6 @@ export interface RoModeRules {
   readonly alphaToCoverage?: DerivedModeRule<"alphaToCoverage">;
 }
 
-/**
- * Uniforms accessor exposed to a derived-mode rule's `(u, declared)`
- * closure. Reads each `u.<Name>` from the supplied aval map at
- * evaluation time and tracks which avals were accessed so the
- * `ModeKeyTracker` can subscribe to them.
- */
-function uniformsProxy(
-  uniformAvals: ReadonlyMap<string, aval<unknown>>,
-  tok: AdaptiveToken,
-  recordDep: ((av: aval<unknown>) => void) | undefined,
-): Record<string, unknown> {
-  return new Proxy({}, {
-    get(_target, prop): unknown {
-      if (typeof prop !== "string") return undefined;
-      const av = uniformAvals.get(prop);
-      if (av === undefined) return undefined;
-      if (recordDep !== undefined) recordDep(av);
-      return av.getValue(tok);
-    },
-  }) as Record<string, unknown>;
-}
 
 /**
  * One-shot snapshot of the current values of every leaf aval in a
@@ -117,41 +96,13 @@ function applyRules(
     readonly recordDep?: (av: aval<unknown>) => void;
   },
 ): PipelineStateDescriptor {
-  const rules = options.modeRules;
-  if (rules === undefined) return d;
-  const uniforms = options.uniformAvals ?? new Map();
-  const tok = options.token ?? AdaptiveToken.top;
-  const proxy = uniformsProxy(uniforms, tok, options.recordDep);
-  let out = d;
-  if (rules.cull !== undefined) {
-    const v = rules.cull.evaluate(proxy, out.cullMode);
-    if (v !== out.cullMode) out = { ...out, cullMode: v };
-  }
-  if (rules.frontFace !== undefined) {
-    const v = rules.frontFace.evaluate(proxy, out.frontFace);
-    if (v !== out.frontFace) out = { ...out, frontFace: v };
-  }
-  if (rules.topology !== undefined) {
-    const v = rules.topology.evaluate(proxy, out.topology);
-    if (v !== out.topology) out = { ...out, topology: v, stripIndexFormat: stripFormatFor(v) };
-  }
-  if (rules.alphaToCoverage !== undefined) {
-    const v = rules.alphaToCoverage.evaluate(proxy, out.alphaToCoverage);
-    if (v !== out.alphaToCoverage) out = { ...out, alphaToCoverage: v };
-  }
-  if (out.depth !== undefined && (rules.depthCompare !== undefined || rules.depthWrite !== undefined)) {
-    let depthOut = out.depth;
-    if (rules.depthCompare !== undefined) {
-      const v = rules.depthCompare.evaluate(proxy, depthOut.compare);
-      if (v !== depthOut.compare) depthOut = { ...depthOut, compare: v };
-    }
-    if (rules.depthWrite !== undefined) {
-      const v = rules.depthWrite.evaluate(proxy, depthOut.write);
-      if (v !== depthOut.write) depthOut = { ...depthOut, write: v };
-    }
-    if (depthOut !== out.depth) out = { ...out, depth: depthOut };
-  }
-  return out;
+  // Phase 5c.3 — rules are IR-traced and run on the GPU. We never
+  // CPU-evaluate them here; the descriptor returned reflects the
+  // raw PipelineState aval values (= the "declared" value for each
+  // axis). The heap runtime creates one bucket slot per
+  // `rule.domain` entry and the partition kernel routes per record.
+  void options;
+  return d;
 }
 
 function buildAttachmentsFor(
@@ -289,10 +240,26 @@ export class ModeKeyTracker implements IDisposable {
       }
       if (ps.alphaToCoverage !== undefined) visit(ps.alphaToCoverage);
     }
-    // Rule-input deps discovered on the last evaluation. The set is
-    // refreshed each `recompute()`; callers re-subscribe accordingly.
-    // Surfaced regardless of `ps` because a rule can fire without
-    // any underlying PipelineState aval (e.g. ps === undefined).
+    // Phase 5c.3: rule-input deps are statically known from each
+    // rule's `inputUniforms`. Look each name up in `uniformAvals`
+    // (the per-RO `spec.inputs` aval map) and visit. Also visit
+    // each rule's `declared` if it's an aval.
+    if (this.modeRules !== undefined) {
+      const uMap = this.uniformAvals;
+      for (const rule of Object.values(this.modeRules) as DerivedModeRule[]) {
+        if (rule === undefined) continue;
+        if (uMap !== undefined) {
+          for (const name of rule.inputUniforms) {
+            const av = uMap.get(name);
+            if (av !== undefined) visit(av);
+          }
+        }
+        const d = rule.declared;
+        if (typeof d === "object" && d !== null && "getValue" in (d as object)) {
+          visit(d as aval<unknown>);
+        }
+      }
+    }
     for (const av of this.ruleDeps) visit(av);
   }
 

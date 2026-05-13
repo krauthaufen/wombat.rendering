@@ -1,29 +1,25 @@
-// `derivedMode(axis, (u, declared) => modeValue)` — author-facing
+// `derivedMode(axis, (u, declared) => DerivedExpr)` — author-facing
 // marker for per-RO pipeline-state values that are functions of the
 // RO's uniforms.
 //
-// v1 is CPU-evaluated: the user's closure runs in JS each time the
-// rule's inputs mark. That's a good fit for the typical authoring
-// shapes (a uniform-driven enum flip, a determinant-sign cull flip,
-// etc.) and pairs naturally with the bucket-level rebuild fast path
-// shipped in 0.9.16 — only ROs whose inputs actually changed get
-// re-evaluated, and same-key buckets re-bind their pipeline once
-// rather than per-RO.
+// The body is a *traced* expression — same IR machinery §7 derived
+// uniforms uses. `u.<Name>` is a uniform leaf (read from arena per
+// RO), `declared` is the SG-context value (per-dispatch kernel
+// uniform). The output is a u32 ENUM INDEX into the rule's `domain`,
+// e.g. for cull with `domain: ["none", "front", "back"]` the rule
+// returns `0` to route a record to the "none" slot, `2` for "back".
 //
-// v2 (deferred) lowers rules to a GPU compute kernel via §7's IR
-// machinery — needed only when bulk-animated per-RO inputs become a
-// CPU-side bottleneck. See docs/derived-mode-rules-plan.md.
-//
-// What can be derived (the small-enum axes — cull/blend/depth-compare/
-// topology/etc.) and what stays static (depth bias, blend constant,
-// stencil ref) is covered in docs/derived-modes.md.
+// At bucket-init time the heap runtime codegens a partition kernel
+// from the rule's IR: per record evaluate every axis-rule, pack the
+// indices into a modeKey, look up the slot index, atomic-scatter.
+// No hand-rolled WGSL anywhere.
 
+import type { Expr, Type } from "@aardworx/wombat.shader/ir";
+import { DerivedExpr } from "../derivedUniforms/marker.js";
+import type { aval } from "@aardworx/wombat.adaptive";
 import type { CullMode, FrontFace, Topology } from "../pipelineCache/index.js";
 
-/** Discrete pipeline-state axes a `derivedMode` rule can target. v1
- *  supports cull / frontFace / topology / depthCompare / depthWrite /
- *  blendEnabled. Stencil + per-attachment blend factor/operation are
- *  deferred — same carve-outs as `derived-modes.md`. */
+/** Discrete pipeline-state axes a `derivedMode` rule can target. */
 export type ModeAxis =
   | "cull" | "frontFace" | "topology"
   | "depthCompare" | "depthWrite"
@@ -39,145 +35,158 @@ export type ModeValue<A extends ModeAxis> =
   A extends "alphaToCoverage" ? boolean :
   never;
 
-/**
- * The closure signature a `derivedMode` rule body takes:
- *   - `u`: a proxy whose properties resolve to the RO's uniform values
- *     at evaluation time. The proxy is type-erased in v1 — declare the
- *     uniforms you'll read via `UniformScope` augmentation on the
- *     wombat.shader side for compile-time safety, or annotate locally.
- *   - `declared`: the SG-declared value for this axis at this leaf.
- *     Identity rules `(u, d) => d` are valid and useful for axes that
- *     want to pass declared through unchanged.
- */
-export type DerivedModeBuilder<A extends ModeAxis> = (
-  u: Record<string, unknown>,
-  declared: ModeValue<A>,
-) => ModeValue<A>;
+const Tu32: Type = { kind: "Int", signed: false, width: 32 };
+
+/** Scope for `u` (per-RO uniform reads, resolved at arena byte offsets). */
+const SCOPE_UNIFORM = "Uniform";
+/** Prefix for `declared` leaves: surfaced as IR `Var` whose name is
+ *  `__declared_<axis>` so the partition-kernel codegen can pattern-
+ *  match it and emit `params.decl_<axis>`. (The shader-IR `InputScope`
+ *  enum is closed; using `Var` avoids forking it.) */
+const DECLARED_VAR_PREFIX = "__declared_";
 
 /**
- * Opt-in GPU evaluation marker. When present on a rule, the heap
- * scene runs a hard-coded WGSL kernel (see `./gpuKernel.ts`) instead
- * of the CPU closure. The closure is retained for fallback (e.g.
- * MockGPU tests, devices without compute, or before frame 0).
+ * Trace proxy for `u`: `u.<Name>` returns a DerivedExpr wrapping
+ * `ReadInput("Uniform", "<Name>")`. Defaults to mat4 (the trafo case);
+ * use `.as(...)` to re-type a leaf inline.
  *
- * v1 supports one kernel: `"flipCullByDeterminant"`. v2 generalizes
- * via a traced IR builder.
+ * Side-effect: collects each accessed leaf name into `out` so the
+ * runtime can resolve arena byte offsets for them at addRO time.
  */
-export interface GpuRuleSpec<A extends ModeAxis = ModeAxis> {
-  readonly kernel: "flipCullByDeterminant";
-  /** Name of the input uniform the kernel reads (e.g. "ModelTrafo"). */
-  readonly inputUniform: string;
-  /**
-   * Declared (SG-scope) value the kernel mutates by. Either a plain
-   * mode value (baked at scene-build) or an `aval` for reactive
-   * declared — the dispatcher re-uploads the kernel uniform on each
-   * dispatch from the aval's current value, so flipping it via a UI
-   * cval re-runs the rule with the new declared.
-   */
-  readonly declared:
-    | ModeValue<A>
-    | import("@aardworx/wombat.adaptive").aval<ModeValue<A>>;
+function makeUniformProxy(out: Set<string>): Record<string, DerivedExpr> {
+  const mat4: Type = { kind: "Matrix", element: { kind: "Float", width: 32 }, rows: 4, cols: 4 };
+  return new Proxy({} as Record<string, DerivedExpr>, {
+    get(_t, key): DerivedExpr {
+      if (typeof key !== "string") throw new Error("derivedMode: leaf names must be strings");
+      out.add(key);
+      return new DerivedExpr({ kind: "ReadInput", scope: SCOPE_UNIFORM, name: key, type: mat4 });
+    },
+  });
 }
 
+/**
+ * `declared` is a single u32 leaf — the SG-context value for this
+ * axis, supplied by the dispatcher each frame from the rule's
+ * `declared` aval. (Codegen reads it from a per-dispatch kernel
+ * uniform; there's no arena offset.)
+ */
+function declaredLeaf(axis: ModeAxis): DerivedExpr {
+  const name = `${DECLARED_VAR_PREFIX}${axis}`;
+  return new DerivedExpr({ kind: "Var", var: { name, type: Tu32, mutable: false }, type: Tu32 });
+}
+
+/** True iff `varName` is a `declared` leaf produced by `declaredLeaf`. */
+export function isDeclaredVarName(varName: string): { axis: ModeAxis } | null {
+  if (!varName.startsWith(DECLARED_VAR_PREFIX)) return null;
+  const axis = varName.slice(DECLARED_VAR_PREFIX.length) as ModeAxis;
+  return { axis };
+}
+
+/** A traced derived-mode rule. The IR's output type must be `u32`
+ *  (the index into `domain`). The runtime checks this at codegen. */
 export interface DerivedModeRule<A extends ModeAxis = ModeAxis> {
   readonly __derivedModeRule: true;
-  readonly axis:    A;
-  readonly evaluate: DerivedModeBuilder<A>;
-  /** Opt-in GPU evaluation. Absent → CPU closure path. */
-  readonly gpu?:    GpuRuleSpec<A>;
+  readonly axis: A;
+  /** Pure IR producing a u32 slot index. Built by `derivedMode(...)`. */
+  readonly ir: Expr;
   /**
-   * Conservative over-approximation of the rule's output set. Used by
-   * the build-time pre-warm in v2 to enumerate the pipelines a scene
-   * could realize. v1 doesn't use it at runtime, but recording it
-   * here keeps the API forward-compatible.
+   * Names of `u.<Name>` leaves the body read. The bucket resolves
+   * each to its arena byte offset at addRO time and packs them into
+   * the partition kernel record.
    */
-  readonly domain?: ReadonlyArray<ModeValue<A>>;
+  readonly inputUniforms: ReadonlyArray<string>;
+  /**
+   * Domain of possible output values, in the order they appear in
+   * the rule's u32 output. `domain[0]` corresponds to the rule
+   * returning `0`, `domain[1]` to `1`, etc. The bucket creates one
+   * slot per domain entry.
+   */
+  readonly domain: ReadonlyArray<ModeValue<A>>;
+  /** The SG-context declared value for this axis (may be reactive). */
+  readonly declared: aval<ModeValue<A>> | ModeValue<A>;
 }
 
-/**
- * Author a derived mode rule.
- *
- *     derivedMode("cull", (u, declared) =>
- *       u.WindingFlipped ? flipCull(declared) : declared);
- *
- *     derivedMode("blend", (u) => u.Premultiplied ? "premul" : "straight");
- *
- *     // Determinant-flip-cull (the motivating case):
- *     derivedMode("cull", (u, declared) => {
- *       const m = u.ModelTrafo as M44d;
- *       const det =
- *         m.M00 * (m.M11 * m.M22 - m.M12 * m.M21) -
- *         m.M01 * (m.M10 * m.M22 - m.M12 * m.M20) +
- *         m.M02 * (m.M10 * m.M21 - m.M11 * m.M20);
- *       return det < 0 ? flipCull(declared) : declared;
- *     });
- */
-export function derivedMode<A extends ModeAxis>(
-  axis: A,
-  evaluate: DerivedModeBuilder<A>,
-  options: { readonly domain?: ReadonlyArray<ModeValue<A>> } = {},
-): DerivedModeRule<A> {
-  const out: DerivedModeRule<A> = options.domain !== undefined
-    ? { __derivedModeRule: true, axis, evaluate, domain: options.domain }
-    : { __derivedModeRule: true, axis, evaluate };
-  return out;
-}
-
-/** Brand check — distinguishes a DerivedModeRule from an aval/raw value
- *  at runtime so PipelineState consumers can route accordingly. */
+/** Brand check. */
 export function isDerivedModeRule(x: unknown): x is DerivedModeRule {
   return typeof x === "object" && x !== null
       && (x as { __derivedModeRule?: unknown }).__derivedModeRule === true;
 }
 
-/** Convenience: flip 'back' ↔ 'front' (and pass through 'none').
- *  Useful in `(u, declared) => mirrored ? flipCull(declared) : declared`. */
-export function flipCull(c: CullMode): CullMode {
-  return c === "back" ? "front" : c === "front" ? "back" : "none";
+export interface DerivedModeOptions<A extends ModeAxis> {
+  readonly domain: ReadonlyArray<ModeValue<A>>;
+  readonly declared: aval<ModeValue<A>> | ModeValue<A>;
 }
 
 /**
- * Construct a derived-mode rule that flips cullMode based on the sign
- * of `det(upperLeft3x3(u.<inputUniform>))`. Runs on the GPU when
- * heapScene's compute path is available; the same logic is mirrored
- * in the CPU closure for tests and fallback.
+ * Define a derived-mode rule by tracing an IR-builder closure.
  *
- *   const rule = gpuFlipCullByDeterminant("ModelTrafo", "back");
- *   spec.modeRules = { cull: rule };
+ *     const cullRule = derivedMode("cull", (u, declared) => {
+ *       const det = u.ModelTrafo.upperLeft3x3().determinant();
+ *       // flipCull lookup: none→none, front→back, back→front.
+ *       const flipped = pickEnum(declared,
+ *         DerivedExpr.u32(0),  // none → none
+ *         DerivedExpr.u32(2),  // front → back
+ *         DerivedExpr.u32(1),  // back → front
+ *       );
+ *       return flipped.select(declared, det.lt(DerivedExpr.f32(0)));
+ *     }, {
+ *       domain: ["none", "front", "back"],
+ *       declared: cullModeC,
+ *     });
  *
- * Useful for mirrored geometry: scenes that animate a per-RO trafo
- * with potentially-negative scale don't pay CPU per-RO determinant
- * cost — the kernel walks the arena once per frame for ALL ROs that
- * carry this rule.
+ * The closure body must build pure expressions on top of `u.<Name>`
+ * leaves and `declared`. It must NOT use host-side conditionals — use
+ * `.select(...)` and `.eq(...)` etc. to encode branches.
  */
-export function gpuFlipCullByDeterminant(
-  inputUniform: string,
-  declared:
-    | CullMode
-    | import("@aardworx/wombat.adaptive").aval<CullMode>
-    = "back",
-): DerivedModeRule<"cull"> {
+export function derivedMode<A extends ModeAxis>(
+  axis: A,
+  build: (u: Record<string, DerivedExpr>, declared: DerivedExpr) => DerivedExpr,
+  options: DerivedModeOptions<A>,
+): DerivedModeRule<A> {
+  const leaves = new Set<string>();
+  const uProxy = makeUniformProxy(leaves);
+  const declared = declaredLeaf(axis);
+  const result = build(uProxy, declared);
+  if (!(result instanceof DerivedExpr)) {
+    throw new Error("derivedMode: the builder must return a DerivedExpr");
+  }
+  if (result.ir.type.kind !== "Int" || result.ir.type.signed || result.ir.type.width !== 32) {
+    throw new Error(
+      `derivedMode("${axis}"): rule body must return a u32 (slot index into domain). ` +
+      `Got ${JSON.stringify(result.ir.type)}`,
+    );
+  }
+  if (options.domain.length === 0) {
+    throw new Error(`derivedMode("${axis}"): domain must be non-empty`);
+  }
   return {
     __derivedModeRule: true,
-    axis: "cull",
-    domain: ["back", "front", "none"],
-    gpu: { kernel: "flipCullByDeterminant", inputUniform, declared },
-    evaluate: (u, declaredFromCtx) => {
-      // Accept Trafo3d ({forward: M44d}) — the wombat.base shape used
-      // by SG ModelTrafo — or any object with M00..M22 accessors.
-      const raw = u[inputUniform];
-      type M = { M00: number; M01: number; M02: number;
-                 M10: number; M11: number; M12: number;
-                 M20: number; M21: number; M22: number };
-      const m: M | undefined =
-        (raw as { forward?: M }).forward
-        ?? (raw as M);
-      if (m === undefined || typeof m.M00 !== "number") return declaredFromCtx;
-      const det =
-        m.M00 * (m.M11 * m.M22 - m.M12 * m.M21)
-      - m.M01 * (m.M10 * m.M22 - m.M12 * m.M20)
-      + m.M02 * (m.M10 * m.M21 - m.M11 * m.M20);
-      return det < 0 ? flipCull(declaredFromCtx) : declaredFromCtx;
-    },
+    axis,
+    ir: result.ir,
+    inputUniforms: Array.from(leaves),
+    domain: options.domain,
+    declared: options.declared,
   };
 }
+
+/**
+ * Pick the n-th DerivedExpr from `cases` based on the u32 value of
+ * `index`. Lowered to a chain of `select` (no array literals in the
+ * IR). For an out-of-range index returns `cases[0]`.
+ *
+ *     pickEnum(declared, valueWhenZero, valueWhenOne, valueWhenTwo)
+ */
+export function pickEnum(index: DerivedExpr, ...cases: DerivedExpr[]): DerivedExpr {
+  if (cases.length === 0) throw new Error("pickEnum: at least one case is required");
+  if (cases.length === 1) return cases[0]!;
+  let acc = cases[0]!;
+  for (let i = 1; i < cases.length; i++) {
+    acc = cases[i]!.select(acc, index.eq(DerivedExpr.u32(i)));
+  }
+  return acc;
+}
+
+/** Internal: the IR scope used for `u.<X>` leaves. */
+export const MODE_RULE_SCOPES = {
+  UNIFORM: SCOPE_UNIFORM,
+} as const;

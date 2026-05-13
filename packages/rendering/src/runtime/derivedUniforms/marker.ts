@@ -142,6 +142,46 @@ export class DerivedExpr {
   length(): DerivedExpr { return new DerivedExpr(intrinsicExpr("length", elemOf(this.ir.type), [this.ir])); }
   distance(o: DerivedExpr): DerivedExpr { return new DerivedExpr(intrinsicExpr("distance", elemOf(this.ir.type), [this.ir, o.ir])); }
   reflect(n: DerivedExpr): DerivedExpr { return new DerivedExpr(intrinsicExpr("reflect", this.ir.type, [this.ir, n.ir])); }
+
+  // ── Comparisons (produce a bool DerivedExpr). Use these to feed `select`. ──
+  private cmp(kind: "Eq" | "Neq" | "Lt" | "Le" | "Gt" | "Ge", other: DerivedExpr): DerivedExpr {
+    const ir = { kind, lhs: this.ir, rhs: other.ir, type: { kind: "Bool" } as Type } as Expr;
+    return new DerivedExpr(ir);
+  }
+  eq(o: DerivedExpr): DerivedExpr { return this.cmp("Eq", o); }
+  ne(o: DerivedExpr): DerivedExpr { return this.cmp("Neq", o); }
+  lt(o: DerivedExpr): DerivedExpr { return this.cmp("Lt", o); }
+  le(o: DerivedExpr): DerivedExpr { return this.cmp("Le", o); }
+  gt(o: DerivedExpr): DerivedExpr { return this.cmp("Gt", o); }
+  ge(o: DerivedExpr): DerivedExpr { return this.cmp("Ge", o); }
+
+  /** `select(this_when_true, else_when_false, cond)` — WGSL ternary. The
+   *  receiver supplies the "true" branch; pass the "false" branch + a
+   *  bool DerivedExpr as the condition. */
+  select(ifFalse: DerivedExpr, cond: DerivedExpr): DerivedExpr {
+    const ir = { kind: "Conditional", cond: cond.ir, ifTrue: this.ir, ifFalse: ifFalse.ir, type: this.ir.type } as Expr;
+    return new DerivedExpr(ir);
+  }
+
+  /** Determinant of a square matrix expression — yields a scalar f32. */
+  determinant(): DerivedExpr {
+    if (this.ir.type.kind !== "Matrix") {
+      throw new Error("DerivedExpr.determinant(): receiver must be a matrix expression");
+    }
+    return new DerivedExpr({ kind: "Determinant", value: this.ir, type: Tf32 } as Expr);
+  }
+
+  // ── Static literal builders. Mode rules in particular need u32 constants for enum
+  //    indices (slot lookup). Floats for thresholds (e.g. determinant against zero).
+  static f32(value: number): DerivedExpr {
+    return new DerivedExpr({ kind: "Const", type: Tf32, value: { kind: "Float", value } } as Expr);
+  }
+  static u32(value: number): DerivedExpr {
+    return new DerivedExpr({ kind: "Const", type: Tu32, value: { kind: "Int", value: value >>> 0, signed: false } } as Expr);
+  }
+  static i32(value: number): DerivedExpr {
+    return new DerivedExpr({ kind: "Const", type: Ti32, value: { kind: "Int", value: value | 0, signed: true } } as Expr);
+  }
 }
 
 /** The `u` passed to a `derivedUniform` builder. `u.<Name>` is a uniform leaf — a mat4

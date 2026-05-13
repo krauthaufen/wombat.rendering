@@ -130,26 +130,16 @@ export {
 export {
   derivedMode,
   isDerivedModeRule,
-  flipCull,
-  gpuFlipCullByDeterminant,
+  pickEnum,
   type DerivedModeRule,
-  type DerivedModeBuilder,
-  type GpuRuleSpec,
+  type DerivedModeOptions,
   type ModeAxis,
   type ModeValue,
 } from "./derivedModes/rule.js";
 
-export { GpuDerivedModesScene } from "./derivedModes/gpuDispatcher.js";
 export {
-  GPU_FLIP_CULL_BY_DET_WGSL,
-  CULL_TO_U32,
-  U32_TO_CULL,
-} from "./derivedModes/gpuKernel.js";
-
-export {
-  PARTITION_FLIP_CULL_BY_DET_WGSL,
   PARTITION_RECORD_U32,
   PARTITION_RECORD_BYTES,
-  cullModeToU32,
-} from "./derivedModes/partitionKernel.js";
-export { GpuPartitionScene } from "./derivedModes/partitionDispatcher.js";
+} from "./derivedModes/partitionKernelLayout.js";
+export { GpuPartitionScene, type PartitionSceneSpec } from "./derivedModes/partitionDispatcher.js";
+export { emitPartitionKernel, packModeKey, type RuleCodegenInput, type KernelCodegenSpec } from "./derivedModes/kernelCodegen.js";

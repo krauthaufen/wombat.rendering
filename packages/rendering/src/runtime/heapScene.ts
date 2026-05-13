@@ -95,9 +95,9 @@ import {
 import { encodeModeKey, type PipelineStateDescriptor } from "./pipelineCache/index.js";
 import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
 import { GpuPartitionScene } from "./derivedModes/partitionDispatcher.js";
-import { CULL_TO_U32 } from "./derivedModes/gpuKernel.js";
-import { flipCull, type DerivedModeRule } from "./derivedModes/rule.js";
-import type { CullMode } from "./pipelineCache/index.js";
+import type { RuleCodegenInput } from "./derivedModes/kernelCodegen.js";
+import { type DerivedModeRule, type ModeAxis } from "./derivedModes/rule.js";
+import type { CullMode, FrontFace, Topology } from "./pipelineCache/index.js";
 import { addMarkingCallback } from "@aardworx/wombat.adaptive";
 
 // GrowBuffer + ALIGN16 + MIN_BUFFER_BYTES + POW2 live in ./heapScene/growBuffer.
@@ -304,14 +304,15 @@ interface Bucket {
    */
   recordToDrawId: number[] | undefined;
   /**
-   * The first RO's `cull` rule (used at dispatch time to resolve
-   * the declared CullMode — may be an aval).
+   * The rules carried by the first RO (one per axis), in the canonical
+   * axis order. Used at dispatch time to resolve `declared` for each
+   * axis and to size the partition kernel's params buffer.
    */
-  cullRule: DerivedModeRule<"cull"> | undefined;
+  rules: ReadonlyArray<DerivedModeRule<ModeAxis>> | undefined;
   /**
-   * Seed PipelineStateDescriptor — the rule-applied descriptor of
-   * the first GPU-routed RO. Used to build per-slot pipeline
-   * descriptors by swapping `cullMode` only.
+   * Seed PipelineStateDescriptor — the descriptor of the first GPU-
+   * routed RO. Used to build per-slot pipeline descriptors by swapping
+   * each rule-controlled axis field with the rule's domain entries.
    */
   baseDescriptor: PipelineStateDescriptor | undefined;
   /**
@@ -1591,11 +1592,8 @@ export function buildHeapScene(
     // Phase 5c.3: partition kernels bind arena.attrs as their input.
     // Force a bind group rebuild on next dispatch for every GPU bucket.
     for (const b of buckets) {
-      if (b.gpuRouted && b.partitionScene !== undefined && b.slots.length >= 2) {
-        b.partitionScene.rebindSlotDrawBufs(
-          b.slots[0]!.drawTableBuf!.buffer,
-          b.slots[1]!.drawTableBuf!.buffer,
-        );
+      if (b.gpuRouted && b.partitionScene !== undefined) {
+        b.partitionScene.rebindSlotDrawBufs(b.slots.map(s => s.drawTableBuf!.buffer));
       }
     }
   });
@@ -1686,14 +1684,10 @@ export function buildHeapScene(
       rebuildScanBg();
       slot.drawTableDirtyMin = 0;
       slot.drawTableDirtyMax = slot.recordCount * RECORD_BYTES;
-      // Phase 5c.3: partition's bind group references slot drawTables.
-      // When EITHER slot's GPUBuffer reallocates we must rebind both
-      // (partition writes into both, so its bind group needs both).
-      if (bucket.gpuRouted && bucket.partitionScene !== undefined && bucket.slots.length >= 2) {
-        bucket.partitionScene.rebindSlotDrawBufs(
-          bucket.slots[0]!.drawTableBuf!.buffer,
-          bucket.slots[1]!.drawTableBuf!.buffer,
-        );
+      // Phase 5c.3: partition's bind group references every slot's
+      // drawTable. When ANY slot's GPUBuffer reallocates we rebind all.
+      if (bucket.gpuRouted && bucket.partitionScene !== undefined) {
+        bucket.partitionScene.rebindSlotDrawBufs(bucket.slots.map(s => s.drawTableBuf!.buffer));
       }
     });
     blockSumsBuf.onResize(rebuildScanBg);
@@ -1711,58 +1705,136 @@ export function buildHeapScene(
   /** Side map from Bucket → family. Populated by findOrCreateBucket. */
   const familyForBucket = new WeakMap<Bucket, ReturnType<typeof familyFor>>();
 
+  /** Canonical axis order — every part of the GPU routing path uses
+   *  this ordering so the kernel's params layout, the per-slot mixed-
+   *  radix mode key, and the declared-aval lookup stay in lockstep. */
+  const AXIS_ORDER: ReadonlyArray<ModeAxis> = [
+    "cull", "frontFace", "topology",
+    "depthCompare", "depthWrite", "alphaToCoverage",
+  ];
+
+  function collectRules(modeRules: NonNullable<HeapDrawSpec["modeRules"]>): DerivedModeRule<ModeAxis>[] {
+    const out: DerivedModeRule<ModeAxis>[] = [];
+    for (const axis of AXIS_ORDER) {
+      const r = (modeRules as Record<string, DerivedModeRule<ModeAxis> | undefined>)[axis];
+      if (r !== undefined) out.push(r);
+    }
+    return out;
+  }
+
+  /** Apply a per-axis enum value to a `PipelineStateDescriptor` and
+   *  return the patched copy. Used to materialise one descriptor per
+   *  slot (= one per cartesian-product point across the rule domains). */
+  function patchDescriptor(
+    base: PipelineStateDescriptor,
+    axis: ModeAxis,
+    value: unknown,
+  ): PipelineStateDescriptor {
+    switch (axis) {
+      case "cull":            return { ...base, cullMode:  value as CullMode };
+      case "frontFace":       return { ...base, frontFace: value as FrontFace };
+      case "topology": {
+        const topology = value as Topology;
+        return { ...base, topology, stripIndexFormat: stripFormatForTopology(topology) };
+      }
+      case "depthCompare":
+        return base.depth !== undefined
+          ? { ...base, depth: { ...base.depth, compare: value as GPUCompareFunction } }
+          : base;
+      case "depthWrite":
+        return base.depth !== undefined
+          ? { ...base, depth: { ...base.depth, write: value as boolean } }
+          : base;
+      case "alphaToCoverage": return { ...base, alphaToCoverage: value as boolean };
+      default: return base;
+    }
+  }
+
+  function stripFormatForTopology(t: Topology): GPUIndexFormat | undefined {
+    return t === "line-strip" || t === "triangle-strip" ? "uint32" : undefined;
+  }
+
+  /** Resolve a rule's `declared` aval (or string) to its u32 index in
+   *  the rule's domain. Used both at init (to pick the seed slot
+   *  pipeline) and per dispatch (to feed the kernel uniform). */
+  function declaredIndex(rule: DerivedModeRule<ModeAxis>, tok: AdaptiveToken): number {
+    const d = rule.declared;
+    const v = (typeof d === "object" && d !== null && "getValue" in (d as object))
+      ? (d as aval<unknown>).getValue(tok)
+      : d;
+    const i = rule.domain.indexOf(v as never);
+    if (i < 0) {
+      throw new Error(
+        `heapScene/gpuRouting: declared value '${String(v)}' for axis '${rule.axis}' not in rule.domain`,
+      );
+    }
+    return i;
+  }
+
   /**
    * Phase 5c.3 — promote `bucket` to GPU-routed.
    *
-   * Called from `addDrawImpl` on the FIRST RO that carries a GPU
-   * cull rule (`spec.modeRules.cull.gpu`). The bucket already has
-   * `slots[0]` from `findOrCreateBucket`'s seed (descriptor = the
-   * declared cull mode). We add `slots[1]` for the flipped cull
-   * mode, then wire a `GpuPartitionScene` that scatters master
-   * records into the two slot drawTables each frame.
+   * Called from `addDrawImpl` on the FIRST RO that carries a derived-
+   * mode rule on any axis. The bucket grows to `product(domain sizes)`
+   * slots — one per cartesian-product point across every rule's
+   * domain — then we wire a `GpuPartitionScene` whose WGSL kernel is
+   * codegen'd from the rules' IRs.
    */
   function initGpuRouting(
     bucket: Bucket,
-    cullRule: DerivedModeRule<"cull">,
+    rules: DerivedModeRule<ModeAxis>[],
     baseDesc: PipelineStateDescriptor,
     tok: AdaptiveToken,
   ): void {
     if (bucket.gpuRouted) return;
-    const gpuSpec = cullRule.gpu;
-    if (gpuSpec === undefined) return;
-    // Resolve the initial declared cull mode (aval → force, else string).
-    const declared: CullMode = typeof gpuSpec.declared === "string"
-      ? gpuSpec.declared
-      : (gpuSpec.declared as aval<CullMode>).getValue(tok);
-    const flipped: CullMode = flipCull(declared);
-    // Slot 0 already exists (seeded by findOrCreateBucket with the
-    // descriptor's current cull). Force its descriptor to match the
-    // declared output. Slot 1 covers the flipped output.
-    const slot0Desc: PipelineStateDescriptor = { ...baseDesc, cullMode: declared };
-    const slot1Desc: PipelineStateDescriptor = { ...baseDesc, cullMode: flipped };
+    if (rules.length === 0) return;
+    // Build the descriptor for each slot via mixed-radix decomposition
+    // of slotIdx into per-axis indices. Slot 0 already exists (seeded
+    // by findOrCreateBucket) — overwrite its pipeline to match the
+    // index-0 descriptor; create the rest.
+    const domainSizes = rules.map(r => r.domain.length);
+    const totalSlots  = domainSizes.reduce((p, s) => p * s, 1);
     const fam = familyForBucket.get(bucket)!;
-    bucket.slots[0]!.pipeline = getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, slot0Desc);
-    bucket.slots[0]!.modeKey  = encodeModeKey(slot0Desc);
-    if (bucket.slots.length < 2) {
-      createSlot(bucket, slot1Desc);
+    for (let slotIdx = 0; slotIdx < totalSlots; slotIdx++) {
+      let descriptor: PipelineStateDescriptor = baseDesc;
+      let remaining = slotIdx;
+      for (let a = 0; a < rules.length; a++) {
+        const size = domainSizes[a]!;
+        const ai = remaining % size;
+        remaining = Math.floor(remaining / size);
+        descriptor = patchDescriptor(descriptor, rules[a]!.axis, rules[a]!.domain[ai]);
+      }
+      if (slotIdx === 0) {
+        bucket.slots[0]!.pipeline = getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, descriptor);
+        bucket.slots[0]!.modeKey  = encodeModeKey(descriptor);
+      } else {
+        createSlot(bucket, descriptor);
+      }
     }
-    // Sanity: both slots present.
-    if (bucket.slots.length < 2) {
-      throw new Error("heapScene/gpuRouting: failed to create flipped slot");
+    if (bucket.slots.length !== totalSlots) {
+      throw new Error(`heapScene/gpuRouting: expected ${totalSlots} slots, got ${bucket.slots.length}`);
     }
-    // Both slot drawTable buffers feed partition's bind group.
-    const partition = new GpuPartitionScene(
-      device,
-      `${bucket.label}/partition`,
-      bucket.slots[0]!.drawTableBuf!.buffer,
-      bucket.slots[1]!.drawTableBuf!.buffer,
-      16,
-    );
+    // Codegen the partition kernel from the rules' IRs and wire it
+    // to the slots' drawTableBuf.buffers.
+    const codegenInputs: RuleCodegenInput[] = rules.map(r => ({
+      axis: r.axis,
+      ir: r.ir,
+      inputUniforms: r.inputUniforms,
+      domainSize: r.domain.length,
+    }));
+    const slotDrawBufs = bucket.slots.map(s => s.drawTableBuf!.buffer);
+    const partition = new GpuPartitionScene(device, `${bucket.label}/partition`, {
+      rules: codegenInputs,
+      totalSlots,
+      slotDrawBufs,
+      initialRecords: 16,
+    });
+    void tok; // declaredIndex needs a token; tok is supplied to the dispatcher path
     bucket.gpuRouted      = true;
     bucket.partitionScene = partition;
     bucket.drawIdToRecord = new Map<number, number>();
     bucket.recordToDrawId = [];
-    bucket.cullRule       = cullRule;
+    bucket.rules          = rules;
     bucket.baseDescriptor = baseDesc;
     bucket.partitionDirty = true;
   }
@@ -1770,51 +1842,46 @@ export function buildHeapScene(
   /**
    * Phase 5c.3 — per-frame partition dispatch for a GPU-routed bucket.
    *
-   * Encodes:
-   *   1. (one-time per frame) writeBuffer master shadow → masterBuf.
-   *   2. partition compute pass: clear + scatter.
-   *   3. `copyBufferToBuffer` of each slot's atomic count into that
-   *      slot's scan `paramsBuf` (overrides numRecords with the
-   *      partition's authoritative per-slot count).
-   *   4. marks both slots scanDirty so the downstream scan loop runs.
-   *
-   * Pipeline freshness: re-resolves the `declared` aval and looks up
-   * pipelines for declared + flipCull(declared). Pre-warm guarantees
-   * cache hits.
+   * Encodes the partition compute pass + a `copyBufferToBuffer` per
+   * slot to forward the partition's atomic count into the slot's
+   * scan `paramsBuf.numRecords`. Refreshes per-slot pipelines if any
+   * rule's `declared` aval changed (pre-warm guarantees cache hits).
    */
   function dispatchPartition(bucket: Bucket, enc: GPUCommandEncoder, tok: AdaptiveToken): void {
     if (!bucket.gpuRouted || bucket.partitionScene === undefined) return;
-    const rule = bucket.cullRule!;
-    const gpuSpec = rule.gpu!;
-    const declared: CullMode = typeof gpuSpec.declared === "string"
-      ? gpuSpec.declared
-      : (gpuSpec.declared as aval<CullMode>).getValue(tok);
-    const flipped: CullMode = flipCull(declared);
-    // Refresh slot pipelines if declared changed (cache hit thanks
-    // to pre-warm). modeKey gates the lookup so this is a no-op when
-    // declared is stable.
-    const fam = familyForBucket.get(bucket)!;
-    const slot0 = bucket.slots[0]!;
-    const slot1 = bucket.slots[1]!;
+    const rules = bucket.rules!;
     const base  = bucket.baseDescriptor!;
-    const slot0Desc: PipelineStateDescriptor = { ...base, cullMode: declared };
-    const slot1Desc: PipelineStateDescriptor = { ...base, cullMode: flipped };
-    const slot0Key  = encodeModeKey(slot0Desc);
-    const slot1Key  = encodeModeKey(slot1Desc);
-    if (slot0.modeKey !== slot0Key) {
-      slot0.pipeline = getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, slot0Desc);
-      slot0.modeKey  = slot0Key;
-    }
-    if (slot1.modeKey !== slot1Key) {
-      slot1.pipeline = getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, slot1Desc);
-      slot1.modeKey  = slot1Key;
+    const declaredU32: number[] = rules.map(r => declaredIndex(r, tok));
+    // Refresh slot pipelines: each slot's descriptor follows from the
+    // per-axis index extracted from slotIdx (mixed-radix). Only re-look-
+    // up + assign when the modeKey would change.
+    const fam = familyForBucket.get(bucket)!;
+    const domainSizes = rules.map(r => r.domain.length);
+    for (let slotIdx = 0; slotIdx < bucket.slots.length; slotIdx++) {
+      let descriptor: PipelineStateDescriptor = base;
+      let remaining = slotIdx;
+      for (let a = 0; a < rules.length; a++) {
+        const size = domainSizes[a]!;
+        const ai = remaining % size;
+        remaining = Math.floor(remaining / size);
+        descriptor = patchDescriptor(descriptor, rules[a]!.axis, rules[a]!.domain[ai]);
+      }
+      const key = encodeModeKey(descriptor);
+      const slot = bucket.slots[slotIdx]!;
+      if (slot.modeKey !== key) {
+        slot.pipeline = getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, descriptor);
+        slot.modeKey  = key;
+      }
     }
     bucket.partitionScene.flush();
-    bucket.partitionScene.dispatch(arena.attrs.buffer, declared, enc);
-    enc.copyBufferToBuffer(bucket.partitionScene.slot0CountBuf, 0, slot0.paramsBuf!, 0, 4);
-    enc.copyBufferToBuffer(bucket.partitionScene.slot1CountBuf, 0, slot1.paramsBuf!, 0, 4);
-    slot0.scanDirty = true;
-    slot1.scanDirty = true;
+    bucket.partitionScene.dispatch(arena.attrs.buffer, declaredU32, enc);
+    for (let i = 0; i < bucket.slots.length; i++) {
+      enc.copyBufferToBuffer(
+        bucket.partitionScene.slotCountBufs[i]!, 0,
+        bucket.slots[i]!.paramsBuf!, 0, 4,
+      );
+      bucket.slots[i]!.scanDirty = true;
+    }
     bucket.partitionDirty = false;
   }
 
@@ -1871,7 +1938,7 @@ export function buildHeapScene(
       partitionScene: undefined,
       drawIdToRecord: undefined,
       recordToDrawId: undefined,
-      cullRule: undefined,
+      rules: undefined,
       baseDescriptor: undefined,
       partitionDirty: false,
     };
@@ -2108,14 +2175,14 @@ export function buildHeapScene(
       });
     }
     const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, precomputedDescriptor);
-    // Phase 5c.3 — first RO carrying a GPU cull rule promotes the
+    // Phase 5c.3 — first RO carrying ANY derived-mode rule promotes the
     // bucket to GPU routing. Subsequent ROs in the same bucket are
-    // assumed to carry the SAME rule (mixed-mode buckets are not
-    // supported in v1; the kernel hard-codes flip-cull-by-det).
-    const cullRule = spec.modeRules?.cull;
+    // assumed to carry the SAME rule set (mixed-mode buckets are
+    // rejected: see the check below).
+    const collectedRules = spec.modeRules !== undefined ? collectRules(spec.modeRules) : [];
     const roDescriptor = precomputedDescriptor ?? snapshotDescriptor(spec.pipelineState, sig);
-    if (!bucket.gpuRouted && cullRule !== undefined && cullRule.gpu !== undefined) {
-      initGpuRouting(bucket, cullRule, roDescriptor, outerTok);
+    if (!bucket.gpuRouted && collectedRules.length > 0) {
+      initGpuRouting(bucket, collectedRules, roDescriptor, outerTok);
     }
     // Phase 5c.2: route this RO to the bucket's slot covering its
     // current descriptor. ensureSlot creates a new slot on miss; the
@@ -2277,11 +2344,21 @@ export function buildHeapScene(
           `heapScene: GPU-routed bucket exceeds SCAN_MAX_RECORDS (${SCAN_MAX_RECORDS})`,
         );
       }
-      const modelRef = perDrawRefs.get(cullRule!.gpu!.inputUniform);
+      // Resolve the first rule's first input uniform — v1 of the
+      // partition kernel reads exactly one arena offset per record
+      // (the bucket's rules all share the same input set, validated
+      // implicitly by the codegen). Generalize when rules read
+      // multiple uniforms.
+      const firstInputName = bucket.rules![0]!.inputUniforms[0];
+      if (firstInputName === undefined) {
+        throw new Error(
+          `heapScene: GPU rule on axis '${bucket.rules![0]!.axis}' declares no input uniforms`,
+        );
+      }
+      const modelRef = perDrawRefs.get(firstInputName);
       if (modelRef === undefined) {
         throw new Error(
-          `heapScene: GPU cull rule inputUniform '${cullRule!.gpu!.inputUniform}' ` +
-          `not present in spec.inputs`,
+          `heapScene: GPU rule input uniform '${firstInputName}' not present in spec.inputs`,
         );
       }
       partition.appendRecord(localSlot, idxAlloc.firstIndex, idxAlloc.count, instanceCount, modelRef);
@@ -2379,34 +2456,18 @@ export function buildHeapScene(
     drawIdToModeTracker[drawId] = tracker;
     tracker.forEachLeaf((av) => subscribeModeLeaf(av, drawId));
 
-    // ─── GPU-eval mode rule registration (Task 2 Phase 5) ────────────
-    // If spec.modeRules.cull is GPU-flavoured, register the RO with
-    // the scene-wide dispatcher. Provide the arena byte offset of the
-    // RO's input uniform so the kernel reads from the right slot.
-    {
-      const cullRule = spec.modeRules?.cull;
-      const gpuRule = cullRule?.gpu;
-      if (gpuRule !== undefined) {
-        // Subscribe to the declared aval (if reactive) so the cull-
-        // mode flip propagates through the rule's CPU fallback
-        // recompute path.
-        if (typeof gpuRule.declared !== "string") {
-          subscribeModeLeaf(gpuRule.declared as aval<unknown>, drawId);
-        }
-      }
-
-      // ─── Pipeline pre-warm for derived-mode rules (5c.2) ──────────
-      // Enumerate the rule's possible outputs and pre-build the
-      // matching pipelines in the scene-level cache. Future cullModeC
-      // flips become cache hits — zero `createRenderPipeline` calls
-      // on the hot path.
-      if (cullRule !== undefined && cullRule.domain !== undefined && tracker.descriptor !== undefined) {
-        const fam = familyFor(spec.effect);
-        const baseDesc = tracker.descriptor;
-        for (const mode of cullRule.domain) {
-          if (mode === baseDesc.cullMode) continue; // already built
-          const variantDesc: PipelineStateDescriptor = { ...baseDesc, cullMode: mode };
-          getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, variantDesc);
+    // ─── Derived-mode rule registration ────────────────────────────
+    // Subscribe to each rule's `declared` aval so the bucket's
+    // partition kernel re-dispatches when it changes. Slot pipelines
+    // for every (axis, declared) combination are pre-built eagerly
+    // in `initGpuRouting` (one per cartesian-product point), so
+    // declared flips are pipeline-cache hits.
+    if (spec.modeRules !== undefined) {
+      for (const rule of Object.values(spec.modeRules) as Array<DerivedModeRule<ModeAxis> | undefined>) {
+        if (rule === undefined) continue;
+        const d = rule.declared;
+        if (typeof d === "object" && d !== null && "getValue" in (d as object)) {
+          subscribeModeLeaf(d as aval<unknown>, drawId);
         }
       }
     }

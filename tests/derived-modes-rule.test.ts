@@ -1,66 +1,70 @@
-import { describe, test, expect } from "vitest";
+// Phase 5c.3 — IR-traced mode rules.
+
+import { describe, expect, test } from "vitest";
 import {
-  derivedMode,
-  isDerivedModeRule,
-  flipCull,
+  derivedMode, isDerivedModeRule, pickEnum, DerivedExpr,
 } from "@aardworx/wombat.rendering/runtime";
 
-describe("derivedModes/rule", () => {
-  test("derivedMode builds a tagged rule with axis + evaluate", () => {
-    const rule = derivedMode("cull", (_u, declared) => declared);
-    expect(rule.axis).toBe("cull");
-    expect(rule.__derivedModeRule).toBe(true);
-    expect(typeof rule.evaluate).toBe("function");
-    expect(rule.domain).toBeUndefined();
-  });
-
-  test("isDerivedModeRule distinguishes rules from plain objects", () => {
-    expect(isDerivedModeRule(derivedMode("cull", (_u, d) => d))).toBe(true);
-    expect(isDerivedModeRule({})).toBe(false);
-    expect(isDerivedModeRule(null)).toBe(false);
-    expect(isDerivedModeRule("back")).toBe(false);
-  });
-
-  test("evaluate runs the closure against a uniforms proxy", () => {
-    const rule = derivedMode("cull", (u, declared) =>
-      (u.Side as number) > 0 ? declared : flipCull(declared));
-    expect(rule.evaluate({ Side: 1 }, "back")).toBe("back");
-    expect(rule.evaluate({ Side: -1 }, "back")).toBe("front");
-    expect(rule.evaluate({ Side: -1 }, "none")).toBe("none");
-  });
-
-  test("flipCull swaps back ↔ front, passes 'none' through", () => {
-    expect(flipCull("back")).toBe("front");
-    expect(flipCull("front")).toBe("back");
-    expect(flipCull("none")).toBe("none");
-  });
-
-  test("domain option is preserved for forward-compat enumeration", () => {
-    const rule = derivedMode("cull", (_u, d) => d, { domain: ["back", "front"] });
-    expect(rule.domain).toEqual(["back", "front"]);
-  });
-
-  test("determinant-flip example evaluates correctly", () => {
-    // Identity matrix -> det = 1 -> declared.
-    // -1 scale on x -> det = -1 -> flip.
-    type M44 = { M00: number; M01: number; M02: number;
-                 M10: number; M11: number; M12: number;
-                 M20: number; M21: number; M22: number };
-    const rule = derivedMode("cull", (u, declared) => {
-      const m = u.ModelTrafo as M44;
-      const det =
-        m.M00 * (m.M11 * m.M22 - m.M12 * m.M21) -
-        m.M01 * (m.M10 * m.M22 - m.M12 * m.M20) +
-        m.M02 * (m.M10 * m.M21 - m.M11 * m.M20);
-      return det < 0 ? flipCull(declared) : declared;
+describe("derivedMode (IR-traced)", () => {
+  test("derivedMode brands the rule and captures axis/domain/declared", () => {
+    const rule = derivedMode("cull", (_u, declared) => declared, {
+      domain: ["none", "front", "back"],
+      declared: "back",
     });
-    const identity: M44 = {
-      M00: 1, M01: 0, M02: 0,
-      M10: 0, M11: 1, M12: 0,
-      M20: 0, M21: 0, M22: 1,
-    };
-    const mirroredX: M44 = { ...identity, M00: -1 };
-    expect(rule.evaluate({ ModelTrafo: identity   }, "back")).toBe("back");
-    expect(rule.evaluate({ ModelTrafo: mirroredX  }, "back")).toBe("front");
+    expect(rule.__derivedModeRule).toBe(true);
+    expect(rule.axis).toBe("cull");
+    expect(rule.domain).toEqual(["none", "front", "back"]);
+    expect(rule.declared).toBe("back");
+    expect(isDerivedModeRule(rule)).toBe(true);
+    expect(isDerivedModeRule({})).toBe(false);
+  });
+
+  test("the builder traces a u32-typed IR", () => {
+    const rule = derivedMode("cull", (_u, declared) => declared, {
+      domain: ["none", "front", "back"],
+      declared: "back",
+    });
+    expect(rule.ir.type.kind).toBe("Int");
+    expect((rule.ir.type as { signed: boolean }).signed).toBe(false);
+  });
+
+  test("body that doesn't return u32 throws", () => {
+    expect(() =>
+      derivedMode("cull",
+        (_u) => DerivedExpr.f32(1.0),   // f32, not u32
+        { domain: ["none"], declared: "none" } as never,
+      ),
+    ).toThrow(/must return a u32/);
+  });
+
+  test("inputUniforms accumulates leaf names visited by the builder", () => {
+    const rule = derivedMode("cull", (u, declared) => {
+      // Touch ModelTrafo via .upperLeft3x3().determinant() and combine
+      // with declared so the body type is u32.
+      const det = u.ModelTrafo.upperLeft3x3().determinant();
+      const flipped = pickEnum(declared,
+        DerivedExpr.u32(0), DerivedExpr.u32(2), DerivedExpr.u32(1),
+      );
+      return flipped.select(declared, det.lt(DerivedExpr.f32(0)));
+    }, {
+      domain: ["none", "front", "back"],
+      declared: "back",
+    });
+    expect(rule.inputUniforms).toContain("ModelTrafo");
+  });
+
+  test("pickEnum chains selects in domain order", () => {
+    // Build a tiny rule whose body uses pickEnum with three cases.
+    const rule = derivedMode("cull", (_u, declared) =>
+      pickEnum(declared,
+        DerivedExpr.u32(0),
+        DerivedExpr.u32(2),
+        DerivedExpr.u32(1),
+      ),
+    {
+      domain: ["none", "front", "back"],
+      declared: "back",
+    });
+    expect(rule.ir.kind).toBe("Conditional");
   });
 });
