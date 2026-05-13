@@ -11,6 +11,28 @@ values on the GPU into drawHeader slots. Derived modes is the
 **discrete-output sibling**: per-RO output is a small mode key, used
 to bucket records into pre-bound pipeline slots at encode.
 
+## Two-task split
+
+This design ships in two independent pieces:
+
+- **Task 1 — multi-pipeline buckets** (see
+  `multi-pipeline-buckets-plan.md`). The architectural change: bucket
+  key drops pipelineState, slot table + partition kernel + encode
+  loop, pipelines pre-warmed from the realized value set. No new user
+  API; existing `<Sg PipelineState={{ cull: cval(...) }}>` Just Works
+  (and now actually works reactively — today's identity-keyed
+  `psIdOf` silently keeps ROs in the wrong bucket when a cval value
+  changes). Delivers the "20k cvals → 1 bucket" collapse and the
+  reactive cullmode correctness fix.
+- **Task 2 — derived mode rules** (see `derived-mode-rules-plan.md`).
+  Layered on Task 1: adds `derivedMode(axis, (u, declared) => …)`,
+  the IR analyzer, the GPU-side mode-eval kernel. Delivers the
+  determinant-flip-cull case and other uniform-driven mode
+  authoring.
+
+The rest of this document describes the combined final design. The
+plan docs split the implementation work.
+
 ## The user-facing shape
 
 ```ts
