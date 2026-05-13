@@ -2597,9 +2597,13 @@ export function buildHeapScene(
     if (gpuModesScene !== undefined && gpuModesScene.registered > 0) {
       const numROs = nextDrawId; // upper bound; sparse entries are skipped via 0xFFFFFFFF sentinel
       gpuModesScene.dispatch(arena.attrs.buffer, numROs, enc);
-      // mapAsync the staging buffer in the background. When it
-      // resolves, diff against gpuModesLastKey to schedule rebuckets.
-      gpuModesScene.finish(numROs).then(() => {
+      // mapAsync the staging buffer AFTER the caller's submit. The
+      // microtask queued by Promise.resolve() runs after the current
+      // synchronous block — by which time `frame()` has already
+      // submitted the enc. Without this deferral, mapAsync fires
+      // before submit and WebGPU rejects the next dispatch's
+      // copy-to-staging with "buffer used in submit while mapped".
+      Promise.resolve().then(() => gpuModesScene!.finish(numROs)).then(() => {
         const out = gpuModesScene!.lastOutput;
         for (let i = 0; i < numROs; i++) {
           const cur = out[i] ?? 0xFFFFFFFF;

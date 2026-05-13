@@ -58,6 +58,10 @@ export class GpuDerivedModesScene {
   /** Last-known declared (for kernel uniform). Common case: all RO
    *  rules share the same declared (= the SG scope's value). */
   private declared: number = CULL_TO_U32.back;
+  /** True while the staging buffer's mapAsync is in flight. We must
+   *  not enqueue a new copyBufferToBuffer into it until it's been
+   *  unmapped (mapAsync resolved + unmap called). */
+  private readbackInFlight = false;
 
   /** Per-RO last-known output. CPU mirror, populated by finish(). */
   readonly lastOutput: Uint32Array;
@@ -156,14 +160,22 @@ export class GpuDerivedModesScene {
    */
   dispatch(arenaBuf: GPUBuffer, numROs: number, enc: GPUCommandEncoder): number {
     this.ensureResources(arenaBuf, numROs);
+    // If the previous frame's readback hasn't resolved yet, we can
+    // still dispatch the compute (writes to outputBuf), but we must
+    // skip the staging copy — otherwise WebGPU rejects the submit
+    // with "buffer used in submit while mapped". Cheap to skip: the
+    // next dispatch will re-copy when staging is unmapped.
     this.uploadInputs(numROs);
     const pass = enc.beginComputePass({ label: "gpuDerivedModes/pass" });
     pass.setPipeline(this.pipeline!);
     pass.setBindGroup(0, this.bindGroup!);
     pass.dispatchWorkgroups(Math.ceil(numROs / WG_SIZE));
     pass.end();
-    const bytes = numROs * 4;
-    enc.copyBufferToBuffer(this.outputBuf!, 0, this.stagingBuf!, 0, bytes);
+    if (!this.readbackInFlight) {
+      const bytes = numROs * 4;
+      enc.copyBufferToBuffer(this.outputBuf!, 0, this.stagingBuf!, 0, bytes);
+      this.readbackInFlight = true;
+    }
     return numROs;
   }
 
@@ -174,11 +186,16 @@ export class GpuDerivedModesScene {
    */
   async finish(numROs: number): Promise<void> {
     if (this.stagingBuf === null || numROs === 0) return;
+    if (!this.readbackInFlight) return; // dispatch skipped the copy; nothing to read
     const bytes = numROs * 4;
-    await this.stagingBuf.mapAsync(GPUMapMode.READ, 0, bytes);
-    const view = new Uint32Array(this.stagingBuf.getMappedRange(0, bytes).slice(0));
-    this.stagingBuf.unmap();
-    (this as { lastOutput: Uint32Array }).lastOutput.set(view, 0);
+    try {
+      await this.stagingBuf.mapAsync(GPUMapMode.READ, 0, bytes);
+      const view = new Uint32Array(this.stagingBuf.getMappedRange(0, bytes).slice(0));
+      this.stagingBuf.unmap();
+      (this as { lastOutput: Uint32Array }).lastOutput.set(view, 0);
+    } finally {
+      this.readbackInFlight = false;
+    }
   }
 
   dispose(): void {

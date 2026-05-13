@@ -79,13 +79,13 @@ fn flipCull(c: u32) -> u32 {
 fn evaluate(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= uIn.numROs) { return; }
-  let ref = roInputRefs[i];
-  if (ref == 0xFFFFFFFFu) {
+  let refByte = roInputRefs[i];
+  if (refByte == 0xFFFFFFFFu) {
     // No rule on this RO; leave existing output untouched. Allows a
     // single kernel dispatch to skip non-participating ROs.
     return;
   }
-  let m = loadUpper3x3(ref);
+  let m = loadUpper3x3(refByte);
   let d = det3x3(m);
   let declared = uIn.declared;
   let outVal = select(declared, flipCull(declared), d < 0.0);
