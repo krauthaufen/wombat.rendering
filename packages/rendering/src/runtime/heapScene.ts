@@ -80,6 +80,9 @@ import {
   HEAP_SCAN_WGSL, SCAN_TILE_SIZE, SCAN_WG_SIZE, SCAN_MAX_RECORDS,
   TILE_K, RECORD_U32, RECORD_BYTES,
 } from "./heapScene/scanKernel.js";
+import {
+  GrowBuffer, MIN_BUFFER_BYTES, POW2, ALIGN16,
+} from "./heapScene/growBuffer.js";
 
 // ---------------------------------------------------------------------------
 // Per-allocation arena layout
@@ -100,8 +103,7 @@ const ENC_V3F_TIGHT = 1;             // tightly-packed array of vec3<f32> (12 B/
 const SEM_POSITIONS = 1;
 const SEM_NORMALS   = 2;
 
-const ALIGN16 = (n: number) => (n + 15) & ~15;
-
+// GrowBuffer + ALIGN16 + MIN_BUFFER_BYTES + POW2 live in ./heapScene/growBuffer.
 // Packers (WGSL-type → JS-value → arena bytes) live in ./heapScene/packers.
 
 // ---------------------------------------------------------------------------
@@ -141,66 +143,6 @@ export interface HeapGeometry {
 }
 
 
-// ---------------------------------------------------------------------------
-// Resizable buffer (pow2 grow + GPU-side copy on resize)
-// ---------------------------------------------------------------------------
-
-const MIN_BUFFER_BYTES = 64 * 1024;
-const POW2 = (n: number): number => {
-  let p = 1; while (p < n) p <<= 1; return p;
-};
-
-/**
- * A GPUBuffer that can grow to next power-of-two on demand. On grow,
- * a fresh buffer is created at the new size, the live tail copied
- * over via copyBufferToBuffer, and dependents (bind groups, mostly)
- * are notified to rebuild via the `onResize` callback.
- *
- * `usedBytes` is the high-water mark — the runtime advances this as
- * it allocates, and `ensureCapacity` grows when required. This
- * separates allocation policy from grow policy.
- */
-class GrowBuffer {
-  private buf: GPUBuffer;
-  private cap: number;
-  private used = 0;
-  private readonly listeners = new Set<() => void>();
-  constructor(
-    private readonly device: GPUDevice,
-    private readonly label: string,
-    private readonly usage: GPUBufferUsageFlags,
-    initialBytes: number,
-  ) {
-    this.cap = Math.max(MIN_BUFFER_BYTES, POW2(initialBytes));
-    this.buf = device.createBuffer({ size: this.cap, usage: usage | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, label });
-  }
-  get buffer(): GPUBuffer { return this.buf; }
-  get capacity(): number { return this.cap; }
-  get usedBytes(): number { return this.used; }
-  setUsed(n: number): void { this.used = n; }
-  onResize(cb: () => void): IDisposable {
-    this.listeners.add(cb);
-    return { dispose: () => { this.listeners.delete(cb); } };
-  }
-  /** Ensure the buffer is at least `bytes` capacity. Grows by pow2 + copies live tail. */
-  ensureCapacity(bytes: number): void {
-    if (bytes <= this.cap) return;
-    const newCap = POW2(bytes);
-    const newBuf = this.device.createBuffer({
-      size: newCap, usage: this.usage | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, label: this.label,
-    });
-    if (this.used > 0) {
-      const enc = this.device.createCommandEncoder({ label: `${this.label}: grow-copy` });
-      enc.copyBufferToBuffer(this.buf, 0, newBuf, 0, ALIGN16(this.used));
-      this.device.queue.submit([enc.finish()]);
-    }
-    this.buf.destroy();
-    this.buf = newBuf;
-    this.cap = newCap;
-    for (const cb of this.listeners) cb();
-  }
-  destroy(): void { this.buf.destroy(); }
-}
 
 // ---------------------------------------------------------------------------
 // UniformPool — aval-keyed refcounted allocations over the AttributeArena
