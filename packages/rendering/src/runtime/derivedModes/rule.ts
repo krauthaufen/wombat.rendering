@@ -52,25 +52,16 @@ export type ModeValue<A extends ModeAxis> =
 export interface DerivedModeRule<A extends ModeAxis = ModeAxis> {
   readonly __derivedModeRule: true;
   readonly axis: A;
-  /** Shader-IR rule body. The entry's return Expr is the rule. */
-  readonly expr: RuleExpr<number>;
+  /** Shader-IR rule body — the entry's return Expr is the rule. For
+   *  axes whose `ModeValue<A>` is a struct (e.g. blend's
+   *  `AttachmentBlend`) the body returns object literals directly;
+   *  the renderer fingerprints distinct returns and auto-assigns
+   *  slot indices. For enum axes (cull etc.) the body returns u32
+   *  enum indices that the renderer maps via the canonical table. */
+  readonly expr: RuleExpr<ModeValue<A> | number>;
   /** SG-context declared value for this axis. May be a reactive aval
    *  — heapScene re-specialises + swaps cached kernels on mark. */
   readonly declared: aval<ModeValue<A>> | ModeValue<A>;
-  /**
-   * Optional u32 → axis value map. Required for axes whose
-   * `ModeValue<A>` is a structured object ({@link blend}) — the
-   * rule's u32 output is an INDEX, not the canonical enum, and the
-   * heap renderer needs this to build per-slot pipeline descriptors.
-   *
-   * For enum axes (cull / frontFace / topology / depthCompare /
-   * depthWrite / alphaToCoverage) the runtime falls back to a
-   * canonical axis-enum table when `resolve` is omitted.
-   *
-   * Receives `u32`s in the order they appear in the rule's resolved
-   * output set (typically just `0`..`N-1` for an N-output rule).
-   */
-  readonly resolve: ((u32: number) => ModeValue<A>) | undefined;
 }
 
 export function isDerivedModeRule(x: unknown): x is DerivedModeRule {
@@ -80,36 +71,6 @@ export function isDerivedModeRule(x: unknown): x is DerivedModeRule {
 
 export interface DerivedModeOptions<A extends ModeAxis> {
   readonly declared: aval<ModeValue<A>> | ModeValue<A>;
-  /**
-   * For "blend" (and other structured axes), supply a callback that
-   * maps the rule's u32 output to the full mode value (a
-   * {@link AttachmentBlend} for blend rules):
-   *
-   *     const blendRule = derivedMode("blend",
-   *       rule(() => u.Premultiplied ? 1 : 0), {
-   *         declared: NOOP_BLEND_AT_INDEX_0,
-   *         resolve: (i) => i === 1
-   *           ? { enabled: true, color: { srcFactor: "one",        dstFactor: "one-minus-src-alpha", operation: "add" },
-   *               alpha:   { srcFactor: "one",        dstFactor: "one-minus-src-alpha", operation: "add" }, writeMask: 0xF }
-   *           : { enabled: true, color: { srcFactor: "src-alpha",  dstFactor: "one-minus-src-alpha", operation: "add" },
-   *               alpha:   { srcFactor: "one",        dstFactor: "one-minus-src-alpha", operation: "add" }, writeMask: 0xF },
-   *       });
-   *
-   * Equivalent shorthand via the `values` array:
-   *
-   *     resolve: undefined,
-   *     values:  [STRAIGHT_ALPHA_BLEND, PREMULT_ALPHA_BLEND],
-   *
-   * (`resolve` and `values` are mutually exclusive; `resolve` wins
-   * when both are passed.)
-   *
-   * For enum axes (cull etc.), omit both — the runtime uses a
-   * canonical enum table to map u32s back to axis values.
-   */
-  readonly resolve?: (u32: number) => ModeValue<A>;
-  /** Compact alias for `resolve: i => values[i]`. Same constraints
-   *  as `resolve`. */
-  readonly values?: ReadonlyArray<ModeValue<A>>;
 }
 
 /**
@@ -127,29 +88,13 @@ export interface DerivedModeOptions<A extends ModeAxis> {
  */
 export function derivedMode<A extends ModeAxis>(
   axis: A,
-  expr: RuleExpr<number>,
+  expr: RuleExpr<ModeValue<A> | number>,
   options: DerivedModeOptions<A>,
 ): DerivedModeRule<A> {
-  let resolve: ((u32: number) => ModeValue<A>) | undefined;
-  if (options.resolve !== undefined) {
-    resolve = options.resolve;
-  } else if (options.values !== undefined) {
-    const arr = options.values;
-    resolve = (i: number): ModeValue<A> => {
-      const v = arr[i];
-      if (v === undefined) {
-        throw new Error(
-          `derivedMode("${axis}"): rule emitted u32=${i} but \`values\` only has ${arr.length} entries`,
-        );
-      }
-      return v;
-    };
-  }
   return {
     __derivedModeRule: true,
     axis,
     expr,
     declared: options.declared,
-    resolve,
   };
 }

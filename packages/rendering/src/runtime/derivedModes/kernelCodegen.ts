@@ -20,33 +20,30 @@
 // etc. in O(1).
 
 import type { Expr, Stmt, Type, Literal, IntrinsicEvalTable } from "@aardworx/wombat.shader/ir";
+import { stableStringify } from "@aardworx/wombat.shader/ir";
 import type { ModeAxis } from "./rule.js";
 
 /** Per-axis rule spec consumed by the codegen. */
 export interface RuleCodegenSpec {
   readonly axis: ModeAxis;
-  /** The rule body (`RuleExpr.template.values[entry].entry.body`). */
-  readonly body: Stmt;
-  /** Current declared value substituted as a Const before codegen. */
-  readonly declaredU32: number;
   /**
-   * The resolved set (output of `evaluateSet` for the rule's symbolic
-   * outputs under the current declared), sorted ascending. Drives
-   * slot count, slot enum ordering, and the SLOT_LOOKUP table.
+   * The rule body — already rewritten by `rewriteOutputsToSlotIndices`
+   * so every `ReturnValue` returns a `Const u32` slot index. The
+   * codegen never sees the original `__record:*` intrinsics.
    */
-  readonly resolved: ReadonlyArray<number>;
+  readonly body: Stmt;
+  /** Total slot count (= number of distinct outputs the rule's
+   *  symbolic set resolved to under the current declared). */
+  readonly slotCount: number;
   /**
    * Axis-specific intrinsic table. The codegen emits direct
    * `intrinsicName(args)` calls in WGSL — the caller must ensure
-   * the intrinsic is available in WGSL OR provide it as a helper
-   * (see `helperWGSL`). The eval table is used only for sanity
-   * checks during pre-emission constant folding.
+   * the intrinsic is available in WGSL OR provide it as a helper.
    */
   readonly intrinsics: IntrinsicEvalTable;
   /**
-   * Pre-emitted WGSL helper functions referenced by the rule body
-   * (e.g. `fn flipCull(c: u32) -> u32 { ... }`). One block per axis;
-   * concatenated into the kernel.
+   * Pre-emitted WGSL helper functions referenced by the rule body.
+   * One block per axis; concatenated into the kernel.
    */
   readonly helpersWGSL: string;
   /** Names of `u.<X>` uniform leaves the body reads, in declaration
@@ -78,24 +75,16 @@ export function emitPartitionKernel(spec: KernelCodegenSpec): string {
 
   const rule = spec.rules[0]!;
   const N = spec.totalSlots;
-  if (N !== rule.resolved.length) {
+  if (N !== rule.slotCount) {
     throw new Error(
-      `kernelCodegen: totalSlots (${N}) != resolved.length (${rule.resolved.length})`,
+      `kernelCodegen: totalSlots (${N}) != rule.slotCount (${rule.slotCount})`,
     );
   }
 
-  // SLOT_LOOKUP[enumValue] = slotIdx (or 0xFFFFFFFFu when invalid).
-  // We size the array to the max enum value + 1 the resolved set
-  // can produce (small — at most a few entries per axis).
-  const maxEnum = rule.resolved.length > 0 ? Math.max(...rule.resolved) : 0;
-  const lookupLen = maxEnum + 1;
-  const lookup = new Array<number>(lookupLen).fill(0xFFFFFFFF >>> 0);
-  for (let i = 0; i < rule.resolved.length; i++) lookup[rule.resolved[i]!] = i;
-  const lookupArr = lookup.map(v => `${v >>> 0}u`).join(", ");
-
-  // Emit the per-axis evaluator function. Walk the Stmt tree.
-  // `declared` ReadInput collapses to a Const(declaredU32). `u.<X>`
-  // ReadInputs lower to `load_<X>(r.modelRef)` etc.
+  // The body's ReturnValues have already been rewritten to emit a
+  // `Const u32` slot index directly (one per dedup'd output), so
+  // the kernel's partition entry uses `rule_<axis>(r)` as the slot
+  // index without any lookup-table indirection.
   const ruleFnBody = emitStmtAsWgslFn(rule);
 
   const slotCases = new Array(N).fill(0).map((_, slotIdx) =>
@@ -139,8 +128,6 @@ ${drawBindings}
 
 const SCAN_REC_U32: u32 = 5u;
 
-const SLOT_LOOKUP_${rule.axis}: array<u32, ${lookupLen}> = array<u32, ${lookupLen}>(${lookupArr});
-
 ${LOADERS}
 
 ${rule.helpersWGSL}
@@ -158,10 +145,8 @@ fn partitionRecords(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= params.numRecords) { return; }
   let r = masterRecords[i];
-  let outVal = rule_${rule.axis}(r);
-  if (outVal >= ${lookupLen}u) { return; }
-  let slotIdx = SLOT_LOOKUP_${rule.axis}[outVal];
-  if (slotIdx == 0xFFFFFFFFu) { return; }
+  let slotIdx = rule_${rule.axis}(r);
+  if (slotIdx >= ${N}u) { return; }
   switch (slotIdx) {
 ${slotCases}
     default: { }
@@ -197,7 +182,6 @@ fn load_mat4(refBytes: u32) -> mat4x4<f32> {
 function emitStmtAsWgslFn(rule: RuleCodegenSpec): string {
   const ctx: EmitCtx = {
     axis: rule.axis,
-    declaredU32: rule.declaredU32,
     inputUniforms: rule.inputUniforms,
     localCounter: 0,
   };
@@ -207,9 +191,164 @@ function emitStmtAsWgslFn(rule: RuleCodegenSpec): string {
 
 interface EmitCtx {
   readonly axis: ModeAxis;
-  readonly declaredU32: number;
   readonly inputUniforms: ReadonlyArray<string>;
   localCounter: number;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// IR rewrite helpers (heap scene calls these before emitPartitionKernel)
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Replace every `ReadInput("<scope>", "<name>")` leaf in `e` with
+ * the supplied `replacement` Expr. Used to bake the rule's
+ * `declared` ReadInput as a `Const u32` of the current declared
+ * value before codegen — the resulting body has no `declared`
+ * references, so the kernel doesn't need a per-dispatch uniform.
+ */
+export function substituteReadInput(
+  e: Expr, scope: string, name: string, replacement: Expr,
+): Expr {
+  return mapExpr(e, (n) => {
+    const r = n as { kind: string; scope?: string; name?: string };
+    if (r.kind === "ReadInput" && r.scope === scope && r.name === name) {
+      return replacement;
+    }
+    return n;
+  });
+}
+export function substituteReadInputInStmt(
+  s: Stmt, scope: string, name: string, replacement: Expr,
+): Stmt {
+  return mapStmtExprs(s, (e) => substituteReadInput(e, scope, name, replacement));
+}
+
+/**
+ * Rewrite the body so every `ReturnValue` returns a `Const u32` slot
+ * index (resolved by `exprToSlot`). `Conditional` expressions are
+ * recursed into — each branch is rewritten independently. Other
+ * non-Conditional return expressions are matched as a whole against
+ * `exprToSlot` (using stableStringify-content equality upstream).
+ *
+ * After this pass the kernel emits a u32 directly from
+ * `rule_<axis>(r)`; the partition entry switches on it as a slot
+ * index, no SLOT_LOOKUP table needed.
+ */
+export function rewriteOutputsToSlotIndices(
+  body: Stmt,
+  exprToSlot: (e: Expr) => number | undefined,
+): Stmt {
+  const Tu32: Type = { kind: "Int", signed: false, width: 32 };
+  const constU32 = (v: number): Expr =>
+    ({ kind: "Const", type: Tu32, value: { kind: "Int", value: v >>> 0, signed: false } } as Expr);
+  const rewriteOutput = (e: Expr): Expr => {
+    const k = (e as { kind: string }).kind;
+    // Try the whole expression first — `exprToSlot` deals in
+    // stableStringify-content matches, so a leaf Expr that
+    // appeared in the symbolic output set gets replaced as a
+    // unit.
+    const direct = exprToSlot(e);
+    if (direct !== undefined) return constU32(direct);
+    // Conditional: rewrite each branch independently. The
+    // condition stays as-is (it's a per-record routing predicate).
+    if (k === "Conditional") {
+      const c = e as { cond: Expr; ifTrue: Expr; ifFalse: Expr };
+      return {
+        kind: "Conditional",
+        cond: c.cond,
+        ifTrue: rewriteOutput(c.ifTrue),
+        ifFalse: rewriteOutput(c.ifFalse),
+        type: Tu32,
+      } as Expr;
+    }
+    return e;
+  };
+  const rewriteStmt = (s: Stmt): Stmt => {
+    const k = (s as { kind: string }).kind;
+    if (k === "ReturnValue") {
+      const r = s as { value: Expr };
+      return { kind: "ReturnValue", value: rewriteOutput(r.value) } as Stmt;
+    }
+    // Recurse into structured statements.
+    if (k === "Sequential" || k === "Isolated") {
+      const b = (s as { body: ReadonlyArray<Stmt> }).body;
+      return { kind: k, body: b.map(rewriteStmt) } as Stmt;
+    }
+    if (k === "If") {
+      const i = s as { cond: Expr; then: Stmt; else?: Stmt };
+      return {
+        kind: "If",
+        cond: i.cond,
+        then: rewriteStmt(i.then),
+        ...(i.else !== undefined ? { else: rewriteStmt(i.else) } : {}),
+      } as Stmt;
+    }
+    if (k === "For" || k === "While" || k === "DoWhile" || k === "Loop") {
+      const w = s as { cond?: Expr; body: Stmt; init?: Stmt; step?: Stmt };
+      return { ...(s as object), body: rewriteStmt(w.body) } as Stmt;
+    }
+    return s;
+  };
+  return rewriteStmt(body);
+}
+
+// Generic Expr/Stmt mapper used by the substitution helpers above.
+function mapExpr(e: Expr, fn: (e: Expr) => Expr): Expr {
+  const mapped = fn(e);
+  if (mapped !== e) return mapped;
+  const obj = e as unknown as Record<string, unknown>;
+  let changed = false;
+  const out: Record<string, unknown> = { ...obj };
+  for (const k of Object.keys(out)) {
+    const v = out[k];
+    if (v !== null && typeof v === "object") {
+      if ("kind" in (v as object) && !Array.isArray(v)) {
+        const sub = mapExpr(v as Expr, fn);
+        if (sub !== v) { out[k] = sub; changed = true; }
+      } else if (Array.isArray(v)) {
+        let ac = false;
+        const m = v.map((c: unknown) => {
+          if (c !== null && typeof c === "object" && "kind" in (c as object)) {
+            const sub = mapExpr(c as Expr, fn);
+            if (sub !== c) ac = true;
+            return sub;
+          }
+          return c;
+        });
+        if (ac) { out[k] = m; changed = true; }
+      }
+    }
+  }
+  return changed ? (out as unknown as Expr) : e;
+}
+function mapStmtExprs(s: Stmt, fn: (e: Expr) => Expr): Stmt {
+  const obj = s as unknown as Record<string, unknown>;
+  let changed = false;
+  const out: Record<string, unknown> = { ...obj };
+  for (const k of Object.keys(out)) {
+    const v = out[k];
+    if (v !== null && typeof v === "object") {
+      if ("kind" in (v as object) && !Array.isArray(v)) {
+        const isStmt = /^(Nop|Expression|Declare|Write|Sequential|Isolated|Return|ReturnValue|Break|Continue|If|For|While|DoWhile|Loop|Switch|Discard|Barrier|WriteOutput|Increment|Decrement)$/.test((v as { kind: string }).kind);
+        const sub = isStmt ? mapStmtExprs(v as Stmt, fn) : mapExpr(v as Expr, fn);
+        if (sub !== v) { out[k] = sub; changed = true; }
+      } else if (Array.isArray(v)) {
+        let ac = false;
+        const m = v.map((c: unknown) => {
+          if (c !== null && typeof c === "object" && "kind" in (c as object)) {
+            const kind = (c as { kind: string }).kind;
+            const isStmt = /^(Nop|Expression|Declare|Write|Sequential|Isolated|Return|ReturnValue|Break|Continue|If|For|While|DoWhile|Loop|Switch|Discard|Barrier|WriteOutput|Increment|Decrement)$/.test(kind);
+            const sub = isStmt ? mapStmtExprs(c as Stmt, fn) : mapExpr(c as Expr, fn);
+            if (sub !== c) ac = true;
+            return sub;
+          }
+          return c;
+        });
+        if (ac) { out[k] = m; changed = true; }
+      }
+    }
+  }
+  return changed ? (out as unknown as Stmt) : s;
 }
 
 function emitStmt(s: Stmt, ctx: EmitCtx, indent: string): string {
@@ -276,9 +415,10 @@ function emitExpr(e: Expr, ctx: EmitCtx): string {
     case "Var":    return (e as { var: { name: string } }).var.name;
     case "ReadInput": {
       const r = e as { scope: string; name: string; type: Type };
-      // `declared` collapses to a Const baked at codegen.
-      if (r.name === "declared") return `${ctx.declaredU32 >>> 0}u`;
-      // `u.<X>` reads from arena via the record's modelRef.
+      void ctx;
+      // `declared` is pre-substituted by heapScene before codegen,
+      // so any surviving ReadInput at this point is a `u.<X>` read
+      // from arena via the record's modelRef.
       if (r.type.kind === "Matrix" && r.type.rows === 3 && r.type.cols === 3) {
         return `load_mat3_upper(r.modelRef)`;
       }

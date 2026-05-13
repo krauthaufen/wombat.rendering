@@ -141,4 +141,9 @@ export {
   PARTITION_RECORD_BYTES,
 } from "./derivedModes/partitionKernelLayout.js";
 export { GpuPartitionScene, type PartitionSceneSpec } from "./derivedModes/partitionDispatcher.js";
-export { emitPartitionKernel, type RuleCodegenSpec, type KernelCodegenSpec } from "./derivedModes/kernelCodegen.js";
+export {
+  emitPartitionKernel,
+  substituteReadInput, substituteReadInputInStmt,
+  rewriteOutputsToSlotIndices,
+  type RuleCodegenSpec, type KernelCodegenSpec,
+} from "./derivedModes/kernelCodegen.js";

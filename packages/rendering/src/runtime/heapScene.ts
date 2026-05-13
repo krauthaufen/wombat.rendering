@@ -95,11 +95,19 @@ import {
 import { encodeModeKey, type PipelineStateDescriptor } from "./pipelineCache/index.js";
 import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
 import { GpuPartitionScene } from "./derivedModes/partitionDispatcher.js";
-import { emitPartitionKernel } from "./derivedModes/kernelCodegen.js";
+import {
+  emitPartitionKernel,
+  substituteReadInputInStmt,
+  rewriteOutputsToSlotIndices,
+} from "./derivedModes/kernelCodegen.js";
 import { type DerivedModeRule, type ModeAxis } from "./derivedModes/rule.js";
 import type { CullMode, FrontFace, Topology } from "./pipelineCache/index.js";
 import { addMarkingCallback } from "@aardworx/wombat.adaptive";
-import { analyseOutputSet, evaluateSet, type Stmt } from "@aardworx/wombat.shader/ir";
+import {
+  analyseOutputSet, evaluateStructural, evaluateStructuralSet,
+  stableStringify,
+  type Expr, type Stmt,
+} from "@aardworx/wombat.shader/ir";
 
 // GrowBuffer + ALIGN16 + MIN_BUFFER_BYTES + POW2 live in ./heapScene/growBuffer.
 // Packers (WGSL-type → JS-value → arena bytes) live in ./heapScene/packers.
@@ -1795,23 +1803,30 @@ export function buildHeapScene(
     blend:           [],
   };
 
-  /** Look up the axis value for a given u32 enum output. Uses the
-   *  rule's `resolve` callback if supplied (mandatory for axes with
-   *  structured values like blend); falls back to the canonical
-   *  axis-enum table for enum axes. */
+  /**
+   * Map a resolved slot value (from `evaluateStructuralSet`) to the
+   * axis-shape value used for descriptor patching.
+   *
+   *  - If the resolved value is a JS object: it's already the full
+   *    axis value (e.g. an `AttachmentBlend` from a blend rule's
+   *    object-literal return) — use it directly.
+   *  - If it's a number: for enum axes, look up the canonical
+   *    table; for structured axes without a table, pass through.
+   */
   function resolveAxisValue<A extends ModeAxis>(
     rule: DerivedModeRule<A>,
-    u32: number,
+    value: unknown,
   ): unknown {
-    if (rule.resolve !== undefined) return rule.resolve(u32);
-    const table = AXIS_ENUM_TABLE[rule.axis];
-    if (table.length === 0) {
-      throw new Error(
-        `heapScene/gpuRouting: axis '${rule.axis}' has no canonical enum table; ` +
-        `supply \`resolve\` or \`values\` in derivedMode options`,
-      );
+    if (typeof value === "object" && value !== null) return value;
+    if (typeof value === "number") {
+      const table = AXIS_ENUM_TABLE[rule.axis];
+      if (table.length > 0) {
+        const v = table[value];
+        if (v !== undefined) return v;
+      }
+      return value;
     }
-    return table[u32];
+    return value;
   }
 
   /** Resolve an axis's `declared` value to a u32 index. For enum
@@ -1855,55 +1870,65 @@ export function buildHeapScene(
     );
   }
 
-  /** Compute the (resolved-set, kernel WGSL) pair for a rule under
-   *  a specific declared u32 value. Used at init and on declared
-   *  marks. */
+  /**
+   * Specialise a rule for the current declared u32 value:
+   *   1. Bake `declared` as a Const in the rule body (so the kernel
+   *      has no per-dispatch uniform — declared marks trigger a
+   *      re-specialise + cached-kernel swap).
+   *   2. Run `analyseOutputSet` to collect distinct return Exprs.
+   *   3. `evaluateStructuralSet` folds each Expr to a JS value (a
+   *      number for enum axes; a full object for structured axes
+   *      like blend). Distinct values define the slot count.
+   *   4. Build a stableStringify-keyed `exprToSlot` map.
+   *   5. Rewrite the body so every ReturnValue emits a Const u32
+   *      slot index.
+   *   6. emitPartitionKernel produces the WGSL.
+   */
   function specialiseRule(
     rule: DerivedModeRule<ModeAxis>,
     body: Stmt,
     declaredU32: number,
-  ): { resolved: ReadonlyArray<number>; kernelWGSL: string } {
-    const symbolic = analyseOutputSet(body);
-    // No intrinsic table yet — user-defined helpers (if any) are
-    // emitted to WGSL by the shader frontend; their JS semantics
-    // aren't reachable here, so unresolvable CallIntrinsic-typed
-    // outputs degrade to a TOP fallback below.
-    const { resolved, unresolvedCount } = evaluateSet(
-      symbolic,
-      new Map<string, number>([["declared", declaredU32]]),
-      new Map(),
-    );
+  ): { resolved: ReadonlyArray<unknown>; kernelWGSL: string } {
+    const Tu32 = { kind: "Int", signed: false, width: 32 } as const;
+    // Bake declared as a const so the kernel has no per-dispatch uniform.
+    const declaredConst: Expr = {
+      kind: "Const",
+      type: Tu32 as never,
+      value: { kind: "Int", value: declaredU32 >>> 0, signed: false } as never,
+    } as Expr;
+    const bakedBody = substituteReadInputInStmt(body, "Uniform", "declared", declaredConst);
+    const symbolic = analyseOutputSet(bakedBody);
+    const env = new Map<string, number>([["declared", declaredU32]]);
+    const { resolved, unresolvedCount } = evaluateStructuralSet(symbolic, env, new Map());
     let outputs = resolved.slice();
-    if (unresolvedCount > 0) {
-      // Fall back: the axis's full enum table (for enum axes) is
-      // the conservative ceiling. For structured axes (blend) the
-      // user's `resolve`/`values` must enumerate the possibilities
-      // — we use [0..N-1] of resolve's domain via... ugh, we don't
-      // know N at this level. So for structured axes we error out
-      // here: the user's rule MUST be analyseable.
+    if (outputs.length === 0 || unresolvedCount > 0) {
       const table = AXIS_ENUM_TABLE[rule.axis];
-      if (table.length > 0) {
+      if (table.length > 0 && unresolvedCount > 0) {
         outputs = table.map((_, i) => i);
       } else if (outputs.length === 0) {
         throw new Error(
           `heapScene/gpuRouting: rule on axis '${rule.axis}' could not be ` +
           `statically resolved AND the axis has no canonical enum table. ` +
-          `Simplify the rule body so analyseOutputSet can fold each branch ` +
-          `to a u32 const.`,
+          `Simplify the rule body so analyseOutputSet can fold each branch.`,
         );
       }
     }
-    if (outputs.length === 0) {
-      // Defensive: at least one slot needed (rule that never
-      // returns?). Use declared as the fallback.
-      outputs = [declaredU32];
-    }
+    // Build exprId → slotIdx via stableStringify. Each Expr in the
+    // symbolic set resolved to a JS value; that value's position in
+    // the deduped `outputs` array is its slot index.
+    const valueKeyToSlot = new Map<string, number>();
+    outputs.forEach((v, i) => valueKeyToSlot.set(stableStringify(v), i));
+    const exprToSlot = (e: Expr): number | undefined => {
+      const v = evaluateStructural(e, env, new Map());
+      if (v === undefined) return undefined;
+      return valueKeyToSlot.get(stableStringify(v));
+    };
+    const rewrittenBody = rewriteOutputsToSlotIndices(bakedBody, exprToSlot);
     const kernelWGSL = emitPartitionKernel({
       rules: [{
         axis: rule.axis,
-        body,
-        declaredU32,
-        resolved: outputs,
+        body: rewrittenBody,
+        slotCount: outputs.length,
         intrinsics: new Map(),
         helpersWGSL: "",
         inputUniforms: ["ModelTrafo"],
@@ -1919,13 +1944,13 @@ export function buildHeapScene(
   function ensureSlotsForResolved(
     bucket: Bucket,
     rule: DerivedModeRule<ModeAxis>,
-    resolved: ReadonlyArray<number>,
+    resolved: ReadonlyArray<unknown>,
   ): void {
     const fam = familyForBucket.get(bucket)!;
     const base = bucket.baseDescriptor!;
     for (let slotIdx = 0; slotIdx < resolved.length; slotIdx++) {
-      const enumValue = resolved[slotIdx]!;
-      const axisValue = resolveAxisValue(rule, enumValue);
+      const slotValue = resolved[slotIdx];
+      const axisValue = resolveAxisValue(rule, slotValue);
       const desc = patchDescriptor(base, rule.axis, axisValue);
       const key = encodeModeKey(desc);
       if (slotIdx < bucket.slots.length) {
