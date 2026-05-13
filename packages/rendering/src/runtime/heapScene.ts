@@ -144,11 +144,54 @@ export interface HeapGeometry {
  * is referenced by `bindGroup` (typically the shared no-textures one
  * or one of the per-texture-set ones).
  */
+/**
+ * Per-slot state inside a bucket. Today every bucket has exactly ONE
+ * slot — `bucket.slots.length === 1`. Multi-pipeline buckets (the
+ * derived-modes work, see docs/derived-modes.md) grow this to one
+ * slot per distinct pipeline state used by the bucket's ROs. Each
+ * slot owns its own drawTable + scan buffers + indirect + pipeline.
+ */
+interface BucketSlot {
+  /** The render pipeline this slot draws with. */
+  readonly pipeline: GPURenderPipeline;
+
+  // ─── drawTable / megacall state ────────────────────────────────────
+  drawTableBuf?: GrowBuffer;
+  drawTableShadow?: Uint32Array;
+  drawTableDirtyMin: number;
+  drawTableDirtyMax: number;
+  /** Number of live records routed to this slot (= drawTable length).
+   *  GPU owns firstEmit / total. */
+  recordCount: number;
+  /** localSlot → recordIdx (or -1). */
+  slotToRecord: number[];
+  /** recordIdx → localSlot. */
+  recordToSlot: number[];
+
+  // ─── Per-slot scan / indirect buffers ──────────────────────────────
+  blockSumsBuf?: GrowBuffer;
+  blockOffsetsBuf?: GrowBuffer;
+  firstDrawInTileBuf?: GrowBuffer;
+  /** CPU sum of indexCounts across live records — drives firstDrawInTileBuf sizing only. */
+  totalEmitEstimate: number;
+  indirectBuf?: GPUBuffer;
+  paramsBuf?: GPUBuffer;
+  scanBindGroup?: GPUBindGroup;
+  /** numRecords used to size the current render bindGroup; rebuild when it changes. */
+  renderBoundRecordCount?: number;
+  scanDirty: boolean;
+}
+
 interface Bucket {
   readonly label: string;
   readonly textures: HeapTextureSet | undefined;
   readonly layout: BucketLayout;
-  readonly pipeline: GPURenderPipeline;
+  /**
+   * One entry per distinct pipeline state. Phase 5a: always length 1
+   * (per-RO pipeline-state still keyed at the bucket level).
+   * Later phases of the derived-modes work let `slots.length > 1`.
+   */
+  readonly slots: BucketSlot[];
   /** Repointed by `rebuildBindGroups` whenever any backing GrowBuffer reallocates. */
   bindGroup: GPUBindGroup;
 
@@ -203,30 +246,6 @@ interface Bucket {
   readonly drawSlots: Set<number>;
   /** Local slots whose DrawHeader needs re-pack + writeBuffer next frame. */
   readonly dirty: Set<number>;
-
-  // ─── Megacall state ────────────────────────────────────────────────
-  drawTableBuf?: GrowBuffer;
-  drawTableShadow?: Uint32Array;
-  drawTableDirtyMin: number;
-  drawTableDirtyMax: number;
-  /** Number of live records (= drawTable length). GPU owns firstEmit / total. */
-  recordCount: number;
-  /** localSlot → recordIdx (or -1). */
-  slotToRecord: number[];
-  /** recordIdx → localSlot. */
-  recordToSlot: number[];
-  /** Per-bucket buffers for the GPU prefix-sum pipeline. */
-  blockSumsBuf?: GrowBuffer;
-  blockOffsetsBuf?: GrowBuffer;
-  firstDrawInTileBuf?: GrowBuffer;
-  /** CPU sum of indexCounts across live records — drives firstDrawInTileBuf sizing only. */
-  totalEmitEstimate: number;
-  indirectBuf?: GPUBuffer;
-  paramsBuf?: GPUBuffer;
-  scanBindGroup?: GPUBindGroup;
-  /** numRecords used to size the current render bindGroup; rebuild when it changes. */
-  renderBoundRecordCount?: number;
-  scanDirty: boolean;
 
   // ─── Atlas-binding state (atlas-variant buckets only) ─────────────
   /**
@@ -975,12 +994,12 @@ export function buildHeapScene(
       label: `heapScene/${bucket.label}/scanBg`,
       layout: scanBgl,
       entries: [
-        { binding: 0, resource: { buffer: bucket.drawTableBuf!.buffer } },
-        { binding: 1, resource: { buffer: bucket.blockSumsBuf!.buffer } },
-        { binding: 2, resource: { buffer: bucket.blockOffsetsBuf!.buffer } },
-        { binding: 3, resource: { buffer: bucket.indirectBuf! } },
-        { binding: 4, resource: { buffer: bucket.paramsBuf! } },
-        { binding: 5, resource: { buffer: bucket.firstDrawInTileBuf!.buffer } },
+        { binding: 0, resource: { buffer: bucket.slots[0]!.drawTableBuf!.buffer } },
+        { binding: 1, resource: { buffer: bucket.slots[0]!.blockSumsBuf!.buffer } },
+        { binding: 2, resource: { buffer: bucket.slots[0]!.blockOffsetsBuf!.buffer } },
+        { binding: 3, resource: { buffer: bucket.slots[0]!.indirectBuf! } },
+        { binding: 4, resource: { buffer: bucket.slots[0]!.paramsBuf! } },
+        { binding: 5, resource: { buffer: bucket.slots[0]!.firstDrawInTileBuf!.buffer } },
       ],
     });
   }
@@ -1277,7 +1296,7 @@ export function buildHeapScene(
       { binding: 3, resource: { buffer: arena.attrs.buffer } },          // heapV4f
     ];
     {
-      if (bucket.drawTableBuf === undefined) {
+      if (bucket.slots[0]!.drawTableBuf === undefined) {
         throw new Error("heapScene: megacall bucket without drawTableBuf");
       }
       // Bind drawTable with size = recordCount * RECORD_BYTES so the VS
@@ -1285,13 +1304,13 @@ export function buildHeapScene(
       // the live record count — keeps stale tail entries out of the
       // binary search. Minimum one zero-record to satisfy WebGPU non-
       // zero size constraint when the bucket is empty.
-      const dtBytes = Math.max(RECORD_BYTES, bucket.recordCount * RECORD_BYTES);
+      const dtBytes = Math.max(RECORD_BYTES, bucket.slots[0]!.recordCount * RECORD_BYTES);
       entries.push(
-        { binding: 4, resource: { buffer: bucket.drawTableBuf.buffer, offset: 0, size: dtBytes } },
+        { binding: 4, resource: { buffer: bucket.slots[0]!.drawTableBuf.buffer, offset: 0, size: dtBytes } },
         { binding: 5, resource: { buffer: arena.indices.buffer } },
-        { binding: 6, resource: { buffer: bucket.firstDrawInTileBuf!.buffer } },
+        { binding: 6, resource: { buffer: bucket.slots[0]!.firstDrawInTileBuf!.buffer } },
       );
-      bucket.renderBoundRecordCount = bucket.recordCount;
+      bucket.slots[0]!.renderBoundRecordCount = bucket.slots[0]!.recordCount;
     }
     // Schema-driven texture + sampler entries. v1 user surface still
     // accepts a single (texture, sampler) pair via HeapTextureSet —
@@ -1465,13 +1484,21 @@ export function buildHeapScene(
     );
     const drawHeap = new DrawHeap(drawHeapBuf, layout.drawHeaderBytes);
 
+    const slot0: BucketSlot = {
+      pipeline,
+      drawTableDirtyMin: Infinity, drawTableDirtyMax: 0,
+      recordCount: 0, slotToRecord: [], recordToSlot: [],
+      totalEmitEstimate: 0,
+      scanDirty: false,
+    };
     const bucket: Bucket = {
       // §6 family-merge: family buckets aren't keyed on a specific
       // texture set — atlas placements are addressed per-RO via
       // drawHeader fields (`pageRef` + `formatBits` + `origin` +
       // `size`), and the bucket's atlas-binding ladder is driven by
       // `atlasPool.pagesFor(format)`. Leave `textures` undefined.
-      label: bk, textures: undefined, layout, pipeline,
+      label: bk, textures: undefined, layout,
+      slots: [slot0],
       bindGroup: null as unknown as GPUBindGroup,
       drawHeap,
       drawHeaderStaging: new Float32Array(drawHeapBuf.capacity / 4),
@@ -1480,10 +1507,6 @@ export function buildHeapScene(
       localEntries: [], localToDrawId: [],
       localPerDrawAvals: [], localPerDrawRefs: [], localLayoutIds: [],
       drawSlots: new Set<number>(), dirty: new Set<number>(),
-      drawTableDirtyMin: Infinity, drawTableDirtyMax: 0,
-      recordCount: 0, slotToRecord: [], recordToSlot: [],
-      totalEmitEstimate: 0,
-      scanDirty: false,
       isAtlasBucket,
       localAtlasReleases: [],
       localAtlasTextures: [],
@@ -1523,30 +1546,30 @@ export function buildHeapScene(
         label: `heapScene/${bk}/params`, size: 16,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
-      bucket.drawTableBuf = dtBuf;
-      bucket.drawTableShadow = new Uint32Array(dtBuf.capacity / 4);
-      bucket.blockSumsBuf = blockSumsBuf;
-      bucket.blockOffsetsBuf = blockOffsetsBuf;
-      bucket.firstDrawInTileBuf = firstDrawInTileBuf;
-      bucket.indirectBuf = indirectBuf;
-      bucket.paramsBuf = paramsBuf;
+      bucket.slots[0]!.drawTableBuf = dtBuf;
+      bucket.slots[0]!.drawTableShadow = new Uint32Array(dtBuf.capacity / 4);
+      bucket.slots[0]!.blockSumsBuf = blockSumsBuf;
+      bucket.slots[0]!.blockOffsetsBuf = blockOffsetsBuf;
+      bucket.slots[0]!.firstDrawInTileBuf = firstDrawInTileBuf;
+      bucket.slots[0]!.indirectBuf = indirectBuf;
+      bucket.slots[0]!.paramsBuf = paramsBuf;
       const ensureScanBuffers = (): void => {
-        const needBlocks = Math.max(1, Math.ceil(bucket.recordCount / SCAN_TILE_SIZE));
+        const needBlocks = Math.max(1, Math.ceil(bucket.slots[0]!.recordCount / SCAN_TILE_SIZE));
         blockSumsBuf.ensureCapacity(needBlocks * 4);
         blockOffsetsBuf.ensureCapacity(needBlocks * 4);
       };
       const rebuildScanBg = (): void => {
-        bucket.scanBindGroup = buildScanBindGroup(bucket);
+        bucket.slots[0]!.scanBindGroup = buildScanBindGroup(bucket);
       };
       dtBuf.onResize(() => {
         const grown = new Uint32Array(dtBuf.capacity / 4);
-        grown.set(bucket.drawTableShadow!);
-        bucket.drawTableShadow = grown;
+        grown.set(bucket.slots[0]!.drawTableShadow!);
+        bucket.slots[0]!.drawTableShadow = grown;
         ensureScanBuffers();
         bucket.bindGroup = buildBucketBindGroup(bucket);
         rebuildScanBg();
-        bucket.drawTableDirtyMin = 0;
-        bucket.drawTableDirtyMax = bucket.recordCount * RECORD_BYTES;
+        bucket.slots[0]!.drawTableDirtyMin = 0;
+        bucket.slots[0]!.drawTableDirtyMax = bucket.slots[0]!.recordCount * RECORD_BYTES;
       });
       blockSumsBuf.onResize(rebuildScanBg);
       blockOffsetsBuf.onResize(rebuildScanBg);
@@ -1554,7 +1577,7 @@ export function buildHeapScene(
         rebuildScanBg();
         bucket.bindGroup = buildBucketBindGroup(bucket);
       });
-      bucket.scanBindGroup = buildScanBindGroup(bucket);
+      bucket.slots[0]!.scanBindGroup = buildScanBindGroup(bucket);
     }
     bucket.bindGroup = buildBucketBindGroup(bucket);
     drawHeap.onResize(() => {
@@ -1876,8 +1899,8 @@ export function buildHeapScene(
     if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
 
     {
-      const dtBuf = bucket.drawTableBuf!;
-      const recIdx = bucket.recordCount;
+      const dtBuf = bucket.slots[0]!.drawTableBuf!;
+      const recIdx = bucket.slots[0]!.recordCount;
       if (recIdx >= SCAN_MAX_RECORDS) {
         throw new Error(
           `heapScene: bucket exceeds SCAN_MAX_RECORDS (${SCAN_MAX_RECORDS}); ` +
@@ -1889,24 +1912,24 @@ export function buildHeapScene(
       dtBuf.setUsed(Math.max(dtBuf.usedBytes, byteOff + RECORD_BYTES));
       // Grow scan-side buffers if recordCount crosses a tile boundary.
       const needBlocks = Math.max(1, Math.ceil((recIdx + 1) / SCAN_TILE_SIZE));
-      bucket.blockSumsBuf!.ensureCapacity(needBlocks * 4);
-      bucket.blockOffsetsBuf!.ensureCapacity(needBlocks * 4);
-      const shadow = bucket.drawTableShadow!;
+      bucket.slots[0]!.blockSumsBuf!.ensureCapacity(needBlocks * 4);
+      bucket.slots[0]!.blockOffsetsBuf!.ensureCapacity(needBlocks * 4);
+      const shadow = bucket.slots[0]!.drawTableShadow!;
       // firstEmit is GPU-overwritten by the prefix-sum pass; 0 is fine.
       shadow[recIdx * RECORD_U32 + 0] = 0;
       shadow[recIdx * RECORD_U32 + 1] = localSlot;
       shadow[recIdx * RECORD_U32 + 2] = idxAlloc.firstIndex;
       shadow[recIdx * RECORD_U32 + 3] = idxAlloc.count;
       shadow[recIdx * RECORD_U32 + 4] = instanceCount;
-      bucket.recordCount = recIdx + 1;
-      bucket.slotToRecord[localSlot] = recIdx;
-      bucket.recordToSlot[recIdx] = localSlot;
-      if (byteOff < bucket.drawTableDirtyMin) bucket.drawTableDirtyMin = byteOff;
-      if (byteOff + RECORD_BYTES > bucket.drawTableDirtyMax) bucket.drawTableDirtyMax = byteOff + RECORD_BYTES;
-      bucket.totalEmitEstimate += idxAlloc.count * instanceCount;
-      const newNumTiles = Math.max(1, Math.ceil(bucket.totalEmitEstimate / TILE_K));
-      bucket.firstDrawInTileBuf!.ensureCapacity((newNumTiles + 1) * 4);
-      bucket.scanDirty = true;
+      bucket.slots[0]!.recordCount = recIdx + 1;
+      bucket.slots[0]!.slotToRecord[localSlot] = recIdx;
+      bucket.slots[0]!.recordToSlot[recIdx] = localSlot;
+      if (byteOff < bucket.slots[0]!.drawTableDirtyMin) bucket.slots[0]!.drawTableDirtyMin = byteOff;
+      if (byteOff + RECORD_BYTES > bucket.slots[0]!.drawTableDirtyMax) bucket.slots[0]!.drawTableDirtyMax = byteOff + RECORD_BYTES;
+      bucket.slots[0]!.totalEmitEstimate += idxAlloc.count * instanceCount;
+      const newNumTiles = Math.max(1, Math.ceil(bucket.slots[0]!.totalEmitEstimate / TILE_K));
+      bucket.slots[0]!.firstDrawInTileBuf!.ensureCapacity((newNumTiles + 1) * 4);
+      bucket.slots[0]!.scanDirty = true;
     }
 
     drawIdToBucket[drawId]    = bucket;
@@ -1987,13 +2010,13 @@ export function buildHeapScene(
       const removedCount = removedEntry !== undefined
         ? removedEntry.indexCount * removedEntry.instanceCount
         : 0;
-      bucket.totalEmitEstimate = Math.max(0, bucket.totalEmitEstimate - removedCount);
+      bucket.slots[0]!.totalEmitEstimate = Math.max(0, bucket.slots[0]!.totalEmitEstimate - removedCount);
       // Swap-pop: move the last record into the freed slot, decrement
       // recordCount. firstEmit is GPU-rewritten by the next scan, so
       // we only fix (drawIdx, indexStart, indexCount, instanceCount).
-      const recIdx     = bucket.slotToRecord[localSlot]!;
-      const lastRecIdx = bucket.recordCount - 1;
-      const shadow = bucket.drawTableShadow!;
+      const recIdx     = bucket.slots[0]!.slotToRecord[localSlot]!;
+      const lastRecIdx = bucket.slots[0]!.recordCount - 1;
+      const shadow = bucket.slots[0]!.drawTableShadow!;
       if (recIdx !== lastRecIdx) {
         const dst = recIdx * RECORD_U32;
         const src = lastRecIdx * RECORD_U32;
@@ -2002,17 +2025,17 @@ export function buildHeapScene(
         shadow[dst + 2] = shadow[src + 2]!;
         shadow[dst + 3] = shadow[src + 3]!;
         shadow[dst + 4] = shadow[src + 4]!;
-        const movedSlot = bucket.recordToSlot[lastRecIdx]!;
-        bucket.slotToRecord[movedSlot] = recIdx;
-        bucket.recordToSlot[recIdx] = movedSlot;
+        const movedSlot = bucket.slots[0]!.recordToSlot[lastRecIdx]!;
+        bucket.slots[0]!.slotToRecord[movedSlot] = recIdx;
+        bucket.slots[0]!.recordToSlot[recIdx] = movedSlot;
         const byteOff = recIdx * RECORD_BYTES;
-        if (byteOff < bucket.drawTableDirtyMin) bucket.drawTableDirtyMin = byteOff;
-        if (byteOff + RECORD_BYTES > bucket.drawTableDirtyMax) bucket.drawTableDirtyMax = byteOff + RECORD_BYTES;
+        if (byteOff < bucket.slots[0]!.drawTableDirtyMin) bucket.slots[0]!.drawTableDirtyMin = byteOff;
+        if (byteOff + RECORD_BYTES > bucket.slots[0]!.drawTableDirtyMax) bucket.slots[0]!.drawTableDirtyMax = byteOff + RECORD_BYTES;
       }
-      bucket.slotToRecord[localSlot] = -1;
-      bucket.recordToSlot[lastRecIdx] = -1;
-      bucket.recordCount = lastRecIdx;
-      bucket.scanDirty = true;
+      bucket.slots[0]!.slotToRecord[localSlot] = -1;
+      bucket.slots[0]!.recordToSlot[lastRecIdx] = -1;
+      bucket.slots[0]!.recordCount = lastRecIdx;
+      bucket.slots[0]!.scanDirty = true;
     }
 
     // Release pool entries — refcount drops; if zero, allocation freed.
@@ -2247,16 +2270,16 @@ export function buildHeapScene(
         bucket.headerDirtyMin = Infinity;
         bucket.headerDirtyMax = 0;
       }
-      if (bucket.drawTableDirtyMax > bucket.drawTableDirtyMin) {
-        const shadow = bucket.drawTableShadow!;
+      if (bucket.slots[0]!.drawTableDirtyMax > bucket.slots[0]!.drawTableDirtyMin) {
+        const shadow = bucket.slots[0]!.drawTableShadow!;
         device.queue.writeBuffer(
-          bucket.drawTableBuf!.buffer, bucket.drawTableDirtyMin,
+          bucket.slots[0]!.drawTableBuf!.buffer, bucket.slots[0]!.drawTableDirtyMin,
           shadow.buffer,
-          shadow.byteOffset + bucket.drawTableDirtyMin,
-          bucket.drawTableDirtyMax - bucket.drawTableDirtyMin,
+          shadow.byteOffset + bucket.slots[0]!.drawTableDirtyMin,
+          bucket.slots[0]!.drawTableDirtyMax - bucket.slots[0]!.drawTableDirtyMin,
         );
-        bucket.drawTableDirtyMin = Infinity;
-        bucket.drawTableDirtyMax = 0;
+        bucket.slots[0]!.drawTableDirtyMin = Infinity;
+        bucket.slots[0]!.drawTableDirtyMax = 0;
       }
     }
   }
@@ -2270,8 +2293,8 @@ export function buildHeapScene(
     let curBg: GPUBindGroup | null = null;
     for (const b of buckets) {
       if (b.bindGroup !== curBg) { pass.setBindGroup(0, b.bindGroup); curBg = b.bindGroup; }
-      pass.setPipeline(b.pipeline);
-      if (b.recordCount > 0) pass.drawIndirect(b.indirectBuf!, 0);
+      pass.setPipeline(b.slots[0]!.pipeline);
+      if (b.slots[0]!.recordCount > 0) pass.drawIndirect(b.slots[0]!.indirectBuf!, 0);
     }
   }
 
@@ -2312,23 +2335,23 @@ export function buildHeapScene(
       stats.derivedRecords  = derivedScene.records.recordCount;
     }
     let anyDirty = false;
-    for (const b of buckets) { if (b.scanDirty) { anyDirty = true; break; } }
+    for (const b of buckets) { if (b.slots[0]!.scanDirty) { anyDirty = true; break; } }
     if (!anyDirty) return;
     const pass = enc.beginComputePass({ label: "heapScene/scan" });
     for (const b of buckets) {
-      if (!b.scanDirty) continue;
+      if (!b.slots[0]!.scanDirty) continue;
       // Rebuild render bind group if recordCount changed — its
       // drawTable binding is sized to recordCount * 16.
-      if (b.renderBoundRecordCount !== b.recordCount) {
+      if (b.slots[0]!.renderBoundRecordCount !== b.slots[0]!.recordCount) {
         b.bindGroup = buildBucketBindGroup(b);
       }
-      const numRecords = b.recordCount;
+      const numRecords = b.slots[0]!.recordCount;
       const numBlocks = Math.max(1, Math.ceil(numRecords / SCAN_TILE_SIZE));
       device.queue.writeBuffer(
-        b.paramsBuf!, 0,
+        b.slots[0]!.paramsBuf!, 0,
         new Uint32Array([numRecords, numBlocks, 0, 0]),
       );
-      pass.setBindGroup(0, b.scanBindGroup!);
+      pass.setBindGroup(0, b.slots[0]!.scanBindGroup!);
       pass.setPipeline(scanPipeTile!);
       pass.dispatchWorkgroups(numBlocks, 1, 1);
       pass.setPipeline(scanPipeBlocks!);
@@ -2339,11 +2362,11 @@ export function buildHeapScene(
       // must cover the worst-case totalEmit. Each WG handles WG_SIZE
       // tiles; +1 for the sentinel slot.
       const SCAN_WG_SIZE = 256;
-      const numTilesCap = Math.max(1, Math.ceil(b.totalEmitEstimate / TILE_K));
+      const numTilesCap = Math.max(1, Math.ceil(b.slots[0]!.totalEmitEstimate / TILE_K));
       const tileWgs = Math.max(1, Math.ceil((numTilesCap + 1) / SCAN_WG_SIZE));
       pass.setPipeline(scanPipeBuildTileIndex!);
       pass.dispatchWorkgroups(tileWgs, 1, 1);
-      b.scanDirty = false;
+      b.slots[0]!.scanDirty = false;
     }
     pass.end();
   }
@@ -2386,12 +2409,12 @@ export function buildHeapScene(
     arena.indices.destroy();
     for (const b of buckets) {
       b.drawHeap.destroy();
-      b.drawTableBuf?.destroy();
-      b.blockSumsBuf?.destroy();
-      b.blockOffsetsBuf?.destroy();
-      b.firstDrawInTileBuf?.destroy();
-      b.indirectBuf?.destroy();
-      b.paramsBuf?.destroy();
+      b.slots[0]!.drawTableBuf?.destroy();
+      b.slots[0]!.blockSumsBuf?.destroy();
+      b.slots[0]!.blockOffsetsBuf?.destroy();
+      b.slots[0]!.firstDrawInTileBuf?.destroy();
+      b.slots[0]!.indirectBuf?.destroy();
+      b.slots[0]!.paramsBuf?.destroy();
     }
   }
 
@@ -2407,11 +2430,11 @@ export function buildHeapScene(
       layout: BucketLayout;
     }[] {
       return buckets.map(b => ({
-        indirectBuf: b.indirectBuf,
-        drawTableBuf: b.drawTableBuf?.buffer,
-        firstDrawInTileBuf: b.firstDrawInTileBuf?.buffer,
-        totalEmitEstimate: b.totalEmitEstimate,
-        recordCount: b.recordCount,
+        indirectBuf: b.slots[0]!.indirectBuf,
+        drawTableBuf: b.slots[0]!.drawTableBuf?.buffer,
+        firstDrawInTileBuf: b.slots[0]!.firstDrawInTileBuf?.buffer,
+        totalEmitEstimate: b.slots[0]!.totalEmitEstimate,
+        recordCount: b.slots[0]!.recordCount,
         layout: b.layout,
       }));
     },
@@ -2480,18 +2503,18 @@ export function buildHeapScene(
       const TILE_K_LOCAL = 64;
       const dcs: DC[] = [];
       for (const b of buckets) {
-        const dhSize = Math.min(b.drawHeap.buffer.size, b.recordCount * b.layout.drawHeaderBytes);
+        const dhSize = Math.min(b.drawHeap.buffer.size, b.slots[0]!.recordCount * b.layout.drawHeaderBytes);
         if (dhSize === 0) continue;
         const dh = stage(b.drawHeap.buffer, dhSize);
-        const dt = b.drawTableBuf !== undefined && b.recordCount > 0
-          ? stage(b.drawTableBuf.buffer, b.recordCount * RECORD_BYTES)
+        const dt = b.slots[0]!.drawTableBuf !== undefined && b.slots[0]!.recordCount > 0
+          ? stage(b.slots[0]!.drawTableBuf.buffer, b.slots[0]!.recordCount * RECORD_BYTES)
           : undefined;
-        const totalEmit = b.totalEmitEstimate;
+        const totalEmit = b.slots[0]!.totalEmitEstimate;
         const numTiles = totalEmit > 0 ? Math.ceil(totalEmit / TILE_K_LOCAL) : 0;
-        const fdt = b.firstDrawInTileBuf !== undefined && numTiles > 0
-          ? stage(b.firstDrawInTileBuf.buffer, Math.min(b.firstDrawInTileBuf.buffer.size, (numTiles + 1) * 4))
+        const fdt = b.slots[0]!.firstDrawInTileBuf !== undefined && numTiles > 0
+          ? stage(b.slots[0]!.firstDrawInTileBuf.buffer, Math.min(b.slots[0]!.firstDrawInTileBuf.buffer.size, (numTiles + 1) * 4))
           : undefined;
-        const ind = b.indirectBuf !== undefined ? stage(b.indirectBuf, 16) : undefined;
+        const ind = b.slots[0]!.indirectBuf !== undefined ? stage(b.slots[0]!.indirectBuf, 16) : undefined;
         dcs.push({
           bucket: b, drawHeap: dh, numTiles,
           ...(dt !== undefined ? { drawTable: dt } : {}),
@@ -2523,7 +2546,7 @@ export function buildHeapScene(
       for (const dc of dcs) {
         const u32 = new Uint32Array(dc.drawHeap.getMappedRange());
         const stride = dc.bucket.layout.drawHeaderBytes;
-        const recordCount = dc.bucket.recordCount;
+        const recordCount = dc.bucket.slots[0]!.recordCount;
 
         for (let slot = 0; slot < recordCount; slot++) {
           const slotOff = slot * stride;
@@ -2679,7 +2702,7 @@ export function buildHeapScene(
         // ── 6. indirect[0] (totalEmit) must match CPU prefix sum.
         if (dc.indirect !== undefined) {
           const ind = new Uint32Array(dc.indirect.getMappedRange());
-          const expectedTotal = dc.bucket.totalEmitEstimate;
+          const expectedTotal = dc.bucket.slots[0]!.totalEmitEstimate;
           const got = ind[0]!;
           if (got !== expectedTotal) {
             push(`bucket#${bucketIdx} indirect[0]=${got} ≠ expected totalEmit=${expectedTotal}`);
@@ -2780,10 +2803,10 @@ export function buildHeapScene(
       };
       const dcs: DC[] = [];
       for (const b of buckets) {
-        if (b.recordCount === 0 || b.totalEmitEstimate === 0) continue;
-        const dh = stage(b.drawHeap.buffer, Math.min(b.drawHeap.buffer.size, b.recordCount * b.layout.drawHeaderBytes));
-        const dt = stage(b.drawTableBuf!.buffer, b.recordCount * RECORD_BYTES);
-        dcs.push({ bucket: b, drawHeap: dh, drawTable: dt, firstEmit: [], totalEmit: b.totalEmitEstimate });
+        if (b.slots[0]!.recordCount === 0 || b.slots[0]!.totalEmitEstimate === 0) continue;
+        const dh = stage(b.drawHeap.buffer, Math.min(b.drawHeap.buffer.size, b.slots[0]!.recordCount * b.layout.drawHeaderBytes));
+        const dt = stage(b.slots[0]!.drawTableBuf!.buffer, b.slots[0]!.recordCount * RECORD_BYTES);
+        dcs.push({ bucket: b, drawHeap: dh, drawTable: dt, firstEmit: [], totalEmit: b.slots[0]!.totalEmitEstimate });
       }
       device.queue.submit([enc.finish()]);
 
@@ -2809,7 +2832,7 @@ export function buildHeapScene(
         const dt = new Uint32Array(dc.drawTable.getMappedRange());
         bucketDt.push(dt);
         bucketHdr.push(new Uint32Array(dc.drawHeap.getMappedRange()));
-        for (let r = 0; r < dc.bucket.recordCount; r++) {
+        for (let r = 0; r < dc.bucket.slots[0]!.recordCount; r++) {
           dc.firstEmit.push(dt[r * RECORD_U32 + 0]!);
         }
         bucketCumEmit.push(totalEmitGlobal);
@@ -2867,7 +2890,7 @@ export function buildHeapScene(
         emitsChecked++;
 
         // Binary search for slot.
-        const recCount = dc.bucket.recordCount;
+        const recCount = dc.bucket.slots[0]!.recordCount;
         let lo = 0, hi = recCount - 1;
         while (lo < hi) {
           const mid = (lo + hi + 1) >>> 1;
@@ -3064,9 +3087,9 @@ export function buildHeapScene(
         : new Uint32Array(0);
 
       for (const target of buckets) {
-        if (target.recordCount === 0 || target.totalEmitEstimate === 0) { bucketIdx++; continue; }
-        const recordCount = target.recordCount;
-        const totalEmit = target.totalEmitEstimate;
+        if (target.slots[0]!.recordCount === 0 || target.slots[0]!.totalEmitEstimate === 0) { bucketIdx++; continue; }
+        const recordCount = target.slots[0]!.recordCount;
+        const totalEmit = target.slots[0]!.totalEmitEstimate;
         const totalTris = Math.floor(totalEmit / 3);
         const remainder = totalEmit % 3;
         if (remainder !== 0) {
@@ -3084,7 +3107,7 @@ export function buildHeapScene(
           usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         });
         const enc0 = device.createCommandEncoder({ label: "checkTriangleCoherence.dt" });
-        enc0.copyBufferToBuffer(target.drawTableBuf!.buffer, 0, dtCopy, 0, recordCount * RECORD_BYTES);
+        enc0.copyBufferToBuffer(target.slots[0]!.drawTableBuf!.buffer, 0, dtCopy, 0, recordCount * RECORD_BYTES);
         enc0.copyBufferToBuffer(target.drawHeap.buffer, 0, dhCopy, 0, recordCount * target.layout.drawHeaderBytes);
         device.queue.submit([enc0.finish()]);
         await dtCopy.mapAsync(GPUMapMode.READ);
@@ -3133,7 +3156,7 @@ export function buildHeapScene(
         });
         {
           const enc1 = device.createCommandEncoder();
-          enc1.copyBufferToBuffer(target.firstDrawInTileBuf!.buffer, 0, fdtCopy, 0, fdtSize);
+          enc1.copyBufferToBuffer(target.slots[0]!.firstDrawInTileBuf!.buffer, 0, fdtCopy, 0, fdtSize);
           device.queue.submit([enc1.finish()]);
           await fdtCopy.mapAsync(GPUMapMode.READ);
         }
@@ -3288,9 +3311,9 @@ export function buildHeapScene(
       // own bytes).
       bucketIdx = 0;
       for (const target of buckets) {
-        if (target.recordCount === 0) { bucketIdx++; continue; }
+        if (target.slots[0]!.recordCount === 0) { bucketIdx++; continue; }
         // Re-stage drawHeap for this bucket.
-        const dhBytes = target.recordCount * target.layout.drawHeaderBytes;
+        const dhBytes = target.slots[0]!.recordCount * target.layout.drawHeaderBytes;
         const dhCopy = device.createBuffer({
           size: dhBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         });
@@ -3300,7 +3323,7 @@ export function buildHeapScene(
         await dhCopy.mapAsync(GPUMapMode.READ);
         const dhU32 = new Uint32Array(dhCopy.getMappedRange());
         const stride2 = target.layout.drawHeaderBytes;
-        for (let slot = 0; slot < target.recordCount; slot++) {
+        for (let slot = 0; slot < target.slots[0]!.recordCount; slot++) {
           for (const f of target.layout.drawHeaderFields) {
             if (f.kind !== "uniform-ref" && f.kind !== "attribute-ref") continue;
             const ref = dhU32[(slot * stride2 + f.byteOffset) >>> 2];
@@ -3360,11 +3383,11 @@ export function buildHeapScene(
       let gpuMismatches = 0;
       const push = (s: string) => { if (issues.length < 30) issues.push(s); };
 
-      const target = buckets.find(b => b.recordCount > 0 && b.totalEmitEstimate > 0);
+      const target = buckets.find(b => b.slots[0]!.recordCount > 0 && b.slots[0]!.totalEmitEstimate > 0);
       if (target === undefined) return { emitsChecked: 0, gpuMismatches: 0, issues };
 
-      const recordCount = target.recordCount;
-      const totalEmit = target.totalEmitEstimate;
+      const recordCount = target.slots[0]!.recordCount;
+      const totalEmit = target.slots[0]!.totalEmitEstimate;
       const sampleCount = Math.min(samples, totalEmit);
       const stride = Math.max(1, Math.floor(totalEmit / sampleCount));
 
@@ -3378,7 +3401,7 @@ export function buildHeapScene(
       });
       {
         const enc0 = device.createCommandEncoder({ label: "probeBinarySearch.dtCopy" });
-        enc0.copyBufferToBuffer(target.drawTableBuf!.buffer, 0, dtCopy, 0, recordCount * RECORD_BYTES);
+        enc0.copyBufferToBuffer(target.slots[0]!.drawTableBuf!.buffer, 0, dtCopy, 0, recordCount * RECORD_BYTES);
         device.queue.submit([enc0.finish()]);
         await dtCopy.mapAsync(GPUMapMode.READ);
       }
@@ -3482,8 +3505,8 @@ export function buildHeapScene(
       const bg = device.createBindGroup({
         layout: bgl,
         entries: [
-          { binding: 0, resource: { buffer: target.drawTableBuf!.buffer } },
-          { binding: 1, resource: { buffer: target.firstDrawInTileBuf!.buffer } },
+          { binding: 0, resource: { buffer: target.slots[0]!.drawTableBuf!.buffer } },
+          { binding: 1, resource: { buffer: target.slots[0]!.firstDrawInTileBuf!.buffer } },
           { binding: 2, resource: { buffer: sampleBuf } },
           { binding: 3, resource: { buffer: arena.indices.buffer } },
           { binding: 4, resource: { buffer: outBuf } },
