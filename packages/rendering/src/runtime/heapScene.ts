@@ -94,6 +94,8 @@ import {
 } from "./heapScene/pools.js";
 import { encodeModeKey, type PipelineStateDescriptor } from "./pipelineCache/index.js";
 import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
+import { GpuDerivedModesScene } from "./derivedModes/gpuDispatcher.js";
+import { U32_TO_CULL } from "./derivedModes/gpuKernel.js";
 import { addMarkingCallback } from "@aardworx/wombat.adaptive";
 
 // GrowBuffer + ALIGN16 + MIN_BUFFER_BYTES + POW2 live in ./heapScene/growBuffer.
@@ -886,6 +888,14 @@ export function buildHeapScene(
   /** Per-RO §7 registration handles, keyed by global drawId.
    *  Drained on removeDraw to release slots + records. */
   const derivedByDrawId = new Map<number, RoRegistration>();
+
+  // ─── GPU-eval mode rules (Task 2 Phase 5, narrow) ─────────────────
+  // Lazily allocated on first registration; one dispatcher per scene.
+  let gpuModesScene: GpuDerivedModesScene | undefined;
+  /** Last per-RO GPU output we routed to a bucket. Diff against
+   *  newly-readback values to decide rebuckets without re-bucketing
+   *  un-changed ROs. */
+  const gpuModesLastKey = new Map<number, number>();
 
   /** The derived-uniform rule for a uniform binding on this RO, if any: an explicit
    *  `derivedUniform(...)` value in `spec.inputs`, or a standard trafo recipe by name
@@ -2076,6 +2086,21 @@ export function buildHeapScene(
     drawIdToModeTracker[drawId] = tracker;
     tracker.forEachLeaf((av) => subscribeModeLeaf(av, drawId));
 
+    // ─── GPU-eval mode rule registration (Task 2 Phase 5) ────────────
+    // If spec.modeRules.cull is GPU-flavoured, register the RO with
+    // the scene-wide dispatcher. Provide the arena byte offset of the
+    // RO's input uniform so the kernel reads from the right slot.
+    {
+      const gpuRule = spec.modeRules?.cull?.gpu;
+      if (gpuRule !== undefined && gpuRule.kernel === "flipCullByDeterminant") {
+        const inputRef = perDrawRefs.get(gpuRule.inputUniform);
+        if (inputRef !== undefined) {
+          if (gpuModesScene === undefined) gpuModesScene = new GpuDerivedModesScene(device);
+          gpuModesScene.registerRo(drawId, inputRef, gpuRule.declared);
+        }
+      }
+    }
+
     // ─── §7 derived-uniforms registration ────────────────────────────
     // A uniform binding on this RO is either a value (aval/constant) or a rule —
     // collect the rules (explicit `derivedUniform(...)` values + standard trafo
@@ -2236,6 +2261,10 @@ export function buildHeapScene(
     }
     drawIdToModeTracker[drawId] = undefined;
     dirtyModeKeyDrawIds.delete(drawId);
+    if (gpuModesScene !== undefined) {
+      gpuModesScene.deregisterRo(drawId);
+      gpuModesLastKey.delete(drawId);
+    }
 
     stats.totalDraws--;
     stats.geometryBytes = arenaBytes(arena);
@@ -2560,6 +2589,52 @@ export function buildHeapScene(
    * we just swap the bind group + dispatch shape per bucket.
    */
   function encodeComputePrep(enc: GPUCommandEncoder, token: AdaptiveToken): void {
+    // GPU-eval derived-mode rules (Task 2 Phase 5): dispatch the
+    // hardcoded determinant-flip-cull kernel + start readback.
+    // Resolved on the next frame's update() — one-frame lag for the
+    // first appearance of a state transition. CPU fallback runs at
+    // addDraw time so the initial bucket assignment is still correct.
+    if (gpuModesScene !== undefined && gpuModesScene.registered > 0) {
+      const numROs = nextDrawId; // upper bound; sparse entries are skipped via 0xFFFFFFFF sentinel
+      gpuModesScene.dispatch(arena.attrs.buffer, numROs, enc);
+      // mapAsync the staging buffer in the background. When it
+      // resolves, diff against gpuModesLastKey to schedule rebuckets.
+      gpuModesScene.finish(numROs).then(() => {
+        const out = gpuModesScene!.lastOutput;
+        for (let i = 0; i < numROs; i++) {
+          const cur = out[i] ?? 0xFFFFFFFF;
+          const prev = gpuModesLastKey.get(i);
+          if (cur === 0xFFFFFFFF) continue;       // no rule on this RO
+          if (prev === cur) continue;
+          gpuModesLastKey.set(i, cur);
+          // Project the kernel's u32 enum back to a CullMode value,
+          // store on the tracker's modeRules so the next snapshot
+          // picks it up, then schedule a rebucket.
+          const tracker = drawIdToModeTracker[i];
+          const spec    = drawIdToSpec[i];
+          if (tracker === undefined || spec === undefined) continue;
+          const cull = U32_TO_CULL[cur];
+          if (cull === undefined) continue;
+          // Inject the GPU result by patching the spec's CPU rule to
+          // return a constant. Slightly hacky but contained: the next
+          // recompute() will read this and route to the right bucket.
+          const patched: typeof spec.modeRules = {
+            ...spec.modeRules,
+            cull: {
+              __derivedModeRule: true, axis: "cull",
+              evaluate: () => cull,
+            },
+          };
+          (spec as { modeRules?: typeof spec.modeRules }).modeRules = patched;
+          dirtyModeKeyDrawIds.add(i);
+        }
+      }).catch((e) => {
+        // mapAsync can reject if the device was lost or the scene was
+        // disposed mid-readback. Log but don't crash the frame.
+        console.warn("gpuModesScene readback failed:", e);
+      });
+    }
+
     // §7: derived-uniforms dispatch first — writes into per-bucket
     // drawHeap regions before the scan reads anything. One dispatcher
     // per bucket; constituents are shared so dirty state propagates
@@ -2687,6 +2762,7 @@ export function buildHeapScene(
     arena.attrs.destroy();
     arena.indices.destroy();
     for (const b of buckets) destroyBucketResources(b);
+    gpuModesScene?.dispose();
   }
 
   // Test-only escape hatch for inspecting megacall bucket state. Not

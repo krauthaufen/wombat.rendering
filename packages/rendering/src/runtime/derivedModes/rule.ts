@@ -54,10 +54,29 @@ export type DerivedModeBuilder<A extends ModeAxis> = (
   declared: ModeValue<A>,
 ) => ModeValue<A>;
 
+/**
+ * Opt-in GPU evaluation marker. When present on a rule, the heap
+ * scene runs a hard-coded WGSL kernel (see `./gpuKernel.ts`) instead
+ * of the CPU closure. The closure is retained for fallback (e.g.
+ * MockGPU tests, devices without compute, or before frame 0).
+ *
+ * v1 supports one kernel: `"flipCullByDeterminant"`. v2 generalizes
+ * via a traced IR builder.
+ */
+export interface GpuRuleSpec<A extends ModeAxis = ModeAxis> {
+  readonly kernel: "flipCullByDeterminant";
+  /** Name of the input uniform the kernel reads (e.g. "ModelTrafo"). */
+  readonly inputUniform: string;
+  /** Declared (SG-scope) value the kernel mutates by. */
+  readonly declared: ModeValue<A>;
+}
+
 export interface DerivedModeRule<A extends ModeAxis = ModeAxis> {
   readonly __derivedModeRule: true;
   readonly axis:    A;
   readonly evaluate: DerivedModeBuilder<A>;
+  /** Opt-in GPU evaluation. Absent → CPU closure path. */
+  readonly gpu?:    GpuRuleSpec<A>;
   /**
    * Conservative over-approximation of the rule's output set. Used by
    * the build-time pre-warm in v2 to enumerate the pipelines a scene
@@ -107,4 +126,47 @@ export function isDerivedModeRule(x: unknown): x is DerivedModeRule {
  *  Useful in `(u, declared) => mirrored ? flipCull(declared) : declared`. */
 export function flipCull(c: CullMode): CullMode {
   return c === "back" ? "front" : c === "front" ? "back" : "none";
+}
+
+/**
+ * Construct a derived-mode rule that flips cullMode based on the sign
+ * of `det(upperLeft3x3(u.<inputUniform>))`. Runs on the GPU when
+ * heapScene's compute path is available; the same logic is mirrored
+ * in the CPU closure for tests and fallback.
+ *
+ *   const rule = gpuFlipCullByDeterminant("ModelTrafo", "back");
+ *   spec.modeRules = { cull: rule };
+ *
+ * Useful for mirrored geometry: scenes that animate a per-RO trafo
+ * with potentially-negative scale don't pay CPU per-RO determinant
+ * cost — the kernel walks the arena once per frame for ALL ROs that
+ * carry this rule.
+ */
+export function gpuFlipCullByDeterminant(
+  inputUniform: string,
+  declared: CullMode = "back",
+): DerivedModeRule<"cull"> {
+  return {
+    __derivedModeRule: true,
+    axis: "cull",
+    domain: ["back", "front", "none"],
+    gpu: { kernel: "flipCullByDeterminant", inputUniform, declared },
+    evaluate: (u, declaredFromCtx) => {
+      const m = u[inputUniform] as { forward?: { _data?: Float64Array | Float32Array } } | { _data?: Float64Array | Float32Array };
+      // Accept Trafo3d ({forward: M44d}), M44 ({_data}), or row-major
+      // Float32Array. Reads upper-left 3x3.
+      const data: ArrayLike<number> | undefined =
+        (m as { forward?: { _data?: ArrayLike<number> } }).forward?._data ??
+        (m as { _data?: ArrayLike<number> })._data ??
+        (m as unknown as ArrayLike<number>);
+      if (data === undefined) return declaredFromCtx;
+      const m00 = data[0]!, m01 = data[1]!, m02 = data[2]!;
+      const m10 = data[4]!, m11 = data[5]!, m12 = data[6]!;
+      const m20 = data[8]!, m21 = data[9]!, m22 = data[10]!;
+      const det = m00 * (m11 * m22 - m12 * m21)
+                - m01 * (m10 * m22 - m12 * m20)
+                + m02 * (m10 * m21 - m11 * m20);
+      return det < 0 ? flipCull(declaredFromCtx) : declaredFromCtx;
+    },
+  };
 }

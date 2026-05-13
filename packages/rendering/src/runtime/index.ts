@@ -131,8 +131,17 @@ export {
   derivedMode,
   isDerivedModeRule,
   flipCull,
+  gpuFlipCullByDeterminant,
   type DerivedModeRule,
   type DerivedModeBuilder,
+  type GpuRuleSpec,
   type ModeAxis,
   type ModeValue,
 } from "./derivedModes/rule.js";
+
+export { GpuDerivedModesScene } from "./derivedModes/gpuDispatcher.js";
+export {
+  GPU_FLIP_CULL_BY_DET_WGSL,
+  CULL_TO_U32,
+  U32_TO_CULL,
+} from "./derivedModes/gpuKernel.js";
