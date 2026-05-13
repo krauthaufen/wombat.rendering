@@ -204,19 +204,39 @@ interface BucketSlot {
 }
 
 /**
- * One distinct derived-mode rule registered on a GPU-routed bucket.
- * Multiple ROs in the same bucket may carry different rules; each
- * gets its own RuleEntry with a bucket-unique `ruleId` baked into
- * the master-pool records the partition kernel reads.
+ * One distinct derived-mode rule registered on a GPU-routed bucket,
+ * keyed by axis. Multiple ROs in the same bucket may carry different
+ * rules across different axes; each axis maintains its own
+ * `axisRuleId` namespace. A bucket-unique `comboId` (a chosen
+ * tuple of (axis → axisRuleId, or "no rule") per RO) is baked into
+ * master-pool records and selects the right composer fn in the
+ * partition kernel.
  */
-interface RuleEntry {
-  readonly ruleId: number;
+interface AxisRuleEntry {
+  readonly axis: ModeAxis;
+  readonly axisRuleId: number;
   readonly contentHash: string;
   readonly rule: DerivedModeRule<ModeAxis>;
   readonly body: Stmt;
   /** Last declared u32 we re-specialised against — drives the
    *  dispatch-time "needs re-specialise?" check. */
   lastDeclaredU32: number | undefined;
+}
+
+/**
+ * One combination of rules carried by ROs in a GPU-routed bucket.
+ * A combo specifies at most one rule per axis (axes absent from the
+ * map fall back to baseDescriptor at a compile-time-constant per-
+ * axis index). Master records store `comboId` — the partition
+ * kernel emits one `combo_<id>` fn per combo composing per-axis
+ * indices into a global slot index via mixed-radix encoding.
+ */
+interface ComboEntry {
+  readonly comboId: number;
+  readonly comboKey: string;
+  /** axis → axisRuleId for axes this combo has a rule on. Axes
+   *  not present in the map use baseDescriptor's value. */
+  readonly axisRules: ReadonlyMap<ModeAxis, number>;
 }
 
 interface Bucket {
@@ -329,19 +349,22 @@ interface Bucket {
    */
   recordToDrawId: number[] | undefined;
   /**
-   * Distinct rules registered on this bucket, keyed by content hash
-   * (axis + expr.id + declared identity). Each entry has a bucket-
-   * unique `ruleId` baked into master-pool records — the partition
-   * kernel switches on `r.ruleId` to pick which rule body runs.
-   * ROs sharing the same effect+textureSet but carrying DIFFERENT
-   * rules each get their own ruleId here.
+   * Per-axis distinct rules registered on this bucket, keyed by
+   * content hash (axis + expr.id + declared identity). `axisRuleId`
+   * is unique within an axis. ROs carry an arbitrary subset of axis
+   * rules; combos (below) dedupe distinct subsets across ROs.
    */
-  rulesById: Map<string, RuleEntry> | undefined;
-  /** `ruleId` → contentHash (= key into rulesById). Index = ruleId. */
-  ruleOrder: string[] | undefined;
-  /** drawId → ruleId. Master records carry the ruleId; this is the
-   *  CPU-side mirror used when an RO is removed. */
-  drawIdToRuleId: Map<number, number> | undefined;
+  rulesByAxis: Map<ModeAxis, Map<string, AxisRuleEntry>> | undefined;
+  /** Per-axis ordered list of registered rule hashes; index =
+   *  `axisRuleId` for that axis. */
+  axisRuleOrder: Map<ModeAxis, string[]> | undefined;
+  /** Distinct combos appearing on ROs in this bucket. */
+  combosByKey: Map<string, ComboEntry> | undefined;
+  /** `comboId` → comboKey. Index = comboId. */
+  comboOrder: string[] | undefined;
+  /** drawId → comboId. Master records carry the comboId; this is
+   *  the CPU-side mirror used when an RO is removed. */
+  drawIdToComboId: Map<number, number> | undefined;
   /** Seed PipelineStateDescriptor (the descriptor of the first GPU-
    *  routed RO). Used as the base for slot descriptors. */
   baseDescriptor: PipelineStateDescriptor | undefined;
@@ -1927,119 +1950,207 @@ export function buildHeapScene(
     return `${rule.axis}|${rule.expr.id}|${dKey}`;
   }
 
+  /** Read baseDescriptor's value for a given axis (the value used by
+   *  combos that have no rule on that axis). */
+  function axisValueOfDesc(desc: PipelineStateDescriptor, axis: ModeAxis): unknown {
+    switch (axis) {
+      case "cull":            return desc.cullMode;
+      case "frontFace":       return desc.frontFace;
+      case "topology":        return desc.topology;
+      case "depthCompare":    return desc.depth?.compare;
+      case "depthWrite":      return desc.depth?.write;
+      case "alphaToCoverage": return desc.alphaToCoverage;
+      case "blend":           return desc.attachments[0];
+    }
+  }
+
   /**
-   * Specialise the WHOLE bucket against every registered rule's
-   * current declared value:
-   *   1. For each rule: bake declared as Const, analyse the body,
+   * Specialise the WHOLE bucket — N-D cartesian over per-axis
+   * unions:
+   *   1. Per (axis, rule): bake declared as Const, analyse the body,
    *      `evaluateStructuralSet` to fold each return Expr to a JS
-   *      value.
-   *   2. UNION the per-rule resolved JS values across all rules
-   *      (dedup by `stableStringify`-content equality, sort
-   *      deterministically). That's the bucket's global slot table.
-   *   3. For each rule: rewrite the body so every `ReturnValue`
-   *      emits a `Const u32` GLOBAL slot index.
-   *   4. Emit a single kernel with one `rule_<axis>_<ruleId>` fn per
-   *      rule plus a `dispatch_<axis>(r)` that switches on r.ruleId.
+   *      value. Collect the per-axis union (dedup by stableStringify,
+   *      sorted deterministically). If any combo lacks a rule on
+   *      this axis, also include baseDesc's value for that axis.
+   *   2. Active axes = axes with ≥1 registered rule, in AXIS_ORDER.
+   *      Cardinalities Cₐ = |axisValues[a]|; totalSlots = ∏ Cₐ.
+   *   3. Per axis-rule: rewrite the body so every `ReturnValue`
+   *      emits a `Const u32` PER-AXIS index (into axisValues[axis]).
+   *   4. Per combo: assemble a ComboCodegenSpec (per-axis source =
+   *      rule or compile-time const index).
+   *   5. Emit the kernel.
    *
-   * Returns the rewritten kernel + the global resolved set.
+   * Returns the cartesian slot descriptors + the kernel WGSL.
    */
   function specialiseBucket(
     bucket: Bucket,
-  ): { resolved: ReadonlyArray<unknown>; kernelWGSL: string } {
+  ): { slotDescs: ReadonlyArray<PipelineStateDescriptor>; kernelWGSL: string } {
     const Tu32 = { kind: "Int", signed: false, width: 32 } as const;
-    const ruleOrder = bucket.ruleOrder!;
-    const rulesById = bucket.rulesById!;
-    if (ruleOrder.length === 0) {
-      throw new Error("heapScene/gpuRouting: specialiseBucket called with no registered rules");
+    const rulesByAxis = bucket.rulesByAxis!;
+    const axisRuleOrder = bucket.axisRuleOrder!;
+    const combosByKey = bucket.combosByKey!;
+    const comboOrder  = bucket.comboOrder!;
+    if (comboOrder.length === 0) {
+      throw new Error("heapScene/gpuRouting: specialiseBucket called with no registered combos");
     }
-    // Step 1: per-rule analyse + evaluate.
-    const perRule: Array<{
-      entry: RuleEntry;
+    const base = bucket.baseDescriptor!;
+    const activeAxes: ModeAxis[] = AXIS_ORDER.filter(a => (rulesByAxis.get(a)?.size ?? 0) > 0);
+
+    // Step 1: per-axis-rule analyse + collect per-axis union.
+    interface PerRule {
+      entry: AxisRuleEntry;
       bakedBody: Stmt;
       resolved: ReadonlyArray<unknown>;
       declaredU32: number;
-    }> = [];
-    for (const hash of ruleOrder) {
-      const entry = rulesById.get(hash)!;
-      const declaredU32 = resolveDeclaredU32(entry.rule, AdaptiveToken.top);
-      const declaredConst: Expr = {
-        kind: "Const", type: Tu32 as never,
-        value: { kind: "Int", value: declaredU32 >>> 0, signed: false } as never,
-      } as Expr;
-      const bakedBody = substituteReadInputInStmt(entry.body, "Uniform", "declared", declaredConst);
-      const symbolic = analyseOutputSet(bakedBody);
-      const env = new Map<string, number>([["declared", declaredU32]]);
-      const { resolved, unresolvedCount } = evaluateStructuralSet(symbolic, env, new Map());
-      let outputs = resolved.slice();
-      if (outputs.length === 0 || unresolvedCount > 0) {
-        const table = AXIS_ENUM_TABLE[entry.rule.axis];
-        if (table.length > 0 && unresolvedCount > 0) {
-          outputs = table.map((_, i) => i);
-        } else if (outputs.length === 0) {
-          throw new Error(
-            `heapScene/gpuRouting: rule on axis '${entry.rule.axis}' could not be ` +
-            `statically resolved AND the axis has no canonical enum table. ` +
-            `Simplify the rule body so analyseOutputSet can fold each branch.`,
-          );
+    }
+    const perAxisRules = new Map<ModeAxis, PerRule[]>();
+    for (const axis of activeAxes) {
+      const list: PerRule[] = [];
+      for (const hash of axisRuleOrder.get(axis)!) {
+        const entry = rulesByAxis.get(axis)!.get(hash)!;
+        const declaredU32 = resolveDeclaredU32(entry.rule, AdaptiveToken.top);
+        const declaredConst: Expr = {
+          kind: "Const", type: Tu32 as never,
+          value: { kind: "Int", value: declaredU32 >>> 0, signed: false } as never,
+        } as Expr;
+        const bakedBody = substituteReadInputInStmt(entry.body, "Uniform", "declared", declaredConst);
+        const symbolic = analyseOutputSet(bakedBody);
+        const env = new Map<string, number>([["declared", declaredU32]]);
+        const { resolved, unresolvedCount } = evaluateStructuralSet(symbolic, env, new Map());
+        let outputs = resolved.slice();
+        if (outputs.length === 0 || unresolvedCount > 0) {
+          const table = AXIS_ENUM_TABLE[entry.rule.axis];
+          if (table.length > 0 && unresolvedCount > 0) {
+            outputs = table.map((_, i) => i);
+          } else if (outputs.length === 0) {
+            throw new Error(
+              `heapScene/gpuRouting: rule on axis '${entry.rule.axis}' could not be ` +
+              `statically resolved AND the axis has no canonical enum table. ` +
+              `Simplify the rule body so analyseOutputSet can fold each branch.`,
+            );
+          }
+        }
+        list.push({ entry, bakedBody, resolved: outputs, declaredU32 });
+        entry.lastDeclaredU32 = declaredU32;
+      }
+      perAxisRules.set(axis, list);
+    }
+
+    // Per axis: union of resolved values (resolveAxisValue'd so
+    // numeric enum indices collapse with canonical-table strings).
+    // Also include baseDesc.value for the axis if any combo lacks a
+    // rule on it.
+    interface AxisInfo {
+      readonly axis: ModeAxis;
+      readonly values: ReadonlyArray<unknown>;          // resolved axis values, sorted
+      readonly keyToIdx: ReadonlyMap<string, number>;   // stableStringify(value) → idx
+      readonly baseValue: unknown;                       // baseDesc's value for this axis
+      readonly baseIdx: number;                          // index of baseValue in values
+    }
+    const axisInfos: AxisInfo[] = [];
+    for (const axis of activeAxes) {
+      const list = perAxisRules.get(axis)!;
+      const dummyRule = { axis } as DerivedModeRule<ModeAxis>;
+      const byKey = new Map<string, unknown>();
+      for (const p of list) {
+        for (const v of p.resolved) {
+          const av = resolveAxisValue(dummyRule, v);
+          byKey.set(stableStringify(av), av);
         }
       }
-      perRule.push({ entry, bakedBody, resolved: outputs, declaredU32 });
-      entry.lastDeclaredU32 = declaredU32;
+      const baseValue = axisValueOfDesc(base, axis);
+      const someComboLacksAxis = comboOrder.some(k => !combosByKey.get(k)!.axisRules.has(axis));
+      if (someComboLacksAxis) {
+        byKey.set(stableStringify(baseValue), baseValue);
+      }
+      const sortedKeys = [...byKey.keys()].sort();
+      const values = sortedKeys.map(k => byKey.get(k)!);
+      const keyToIdx = new Map(sortedKeys.map((k, i) => [k, i] as const));
+      const baseIdx = keyToIdx.get(stableStringify(baseValue)) ?? 0;
+      axisInfos.push({ axis, values, keyToIdx, baseValue, baseIdx });
     }
-    // Step 2: union dedup by stableStringify; deterministic order.
-    const globalSlotByKey = new Map<string, { value: unknown; idx: number }>();
-    for (const p of perRule) {
-      for (const v of p.resolved) {
-        const key = stableStringify(v);
-        if (!globalSlotByKey.has(key)) {
-          globalSlotByKey.set(key, { value: v, idx: 0 });
-        }
+
+    // Step 2: cartesian shape.
+    const cards = axisInfos.map(a => a.values.length);
+    const totalSlots = cards.reduce((m, n) => m * n, 1);
+
+    // Step 3: rewrite each axis-rule body to emit per-axis indices.
+    const ruleSpecs: import("./derivedModes/kernelCodegen.js").RuleCodegenSpec[] = [];
+    for (const info of axisInfos) {
+      const list = perAxisRules.get(info.axis)!;
+      const dummyRule = { axis: info.axis } as DerivedModeRule<ModeAxis>;
+      for (const p of list) {
+        const env = new Map<string, number>([["declared", p.declaredU32]]);
+        const exprToAxisIdx = (e: Expr): number | undefined => {
+          const v = evaluateStructural(e, env, new Map());
+          if (v === undefined) return undefined;
+          const av = resolveAxisValue(dummyRule, v);
+          return info.keyToIdx.get(stableStringify(av));
+        };
+        const rewrittenBody = rewriteOutputsToSlotIndices(p.bakedBody, exprToAxisIdx);
+        ruleSpecs.push({
+          axis: info.axis,
+          axisRuleId: p.entry.axisRuleId,
+          body: rewrittenBody,
+          intrinsics: new Map(),
+          helpersWGSL: "",
+          inputUniforms: ["ModelTrafo"],
+        });
       }
     }
-    const sortedKeys = [...globalSlotByKey.keys()].sort();
-    sortedKeys.forEach((k, i) => globalSlotByKey.get(k)!.idx = i);
-    const globalResolved: ReadonlyArray<unknown> = sortedKeys.map(k => globalSlotByKey.get(k)!.value);
-    // Step 3: per-rule body rewrite with GLOBAL slot indices.
-    const codegenRules = perRule.map(p => {
-      const env = new Map<string, number>([["declared", p.declaredU32]]);
-      const exprToSlot = (e: Expr): number | undefined => {
-        const v = evaluateStructural(e, env, new Map());
-        if (v === undefined) return undefined;
-        return globalSlotByKey.get(stableStringify(v))?.idx;
-      };
-      const rewrittenBody = rewriteOutputsToSlotIndices(p.bakedBody, exprToSlot);
-      return {
-        axis: p.entry.rule.axis,
-        ruleId: p.entry.ruleId,
-        body: rewrittenBody,
-        intrinsics: new Map(),
-        helpersWGSL: "",
-        inputUniforms: ["ModelTrafo"],
-      };
-    });
+
+    // Step 4: per-combo axis sources.
+    const comboSpecs: import("./derivedModes/kernelCodegen.js").ComboCodegenSpec[] = [];
+    for (const comboKey of comboOrder) {
+      const combo = combosByKey.get(comboKey)!;
+      const axes = axisInfos.map(info => {
+        const axisRuleId = combo.axisRules.get(info.axis);
+        return {
+          axis: info.axis,
+          cardinality: info.values.length,
+          source: axisRuleId !== undefined
+            ? { kind: "rule" as const, axisRuleId }
+            : { kind: "const" as const, idx: info.baseIdx },
+        };
+      });
+      comboSpecs.push({ comboId: combo.comboId, axes });
+    }
+
+    // Step 5: enumerate cartesian → slot descriptors (mixed-radix
+    // decode in the same axis order the kernel uses).
+    const slotDescs: PipelineStateDescriptor[] = [];
+    for (let slotIdx = 0; slotIdx < totalSlots; slotIdx++) {
+      let desc = base;
+      let rem = slotIdx;
+      // Match kernel: strides[i] = ∏_{j>i} cards[j]. Decode:
+      // idx[i] = (slotIdx / strides[i]) % cards[i].
+      const strides: number[] = new Array(axisInfos.length).fill(1);
+      for (let i = axisInfos.length - 2; i >= 0; i--) strides[i] = strides[i + 1]! * cards[i + 1]!;
+      for (let i = 0; i < axisInfos.length; i++) {
+        const info = axisInfos[i]!;
+        const ai = Math.floor(rem / strides[i]!) % cards[i]!;
+        rem -= ai * strides[i]!;
+        desc = patchDescriptor(desc, info.axis, info.values[ai]);
+      }
+      slotDescs.push(desc);
+    }
+
     const kernelWGSL = emitPartitionKernel({
-      rules: codegenRules,
-      totalSlots: globalResolved.length,
+      rules: ruleSpecs,
+      combos: comboSpecs,
+      totalSlots,
     });
-    return { resolved: globalResolved, kernelWGSL };
+    return { slotDescs, kernelWGSL };
   }
 
-  /** Build pipeline + slot for each global resolved value. The axis
-   *  is shared across all rules in the bucket (v1 single-axis). */
+  /** Build pipeline + slot for each cartesian slot descriptor. */
   function ensureSlotsForResolved(
     bucket: Bucket,
-    resolved: ReadonlyArray<unknown>,
+    slotDescs: ReadonlyArray<PipelineStateDescriptor>,
   ): void {
     const fam = familyForBucket.get(bucket)!;
-    const base = bucket.baseDescriptor!;
-    const axis = bucket.ruleOrder!.length > 0
-      ? bucket.rulesById!.get(bucket.ruleOrder![0]!)!.rule.axis
-      : ("cull" as ModeAxis);
-    const dummyRule = { axis } as DerivedModeRule<ModeAxis>;
-    for (let slotIdx = 0; slotIdx < resolved.length; slotIdx++) {
-      const slotValue = resolved[slotIdx];
-      const axisValue = resolveAxisValue(dummyRule, slotValue);
-      const desc = patchDescriptor(base, axis, axisValue);
+    for (let slotIdx = 0; slotIdx < slotDescs.length; slotIdx++) {
+      const desc = slotDescs[slotIdx]!;
       const key = encodeModeKey(desc);
       if (slotIdx < bucket.slots.length) {
         const slot = bucket.slots[slotIdx]!;
@@ -2053,58 +2164,85 @@ export function buildHeapScene(
     }
   }
 
-  /**
-   * Register a rule on a GPU-routed bucket (or promote the bucket
-   * to GPU-routed on the first rule). Returns the bucket-unique
-   * `ruleId` to bake into master-pool records.
-   *
-   * If the rule's content hash is new to this bucket, the bucket is
-   * re-specialised (rebuilds the kernel and may grow the slot table
-   * to accommodate the rule's outputs).
-   */
-  function registerRule(
+  /** Register a combo (set of axis rules, ≤ one per axis) on a GPU-
+   *  routed bucket (or promote the bucket on first call). Returns
+   *  the bucket-unique `comboId` to bake into master-pool records. */
+  function registerCombo(
     bucket: Bucket,
-    rule: DerivedModeRule<ModeAxis>,
+    axisRules: ReadonlyArray<DerivedModeRule<ModeAxis>>,
     baseDesc: PipelineStateDescriptor,
   ): number {
-    const hash = ruleContentHash(rule);
-    // First rule on this bucket: lazy-init the multi-rule machinery.
+    // First combo on this bucket: lazy-init the multi-rule machinery.
     if (!bucket.gpuRouted) {
       bucket.baseDescriptor = baseDesc;
-      bucket.rulesById      = new Map<string, RuleEntry>();
-      bucket.ruleOrder      = [];
-      bucket.drawIdToRuleId = new Map<number, number>();
-      bucket.drawIdToRecord = new Map<number, number>();
+      bucket.rulesByAxis    = new Map();
+      bucket.axisRuleOrder  = new Map();
+      bucket.combosByKey    = new Map();
+      bucket.comboOrder     = [];
+      bucket.drawIdToComboId = new Map();
+      bucket.drawIdToRecord = new Map();
       bucket.recordToDrawId = [];
     }
-    let entry = bucket.rulesById!.get(hash);
-    let newRule = false;
-    if (entry === undefined) {
-      const ruleId = bucket.ruleOrder!.length;
-      entry = {
-        ruleId, contentHash: hash, rule,
-        body: ruleBodyOf(rule),
-        lastDeclaredU32: undefined,
-      };
-      bucket.rulesById!.set(hash, entry);
-      bucket.ruleOrder!.push(hash);
-      newRule = true;
-    } else {
-      // Cross-axis sanity (multi-axis rules in one bucket are a
-      // future lift).
-      if (entry.rule.axis !== rule.axis) {
+    // Per-axis: dedupe rule by content hash; assign axisRuleId.
+    const perAxisRuleId = new Map<ModeAxis, number>();
+    let respec = false;
+    for (const rule of axisRules) {
+      if (perAxisRuleId.has(rule.axis)) {
         throw new Error(
-          `heapScene/gpuRouting: bucket already has rule on axis '${entry.rule.axis}'; ` +
-          `cannot mix with axis '${rule.axis}'`,
+          `heapScene/gpuRouting: combo has two rules on the same axis '${rule.axis}'`,
         );
       }
+      const hash = ruleContentHash(rule);
+      let axisMap = bucket.rulesByAxis!.get(rule.axis);
+      if (axisMap === undefined) {
+        axisMap = new Map();
+        bucket.rulesByAxis!.set(rule.axis, axisMap);
+        bucket.axisRuleOrder!.set(rule.axis, []);
+      }
+      let entry = axisMap.get(hash);
+      if (entry === undefined) {
+        const order = bucket.axisRuleOrder!.get(rule.axis)!;
+        entry = {
+          axis: rule.axis,
+          axisRuleId: order.length,
+          contentHash: hash,
+          rule,
+          body: ruleBodyOf(rule),
+          lastDeclaredU32: undefined,
+        };
+        axisMap.set(hash, entry);
+        order.push(hash);
+        respec = true;
+      }
+      perAxisRuleId.set(rule.axis, entry.axisRuleId);
+    }
+    // Combo key = canonical-axis-order list of (axis, contentHash).
+    const comboKeyParts: string[] = [];
+    for (const axis of AXIS_ORDER) {
+      const axisRuleId = perAxisRuleId.get(axis);
+      if (axisRuleId === undefined) {
+        comboKeyParts.push(`${axis}:_`);
+      } else {
+        comboKeyParts.push(`${axis}:${bucket.axisRuleOrder!.get(axis)![axisRuleId]!}`);
+      }
+    }
+    const comboKey = comboKeyParts.join("|");
+    let combo = bucket.combosByKey!.get(comboKey);
+    if (combo === undefined) {
+      const comboId = bucket.comboOrder!.length;
+      const axisRules = new Map<ModeAxis, number>();
+      for (const [axis, id] of perAxisRuleId) axisRules.set(axis, id);
+      combo = { comboId, comboKey, axisRules };
+      bucket.combosByKey!.set(comboKey, combo);
+      bucket.comboOrder!.push(comboKey);
+      respec = true;
     }
     // First time gpuRouted? Build the partition scene now.
     if (!bucket.gpuRouted) {
-      const { resolved, kernelWGSL } = specialiseBucket(bucket);
-      ensureSlotsForResolved(bucket, resolved);
+      const { slotDescs, kernelWGSL } = specialiseBucket(bucket);
+      ensureSlotsForResolved(bucket, slotDescs);
       const partition = new GpuPartitionScene(device, `${bucket.label}/partition`, {
-        totalSlots: resolved.length,
+        totalSlots: slotDescs.length,
         slotDrawBufs: bucket.slots.map(s => s.drawTableBuf!.buffer),
         kernelWGSL,
         initialRecords: 16,
@@ -2112,11 +2250,9 @@ export function buildHeapScene(
       bucket.gpuRouted      = true;
       bucket.partitionScene = partition;
       bucket.partitionDirty = true;
-    } else if (newRule) {
-      // Extending an existing GPU bucket with a fresh rule — re-
-      // specialise (may grow the slot table + needs new kernel).
-      const { resolved, kernelWGSL } = specialiseBucket(bucket);
-      ensureSlotsForResolved(bucket, resolved);
+    } else if (respec) {
+      const { slotDescs, kernelWGSL } = specialiseBucket(bucket);
+      ensureSlotsForResolved(bucket, slotDescs);
       const newCount = bucket.slots.length;
       const draws = bucket.slots.map(s => s.drawTableBuf!.buffer);
       if (newCount > bucket.partitionScene!.totalSlots) {
@@ -2127,7 +2263,7 @@ export function buildHeapScene(
       bucket.partitionScene!.rebuildKernel(kernelWGSL);
       bucket.partitionDirty = true;
     }
-    return entry.ruleId;
+    return combo.comboId;
   }
 
   /**
@@ -2138,16 +2274,16 @@ export function buildHeapScene(
    */
   function dispatchPartition(bucket: Bucket, enc: GPUCommandEncoder, tok: AdaptiveToken): void {
     if (!bucket.gpuRouted || bucket.partitionScene === undefined) return;
-    // Detect any rule whose declared changed.
     let needRespec = false;
-    for (const hash of bucket.ruleOrder!) {
-      const entry = bucket.rulesById!.get(hash)!;
-      const declaredU32 = resolveDeclaredU32(entry.rule, tok);
-      if (declaredU32 !== entry.lastDeclaredU32) { needRespec = true; break; }
+    outer: for (const axisMap of bucket.rulesByAxis!.values()) {
+      for (const entry of axisMap.values()) {
+        const declaredU32 = resolveDeclaredU32(entry.rule, tok);
+        if (declaredU32 !== entry.lastDeclaredU32) { needRespec = true; break outer; }
+      }
     }
     if (needRespec) {
-      const { resolved, kernelWGSL } = specialiseBucket(bucket);
-      ensureSlotsForResolved(bucket, resolved);
+      const { slotDescs, kernelWGSL } = specialiseBucket(bucket);
+      ensureSlotsForResolved(bucket, slotDescs);
       const newCount = bucket.slots.length;
       const draws = bucket.slots.map(s => s.drawTableBuf!.buffer);
       if (newCount > bucket.partitionScene.totalSlots) {
@@ -2222,9 +2358,11 @@ export function buildHeapScene(
       partitionScene: undefined,
       drawIdToRecord: undefined,
       recordToDrawId: undefined,
-      rulesById: undefined,
-      ruleOrder: undefined,
-      drawIdToRuleId: undefined,
+      rulesByAxis: undefined,
+      axisRuleOrder: undefined,
+      combosByKey: undefined,
+      comboOrder: undefined,
+      drawIdToComboId: undefined,
       baseDescriptor: undefined,
       partitionDirty: false,
     };
@@ -2469,14 +2607,9 @@ export function buildHeapScene(
     // dispatch switch picks the right body per record.
     const collectedRules = spec.modeRules !== undefined ? collectRules(spec.modeRules) : [];
     const roDescriptor = precomputedDescriptor ?? snapshotDescriptor(spec.pipelineState, sig);
-    let roRuleId = 0;
+    let roComboId = 0;
     if (collectedRules.length > 0) {
-      if (collectedRules.length > 1) {
-        throw new Error(
-          `heapScene: multi-axis rules on one RO not yet supported (got ${collectedRules.length} axes)`,
-        );
-      }
-      roRuleId = registerRule(bucket, collectedRules[0]!, roDescriptor);
+      roComboId = registerCombo(bucket, collectedRules, roDescriptor);
     }
     // Phase 5c.2: route this RO to the bucket's slot covering its
     // current descriptor. ensureSlot creates a new slot on miss; the
@@ -2642,10 +2775,10 @@ export function buildHeapScene(
       // uniform (today fixed to ModelTrafo until rules with multiple
       // arena inputs land).
       const modelRef = perDrawRefs.get("ModelTrafo") ?? 0;
-      partition.appendRecord(localSlot, idxAlloc.firstIndex, idxAlloc.count, instanceCount, modelRef, roRuleId);
+      partition.appendRecord(localSlot, idxAlloc.firstIndex, idxAlloc.count, instanceCount, modelRef, roComboId);
       bucket.drawIdToRecord!.set(drawId, recIdx);
       bucket.recordToDrawId![recIdx] = drawId;
-      bucket.drawIdToRuleId!.set(drawId, roRuleId);
+      bucket.drawIdToComboId!.set(drawId, roComboId);
       // Master grew? Invalidate partition's bind group so it picks
       // up the new masterBuf.  (rebindSlotDrawBufs nulls bindGroup.)
       // grow() inside appendRecord already does this when capacity

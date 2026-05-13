@@ -23,16 +23,15 @@ import type { Expr, Stmt, Type, Literal, IntrinsicEvalTable } from "@aardworx/wo
 import { stableStringify } from "@aardworx/wombat.shader/ir";
 import type { ModeAxis } from "./rule.js";
 
-/** One traced+rewritten rule body, ready for codegen. */
+/** One traced+rewritten axis-rule body, ready for codegen. */
 export interface RuleCodegenSpec {
   readonly axis: ModeAxis;
-  /** Bucket-unique id. Master-pool records carry this in their
-   *  `ruleId` field; the partition kernel switches on it. */
-  readonly ruleId: number;
+  /** Unique within `axis` within the bucket. */
+  readonly axisRuleId: number;
   /**
    * The rule body — already rewritten so every `ReturnValue` returns
-   * a `Const u32` GLOBAL slot index (into the bucket's union resolved
-   * set across all rules). The codegen never sees the original
+   * a `Const u32` PER-AXIS index into this axis's union value table
+   * (`axisCardinality` below). The codegen never sees the original
    * `__record:*` intrinsics.
    */
   readonly body: Stmt;
@@ -42,57 +41,82 @@ export interface RuleCodegenSpec {
   readonly inputUniforms: ReadonlyArray<string>;
 }
 
+/** Per-active-axis entry inside a single combo: either picks a rule
+ *  (axis index computed at runtime by `rule_<axis>_<id>`) or a fixed
+ *  per-axis index (a compile-time constant for axes the combo has no
+ *  rule on — the index of baseDescriptor's value in this axis's
+ *  union table). */
+export type ComboAxisSource =
+  | { readonly kind: "rule"; readonly axisRuleId: number }
+  | { readonly kind: "const"; readonly idx: number };
+
+export interface ComboAxis {
+  readonly axis: ModeAxis;
+  /** |axisValues[axis]| — the stride for mixed-radix encoding is the
+   *  product of cardinalities of axes after this one in `axes`. */
+  readonly cardinality: number;
+  readonly source: ComboAxisSource;
+}
+
+export interface ComboCodegenSpec {
+  readonly comboId: number;
+  /** Active axes (those with at least one rule in the bucket), in
+   *  canonical order. Every combo in the bucket carries the same
+   *  axis list — combos differ only in which axes have rules. */
+  readonly axes: ReadonlyArray<ComboAxis>;
+}
+
 export interface KernelCodegenSpec {
-  /** One per distinct rule in the bucket. Each record's `ruleId`
-   *  selects which rule body runs at partition time. */
+  /** Distinct axis-rules registered on the bucket. */
   readonly rules: ReadonlyArray<RuleCodegenSpec>;
-  /** Total slot count = size of the UNION resolved set across every
-   *  rule, deduped by structural-value equality. */
+  /** Distinct combos appearing on ROs in this bucket. */
+  readonly combos: ReadonlyArray<ComboCodegenSpec>;
+  /** Total slot count = ∏ cardinality across active axes. */
   readonly totalSlots: number;
 }
 
-/** Emit the WGSL partition kernel for the given rules. Per-record
- *  dispatch: `switch(r.ruleId) { case 0u: { … rule body 0 …; case 1u:
- *  { … rule body 1 …; … }` — each body has been pre-rewritten so
- *  its `ReturnValue`s emit GLOBAL slot indices (across all rules in
- *  the bucket). */
+/** Emit the WGSL partition kernel for the given rules + combos.
+ *  Per-record dispatch:
+ *    `switch (r.comboId) { case 0u: { return combo_0(r); } … }`
+ *  Each `combo_<id>(r)` computes per-axis indices (calling
+ *  `rule_<axis>_<axisRuleId>(r)` for axes the combo has a rule on,
+ *  or using a const for the others) and composes them into a
+ *  global slot index via mixed-radix encoding over `axes`. */
 export function emitPartitionKernel(spec: KernelCodegenSpec): string {
-  if (spec.rules.length === 0) {
-    throw new Error("kernelCodegen: at least one rule is required");
+  if (spec.combos.length === 0) {
+    throw new Error("kernelCodegen: at least one combo is required");
   }
   if (spec.totalSlots > 16) {
     throw new Error(`kernelCodegen: totalSlots ${spec.totalSlots} exceeds the v1 limit of 16`);
   }
-  // Sanity: rules must share an axis for the v1 single-axis bucket
-  // assumption to hold. Multi-axis (cartesian product) is a future lift.
-  const axis = spec.rules[0]!.axis;
-  for (const r of spec.rules) {
-    if (r.axis !== axis) {
-      throw new Error(`kernelCodegen: all rules must target the same axis (v1) — got ${r.axis} and ${axis}`);
-    }
-  }
   const N = spec.totalSlots;
 
-  // Emit one `rule_<axis>_<ruleId>(r) -> u32` per rule, plus a
-  // dispatcher that switches on r.ruleId. The dispatcher's default
-  // returns OOB (record skipped). Helpers are deduped by string
-  // equality so two rules sharing the same WGSL helper don't
-  // double-emit (rule_<axis>_X and rule_<axis>_Y can both use a
-  // user-defined `flipCull` etc. that the shader frontend lifted
-  // into module scope).
+  // Emit one `rule_<axis>_<axisRuleId>(r) -> u32` per axis-rule.
+  // Helpers are deduped by string equality so two rules sharing the
+  // same WGSL helper don't double-emit (rule_<axis>_X and
+  // rule_<axis>_Y can both use a user-defined `flipCull` etc. that
+  // the shader frontend lifted into module scope).
   const helperSet = new Set<string>();
   const ruleFns: string[] = [];
-  const dispatchCases: string[] = [];
   for (const r of spec.rules) {
     if (r.helpersWGSL.trim().length > 0) helperSet.add(r.helpersWGSL);
     ruleFns.push(emitStmtAsWgslFn(r));
-    dispatchCases.push(`    case ${r.ruleId}u: { return rule_${r.axis}_${r.ruleId}(r); }`);
   }
   const helpersWGSL = [...helperSet].join("\n");
   const ruleFnsWGSL = ruleFns.join("\n");
+
+  // Emit one combo fn per combo: per-axis index via rule call or
+  // const, then mixed-radix encode into the global slot index.
+  const comboFns: string[] = [];
+  const dispatchCases: string[] = [];
+  for (const c of spec.combos) {
+    comboFns.push(emitComboFn(c));
+    dispatchCases.push(`    case ${c.comboId}u: { return combo_${c.comboId}(r); }`);
+  }
+  const comboFnsWGSL = comboFns.join("\n");
   const dispatcherWGSL = `
-fn dispatch_${axis}(r: Record) -> u32 {
-  switch (r.ruleId) {
+fn dispatch(r: Record) -> u32 {
+  switch (r.comboId) {
 ${dispatchCases.join("\n")}
     default: { return ${N}u; }
   }
@@ -129,7 +153,7 @@ struct Record {
   indexCount:    u32,
   instanceCount: u32,
   modelRef:      u32,
-  ruleId:        u32,
+  comboId:       u32,
 };
 struct PartitionParams { numRecords: u32 };
 
@@ -147,6 +171,8 @@ ${helpersWGSL}
 
 ${ruleFnsWGSL}
 
+${comboFnsWGSL}
+
 ${dispatcherWGSL}
 
 @compute @workgroup_size(64)
@@ -160,7 +186,7 @@ fn partitionRecords(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= params.numRecords) { return; }
   let r = masterRecords[i];
-  let slotIdx = dispatch_${axis}(r);
+  let slotIdx = dispatch(r);
   if (slotIdx >= ${N}u) { return; }
   switch (slotIdx) {
 ${slotCases}
@@ -168,6 +194,35 @@ ${slotCases}
   }
 }
 `;
+}
+
+/** Emit one combo fn: per-axis index via rule call or const, then
+ *  mixed-radix encode into a global slot index. Strides are
+ *  precomputed (product of cardinalities of axes *after* the
+ *  current one in `axes`). */
+function emitComboFn(c: ComboCodegenSpec): string {
+  if (c.axes.length === 0) {
+    // Trivial combo (no active axes): always slot 0.
+    return `fn combo_${c.comboId}(r: Record) -> u32 {\n  return 0u;\n}\n`;
+  }
+  // Mixed-radix strides: stride[i] = ∏_{j>i} cardinality[j].
+  const strides: number[] = new Array(c.axes.length).fill(1);
+  for (let i = c.axes.length - 2; i >= 0; i--) {
+    strides[i] = strides[i + 1]! * c.axes[i + 1]!.cardinality;
+  }
+  const idxLines: string[] = [];
+  const sumTerms: string[] = [];
+  for (let i = 0; i < c.axes.length; i++) {
+    const a = c.axes[i]!;
+    const varName = `i_${a.axis}`;
+    if (a.source.kind === "rule") {
+      idxLines.push(`  let ${varName} = rule_${a.axis}_${a.source.axisRuleId}(r);`);
+    } else {
+      idxLines.push(`  let ${varName} = ${a.source.idx >>> 0}u;`);
+    }
+    sumTerms.push(strides[i] === 1 ? `${varName}` : `${varName} * ${strides[i]}u`);
+  }
+  return `fn combo_${c.comboId}(r: Record) -> u32 {\n${idxLines.join("\n")}\n  return ${sumTerms.join(" + ")};\n}\n`;
 }
 
 const LOADERS = `
@@ -201,7 +256,7 @@ function emitStmtAsWgslFn(rule: RuleCodegenSpec): string {
     localCounter: 0,
   };
   const bodyWgsl = emitStmt(rule.body, ctx, "  ");
-  return `fn rule_${rule.axis}_${rule.ruleId}(r: Record) -> u32 {\n${bodyWgsl}\n  return 0u;\n}\n`;
+  return `fn rule_${rule.axis}_${rule.axisRuleId}(r: Record) -> u32 {\n${bodyWgsl}\n  return 0u;\n}\n`;
 }
 
 interface EmitCtx {

@@ -205,7 +205,7 @@ export class GpuPartitionScene {
     indexCount: number,
     instanceCount: number,
     modelRef: number,
-    ruleId = 0,
+    comboId = 0,
   ): number {
     if (this.numRecords >= this.capacity) this.grow();
     const i = this.numRecords;
@@ -216,17 +216,17 @@ export class GpuPartitionScene {
     this.masterShadow[o + 3] = indexCount;
     this.masterShadow[o + 4] = instanceCount;
     this.masterShadow[o + 5] = modelRef;
-    this.masterShadow[o + 6] = ruleId >>> 0;
+    this.masterShadow[o + 6] = comboId >>> 0;
     this.numRecords = i + 1;
     return i;
   }
 
-  /** Update an existing record's ruleId. Used when an RO already
+  /** Update an existing record's comboId. Used when an RO already
    *  in the master is re-classified (rare; only when rule rebucket
    *  fires on aval marks). */
-  setRecordRuleId(recordIdx: number, ruleId: number): void {
+  setRecordComboId(recordIdx: number, comboId: number): void {
     if (recordIdx < 0 || recordIdx >= this.numRecords) return;
-    this.masterShadow[recordIdx * PARTITION_RECORD_U32 + 6] = ruleId >>> 0;
+    this.masterShadow[recordIdx * PARTITION_RECORD_U32 + 6] = comboId >>> 0;
   }
 
   removeRecord(recordIdx: number): number {
