@@ -94,6 +94,10 @@ import {
 } from "./heapScene/pools.js";
 import { encodeModeKey, type PipelineStateDescriptor } from "./pipelineCache/index.js";
 import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
+import { GpuPartitionScene } from "./derivedModes/partitionDispatcher.js";
+import { CULL_TO_U32 } from "./derivedModes/gpuKernel.js";
+import { flipCull, type DerivedModeRule } from "./derivedModes/rule.js";
+import type { CullMode } from "./pipelineCache/index.js";
 import { addMarkingCallback } from "@aardworx/wombat.adaptive";
 
 // GrowBuffer + ALIGN16 + MIN_BUFFER_BYTES + POW2 live in ./heapScene/growBuffer.
@@ -276,6 +280,46 @@ interface Bucket {
    * for slots without an atlas source aval.
    */
   readonly localAtlasArrIdx: (number | undefined)[];
+
+  // ─── Phase 5c.3 GPU-routed bucket state ─────────────────────────
+  /**
+   * True when this bucket's first RO carried a GPU-flavoured mode
+   * rule (e.g. `gpuFlipCullByDeterminant`). The partition kernel
+   * decides per-record routing each frame; CPU never reslots.
+   */
+  gpuRouted: boolean;
+  /**
+   * Per-bucket partition dispatcher. Owns the master record buffer
+   * + per-slot atomic counters + params. Slot draw buffers are
+   * externally owned (point at `bucket.slots[i].drawTableBuf.buffer`).
+   */
+  partitionScene: GpuPartitionScene | undefined;
+  /**
+   * drawId → master record index (for swap-pop on removeDraw).
+   */
+  drawIdToRecord: Map<number, number> | undefined;
+  /**
+   * master record index → drawId (for fixup when swap-pop moves the
+   * tail record into the freed slot).
+   */
+  recordToDrawId: number[] | undefined;
+  /**
+   * The first RO's `cull` rule (used at dispatch time to resolve
+   * the declared CullMode — may be an aval).
+   */
+  cullRule: DerivedModeRule<"cull"> | undefined;
+  /**
+   * Seed PipelineStateDescriptor — the rule-applied descriptor of
+   * the first GPU-routed RO. Used to build per-slot pipeline
+   * descriptors by swapping `cullMode` only.
+   */
+  baseDescriptor: PipelineStateDescriptor | undefined;
+  /**
+   * Has the partition kernel's inputs (records or rule deps)
+   * changed since last dispatch? Set true on addRO / removeDraw /
+   * any tracker-leaf mark. Reset after dispatch.
+   */
+  partitionDirty: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,6 +1588,16 @@ export function buildHeapScene(
   arena.attrs.onResize(() => {
     rebuildAllBindGroups();
     if (derivedScene !== undefined) derivedScene.rebindMainHeap(arena.attrs.buffer);
+    // Phase 5c.3: partition kernels bind arena.attrs as their input.
+    // Force a bind group rebuild on next dispatch for every GPU bucket.
+    for (const b of buckets) {
+      if (b.gpuRouted && b.partitionScene !== undefined && b.slots.length >= 2) {
+        b.partitionScene.rebindSlotDrawBufs(
+          b.slots[0]!.drawTableBuf!.buffer,
+          b.slots[1]!.drawTableBuf!.buffer,
+        );
+      }
+    }
   });
   if (atlasPool !== undefined) {
     for (const f of ATLAS_PAGE_FORMATS) {
@@ -1632,6 +1686,15 @@ export function buildHeapScene(
       rebuildScanBg();
       slot.drawTableDirtyMin = 0;
       slot.drawTableDirtyMax = slot.recordCount * RECORD_BYTES;
+      // Phase 5c.3: partition's bind group references slot drawTables.
+      // When EITHER slot's GPUBuffer reallocates we must rebind both
+      // (partition writes into both, so its bind group needs both).
+      if (bucket.gpuRouted && bucket.partitionScene !== undefined && bucket.slots.length >= 2) {
+        bucket.partitionScene.rebindSlotDrawBufs(
+          bucket.slots[0]!.drawTableBuf!.buffer,
+          bucket.slots[1]!.drawTableBuf!.buffer,
+        );
+      }
     });
     blockSumsBuf.onResize(rebuildScanBg);
     blockOffsetsBuf.onResize(rebuildScanBg);
@@ -1647,6 +1710,114 @@ export function buildHeapScene(
 
   /** Side map from Bucket → family. Populated by findOrCreateBucket. */
   const familyForBucket = new WeakMap<Bucket, ReturnType<typeof familyFor>>();
+
+  /**
+   * Phase 5c.3 — promote `bucket` to GPU-routed.
+   *
+   * Called from `addDrawImpl` on the FIRST RO that carries a GPU
+   * cull rule (`spec.modeRules.cull.gpu`). The bucket already has
+   * `slots[0]` from `findOrCreateBucket`'s seed (descriptor = the
+   * declared cull mode). We add `slots[1]` for the flipped cull
+   * mode, then wire a `GpuPartitionScene` that scatters master
+   * records into the two slot drawTables each frame.
+   */
+  function initGpuRouting(
+    bucket: Bucket,
+    cullRule: DerivedModeRule<"cull">,
+    baseDesc: PipelineStateDescriptor,
+    tok: AdaptiveToken,
+  ): void {
+    if (bucket.gpuRouted) return;
+    const gpuSpec = cullRule.gpu;
+    if (gpuSpec === undefined) return;
+    // Resolve the initial declared cull mode (aval → force, else string).
+    const declared: CullMode = typeof gpuSpec.declared === "string"
+      ? gpuSpec.declared
+      : (gpuSpec.declared as aval<CullMode>).getValue(tok);
+    const flipped: CullMode = flipCull(declared);
+    // Slot 0 already exists (seeded by findOrCreateBucket with the
+    // descriptor's current cull). Force its descriptor to match the
+    // declared output. Slot 1 covers the flipped output.
+    const slot0Desc: PipelineStateDescriptor = { ...baseDesc, cullMode: declared };
+    const slot1Desc: PipelineStateDescriptor = { ...baseDesc, cullMode: flipped };
+    const fam = familyForBucket.get(bucket)!;
+    bucket.slots[0]!.pipeline = getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, slot0Desc);
+    bucket.slots[0]!.modeKey  = encodeModeKey(slot0Desc);
+    if (bucket.slots.length < 2) {
+      createSlot(bucket, slot1Desc);
+    }
+    // Sanity: both slots present.
+    if (bucket.slots.length < 2) {
+      throw new Error("heapScene/gpuRouting: failed to create flipped slot");
+    }
+    // Both slot drawTable buffers feed partition's bind group.
+    const partition = new GpuPartitionScene(
+      device,
+      `${bucket.label}/partition`,
+      bucket.slots[0]!.drawTableBuf!.buffer,
+      bucket.slots[1]!.drawTableBuf!.buffer,
+      16,
+    );
+    bucket.gpuRouted      = true;
+    bucket.partitionScene = partition;
+    bucket.drawIdToRecord = new Map<number, number>();
+    bucket.recordToDrawId = [];
+    bucket.cullRule       = cullRule;
+    bucket.baseDescriptor = baseDesc;
+    bucket.partitionDirty = true;
+  }
+
+  /**
+   * Phase 5c.3 — per-frame partition dispatch for a GPU-routed bucket.
+   *
+   * Encodes:
+   *   1. (one-time per frame) writeBuffer master shadow → masterBuf.
+   *   2. partition compute pass: clear + scatter.
+   *   3. `copyBufferToBuffer` of each slot's atomic count into that
+   *      slot's scan `paramsBuf` (overrides numRecords with the
+   *      partition's authoritative per-slot count).
+   *   4. marks both slots scanDirty so the downstream scan loop runs.
+   *
+   * Pipeline freshness: re-resolves the `declared` aval and looks up
+   * pipelines for declared + flipCull(declared). Pre-warm guarantees
+   * cache hits.
+   */
+  function dispatchPartition(bucket: Bucket, enc: GPUCommandEncoder, tok: AdaptiveToken): void {
+    if (!bucket.gpuRouted || bucket.partitionScene === undefined) return;
+    const rule = bucket.cullRule!;
+    const gpuSpec = rule.gpu!;
+    const declared: CullMode = typeof gpuSpec.declared === "string"
+      ? gpuSpec.declared
+      : (gpuSpec.declared as aval<CullMode>).getValue(tok);
+    const flipped: CullMode = flipCull(declared);
+    // Refresh slot pipelines if declared changed (cache hit thanks
+    // to pre-warm). modeKey gates the lookup so this is a no-op when
+    // declared is stable.
+    const fam = familyForBucket.get(bucket)!;
+    const slot0 = bucket.slots[0]!;
+    const slot1 = bucket.slots[1]!;
+    const base  = bucket.baseDescriptor!;
+    const slot0Desc: PipelineStateDescriptor = { ...base, cullMode: declared };
+    const slot1Desc: PipelineStateDescriptor = { ...base, cullMode: flipped };
+    const slot0Key  = encodeModeKey(slot0Desc);
+    const slot1Key  = encodeModeKey(slot1Desc);
+    if (slot0.modeKey !== slot0Key) {
+      slot0.pipeline = getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, slot0Desc);
+      slot0.modeKey  = slot0Key;
+    }
+    if (slot1.modeKey !== slot1Key) {
+      slot1.pipeline = getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, slot1Desc);
+      slot1.modeKey  = slot1Key;
+    }
+    bucket.partitionScene.flush();
+    bucket.partitionScene.dispatch(arena.attrs.buffer, declared, enc);
+    enc.copyBufferToBuffer(bucket.partitionScene.slot0CountBuf, 0, slot0.paramsBuf!, 0, 4);
+    enc.copyBufferToBuffer(bucket.partitionScene.slot1CountBuf, 0, slot1.paramsBuf!, 0, 4);
+    slot0.scanDirty = true;
+    slot1.scanDirty = true;
+    bucket.partitionDirty = false;
+  }
+
 
   function findOrCreateBucket(
     effect: Effect,
@@ -1696,6 +1867,13 @@ export function buildHeapScene(
       localAtlasReleases: [],
       localAtlasTextures: [],
       localAtlasArrIdx: [],
+      gpuRouted: false,
+      partitionScene: undefined,
+      drawIdToRecord: undefined,
+      recordToDrawId: undefined,
+      cullRule: undefined,
+      baseDescriptor: undefined,
+      partitionDirty: false,
     };
     familyForBucket.set(bucket, fam);
 
@@ -1930,11 +2108,24 @@ export function buildHeapScene(
       });
     }
     const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, precomputedDescriptor);
+    // Phase 5c.3 — first RO carrying a GPU cull rule promotes the
+    // bucket to GPU routing. Subsequent ROs in the same bucket are
+    // assumed to carry the SAME rule (mixed-mode buckets are not
+    // supported in v1; the kernel hard-codes flip-cull-by-det).
+    const cullRule = spec.modeRules?.cull;
+    const roDescriptor = precomputedDescriptor ?? snapshotDescriptor(spec.pipelineState, sig);
+    if (!bucket.gpuRouted && cullRule !== undefined && cullRule.gpu !== undefined) {
+      initGpuRouting(bucket, cullRule, roDescriptor, outerTok);
+    }
     // Phase 5c.2: route this RO to the bucket's slot covering its
     // current descriptor. ensureSlot creates a new slot on miss; the
-    // pipeline lookup hits the scene-level cache.
-    const roDescriptor = precomputedDescriptor ?? snapshotDescriptor(spec.pipelineState, sig);
-    const roSlot       = ensureSlot(bucket, roDescriptor);
+    // pipeline lookup hits the scene-level cache. For GPU-routed
+    // buckets the slot decision is made each frame on the GPU; we
+    // still pin the RO to slot 0 (declared) CPU-side so existing
+    // accounting paths (slotToRecord, dirty bookkeeping) keep
+    // working. The partition kernel overwrites both slots' draw
+    // tables every frame from the master.
+    const roSlot       = bucket.gpuRouted ? bucket.slots[0]! : ensureSlot(bucket, roDescriptor);
     const roSlotIdx    = bucket.slots.indexOf(roSlot);
     const fam = familyFor(spec.effect);
     const effectFields = fam.fieldsForEffect.get(spec.effect.id)!;
@@ -2072,7 +2263,51 @@ export function buildHeapScene(
     const end = byteOff + bucket.layout.drawHeaderBytes;
     if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
 
-    {
+    if (bucket.gpuRouted) {
+      // Phase 5c.3 GPU routing: master pool is authoritative.
+      // Both slot[0] and slot[1] get the SAME accounting (counts,
+      // emit estimates, buffer capacities) — partition overwrites
+      // their GPU drawTables every frame, so per-slot CPU shadows
+      // are irrelevant. We still grow their buffers in lockstep so
+      // the scan dispatch shape covers every possible record.
+      const partition = bucket.partitionScene!;
+      const recIdx = partition.numRecords;
+      if (recIdx >= SCAN_MAX_RECORDS) {
+        throw new Error(
+          `heapScene: GPU-routed bucket exceeds SCAN_MAX_RECORDS (${SCAN_MAX_RECORDS})`,
+        );
+      }
+      const modelRef = perDrawRefs.get(cullRule!.gpu!.inputUniform);
+      if (modelRef === undefined) {
+        throw new Error(
+          `heapScene: GPU cull rule inputUniform '${cullRule!.gpu!.inputUniform}' ` +
+          `not present in spec.inputs`,
+        );
+      }
+      partition.appendRecord(localSlot, idxAlloc.firstIndex, idxAlloc.count, instanceCount, modelRef);
+      bucket.drawIdToRecord!.set(drawId, recIdx);
+      bucket.recordToDrawId![recIdx] = drawId;
+      // Master grew? Invalidate partition's bind group so it picks
+      // up the new masterBuf.  (rebindSlotDrawBufs nulls bindGroup.)
+      // grow() inside appendRecord already does this when capacity
+      // is exceeded; nothing to do here.
+      const numRecords = recIdx + 1;
+      const recBytes = numRecords * RECORD_BYTES;
+      const needBlocks = Math.max(1, Math.ceil(numRecords / SCAN_TILE_SIZE));
+      const emitDelta = idxAlloc.count * instanceCount;
+      for (const s of bucket.slots) {
+        s.drawTableBuf!.ensureCapacity(recBytes);
+        s.drawTableBuf!.setUsed(Math.max(s.drawTableBuf!.usedBytes, recBytes));
+        s.blockSumsBuf!.ensureCapacity(needBlocks * 4);
+        s.blockOffsetsBuf!.ensureCapacity(needBlocks * 4);
+        s.recordCount = numRecords;
+        s.totalEmitEstimate += emitDelta;
+        const newNumTiles = Math.max(1, Math.ceil(s.totalEmitEstimate / TILE_K));
+        s.firstDrawInTileBuf!.ensureCapacity((newNumTiles + 1) * 4);
+        s.scanDirty = true;
+      }
+      bucket.partitionDirty = true;
+    } else {
       const dtBuf = roSlot.drawTableBuf!;
       const recIdx = roSlot.recordCount;
       if (recIdx >= SCAN_MAX_RECORDS) {
@@ -2245,7 +2480,36 @@ export function buildHeapScene(
         derivedByDrawId.delete(drawId);
       }
     }
-    {
+    if (bucket.gpuRouted) {
+      const partition = bucket.partitionScene!;
+      const recIdx = bucket.drawIdToRecord!.get(drawId);
+      const removedEntry = bucket.localEntries[localSlot];
+      const removedCount = removedEntry !== undefined
+        ? removedEntry.indexCount * removedEntry.instanceCount
+        : 0;
+      if (recIdx !== undefined) {
+        const moved = partition.removeRecord(recIdx);
+        if (moved >= 0) {
+          // The record at `moved` (the old tail) now lives at recIdx.
+          // Fix maps for the moved drawId.
+          const movedDrawId = bucket.recordToDrawId![moved]!;
+          bucket.drawIdToRecord!.set(movedDrawId, recIdx);
+          bucket.recordToDrawId![recIdx] = movedDrawId;
+          bucket.recordToDrawId![moved] = -1;
+        } else {
+          bucket.recordToDrawId![recIdx] = -1;
+        }
+        bucket.drawIdToRecord!.delete(drawId);
+      }
+      // Mirror the count + emit-estimate decrement across every slot
+      // (both share the master's accounting).
+      for (const s of bucket.slots) {
+        s.recordCount = partition.numRecords;
+        s.totalEmitEstimate = Math.max(0, s.totalEmitEstimate - removedCount);
+        s.scanDirty = true;
+      }
+      bucket.partitionDirty = true;
+    } else {
       const slotIdx = drawIdToSlotIdx[drawId];
       const slot = slotIdx !== undefined ? bucket.slots[slotIdx]! : bucket.slots[0]!;
       const removedEntry = bucket.localEntries[localSlot];
@@ -2458,11 +2722,19 @@ export function buildHeapScene(
         for (const drawId of dirty) {
           const tracker = drawIdToModeTracker[drawId];
           if (tracker === undefined) continue;
+          const bucket = drawIdToBucket[drawId];
+          // Phase 5c.3: GPU-routed buckets never reslot CPU-side.
+          // The partition kernel handles re-routing per frame.
+          // Just mark the bucket so the next encodeComputePrep
+          // dispatches partition.
+          if (bucket !== undefined && bucket.gpuRouted) {
+            bucket.partitionDirty = true;
+            continue;
+          }
           const oldKey = tracker.modeKey;
           if (!tracker.recompute()) continue;
           if (tracker.modeKey === oldKey) continue;
 
-          const bucket = drawIdToBucket[drawId];
           const localSlot = drawIdToLocalSlot[drawId];
           const oldSlotIdx = drawIdToSlotIdx[drawId];
           if (bucket === undefined || localSlot === undefined || oldSlotIdx === undefined) continue;
@@ -2625,6 +2897,9 @@ export function buildHeapScene(
       }
       // Phase 5c.2: each slot has its own drawTable + shadow. Upload
       // the dirty range of every slot, not just slots[0].
+      // Phase 5c.3: GPU-routed buckets skip this entirely — the
+      // partition kernel writes slot drawTables directly each frame.
+      if (bucket.gpuRouted) continue;
       for (const slot of bucket.slots) {
         if (slot.drawTableDirtyMax <= slot.drawTableDirtyMin) continue;
         const shadow = slot.drawTableShadow!;
@@ -2702,11 +2977,20 @@ export function buildHeapScene(
     }
     let anyDirty = false;
     outer: for (const b of buckets) {
+      if (b.gpuRouted && b.partitionDirty) { anyDirty = true; break outer; }
       for (const s of b.slots) {
         if (s.scanDirty) { anyDirty = true; break outer; }
       }
     }
     if (!anyDirty) return;
+    // Phase 5c.3: per GPU-routed bucket — dispatch partition (its own
+    // compute pass), then copyBufferToBuffer slot counts into scan
+    // paramsBuf. Must happen BEFORE the shared scan pass below.
+    for (const b of buckets) {
+      if (b.gpuRouted && b.partitionDirty) {
+        dispatchPartition(b, enc, token);
+      }
+    }
     const pass = enc.beginComputePass({ label: "heapScene/scan" });
     for (const b of buckets) {
       for (let i = 0; i < b.slots.length; i++) {

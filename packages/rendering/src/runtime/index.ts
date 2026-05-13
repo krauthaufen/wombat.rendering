@@ -145,3 +145,11 @@ export {
   CULL_TO_U32,
   U32_TO_CULL,
 } from "./derivedModes/gpuKernel.js";
+
+export {
+  PARTITION_FLIP_CULL_BY_DET_WGSL,
+  PARTITION_RECORD_U32,
+  PARTITION_RECORD_BYTES,
+  cullModeToU32,
+} from "./derivedModes/partitionKernel.js";
+export { GpuPartitionScene } from "./derivedModes/partitionDispatcher.js";
