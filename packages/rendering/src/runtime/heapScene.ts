@@ -92,6 +92,8 @@ import {
   ENC_V3F_TIGHT, SEM_POSITIONS, SEM_NORMALS,
   type ArenaState,
 } from "./heapScene/pools.js";
+import { encodeModeKey } from "./pipelineCache/index.js";
+import { snapshotDescriptor } from "./derivedModes/modeKeyCpu.js";
 
 // GrowBuffer + ALIGN16 + MIN_BUFFER_BYTES + POW2 live in ./heapScene/growBuffer.
 // Packers (WGSL-type → JS-value → arena bytes) live in ./heapScene/packers.
@@ -1226,29 +1228,10 @@ export function buildHeapScene(
     avalIds.set(av, vid);
     return `c${vid}`;
   };
-  const psContentIds = new WeakMap<PipelineState, string>();
-  const psIdOf = (ps: PipelineState | undefined): string => {
-    if (ps === undefined) return "ps#default";
-    const cached = psContentIds.get(ps);
-    if (cached !== undefined) return cached;
-    const r = ps.rasterizer;
-    const parts: string[] = [
-      avalIdOf(r.topology),
-      avalIdOf(r.cullMode),
-      avalIdOf(r.frontFace),
-      avalIdOf(r.depthBias),
-      ps.depth !== undefined
-        ? `d:${avalIdOf(ps.depth.write)}:${avalIdOf(ps.depth.compare)}:${avalIdOf(ps.depth.clamp)}`
-        : "d:_",
-      ps.stencil !== undefined ? "s:1" : "s:_",
-      avalIdOf(ps.blends),
-      avalIdOf(ps.alphaToCoverage),
-      avalIdOf(ps.blendConstant),
-    ];
-    const key = `ps#${parts.join("|")}`;
-    psContentIds.set(ps, key);
-    return key;
-  };
+  // (psIdOf removed in Phase 5b — replaced by snapshotDescriptor +
+  // encodeModeKey at the findOrCreateBucket call site, which keys on
+  // the VALUE of the pipeline state rather than aval identity. The
+  // 20k-cvals-with-same-value pathology now collapses correctly.)
 
   /** Resolved (forced) snapshot of the user's PipelineState. */
   interface ResolvedPipelineState {
@@ -1448,8 +1431,17 @@ export function buildHeapScene(
       throw new Error("heapScene: findOrCreateBucket called before family build");
     }
     const fam = familyFor(effect);
-    const psKey = psIdOf(pipelineState);
-    const bk = `family#${fam.schema.id}|${psKey}`;
+    // ─── PS keying — VALUE based, not identity based ───────────────
+    // psIdOf used to hash by aval identity. That meant 20k ROs each
+    // constructed with `cval("back")` for cullMode hashed to 20k
+    // distinct keys → 20k buckets, all rendering with bitwise-
+    // identical state. Now the key is the bitfield-encoded modeKey
+    // (the actual value-set in the descriptor), so identical-value
+    // cvals collapse to ONE bucket. See docs/derived-modes.md and
+    // tests/heap-multi-pipeline-bucket.test.ts.
+    const psDescriptor = snapshotDescriptor(pipelineState, sig);
+    const psModeKey    = encodeModeKey(psDescriptor);
+    const bk = `family#${fam.schema.id}|mk#${psModeKey.toString(16)}`;
     const existing = bucketByKey.get(bk);
     if (existing !== undefined) return existing;
     const ps = resolvePipelineState(pipelineState);
