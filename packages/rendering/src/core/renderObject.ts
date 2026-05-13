@@ -67,4 +67,23 @@ export interface RenderObject {
   /** Index buffer for indexed draws. */
   readonly indices?: BufferView;
   readonly drawCall: aval<DrawCall>;
+  /**
+   * Per-axis derived-mode rules — `(u, declared) => modeValue`
+   * closures evaluated against this RO's uniforms at scene-build
+   * (and on reactive marks). See
+   * `@aardworx/wombat.rendering/runtime` — `derivedMode(...)`.
+   *
+   * A rule overrides the corresponding `pipelineState.rasterizer.*`
+   * (or `pipelineState.depth.*`) aval value. v1 evaluates rules
+   * CPU-side; v2 (deferred) lowers them to a GPU compute kernel.
+   * See `docs/derived-modes.md`.
+   */
+  readonly modeRules?: {
+    readonly cull?:           import("../runtime/derivedModes/rule.js").DerivedModeRule<"cull">;
+    readonly frontFace?:      import("../runtime/derivedModes/rule.js").DerivedModeRule<"frontFace">;
+    readonly topology?:       import("../runtime/derivedModes/rule.js").DerivedModeRule<"topology">;
+    readonly depthCompare?:   import("../runtime/derivedModes/rule.js").DerivedModeRule<"depthCompare">;
+    readonly depthWrite?:     import("../runtime/derivedModes/rule.js").DerivedModeRule<"depthWrite">;
+    readonly alphaToCoverage?: import("../runtime/derivedModes/rule.js").DerivedModeRule<"alphaToCoverage">;
+  };
 }

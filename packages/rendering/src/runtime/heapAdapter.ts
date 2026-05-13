@@ -349,5 +349,6 @@ export function renderObjectToHeapSpec(
     ...(dc.instanceCount > 1 ? { instanceCount: dc.instanceCount } : {}),
     indices,
     ...(textures !== undefined ? { textures } : {}),
+    ...(ro.modeRules !== undefined ? { modeRules: ro.modeRules } : {}),
   };
 }
