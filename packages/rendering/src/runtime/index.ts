@@ -130,7 +130,6 @@ export {
 export {
   derivedMode,
   isDerivedModeRule,
-  pickEnum,
   type DerivedModeRule,
   type DerivedModeOptions,
   type ModeAxis,
@@ -142,4 +141,4 @@ export {
   PARTITION_RECORD_BYTES,
 } from "./derivedModes/partitionKernelLayout.js";
 export { GpuPartitionScene, type PartitionSceneSpec } from "./derivedModes/partitionDispatcher.js";
-export { emitPartitionKernel, packModeKey, type RuleCodegenInput, type KernelCodegenSpec } from "./derivedModes/kernelCodegen.js";
+export { emitPartitionKernel, type RuleCodegenSpec, type KernelCodegenSpec } from "./derivedModes/kernelCodegen.js";

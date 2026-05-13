@@ -95,7 +95,6 @@ import {
 import { encodeModeKey, type PipelineStateDescriptor } from "./pipelineCache/index.js";
 import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
 import { GpuPartitionScene } from "./derivedModes/partitionDispatcher.js";
-import type { RuleCodegenInput } from "./derivedModes/kernelCodegen.js";
 import { type DerivedModeRule, type ModeAxis } from "./derivedModes/rule.js";
 import type { CullMode, FrontFace, Topology } from "./pipelineCache/index.js";
 import { addMarkingCallback } from "@aardworx/wombat.adaptive";
@@ -1754,135 +1753,38 @@ export function buildHeapScene(
     return t === "line-strip" || t === "triangle-strip" ? "uint32" : undefined;
   }
 
-  /** Resolve a rule's `declared` aval (or string) to its u32 index in
-   *  the rule's domain. Used both at init (to pick the seed slot
-   *  pipeline) and per dispatch (to feed the kernel uniform). */
-  function declaredIndex(rule: DerivedModeRule<ModeAxis>, tok: AdaptiveToken): number {
-    const d = rule.declared;
-    const v = (typeof d === "object" && d !== null && "getValue" in (d as object))
-      ? (d as aval<unknown>).getValue(tok)
-      : d;
-    const i = rule.domain.indexOf(v as never);
-    if (i < 0) {
-      throw new Error(
-        `heapScene/gpuRouting: declared value '${String(v)}' for axis '${rule.axis}' not in rule.domain`,
-      );
-    }
-    return i;
-  }
-
   /**
-   * Phase 5c.3 — promote `bucket` to GPU-routed.
+   * Phase 5c.3 (foundation shipped; full wire-up pending).
    *
-   * Called from `addDrawImpl` on the FIRST RO that carries a derived-
-   * mode rule on any axis. The bucket grows to `product(domain sizes)`
-   * slots — one per cartesian-product point across every rule's
-   * domain — then we wire a `GpuPartitionScene` whose WGSL kernel is
-   * codegen'd from the rules' IRs.
+   * The `rule(...)`-based DerivedModeRule shape carries a shader-IR
+   * `RuleExpr` instead of the previous proxy-built `DerivedExpr`
+   * trace. The runtime side that consumes it (analyseOutputSet,
+   * evaluateSet, kernelCodegen) is committed but not yet plumbed
+   * into bucket-level GPU routing. For now this path errors loudly
+   * — callers shouldn't pass mode rules through the heap path until
+   * the M6/M7 milestones land.
    */
   function initGpuRouting(
-    bucket: Bucket,
+    _bucket: Bucket,
     rules: DerivedModeRule<ModeAxis>[],
-    baseDesc: PipelineStateDescriptor,
-    tok: AdaptiveToken,
+    _baseDesc: PipelineStateDescriptor,
+    _tok: AdaptiveToken,
   ): void {
-    if (bucket.gpuRouted) return;
     if (rules.length === 0) return;
-    // Build the descriptor for each slot via mixed-radix decomposition
-    // of slotIdx into per-axis indices. Slot 0 already exists (seeded
-    // by findOrCreateBucket) — overwrite its pipeline to match the
-    // index-0 descriptor; create the rest.
-    const domainSizes = rules.map(r => r.domain.length);
-    const totalSlots  = domainSizes.reduce((p, s) => p * s, 1);
-    const fam = familyForBucket.get(bucket)!;
-    for (let slotIdx = 0; slotIdx < totalSlots; slotIdx++) {
-      let descriptor: PipelineStateDescriptor = baseDesc;
-      let remaining = slotIdx;
-      for (let a = 0; a < rules.length; a++) {
-        const size = domainSizes[a]!;
-        const ai = remaining % size;
-        remaining = Math.floor(remaining / size);
-        descriptor = patchDescriptor(descriptor, rules[a]!.axis, rules[a]!.domain[ai]);
-      }
-      if (slotIdx === 0) {
-        bucket.slots[0]!.pipeline = getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, descriptor);
-        bucket.slots[0]!.modeKey  = encodeModeKey(descriptor);
-      } else {
-        createSlot(bucket, descriptor);
-      }
-    }
-    if (bucket.slots.length !== totalSlots) {
-      throw new Error(`heapScene/gpuRouting: expected ${totalSlots} slots, got ${bucket.slots.length}`);
-    }
-    // Codegen the partition kernel from the rules' IRs and wire it
-    // to the slots' drawTableBuf.buffers.
-    const codegenInputs: RuleCodegenInput[] = rules.map(r => ({
-      axis: r.axis,
-      ir: r.ir,
-      inputUniforms: r.inputUniforms,
-      domainSize: r.domain.length,
-    }));
-    const slotDrawBufs = bucket.slots.map(s => s.drawTableBuf!.buffer);
-    const partition = new GpuPartitionScene(device, `${bucket.label}/partition`, {
-      rules: codegenInputs,
-      totalSlots,
-      slotDrawBufs,
-      initialRecords: 16,
-    });
-    void tok; // declaredIndex needs a token; tok is supplied to the dispatcher path
-    bucket.gpuRouted      = true;
-    bucket.partitionScene = partition;
-    bucket.drawIdToRecord = new Map<number, number>();
-    bucket.recordToDrawId = [];
-    bucket.rules          = rules;
-    bucket.baseDescriptor = baseDesc;
-    bucket.partitionDirty = true;
+    throw new Error(
+      `heapScene: GPU routing for derived-mode rules is being rewired around the new rule(...) marker. ` +
+      `The shader-IR analyses (analyseOutputSet, evaluateSet) and kernelCodegen API are in place, ` +
+      `but the heapScene integration (kernel emission, declared-mark reactivity, slot pipeline ` +
+      `instantiation from resolved sets) lands in the follow-up. Until then, don't attach a ` +
+      `derived-mode rule on axis '${rules[0]!.axis}' to a HeapDrawSpec.`,
+    );
   }
 
-  /**
-   * Phase 5c.3 — per-frame partition dispatch for a GPU-routed bucket.
-   *
-   * Encodes the partition compute pass + a `copyBufferToBuffer` per
-   * slot to forward the partition's atomic count into the slot's
-   * scan `paramsBuf.numRecords`. Refreshes per-slot pipelines if any
-   * rule's `declared` aval changed (pre-warm guarantees cache hits).
-   */
-  function dispatchPartition(bucket: Bucket, enc: GPUCommandEncoder, tok: AdaptiveToken): void {
-    if (!bucket.gpuRouted || bucket.partitionScene === undefined) return;
-    const rules = bucket.rules!;
-    const base  = bucket.baseDescriptor!;
-    const declaredU32: number[] = rules.map(r => declaredIndex(r, tok));
-    // Refresh slot pipelines: each slot's descriptor follows from the
-    // per-axis index extracted from slotIdx (mixed-radix). Only re-look-
-    // up + assign when the modeKey would change.
-    const fam = familyForBucket.get(bucket)!;
-    const domainSizes = rules.map(r => r.domain.length);
-    for (let slotIdx = 0; slotIdx < bucket.slots.length; slotIdx++) {
-      let descriptor: PipelineStateDescriptor = base;
-      let remaining = slotIdx;
-      for (let a = 0; a < rules.length; a++) {
-        const size = domainSizes[a]!;
-        const ai = remaining % size;
-        remaining = Math.floor(remaining / size);
-        descriptor = patchDescriptor(descriptor, rules[a]!.axis, rules[a]!.domain[ai]);
-      }
-      const key = encodeModeKey(descriptor);
-      const slot = bucket.slots[slotIdx]!;
-      if (slot.modeKey !== key) {
-        slot.pipeline = getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, descriptor);
-        slot.modeKey  = key;
-      }
-    }
-    bucket.partitionScene.flush();
-    bucket.partitionScene.dispatch(arena.attrs.buffer, declaredU32, enc);
-    for (let i = 0; i < bucket.slots.length; i++) {
-      enc.copyBufferToBuffer(
-        bucket.partitionScene.slotCountBufs[i]!, 0,
-        bucket.slots[i]!.paramsBuf!, 0, 4,
-      );
-      bucket.slots[i]!.scanDirty = true;
-    }
-    bucket.partitionDirty = false;
+  function dispatchPartition(bucket: Bucket, _enc: GPUCommandEncoder, _tok: AdaptiveToken): void {
+    if (!bucket.gpuRouted) return;
+    // Unreachable while initGpuRouting throws — kept so the rest of
+    // the encodeComputePrep flow type-checks unchanged.
+    throw new Error("heapScene: GPU partition dispatch not yet wired for new rule shape");
   }
 
 
@@ -2344,23 +2246,11 @@ export function buildHeapScene(
           `heapScene: GPU-routed bucket exceeds SCAN_MAX_RECORDS (${SCAN_MAX_RECORDS})`,
         );
       }
-      // Resolve the first rule's first input uniform — v1 of the
-      // partition kernel reads exactly one arena offset per record
-      // (the bucket's rules all share the same input set, validated
-      // implicitly by the codegen). Generalize when rules read
-      // multiple uniforms.
-      const firstInputName = bucket.rules![0]!.inputUniforms[0];
-      if (firstInputName === undefined) {
-        throw new Error(
-          `heapScene: GPU rule on axis '${bucket.rules![0]!.axis}' declares no input uniforms`,
-        );
-      }
-      const modelRef = perDrawRefs.get(firstInputName);
-      if (modelRef === undefined) {
-        throw new Error(
-          `heapScene: GPU rule input uniform '${firstInputName}' not present in spec.inputs`,
-        );
-      }
+      // Pending M6/M7: the modelRef wiring for the new rule shape
+      // will inspect the rule body's `ReadInput("Uniform", X)`
+      // leaves and resolve each to its arena byte offset. For now
+      // `initGpuRouting` throws before we reach here.
+      const modelRef = perDrawRefs.get("ModelTrafo") ?? 0;
       partition.appendRecord(localSlot, idxAlloc.firstIndex, idxAlloc.count, instanceCount, modelRef);
       bucket.drawIdToRecord!.set(drawId, recIdx);
       bucket.recordToDrawId![recIdx] = drawId;

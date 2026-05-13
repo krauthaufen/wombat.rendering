@@ -49,27 +49,79 @@ function intrinsicExpr(name: string, type: Type, args: readonly Expr[]): Expr {
   };
 }
 
-/** A traced expression in a `derivedUniform` builder. */
+/** Convertible-to-DerivedExpr operand. `aardvark-operators` rewrites
+ *  e.g. `det < 0` to `det.lt(0)` — so every binary method accepts a
+ *  raw number and lifts it to a Const matching the receiver's
+ *  numeric type (f32 / u32 / i32). */
+export type DerivedOperand = DerivedExpr | number;
+
+/** True iff `t` is a numeric scalar IR type (Float / Int). */
+function isNumericScalar(t: Type): boolean {
+  return t.kind === "Float" || t.kind === "Int";
+}
+/** Element type for scalar arithmetic: scalar types pass through,
+ *  vector/matrix types unwrap to their element type, anything else
+ *  defaults to f32 (the natural numeric on the GPU side). */
+function scalarLiftType(t: Type): Type {
+  if (isNumericScalar(t)) return t;
+  if (t.kind === "Vector" || t.kind === "Matrix") return t.element;
+  return Tf32;
+}
+function liftConst(value: number, target: Type): Expr {
+  if (target.kind === "Int") {
+    if (target.signed) {
+      return { kind: "Const", type: target, value: { kind: "Int", value: value | 0, signed: true } } as Expr;
+    }
+    return { kind: "Const", type: target, value: { kind: "Int", value: value >>> 0, signed: false } } as Expr;
+  }
+  // Default: f32 const.
+  return { kind: "Const", type: Tf32, value: { kind: "Float", value } } as Expr;
+}
+/** Coerce `DerivedOperand` to a DerivedExpr, lifting raw numbers to a
+ *  Const expression whose type matches the receiver's scalar type. */
+function lift(other: DerivedOperand, receiverType: Type): DerivedExpr {
+  if (other instanceof DerivedExpr) return other;
+  return new DerivedExpr(liftConst(other, scalarLiftType(receiverType)));
+}
+
+/**
+ * A traced expression in a `derivedUniform` / `derivedMode` builder.
+ *
+ * Plays nicely with `boperators` (https://npmjs.com/package/boperators):
+ * the named-static operator methods (`static ["+"]`, `static ["*"]`,
+ * `static ["<"]`, …) make `a + b`, `a * b`, `a < b`, etc. on
+ * DerivedExprs rewrite to those statics at build time. Without the
+ * plugin, the same logic is reachable via the instance methods
+ * (`.add`, `.mul`, `.lt`, …).
+ *
+ * Ternary `a < b ? x : y` isn't rewritten — call `.select` on the
+ * resulting bool DerivedExpr:
+ *
+ *     (det < 0).select(flipped, declared)
+ */
 export class DerivedExpr {
   constructor(readonly ir: Expr) {}
   get type(): Type { return this.ir.type; }
 
   /** Matrix product `this · other` (also matrix·vector / vector·matrix by operand types). */
-  mul(other: DerivedExpr): DerivedExpr {
-    const a = this.ir.type, b = other.ir.type;
+  mul(other: DerivedOperand): DerivedExpr {
+    const o = lift(other, this.ir.type);
+    const a = this.ir.type, b = o.ir.type;
     if (a.kind === "Matrix" && b.kind === "Matrix") {
-      return new DerivedExpr({ kind: "MulMatMat", lhs: this.ir, rhs: other.ir, type: { kind: "Matrix", element: a.element, rows: a.rows, cols: b.cols } });
+      return new DerivedExpr({ kind: "MulMatMat", lhs: this.ir, rhs: o.ir, type: { kind: "Matrix", element: a.element, rows: a.rows, cols: b.cols } });
     }
     if (a.kind === "Matrix" && b.kind === "Vector") {
-      return new DerivedExpr({ kind: "MulMatVec", lhs: this.ir, rhs: other.ir, type: { kind: "Vector", element: b.element, dim: a.rows } });
+      return new DerivedExpr({ kind: "MulMatVec", lhs: this.ir, rhs: o.ir, type: { kind: "Vector", element: b.element, dim: a.rows } });
     }
     if (a.kind === "Vector" && b.kind === "Matrix") {
-      return new DerivedExpr({ kind: "MulVecMat", lhs: this.ir, rhs: other.ir, type: { kind: "Vector", element: a.element, dim: b.cols } });
+      return new DerivedExpr({ kind: "MulVecMat", lhs: this.ir, rhs: o.ir, type: { kind: "Vector", element: a.element, dim: b.cols } });
     }
-    return new DerivedExpr({ kind: "Mul", lhs: this.ir, rhs: other.ir, type: a.kind === "Float" ? b : a });
+    return new DerivedExpr({ kind: "Mul", lhs: this.ir, rhs: o.ir, type: a.kind === "Float" || a.kind === "Int" ? b : a });
   }
-  add(other: DerivedExpr): DerivedExpr { return new DerivedExpr({ kind: "Add", lhs: this.ir, rhs: other.ir, type: this.ir.type }); }
-  sub(other: DerivedExpr): DerivedExpr { return new DerivedExpr({ kind: "Sub", lhs: this.ir, rhs: other.ir, type: this.ir.type }); }
+  add(other: DerivedOperand): DerivedExpr { const o = lift(other, this.ir.type); return new DerivedExpr({ kind: "Add", lhs: this.ir, rhs: o.ir, type: this.ir.type }); }
+  sub(other: DerivedOperand): DerivedExpr { const o = lift(other, this.ir.type); return new DerivedExpr({ kind: "Sub", lhs: this.ir, rhs: o.ir, type: this.ir.type }); }
+  div(other: DerivedOperand): DerivedExpr { const o = lift(other, this.ir.type); return new DerivedExpr({ kind: "Div", lhs: this.ir, rhs: o.ir, type: this.ir.type }); }
+  mod(other: DerivedOperand): DerivedExpr { const o = lift(other, this.ir.type); return new DerivedExpr({ kind: "Mod", lhs: this.ir, rhs: o.ir, type: this.ir.type }); }
   neg(): DerivedExpr { return new DerivedExpr({ kind: "Neg", value: this.ir, type: this.ir.type }); }
 
   /** Inverse (of a constituent trafo this reads its stored backward half; otherwise unsupported in codegen). */
@@ -130,36 +182,52 @@ export class DerivedExpr {
   log2(): DerivedExpr { return this.u1("log2"); }
   sign(): DerivedExpr { return this.u1("sign"); }
   normalize(): DerivedExpr { return this.u1("normalize"); }
-  min(o: DerivedExpr): DerivedExpr { return this.bin("min", o); }
-  max(o: DerivedExpr): DerivedExpr { return this.bin("max", o); }
-  pow(o: DerivedExpr): DerivedExpr { return this.bin("pow", o); }
-  atan2(o: DerivedExpr): DerivedExpr { return this.bin("atan2", o); }
-  step(edge: DerivedExpr): DerivedExpr { return new DerivedExpr(intrinsicExpr("step", this.ir.type, [edge.ir, this.ir])); }
-  clamp(lo: DerivedExpr, hi: DerivedExpr): DerivedExpr { return new DerivedExpr(intrinsicExpr("clamp", this.ir.type, [this.ir, lo.ir, hi.ir])); }
-  mix(o: DerivedExpr, t: DerivedExpr): DerivedExpr { return new DerivedExpr(intrinsicExpr("mix", this.ir.type, [this.ir, o.ir, t.ir])); }
+  min(o: DerivedOperand): DerivedExpr { return this.bin("min", lift(o, this.ir.type)); }
+  max(o: DerivedOperand): DerivedExpr { return this.bin("max", lift(o, this.ir.type)); }
+  pow(o: DerivedOperand): DerivedExpr { return this.bin("pow", lift(o, this.ir.type)); }
+  atan2(o: DerivedOperand): DerivedExpr { return this.bin("atan2", lift(o, this.ir.type)); }
+  step(edge: DerivedOperand): DerivedExpr { const e = lift(edge, this.ir.type); return new DerivedExpr(intrinsicExpr("step", this.ir.type, [e.ir, this.ir])); }
+  clamp(lo: DerivedOperand, hi: DerivedOperand): DerivedExpr { const l = lift(lo, this.ir.type); const h = lift(hi, this.ir.type); return new DerivedExpr(intrinsicExpr("clamp", this.ir.type, [this.ir, l.ir, h.ir])); }
+  mix(o: DerivedOperand, t: DerivedOperand): DerivedExpr { const oo = lift(o, this.ir.type); const tt = lift(t, this.ir.type); return new DerivedExpr(intrinsicExpr("mix", this.ir.type, [this.ir, oo.ir, tt.ir])); }
   dot(o: DerivedExpr): DerivedExpr { return new DerivedExpr(intrinsicExpr("dot", elemOf(this.ir.type), [this.ir, o.ir])); }
   cross(o: DerivedExpr): DerivedExpr { return new DerivedExpr(intrinsicExpr("cross", this.ir.type, [this.ir, o.ir])); }
   length(): DerivedExpr { return new DerivedExpr(intrinsicExpr("length", elemOf(this.ir.type), [this.ir])); }
   distance(o: DerivedExpr): DerivedExpr { return new DerivedExpr(intrinsicExpr("distance", elemOf(this.ir.type), [this.ir, o.ir])); }
   reflect(n: DerivedExpr): DerivedExpr { return new DerivedExpr(intrinsicExpr("reflect", this.ir.type, [this.ir, n.ir])); }
 
-  // ── Comparisons (produce a bool DerivedExpr). Use these to feed `select`. ──
-  private cmp(kind: "Eq" | "Neq" | "Lt" | "Le" | "Gt" | "Ge", other: DerivedExpr): DerivedExpr {
-    const ir = { kind, lhs: this.ir, rhs: other.ir, type: { kind: "Bool" } as Type } as Expr;
+  // ── Comparisons (produce a bool DerivedExpr). Receivers + arg can be
+  //    raw numbers — `aardvark-operators` lifts `a < 2` to `a.lt(2)`,
+  //    and we lift `2` to a const matching the receiver's scalar type. ──
+  private cmp(kind: "Eq" | "Neq" | "Lt" | "Le" | "Gt" | "Ge", other: DerivedOperand): DerivedExpr {
+    const o = lift(other, this.ir.type);
+    const ir = { kind, lhs: this.ir, rhs: o.ir, type: { kind: "Bool" } as Type } as Expr;
     return new DerivedExpr(ir);
   }
-  eq(o: DerivedExpr): DerivedExpr { return this.cmp("Eq", o); }
-  ne(o: DerivedExpr): DerivedExpr { return this.cmp("Neq", o); }
-  lt(o: DerivedExpr): DerivedExpr { return this.cmp("Lt", o); }
-  le(o: DerivedExpr): DerivedExpr { return this.cmp("Le", o); }
-  gt(o: DerivedExpr): DerivedExpr { return this.cmp("Gt", o); }
-  ge(o: DerivedExpr): DerivedExpr { return this.cmp("Ge", o); }
+  eq(o: DerivedOperand): DerivedExpr { return this.cmp("Eq", o); }
+  ne(o: DerivedOperand): DerivedExpr { return this.cmp("Neq", o); }
+  lt(o: DerivedOperand): DerivedExpr { return this.cmp("Lt", o); }
+  le(o: DerivedOperand): DerivedExpr { return this.cmp("Le", o); }
+  gt(o: DerivedOperand): DerivedExpr { return this.cmp("Gt", o); }
+  ge(o: DerivedOperand): DerivedExpr { return this.cmp("Ge", o); }
 
-  /** `select(this_when_true, else_when_false, cond)` — WGSL ternary. The
-   *  receiver supplies the "true" branch; pass the "false" branch + a
-   *  bool DerivedExpr as the condition. */
-  select(ifFalse: DerivedExpr, cond: DerivedExpr): DerivedExpr {
-    const ir = { kind: "Conditional", cond: cond.ir, ifTrue: this.ir, ifFalse: ifFalse.ir, type: this.ir.type } as Expr;
+  /**
+   * Ternary select. The RECEIVER must be a bool — typically the
+   * result of a comparison — and the args are the then / else
+   * branches:
+   *
+   *     (det < 0).select(flipped, declared)   // det<0 ? flipped : declared
+   *
+   * The result type follows `then` (which must be widening-
+   * compatible with `else`). Raw numbers are lifted using `then`'s
+   * type when `then` is a DerivedExpr, else f32.
+   */
+  select(thenE: DerivedOperand, elseE: DerivedOperand): DerivedExpr {
+    if (this.ir.type.kind !== "Bool") {
+      throw new Error("DerivedExpr.select(then, else): receiver must be a bool (typically a comparison)");
+    }
+    const t = thenE instanceof DerivedExpr ? thenE : lift(thenE, elseE instanceof DerivedExpr ? elseE.ir.type : Tf32);
+    const e = elseE instanceof DerivedExpr ? elseE : lift(elseE, t.ir.type);
+    const ir = { kind: "Conditional", cond: this.ir, ifTrue: t.ir, ifFalse: e.ir, type: t.ir.type } as Expr;
     return new DerivedExpr(ir);
   }
 
@@ -181,6 +249,92 @@ export class DerivedExpr {
   }
   static i32(value: number): DerivedExpr {
     return new DerivedExpr({ kind: "Const", type: Ti32, value: { kind: "Int", value: value | 0, signed: true } } as Expr);
+  }
+
+  // ─── boperators static dispatch ──────────────────────────────────────
+  // `a OP b` (where at least one operand is a DerivedExpr) is rewritten
+  // by the boperators plugin to `DerivedExpr["OP"](a, b)`. Either-order
+  // overloads (`number OP expr`, `expr OP number`) are handled by lifting
+  // the raw number to a Const matching the other operand's scalar type.
+
+  static "+"(a: DerivedExpr, b: DerivedExpr): DerivedExpr;
+  static "+"(a: DerivedExpr, b: number): DerivedExpr;
+  static "+"(a: number, b: DerivedExpr): DerivedExpr;
+  static "+"(a: DerivedOperand, b: DerivedOperand): DerivedExpr {
+    const x = a instanceof DerivedExpr ? a : lift(a, (b as DerivedExpr).ir.type);
+    return x.add(b);
+  }
+  static "-"(a: DerivedExpr, b: DerivedExpr): DerivedExpr;
+  static "-"(a: DerivedExpr, b: number): DerivedExpr;
+  static "-"(a: number, b: DerivedExpr): DerivedExpr;
+  static "-"(a: DerivedExpr): DerivedExpr; // unary minus
+  static "-"(a: DerivedOperand, b?: DerivedOperand): DerivedExpr {
+    if (b === undefined) return (a as DerivedExpr).neg();
+    const x = a instanceof DerivedExpr ? a : lift(a, (b as DerivedExpr).ir.type);
+    return x.sub(b);
+  }
+  static "*"(a: DerivedExpr, b: DerivedExpr): DerivedExpr;
+  static "*"(a: DerivedExpr, b: number): DerivedExpr;
+  static "*"(a: number, b: DerivedExpr): DerivedExpr;
+  static "*"(a: DerivedOperand, b: DerivedOperand): DerivedExpr {
+    const x = a instanceof DerivedExpr ? a : lift(a, (b as DerivedExpr).ir.type);
+    return x.mul(b);
+  }
+  static "/"(a: DerivedExpr, b: DerivedExpr): DerivedExpr;
+  static "/"(a: DerivedExpr, b: number): DerivedExpr;
+  static "/"(a: number, b: DerivedExpr): DerivedExpr;
+  static "/"(a: DerivedOperand, b: DerivedOperand): DerivedExpr {
+    const x = a instanceof DerivedExpr ? a : lift(a, (b as DerivedExpr).ir.type);
+    return x.div(b);
+  }
+  static "%"(a: DerivedExpr, b: DerivedExpr): DerivedExpr;
+  static "%"(a: DerivedExpr, b: number): DerivedExpr;
+  static "%"(a: number, b: DerivedExpr): DerivedExpr;
+  static "%"(a: DerivedOperand, b: DerivedOperand): DerivedExpr {
+    const x = a instanceof DerivedExpr ? a : lift(a, (b as DerivedExpr).ir.type);
+    return x.mod(b);
+  }
+  static "<"(a: DerivedExpr, b: DerivedExpr): DerivedExpr;
+  static "<"(a: DerivedExpr, b: number): DerivedExpr;
+  static "<"(a: number, b: DerivedExpr): DerivedExpr;
+  static "<"(a: DerivedOperand, b: DerivedOperand): DerivedExpr {
+    const x = a instanceof DerivedExpr ? a : lift(a, (b as DerivedExpr).ir.type);
+    return x.lt(b);
+  }
+  static "<="(a: DerivedExpr, b: DerivedExpr): DerivedExpr;
+  static "<="(a: DerivedExpr, b: number): DerivedExpr;
+  static "<="(a: number, b: DerivedExpr): DerivedExpr;
+  static "<="(a: DerivedOperand, b: DerivedOperand): DerivedExpr {
+    const x = a instanceof DerivedExpr ? a : lift(a, (b as DerivedExpr).ir.type);
+    return x.le(b);
+  }
+  static ">"(a: DerivedExpr, b: DerivedExpr): DerivedExpr;
+  static ">"(a: DerivedExpr, b: number): DerivedExpr;
+  static ">"(a: number, b: DerivedExpr): DerivedExpr;
+  static ">"(a: DerivedOperand, b: DerivedOperand): DerivedExpr {
+    const x = a instanceof DerivedExpr ? a : lift(a, (b as DerivedExpr).ir.type);
+    return x.gt(b);
+  }
+  static ">="(a: DerivedExpr, b: DerivedExpr): DerivedExpr;
+  static ">="(a: DerivedExpr, b: number): DerivedExpr;
+  static ">="(a: number, b: DerivedExpr): DerivedExpr;
+  static ">="(a: DerivedOperand, b: DerivedOperand): DerivedExpr {
+    const x = a instanceof DerivedExpr ? a : lift(a, (b as DerivedExpr).ir.type);
+    return x.ge(b);
+  }
+  static "=="(a: DerivedExpr, b: DerivedExpr): DerivedExpr;
+  static "=="(a: DerivedExpr, b: number): DerivedExpr;
+  static "=="(a: number, b: DerivedExpr): DerivedExpr;
+  static "=="(a: DerivedOperand, b: DerivedOperand): DerivedExpr {
+    const x = a instanceof DerivedExpr ? a : lift(a, (b as DerivedExpr).ir.type);
+    return x.eq(b);
+  }
+  static "!="(a: DerivedExpr, b: DerivedExpr): DerivedExpr;
+  static "!="(a: DerivedExpr, b: number): DerivedExpr;
+  static "!="(a: number, b: DerivedExpr): DerivedExpr;
+  static "!="(a: DerivedOperand, b: DerivedOperand): DerivedExpr {
+    const x = a instanceof DerivedExpr ? a : lift(a, (b as DerivedExpr).ir.type);
+    return x.ne(b);
   }
 }
 

@@ -15,14 +15,14 @@
 // slot's drawTable that the partition just populated.
 
 import { PARTITION_RECORD_BYTES, PARTITION_RECORD_U32 } from "./partitionKernelLayout.js";
-import { emitPartitionKernel, type RuleCodegenInput } from "./kernelCodegen.js";
+import { emitPartitionKernel, type RuleCodegenSpec } from "./kernelCodegen.js";
 
 const WG_SIZE = 64;
 const POW2 = (n: number): number => { let p = 1; while (p < n) p <<= 1; return Math.max(64, p); };
 
 export interface PartitionSceneSpec {
   /** One per axis-with-rule on this bucket. */
-  readonly rules: ReadonlyArray<RuleCodegenInput>;
+  readonly rules: ReadonlyArray<RuleCodegenSpec>;
   /** Total slot count = product of rule.domainSize. Must equal slotDrawBufs.length. */
   readonly totalSlots: number;
   /** Externally-owned slot draw buffers (one per slot). */

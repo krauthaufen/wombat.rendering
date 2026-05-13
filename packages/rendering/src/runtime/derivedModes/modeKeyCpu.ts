@@ -240,20 +240,15 @@ export class ModeKeyTracker implements IDisposable {
       }
       if (ps.alphaToCoverage !== undefined) visit(ps.alphaToCoverage);
     }
-    // Phase 5c.3: rule-input deps are statically known from each
-    // rule's `inputUniforms`. Look each name up in `uniformAvals`
-    // (the per-RO `spec.inputs` aval map) and visit. Also visit
-    // each rule's `declared` if it's an aval.
+    // Phase 5c.3: rule-input deps will be walked from the rule's
+    // shader-IR body (analyseInputUniforms — pending M6/M7 wire-up).
+    // For now we only visit `declared` if it's an aval — leaves
+    // referenced from the rule body don't trigger partition re-
+    // dispatch until the heap side reads the IR. Hidden behind the
+    // initGpuRouting stub that throws on attached rules.
     if (this.modeRules !== undefined) {
-      const uMap = this.uniformAvals;
       for (const rule of Object.values(this.modeRules) as DerivedModeRule[]) {
         if (rule === undefined) continue;
-        if (uMap !== undefined) {
-          for (const name of rule.inputUniforms) {
-            const av = uMap.get(name);
-            if (av !== undefined) visit(av);
-          }
-        }
         const d = rule.declared;
         if (typeof d === "object" && d !== null && "getValue" in (d as object)) {
           visit(d as aval<unknown>);
