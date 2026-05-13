@@ -112,3 +112,8 @@ export {
   ModeKeyTracker,
   snapshotDescriptor,
 } from "./derivedModes/modeKeyCpu.js";
+
+export {
+  SlotTable,
+  type SlotTableEntry,
+} from "./derivedModes/slotTable.js";
