@@ -48,17 +48,17 @@ export function snapshotDescriptor(
   }
   const r = ps.rasterizer;
   const depth = ps.depth !== undefined ? snapshotDepth(ps.depth, signature) : undefined;
-  const atc = ps.alphaToCoverage !== undefined ? ps.alphaToCoverage.force() : false;
-  const blends = ps.blends !== undefined ? ps.blends.force() : undefined;
+  const atc = ps.alphaToCoverage !== undefined ? ps.alphaToCoverage.force(/* allow-force */) : false;
+  const blends = ps.blends !== undefined ? ps.blends.force(/* allow-force */) : undefined;
   const attachments: AttachmentBlend[] = signature.colorNames.map((name) => {
     const b = blends?.tryFind(name);
     return b !== undefined ? snapshotAttachment(b) : DEFAULT_ATTACHMENT_BLEND;
   });
   const out: PipelineStateDescriptor = {
-    topology:         r.topology.force(),
-    stripIndexFormat: stripFormatFor(r.topology.force()),
-    frontFace:        r.frontFace.force(),
-    cullMode:         r.cullMode.force(),
+    topology:         r.topology.force(/* allow-force */),
+    stripIndexFormat: stripFormatFor(r.topology.force(/* allow-force */)),
+    frontFace:        r.frontFace.force(/* allow-force */),
+    cullMode:         r.cullMode.force(/* allow-force */),
     ...(depth !== undefined ? { depth } : {}),
     attachments,
     alphaToCoverage: atc,
@@ -80,16 +80,16 @@ function buildAttachmentsFor(
 function snapshotDepth(d: DepthState, signature: FramebufferSignature): DepthSlice | undefined {
   if (signature.depthStencil === undefined) return undefined;
   return {
-    write:   d.write.force(),
-    compare: d.compare.force(),
-    clamp:   d.clamp !== undefined ? d.clamp.force() : false,
+    write:   d.write.force(/* allow-force */),
+    compare: d.compare.force(/* allow-force */),
+    clamp:   d.clamp !== undefined ? d.clamp.force(/* allow-force */) : false,
   };
 }
 
 function snapshotAttachment(b: PsBlendState): AttachmentBlend {
   const color = snapshotBlendComponent(b.color);
   const alpha = snapshotBlendComponent(b.alpha);
-  const writeMask = b.writeMask.force() & 0xF;
+  const writeMask = b.writeMask.force(/* allow-force */) & 0xF;
   // "Blend enabled" derives from whether the components differ from
   // the no-op (src=one, dst=zero, op=add) shape. This mirrors WebGPU's
   // contract: a blend descriptor MUST be present for blending to occur,
@@ -102,9 +102,9 @@ function snapshotAttachment(b: PsBlendState): AttachmentBlend {
 
 function snapshotBlendComponent(c: PsBlendComponentState): BlendComponent {
   return {
-    srcFactor: c.srcFactor.force(),
-    dstFactor: c.dstFactor.force(),
-    operation: c.operation.force(),
+    srcFactor: c.srcFactor.force(/* allow-force */),
+    dstFactor: c.dstFactor.force(/* allow-force */),
+    operation: c.operation.force(/* allow-force */),
   };
 }
 
@@ -189,7 +189,7 @@ export class ModeKeyTracker implements IDisposable {
     }
     if (ps.blends !== undefined) {
       this.sub(ps.blends);
-      const map = ps.blends.force();
+      const map = ps.blends.force(/* allow-force */);
       for (const [, bs] of map) this.subBlendState(bs);
     }
     if (ps.alphaToCoverage !== undefined) this.sub(ps.alphaToCoverage);
