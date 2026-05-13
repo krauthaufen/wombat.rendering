@@ -49,21 +49,15 @@ describe("derivedModes/gpuFlipCullByDeterminant", () => {
 
   it("CPU fallback correctly flips by determinant sign", () => {
     const rule = gpuFlipCullByDeterminant("ModelTrafo", "back");
-    // Row-major identity → det = 1 → no flip.
-    const identity = { forward: { _data: new Float64Array([
-      1, 0, 0, 0,
-      0, 1, 0, 0,
-      0, 0, 1, 0,
-      0, 0, 0, 1,
-    ]) } };
+    // Trafo3d shape: { forward: M44d-like with M00..M33 getters }
+    const identity = { forward: {
+      M00: 1, M01: 0, M02: 0, M10: 0, M11: 1, M12: 0, M20: 0, M21: 0, M22: 1,
+    } };
     expect(rule.evaluate({ ModelTrafo: identity }, "back")).toBe("back");
     // -1 scale on x → det = -1 → flip.
-    const mirroredX = { forward: { _data: new Float64Array([
-      -1, 0, 0, 0,
-       0, 1, 0, 0,
-       0, 0, 1, 0,
-       0, 0, 0, 1,
-    ]) } };
+    const mirroredX = { forward: {
+      M00: -1, M01: 0, M02: 0, M10: 0, M11: 1, M12: 0, M20: 0, M21: 0, M22: 1,
+    } };
     expect(rule.evaluate({ ModelTrafo: mirroredX }, "back")).toBe("front");
     expect(rule.evaluate({ ModelTrafo: mirroredX }, "front")).toBe("back");
     // 'none' is preserved.

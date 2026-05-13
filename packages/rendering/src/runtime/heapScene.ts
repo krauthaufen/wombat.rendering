@@ -1945,6 +1945,9 @@ export function buildHeapScene(
     const roDescriptor = precomputedDescriptor ?? snapshotDescriptor(spec.pipelineState, sig);
     const roSlot       = ensureSlot(bucket, roDescriptor);
     const roSlotIdx    = bucket.slots.indexOf(roSlot);
+    if (spec.modeRules !== undefined && drawId < 8) {
+      console.debug(`[heapScene] addDraw drawId=${drawId} bucket=${bucket.label} slotIdx=${roSlotIdx}/${bucket.slots.length} cullMode=${roDescriptor.cullMode} recordCount=${roSlot.recordCount}`);
+    }
     const fam = familyFor(spec.effect);
     const effectFields = fam.fieldsForEffect.get(spec.effect.id)!;
 
@@ -2665,22 +2668,25 @@ export function buildHeapScene(
    * begin/end — caller owns the pass. Used by both the convenience
    * `frame()` below and (eventually) the hybrid render task.
    */
+  let _encodeLogged = false;
   function encodeIntoPass(pass: GPURenderPassEncoder): void {
     let curBg: GPUBindGroup | null = null;
+    let drawCount = 0;
+    const slotInfo: string[] = [];
     for (const b of buckets) {
-      // Phase 5c.2: iterate the bucket's slots, drawIndirect per
-      // non-empty slot. Empty slots draw zero (skip — saves the
-      // setPipeline/setBindGroup overhead).
-      for (const slot of b.slots) {
+      for (let i = 0; i < b.slots.length; i++) {
+        const slot = b.slots[i]!;
+        slotInfo.push(`b=${b.label.slice(7, 15)} s=${i} rc=${slot.recordCount} bg=${slot.bindGroup !== undefined ? 'Y' : 'N'} ib=${slot.indirectBuf !== undefined ? 'Y' : 'N'}`);
         if (slot.recordCount === 0) continue;
         const bg = slot.bindGroup;
-        if (bg !== undefined && bg !== curBg) {
-          pass.setBindGroup(0, bg);
-          curBg = bg;
-        }
+        if (bg !== undefined && bg !== curBg) { pass.setBindGroup(0, bg); curBg = bg; }
         pass.setPipeline(slot.pipeline);
-        if (slot.indirectBuf !== undefined) pass.drawIndirect(slot.indirectBuf, 0);
+        if (slot.indirectBuf !== undefined) { pass.drawIndirect(slot.indirectBuf, 0); drawCount++; }
       }
+    }
+    if (!_encodeLogged) {
+      console.debug(`[heapScene] encode: ${drawCount} drawIndirect; slots:`, slotInfo);
+      _encodeLogged = true;
     }
   }
 

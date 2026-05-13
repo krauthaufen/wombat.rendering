@@ -163,20 +163,20 @@ export function gpuFlipCullByDeterminant(
     domain: ["back", "front", "none"],
     gpu: { kernel: "flipCullByDeterminant", inputUniform, declared },
     evaluate: (u, declaredFromCtx) => {
-      const m = u[inputUniform] as { forward?: { _data?: Float64Array | Float32Array } } | { _data?: Float64Array | Float32Array };
-      // Accept Trafo3d ({forward: M44d}), M44 ({_data}), or row-major
-      // Float32Array. Reads upper-left 3x3.
-      const data: ArrayLike<number> | undefined =
-        (m as { forward?: { _data?: ArrayLike<number> } }).forward?._data ??
-        (m as { _data?: ArrayLike<number> })._data ??
-        (m as unknown as ArrayLike<number>);
-      if (data === undefined) return declaredFromCtx;
-      const m00 = data[0]!, m01 = data[1]!, m02 = data[2]!;
-      const m10 = data[4]!, m11 = data[5]!, m12 = data[6]!;
-      const m20 = data[8]!, m21 = data[9]!, m22 = data[10]!;
-      const det = m00 * (m11 * m22 - m12 * m21)
-                - m01 * (m10 * m22 - m12 * m20)
-                + m02 * (m10 * m21 - m11 * m20);
+      // Accept Trafo3d ({forward: M44d}) — the wombat.base shape used
+      // by SG ModelTrafo — or any object with M00..M22 accessors.
+      const raw = u[inputUniform];
+      type M = { M00: number; M01: number; M02: number;
+                 M10: number; M11: number; M12: number;
+                 M20: number; M21: number; M22: number };
+      const m: M | undefined =
+        (raw as { forward?: M }).forward
+        ?? (raw as M);
+      if (m === undefined || typeof m.M00 !== "number") return declaredFromCtx;
+      const det =
+        m.M00 * (m.M11 * m.M22 - m.M12 * m.M21)
+      - m.M01 * (m.M10 * m.M22 - m.M12 * m.M20)
+      + m.M02 * (m.M10 * m.M21 - m.M11 * m.M20);
       return det < 0 ? flipCull(declaredFromCtx) : declaredFromCtx;
     },
   };
