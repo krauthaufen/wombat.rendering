@@ -2,33 +2,36 @@
 //
 // Owns the master record buffer + per-slot atomic counters + the
 // compute pipelines. One instance per GPU-routed bucket. The WGSL
-// kernel is **codegen'd from the bucket's mode-rule IRs** — no
-// hand-rolled kernel anywhere.
+// kernel is codegen'd by `emitPartitionKernel(...)` upstream (in
+// heapScene) and handed to the dispatcher as a string — declared
+// values are baked in as Consts, so a `declared`-aval mark
+// triggers `rebuildKernel(newWgsl)` to swap to a freshly-codegen'd
+// kernel for the new declared.
 //
 // `dispatch(enc)` encodes:
 //   1. clear pass (zero every slot's atomic counter)
-//   2. partition pass (one thread per record; evaluates every axis-
-//      rule, packs the per-axis u32 outputs into a slotIdx, atomic-
-//      scatters into the matching slot's drawTable)
+//   2. partition pass (one thread per record; evaluates the per-
+//      axis rule, scatters into the matching slot via the kernel's
+//      embedded SLOT_LOOKUP table)
 //
 // After dispatch the existing scan kernel runs per slot, reading the
 // slot's drawTable that the partition just populated.
 
 import { PARTITION_RECORD_BYTES, PARTITION_RECORD_U32 } from "./partitionKernelLayout.js";
-import { emitPartitionKernel, type RuleCodegenSpec } from "./kernelCodegen.js";
 
 const WG_SIZE = 64;
 const POW2 = (n: number): number => { let p = 1; while (p < n) p <<= 1; return Math.max(64, p); };
 
 export interface PartitionSceneSpec {
-  /** One per axis-with-rule on this bucket. */
-  readonly rules: ReadonlyArray<RuleCodegenSpec>;
-  /** Total slot count = product of rule.domainSize. Must equal slotDrawBufs.length. */
+  /** Total slot count = `resolved.length` (for the single-axis v1). */
   readonly totalSlots: number;
   /** Externally-owned slot draw buffers (one per slot). */
   readonly slotDrawBufs: ReadonlyArray<GPUBuffer>;
   /** Initial record capacity. */
   readonly initialRecords?: number;
+  /** Codegen'd kernel WGSL. Embeds `declared` as a Const + the
+   *  SLOT_LOOKUP table. Swap via `rebuildKernel(...)` on declared mark. */
+  readonly kernelWGSL: string;
 }
 
 export class GpuPartitionScene {
@@ -36,25 +39,20 @@ export class GpuPartitionScene {
   readonly label: string;
   readonly totalSlots: number;
 
-  /** Master record buffer (CPU populates via writeBuffer at addRO). */
   masterBuf: GPUBuffer;
-  /** CPU shadow of master. */
   masterShadow: Uint32Array;
   numRecords = 0;
   capacity = 0;
 
-  /** One atomic counter per slot. After partition, copyBufferToBuffer
-   *  into the slot's scan paramsBuf for the correct numRecords. */
   readonly slotCountBufs: GPUBuffer[];
-  /** Externally-owned (the bucket's drawTableBuf.buffer). */
   slotDrawBufs: GPUBuffer[];
 
-  /** params: [numRecords, decl_<axis0>, decl_<axis1>, …] u32s. */
+  /** params: [numRecords] — single u32 (padded to 16 bytes for WGSL
+   *  uniform alignment). `declared` is no longer carried here; the
+   *  kernel WGSL bakes it as a Const at codegen time. */
   paramsBuf: GPUBuffer;
-  readonly paramsSize: number;
 
-  private readonly axisCount: number;
-  private readonly kernelWGSL: string;
+  private kernelWGSL: string;
 
   private bindGroup: GPUBindGroup | null = null;
   private layout: GPUBindGroupLayout | null = null;
@@ -70,7 +68,6 @@ export class GpuPartitionScene {
     this.device = device;
     this.label = label;
     this.totalSlots = spec.totalSlots;
-    this.axisCount = spec.rules.length;
     this.capacity = POW2(spec.initialRecords ?? 16);
     const bytes = this.capacity * PARTITION_RECORD_BYTES;
     this.masterBuf = device.createBuffer({
@@ -85,14 +82,24 @@ export class GpuPartitionScene {
       }),
     );
     this.slotDrawBufs = [...spec.slotDrawBufs];
-    // params: 4-byte aligned, padded to 16-byte multiple for WGSL uniform.
-    const fields = 1 + spec.rules.length; // numRecords + one decl_* per axis
-    this.paramsSize = Math.max(16, Math.ceil((fields * 4) / 16) * 16);
     this.paramsBuf = device.createBuffer({
-      label: `${label}/params`, size: this.paramsSize,
+      label: `${label}/params`, size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    this.kernelWGSL = emitPartitionKernel({ rules: spec.rules, totalSlots: spec.totalSlots });
+    this.kernelWGSL = spec.kernelWGSL;
+  }
+
+  /** Swap to a freshly-codegen'd kernel WGSL string. Triggered when
+   *  `declared` (baked as a Const in the kernel) changes — the
+   *  pipelines + bind group are reset so the next dispatch
+   *  recompiles. The master records, slot count buffers and slot
+   *  draw buffers are kept. */
+  rebuildKernel(kernelWGSL: string): void {
+    this.kernelWGSL = kernelWGSL;
+    this.clearPipeline = null;
+    this.partitionPipeline = null;
+    // layout shape is invariant across declared values (slot count
+    // is fixed for a given bucket); keep it.
   }
 
   rebindSlotDrawBufs(slotDraws: ReadonlyArray<GPUBuffer>): void {
@@ -219,22 +226,13 @@ export class GpuPartitionScene {
     );
   }
 
-  /** Encode clear + partition into `enc`.
-   *
-   *  `declaredValues[i]` = current u32 declared value for `rules[i].axis`,
-   *  in the same order the rules were passed at construction. */
-  dispatch(arenaBuf: GPUBuffer, declaredValues: ReadonlyArray<number>, enc: GPUCommandEncoder): void {
-    if (declaredValues.length !== this.axisCount) {
-      throw new Error(
-        `GpuPartitionScene.dispatch: expected ${this.axisCount} declared values, got ${declaredValues.length}`,
-      );
-    }
+  /** Encode clear + partition into `enc`. */
+  dispatch(arenaBuf: GPUBuffer, enc: GPUCommandEncoder): void {
     this.ensureBindGroup(arenaBuf);
-    // params layout: [numRecords, decl_0, decl_1, …], 4-byte u32s, padded.
-    const params = new Uint32Array(this.paramsSize / 4);
-    params[0] = this.numRecords;
-    for (let i = 0; i < declaredValues.length; i++) params[1 + i] = declaredValues[i]! >>> 0;
-    this.device.queue.writeBuffer(this.paramsBuf, 0, params.buffer, 0, this.paramsSize);
+    this.device.queue.writeBuffer(
+      this.paramsBuf, 0,
+      new Uint32Array([this.numRecords, 0, 0, 0]).buffer, 0, 16,
+    );
     const pass = enc.beginComputePass({ label: `${this.label}/pass` });
     pass.setBindGroup(0, this.bindGroup!);
     pass.setPipeline(this.clearPipeline!);

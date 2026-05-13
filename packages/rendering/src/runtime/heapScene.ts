@@ -95,9 +95,11 @@ import {
 import { encodeModeKey, type PipelineStateDescriptor } from "./pipelineCache/index.js";
 import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
 import { GpuPartitionScene } from "./derivedModes/partitionDispatcher.js";
+import { emitPartitionKernel } from "./derivedModes/kernelCodegen.js";
 import { type DerivedModeRule, type ModeAxis } from "./derivedModes/rule.js";
 import type { CullMode, FrontFace, Topology } from "./pipelineCache/index.js";
 import { addMarkingCallback } from "@aardworx/wombat.adaptive";
+import { analyseOutputSet, evaluateSet, type Stmt } from "@aardworx/wombat.shader/ir";
 
 // GrowBuffer + ALIGN16 + MIN_BUFFER_BYTES + POW2 live in ./heapScene/growBuffer.
 // Packers (WGSL-type → JS-value → arena bytes) live in ./heapScene/packers.
@@ -314,6 +316,19 @@ interface Bucket {
    * each rule-controlled axis field with the rule's domain entries.
    */
   baseDescriptor: PipelineStateDescriptor | undefined;
+  /**
+   * Last `declared` u32 we built the kernel + slots for. When a new
+   * dispatch reads a different value from the declared aval, we
+   * re-specialise (re-codegen kernel, refresh slot pipelines).
+   */
+  lastDeclaredU32: number | undefined;
+  /**
+   * Rule body Stmt (extracted from RuleExpr.template) for the
+   * single-axis-with-rule. Cached so dispatchPartition can re-run
+   * analyseOutputSet + evaluateSet on declared mark without
+   * re-traversing the Module.
+   */
+  ruleBody: Stmt | undefined;
   /**
    * Has the partition kernel's inputs (records or rule deps)
    * changed since last dispatch? Set true on addRO / removeDraw /
@@ -1753,38 +1768,199 @@ export function buildHeapScene(
     return t === "line-strip" || t === "triangle-strip" ? "uint32" : undefined;
   }
 
-  /**
-   * Phase 5c.3 (foundation shipped; full wire-up pending).
-   *
-   * The `rule(...)`-based DerivedModeRule shape carries a shader-IR
-   * `RuleExpr` instead of the previous proxy-built `DerivedExpr`
-   * trace. The runtime side that consumes it (analyseOutputSet,
-   * evaluateSet, kernelCodegen) is committed but not yet plumbed
-   * into bucket-level GPU routing. For now this path errors loudly
-   * — callers shouldn't pass mode rules through the heap path until
-   * the M6/M7 milestones land.
-   */
-  function initGpuRouting(
-    _bucket: Bucket,
-    rules: DerivedModeRule<ModeAxis>[],
-    _baseDesc: PipelineStateDescriptor,
-    _tok: AdaptiveToken,
-  ): void {
-    if (rules.length === 0) return;
+  /** Per-axis enum order. The rule body produces u32 indices into
+   *  this array, and the heap renderer uses the same order to map
+   *  resolved-set integers back to pipeline descriptor values. The
+   *  ordering MUST match the bitfield encoder in pipelineCache. */
+  const AXIS_ENUM_TABLE: { readonly [A in ModeAxis]: ReadonlyArray<unknown> } = {
+    cull:            ["none", "front", "back"],
+    frontFace:       ["ccw", "cw"],
+    topology:        ["point-list", "line-list", "line-strip", "triangle-list", "triangle-strip"],
+    depthCompare:    ["never", "less", "equal", "less-equal", "greater", "not-equal", "greater-equal", "always"],
+    depthWrite:      [false, true],
+    alphaToCoverage: [false, true],
+  };
+
+  /** Resolve an axis's `declared` value (string / boolean / aval)
+   *  to a u32 index in the axis's enum table. */
+  function resolveDeclaredU32<A extends ModeAxis>(rule: DerivedModeRule<A>, tok: AdaptiveToken): number {
+    const d = rule.declared;
+    const v = (typeof d === "object" && d !== null && "getValue" in (d as object))
+      ? (d as aval<unknown>).getValue(tok)
+      : d;
+    const table = AXIS_ENUM_TABLE[rule.axis];
+    const i = table.indexOf(v);
+    if (i < 0) {
+      throw new Error(
+        `heapScene/gpuRouting: declared value '${String(v)}' for axis '${rule.axis}' ` +
+        `not in canonical enum table ${JSON.stringify(table)}`,
+      );
+    }
+    return i;
+  }
+
+  /** Extract the rule body Stmt from a RuleExpr's Module. The plugin
+   *  emits one `Entry` ValueDef whose body is the user's closure body
+   *  (with the synthetic compute-stage scaffolding stripped). */
+  function ruleBodyOf(rule: DerivedModeRule<ModeAxis>): Stmt {
+    const tmpl = rule.expr.template as { values: ReadonlyArray<{ kind: string; entry?: { body: Stmt } }> };
+    for (const v of tmpl.values) {
+      if (v.kind === "Entry" && v.entry !== undefined) return v.entry.body;
+    }
     throw new Error(
-      `heapScene: GPU routing for derived-mode rules is being rewired around the new rule(...) marker. ` +
-      `The shader-IR analyses (analyseOutputSet, evaluateSet) and kernelCodegen API are in place, ` +
-      `but the heapScene integration (kernel emission, declared-mark reactivity, slot pipeline ` +
-      `instantiation from resolved sets) lands in the follow-up. Until then, don't attach a ` +
-      `derived-mode rule on axis '${rules[0]!.axis}' to a HeapDrawSpec.`,
+      `heapScene/gpuRouting: rule for axis '${rule.axis}' has no Entry in its template (id=${rule.expr.id})`,
     );
   }
 
-  function dispatchPartition(bucket: Bucket, _enc: GPUCommandEncoder, _tok: AdaptiveToken): void {
-    if (!bucket.gpuRouted) return;
-    // Unreachable while initGpuRouting throws — kept so the rest of
-    // the encodeComputePrep flow type-checks unchanged.
-    throw new Error("heapScene: GPU partition dispatch not yet wired for new rule shape");
+  /** Compute the (resolved-set, kernel WGSL) pair for a rule under
+   *  a specific declared u32 value. Used at init and on declared
+   *  marks. */
+  function specialiseRule(
+    rule: DerivedModeRule<ModeAxis>,
+    body: Stmt,
+    declaredU32: number,
+  ): { resolved: ReadonlyArray<number>; kernelWGSL: string } {
+    const symbolic = analyseOutputSet(body);
+    // No intrinsic table yet — user-defined helpers (if any) are
+    // emitted to WGSL by the shader frontend; their JS semantics
+    // aren't reachable here, so unresolvable CallIntrinsic-typed
+    // outputs degrade to a TOP fallback below.
+    const { resolved, unresolvedCount } = evaluateSet(
+      symbolic,
+      new Map<string, number>([["declared", declaredU32]]),
+      new Map(),
+    );
+    let outputs = resolved.slice();
+    if (unresolvedCount > 0) {
+      // Fall back: the axis's full enum table is the conservative
+      // ceiling. The bucket pays for unused slots but renders
+      // correctly.
+      outputs = AXIS_ENUM_TABLE[rule.axis].map((_, i) => i);
+    }
+    if (outputs.length === 0) {
+      // Defensive: at least one slot needed (rule that never
+      // returns?). Use declared as the fallback.
+      outputs = [declaredU32];
+    }
+    const kernelWGSL = emitPartitionKernel({
+      rules: [{
+        axis: rule.axis,
+        body,
+        declaredU32,
+        resolved: outputs,
+        intrinsics: new Map(),
+        helpersWGSL: "",
+        inputUniforms: ["ModelTrafo"],
+      }],
+      totalSlots: outputs.length,
+    });
+    return { resolved: outputs, kernelWGSL };
+  }
+
+  /** Refresh `bucket.slots[i].pipeline` to match the resolved-set
+   *  axis enum value at position `i`. Slot 0's createSlot already
+   *  exists from findOrCreateBucket; slots 1..N are created lazily. */
+  function ensureSlotsForResolved(
+    bucket: Bucket,
+    rule: DerivedModeRule<ModeAxis>,
+    resolved: ReadonlyArray<number>,
+  ): void {
+    const fam = familyForBucket.get(bucket)!;
+    const base = bucket.baseDescriptor!;
+    for (let slotIdx = 0; slotIdx < resolved.length; slotIdx++) {
+      const enumValue = resolved[slotIdx]!;
+      const axisValue = AXIS_ENUM_TABLE[rule.axis][enumValue];
+      const desc = patchDescriptor(base, rule.axis, axisValue);
+      const key = encodeModeKey(desc);
+      if (slotIdx < bucket.slots.length) {
+        const slot = bucket.slots[slotIdx]!;
+        if (slot.modeKey !== key) {
+          slot.pipeline = getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, desc);
+          slot.modeKey  = key;
+        }
+      } else {
+        createSlot(bucket, desc);
+      }
+    }
+  }
+
+  /**
+   * Phase 5c.3 — promote `bucket` to GPU-routed.
+   *
+   * Pipeline:
+   *   1. extract the rule body Stmt from `rule.expr.template`
+   *   2. resolve current declared aval value → u32 index
+   *   3. analyseOutputSet + evaluateSet → resolved u32 set
+   *   4. create one slot per resolved enum value (pipeline = axis
+   *      value at that enum index)
+   *   5. emitPartitionKernel → WGSL string
+   *   6. create GpuPartitionScene with the kernel string
+   *
+   * Single-axis only for v1. Declared marks trigger a re-specialise
+   * via `dispatchPartition`'s mid-flight cache check.
+   */
+  function initGpuRouting(
+    bucket: Bucket,
+    rules: DerivedModeRule<ModeAxis>[],
+    baseDesc: PipelineStateDescriptor,
+    tok: AdaptiveToken,
+  ): void {
+    if (bucket.gpuRouted) return;
+    if (rules.length === 0) return;
+    if (rules.length > 1) {
+      throw new Error(
+        `heapScene: multi-axis derived-mode rules not yet supported (got ${rules.length} axes)`,
+      );
+    }
+    const rule = rules[0]!;
+    bucket.baseDescriptor = baseDesc;
+    bucket.rules          = rules;
+    bucket.ruleBody       = ruleBodyOf(rule);
+    const declaredU32 = resolveDeclaredU32(rule, tok);
+    const { resolved, kernelWGSL } = specialiseRule(rule, bucket.ruleBody!, declaredU32);
+    bucket.lastDeclaredU32 = declaredU32;
+    ensureSlotsForResolved(bucket, rule, resolved);
+    const partition = new GpuPartitionScene(device, `${bucket.label}/partition`, {
+      totalSlots: resolved.length,
+      slotDrawBufs: bucket.slots.map(s => s.drawTableBuf!.buffer),
+      kernelWGSL,
+      initialRecords: 16,
+    });
+    bucket.gpuRouted      = true;
+    bucket.partitionScene = partition;
+    bucket.drawIdToRecord = new Map<number, number>();
+    bucket.recordToDrawId = [];
+    bucket.partitionDirty = true;
+  }
+
+  /**
+   * Phase 5c.3 — per-frame partition dispatch.
+   *
+   * Re-resolves the rule's `declared` aval. If it changed since the
+   * last dispatch, re-runs `specialiseRule` (analyse + evaluate +
+   * codegen) and swaps the partition kernel + slot pipelines. Then
+   * encodes the dispatch + `copyBufferToBuffer` per slot.
+   */
+  function dispatchPartition(bucket: Bucket, enc: GPUCommandEncoder, tok: AdaptiveToken): void {
+    if (!bucket.gpuRouted || bucket.partitionScene === undefined) return;
+    const rule = bucket.rules![0]!;
+    const declaredU32 = resolveDeclaredU32(rule, tok);
+    if (declaredU32 !== bucket.lastDeclaredU32) {
+      const { resolved, kernelWGSL } = specialiseRule(rule, bucket.ruleBody!, declaredU32);
+      ensureSlotsForResolved(bucket, rule, resolved);
+      bucket.partitionScene.rebuildKernel(kernelWGSL);
+      bucket.lastDeclaredU32 = declaredU32;
+    }
+    bucket.partitionScene.flush();
+    bucket.partitionScene.dispatch(arena.attrs.buffer, enc);
+    for (let i = 0; i < bucket.slots.length; i++) {
+      enc.copyBufferToBuffer(
+        bucket.partitionScene.slotCountBufs[i]!, 0,
+        bucket.slots[i]!.paramsBuf!, 0, 4,
+      );
+      bucket.slots[i]!.scanDirty = true;
+    }
+    bucket.partitionDirty = false;
   }
 
 
@@ -1842,6 +2018,8 @@ export function buildHeapScene(
       recordToDrawId: undefined,
       rules: undefined,
       baseDescriptor: undefined,
+      lastDeclaredU32: undefined,
+      ruleBody: undefined,
       partitionDirty: false,
     };
     familyForBucket.set(bucket, fam);
