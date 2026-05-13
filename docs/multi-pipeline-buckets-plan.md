@@ -1,5 +1,20 @@
 # Multi-pipeline buckets — implementation plan
 
+**Status (2026-05-13)**: the **correctness story** of this task is
+SHIPPED through commits `57d949e` … `266fdba`. The 20k-cvals-→20k-
+buckets pathology is fixed and reactive cullMode flips correctly
+move ROs to their new bucket. See "Phase 5a/5b/5b.2 — shipped"
+below.
+
+What remains deferred is the **perf collapse**: today, two ROs
+with the same effect but different PS values land in two
+different buckets, each with its own arena and pipeline. The full
+design (Phase 5c) would collapse them into ONE bucket with N slots
+sharing arena + bindGroup. That's pure perf for scenes with many
+distinct PS combos; no user-visible bug is open without it.
+
+---
+
 **Task 1 of 2** for the derived-modes design (`derived-modes.md`).
 This task is the architectural change: bucket key drops
 pipelineState; ROs with different declared pipeline state values
@@ -229,3 +244,47 @@ cross-cutting moment; everything else is additive.
   to express `sign(det(u.ModelTrafo.upperLeft3x3))`.
 
 Task 1 is the chassis; Task 2 mounts the engine.
+
+## Phase 5a/5b/5b.2 — shipped (2026-05-13)
+
+The plan above prescribed seven phases. What actually shipped:
+
+- **Phase 1** (pipeline cache + bitfield modeKey) — `57d949e`.
+  Standalone module; 12 tests.
+- **Phase 2** (CPU modeKey production, ModeKeyTracker subscribed
+  to mode-axis avals) — `67175e0`. Standalone; 6 tests.
+- **Phase 3** (SlotTable) — `96c7926`. Standalone; 7 tests.
+- **Phase 4** (partition kernel CPU reference + WGSL skeleton) —
+  `7203e8d`. Standalone; 6 tests.
+- **heapScene split** (`packers.ts`, `scanKernel.ts`,
+  `growBuffer.ts`, `pools.ts`) — `eee5742` … `4e3fa29`. heapScene.ts
+  shrank from 4449 → 3571 LOC.
+- **Phase 5a** (BucketSlot struct hoist, slots: BucketSlot[],
+  length 1 today) — `e3576f1`.
+- **Phase 5b** (bucket key VALUE-based: `psIdOf` removed, replaced
+  by `snapshotDescriptor + encodeModeKey`) — `d81cf6f`. Fixes the
+  20k-cvals-with-same-value collapse. 3 new tests.
+- **Phase 5b.2** (reactive rebucket on PS aval mark via
+  `dirtyModeKeyDrawIds` + per-RO ModeKeyTracker → update() runs
+  remove + add with retained spec) — `c02ac36`. Fixes silently-
+  broken reactive cullMode flip. 1 new test.
+- **Phase 6.1** (GC empty buckets when removeDraw empties them) —
+  `fefbf64`.
+
+Total: 14 new passing tests on top of the prior 179. heapScene.ts
+ends at 3571 LOC (vs starting 4449); four self-contained submodules
+under `runtime/pipelineCache/` and `runtime/derivedModes/` plus the
+heapScene/ split.
+
+## Phase 5c — deferred (perf only)
+
+The full multi-slot design from this doc — one bucket per `(effect,
+textureSet)` instead of per `(effect, ps, textureSet)`, with N slots
+per bucket sharing arena + bindGroup — is the perf collapse. **Not
+needed for correctness**; the value-keyed bucket lookup + reactive
+rebucket already deliver the correct user-visible behaviour.
+
+Defer until a workload shows the bucket-fragmentation cost (many
+distinct PS combos in one scene fragmenting arena + encode). Today's
+typical scenes use 1–10 distinct PS combos, so the redundancy is
+small.
