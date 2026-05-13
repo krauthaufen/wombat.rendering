@@ -126,3 +126,13 @@ export {
   type PartitionInput,
   type PartitionResult,
 } from "./derivedModes/partition.js";
+
+export {
+  derivedMode,
+  isDerivedModeRule,
+  flipCull,
+  type DerivedModeRule,
+  type DerivedModeBuilder,
+  type ModeAxis,
+  type ModeValue,
+} from "./derivedModes/rule.js";

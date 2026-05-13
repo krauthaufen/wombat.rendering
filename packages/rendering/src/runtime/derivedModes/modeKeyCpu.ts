@@ -20,7 +20,7 @@ import type {
 } from "../../core/pipelineState.js";
 import type { FramebufferSignature } from "../../core/framebufferSignature.js";
 import type { aval, IDisposable } from "@aardworx/wombat.adaptive";
-import { addMarkingCallback } from "@aardworx/wombat.adaptive";
+import { addMarkingCallback, AdaptiveToken } from "@aardworx/wombat.adaptive";
 
 import {
   encodeModeKey,
@@ -31,6 +31,42 @@ import {
   type BlendComponent,
   type DepthSlice,
 } from "../pipelineCache/index.js";
+import type { DerivedModeRule } from "./rule.js";
+
+/**
+ * Per-axis derived-mode rules for one RO. Same shape as
+ * `HeapDrawSpec.modeRules`.
+ */
+export interface RoModeRules {
+  readonly cull?:            DerivedModeRule<"cull">;
+  readonly frontFace?:       DerivedModeRule<"frontFace">;
+  readonly topology?:        DerivedModeRule<"topology">;
+  readonly depthCompare?:    DerivedModeRule<"depthCompare">;
+  readonly depthWrite?:      DerivedModeRule<"depthWrite">;
+  readonly alphaToCoverage?: DerivedModeRule<"alphaToCoverage">;
+}
+
+/**
+ * Uniforms accessor exposed to a derived-mode rule's `(u, declared)`
+ * closure. Reads each `u.<Name>` from the supplied aval map at
+ * evaluation time and tracks which avals were accessed so the
+ * `ModeKeyTracker` can subscribe to them.
+ */
+function uniformsProxy(
+  uniformAvals: ReadonlyMap<string, aval<unknown>>,
+  tok: AdaptiveToken,
+  recordDep: ((av: aval<unknown>) => void) | undefined,
+): Record<string, unknown> {
+  return new Proxy({}, {
+    get(_target, prop): unknown {
+      if (typeof prop !== "string") return undefined;
+      const av = uniformAvals.get(prop);
+      if (av === undefined) return undefined;
+      if (recordDep !== undefined) recordDep(av);
+      return av.getValue(tok);
+    },
+  }) as Record<string, unknown>;
+}
 
 /**
  * One-shot snapshot of the current values of every leaf aval in a
@@ -42,9 +78,15 @@ import {
 export function snapshotDescriptor(
   ps: PipelineState | undefined,
   signature: FramebufferSignature,
+  options: {
+    readonly modeRules?: RoModeRules;
+    readonly uniformAvals?: ReadonlyMap<string, aval<unknown>>;
+    readonly token?: AdaptiveToken;
+    readonly recordDep?: (av: aval<unknown>) => void;
+  } = {},
 ): PipelineStateDescriptor {
   if (ps === undefined) {
-    return buildAttachmentsFor(DEFAULT_DESCRIPTOR, signature);
+    return applyRules(buildAttachmentsFor(DEFAULT_DESCRIPTOR, signature), options);
   }
   const r = ps.rasterizer;
   const depth = ps.depth !== undefined ? snapshotDepth(ps.depth, signature) : undefined;
@@ -63,6 +105,52 @@ export function snapshotDescriptor(
     attachments,
     alphaToCoverage: atc,
   };
+  return applyRules(out, options);
+}
+
+function applyRules(
+  d: PipelineStateDescriptor,
+  options: {
+    readonly modeRules?: RoModeRules;
+    readonly uniformAvals?: ReadonlyMap<string, aval<unknown>>;
+    readonly token?: AdaptiveToken;
+    readonly recordDep?: (av: aval<unknown>) => void;
+  },
+): PipelineStateDescriptor {
+  const rules = options.modeRules;
+  if (rules === undefined) return d;
+  const uniforms = options.uniformAvals ?? new Map();
+  const tok = options.token ?? AdaptiveToken.top;
+  const proxy = uniformsProxy(uniforms, tok, options.recordDep);
+  let out = d;
+  if (rules.cull !== undefined) {
+    const v = rules.cull.evaluate(proxy, out.cullMode);
+    if (v !== out.cullMode) out = { ...out, cullMode: v };
+  }
+  if (rules.frontFace !== undefined) {
+    const v = rules.frontFace.evaluate(proxy, out.frontFace);
+    if (v !== out.frontFace) out = { ...out, frontFace: v };
+  }
+  if (rules.topology !== undefined) {
+    const v = rules.topology.evaluate(proxy, out.topology);
+    if (v !== out.topology) out = { ...out, topology: v, stripIndexFormat: stripFormatFor(v) };
+  }
+  if (rules.alphaToCoverage !== undefined) {
+    const v = rules.alphaToCoverage.evaluate(proxy, out.alphaToCoverage);
+    if (v !== out.alphaToCoverage) out = { ...out, alphaToCoverage: v };
+  }
+  if (out.depth !== undefined && (rules.depthCompare !== undefined || rules.depthWrite !== undefined)) {
+    let depthOut = out.depth;
+    if (rules.depthCompare !== undefined) {
+      const v = rules.depthCompare.evaluate(proxy, depthOut.compare);
+      if (v !== depthOut.compare) depthOut = { ...depthOut, compare: v };
+    }
+    if (rules.depthWrite !== undefined) {
+      const v = rules.depthWrite.evaluate(proxy, depthOut.write);
+      if (v !== depthOut.write) depthOut = { ...depthOut, write: v };
+    }
+    if (depthOut !== out.depth) out = { ...out, depth: depthOut };
+  }
   return out;
 }
 
@@ -131,6 +219,11 @@ export class ModeKeyTracker implements IDisposable {
   private readonly subs: IDisposable[] = [];
   private cachedDescriptor: PipelineStateDescriptor;
   private cachedModeKey: bigint;
+  private readonly modeRules: RoModeRules | undefined;
+  private readonly uniformAvals: ReadonlyMap<string, aval<unknown>> | undefined;
+  /** Avals discovered while evaluating rules; merged into the leaf
+   *  set returned by `forEachLeaf` so the heap scene subscribes once. */
+  private readonly ruleDeps = new Set<aval<unknown>>();
 
   constructor(
     ps: PipelineState | undefined,
@@ -144,14 +237,28 @@ export class ModeKeyTracker implements IDisposable {
      * cullCval case) — saves N subscriptions and N callback dispatches
      * per mark.
      */
-    options: { skipSubscribe?: boolean } = {},
+    options: {
+      skipSubscribe?: boolean;
+      modeRules?: RoModeRules;
+      uniformAvals?: ReadonlyMap<string, aval<unknown>>;
+    } = {},
   ) {
     this.ps        = ps;
     this.signature = signature;
     this.onDirty   = onDirty;
-    this.cachedDescriptor = snapshotDescriptor(ps, signature);
+    if (options.modeRules    !== undefined) this.modeRules    = options.modeRules;
+    if (options.uniformAvals !== undefined) this.uniformAvals = options.uniformAvals;
+    this.cachedDescriptor = this.snapshot();
     this.cachedModeKey    = encodeModeKey(this.cachedDescriptor);
     if (options.skipSubscribe !== true) this.subscribeAll();
+  }
+
+  private snapshot(): PipelineStateDescriptor {
+    return snapshotDescriptor(this.ps, this.signature, {
+      ...(this.modeRules    !== undefined ? { modeRules:    this.modeRules    } : {}),
+      ...(this.uniformAvals !== undefined ? { uniformAvals: this.uniformAvals } : {}),
+      recordDep: (av) => { this.ruleDeps.add(av); },
+    });
   }
 
   /**
@@ -160,27 +267,33 @@ export class ModeKeyTracker implements IDisposable {
    * addMarkingCallback per unique aval across many trackers.
    */
   forEachLeaf(visit: (a: aval<unknown>) => void): void {
-    if (this.ps === undefined) return;
     const ps = this.ps;
-    visit(ps.rasterizer.topology);
-    visit(ps.rasterizer.cullMode);
-    visit(ps.rasterizer.frontFace);
-    if (ps.rasterizer.depthBias !== undefined) visit(ps.rasterizer.depthBias);
-    if (ps.depth !== undefined) {
-      visit(ps.depth.write);
-      visit(ps.depth.compare);
-      if (ps.depth.clamp !== undefined) visit(ps.depth.clamp);
-    }
-    if (ps.blends !== undefined) {
-      visit(ps.blends);
-      const map = ps.blends.force(/* allow-force */);
-      for (const [, bs] of map) {
-        visit(bs.color.srcFactor); visit(bs.color.dstFactor); visit(bs.color.operation);
-        visit(bs.alpha.srcFactor); visit(bs.alpha.dstFactor); visit(bs.alpha.operation);
-        visit(bs.writeMask);
+    if (ps !== undefined) {
+      visit(ps.rasterizer.topology);
+      visit(ps.rasterizer.cullMode);
+      visit(ps.rasterizer.frontFace);
+      if (ps.rasterizer.depthBias !== undefined) visit(ps.rasterizer.depthBias);
+      if (ps.depth !== undefined) {
+        visit(ps.depth.write);
+        visit(ps.depth.compare);
+        if (ps.depth.clamp !== undefined) visit(ps.depth.clamp);
       }
+      if (ps.blends !== undefined) {
+        visit(ps.blends);
+        const map = ps.blends.force(/* allow-force */);
+        for (const [, bs] of map) {
+          visit(bs.color.srcFactor); visit(bs.color.dstFactor); visit(bs.color.operation);
+          visit(bs.alpha.srcFactor); visit(bs.alpha.dstFactor); visit(bs.alpha.operation);
+          visit(bs.writeMask);
+        }
+      }
+      if (ps.alphaToCoverage !== undefined) visit(ps.alphaToCoverage);
     }
-    if (ps.alphaToCoverage !== undefined) visit(ps.alphaToCoverage);
+    // Rule-input deps discovered on the last evaluation. The set is
+    // refreshed each `recompute()`; callers re-subscribe accordingly.
+    // Surfaced regardless of `ps` because a rule can fire without
+    // any underlying PipelineState aval (e.g. ps === undefined).
+    for (const av of this.ruleDeps) visit(av);
   }
 
   get descriptor(): PipelineStateDescriptor { return this.cachedDescriptor; }
@@ -190,9 +303,15 @@ export class ModeKeyTracker implements IDisposable {
    * Snapshot current aval values and rebuild descriptor + modeKey.
    * Returns true iff the modeKey changed (so the bucket only needs to
    * upload + repartition when something actually moved).
+   *
+   * Also rediscovers rule-input dependencies on every call — a
+   * conditional rule body may read different uniforms in different
+   * branches. New deps surface in `forEachLeaf` so the heap scene's
+   * subscription-dedupe layer picks them up.
    */
   recompute(): boolean {
-    const next = snapshotDescriptor(this.ps, this.signature);
+    this.ruleDeps.clear();
+    const next = this.snapshot();
     const nextKey = encodeModeKey(next);
     if (nextKey === this.cachedModeKey) return false;
     this.cachedDescriptor = next;

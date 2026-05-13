@@ -92,7 +92,7 @@ import {
   ENC_V3F_TIGHT, SEM_POSITIONS, SEM_NORMALS,
   type ArenaState,
 } from "./heapScene/pools.js";
-import { encodeModeKey } from "./pipelineCache/index.js";
+import { encodeModeKey, type PipelineStateDescriptor } from "./pipelineCache/index.js";
 import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
 import { addMarkingCallback } from "@aardworx/wombat.adaptive";
 
@@ -341,6 +341,38 @@ export interface HeapDrawSpec {
    * with depth write enabled. Matches the demo's existing visuals.
    */
   readonly pipelineState?: PipelineState;
+  /**
+   * Per-RO derived pipeline-mode rules: per-axis closures
+   * `(u, declared) => modeValue` that compute the effective mode
+   * value as a function of this RO's uniforms (see
+   * `derivedMode(...)` in `runtime/derivedModes/rule.ts`).
+   *
+   * A rule overrides the corresponding `pipelineState.rasterizer.*`
+   * (or `pipelineState.depth.*`) aval value at descriptor-snapshot
+   * time. The rule's closure runs CPU-side with a proxy that
+   * resolves `u.<Name>` against this spec's `inputs[<Name>]`. The
+   * heap renderer auto-discovers the closure's input dependencies on
+   * first run and subscribes the per-RO ModeKeyTracker to each of
+   * them — so a rule that reads `u.ModelTrafo` reactively rebuckets
+   * when ModelTrafo marks.
+   *
+   * Common use cases:
+   *   - cull: flip-by-determinant-sign for mirrored geometry
+   *   - blend: pick a preset based on a boolean uniform
+   *   - depthCompare: lighter passes for transparent overlays
+   *
+   * v1 evaluates rules CPU-side. v2 (deferred) lowers them to a GPU
+   * compute kernel for the bulk-animated-input case. See
+   * `docs/derived-modes.md`.
+   */
+  readonly modeRules?: {
+    readonly cull?:           import("./derivedModes/rule.js").DerivedModeRule<"cull">;
+    readonly frontFace?:      import("./derivedModes/rule.js").DerivedModeRule<"frontFace">;
+    readonly topology?:       import("./derivedModes/rule.js").DerivedModeRule<"topology">;
+    readonly depthCompare?:   import("./derivedModes/rule.js").DerivedModeRule<"depthCompare">;
+    readonly depthWrite?:     import("./derivedModes/rule.js").DerivedModeRule<"depthWrite">;
+    readonly alphaToCoverage?: import("./derivedModes/rule.js").DerivedModeRule<"alphaToCoverage">;
+  };
 }
 
 export interface HeapSceneStats {
@@ -1473,6 +1505,13 @@ export function buildHeapScene(
     effect: Effect,
     _textures: HeapTextureSet | undefined,
     pipelineState: PipelineState | undefined,
+    /**
+     * Optional precomputed descriptor. addDrawImpl passes this when
+     * the spec carries `modeRules` so the bucket key reflects the
+     * rule-evaluated value (not the raw PS aval values). When omitted
+     * the descriptor is snapshotted from PS as before.
+     */
+    precomputedDescriptor?: PipelineStateDescriptor,
   ): Bucket {
     if (!familyBuilt) {
       throw new Error("heapScene: findOrCreateBucket called before family build");
@@ -1486,12 +1525,24 @@ export function buildHeapScene(
     // (the actual value-set in the descriptor), so identical-value
     // cvals collapse to ONE bucket. See docs/derived-modes.md and
     // tests/heap-multi-pipeline-bucket.test.ts.
-    const psDescriptor = snapshotDescriptor(pipelineState, sig);
+    const psDescriptor = precomputedDescriptor ?? snapshotDescriptor(pipelineState, sig);
     const psModeKey    = encodeModeKey(psDescriptor);
     const bk = `family#${fam.schema.id}|mk#${psModeKey.toString(16)}`;
     const existing = bucketByKey.get(bk);
     if (existing !== undefined) return existing;
-    const ps = resolvePipelineState(pipelineState);
+    // If a precomputed descriptor is supplied (rule-evaluated path),
+    // use its post-rule axis values so the pipeline reflects what the
+    // RO actually wants. Otherwise fall through to PS-aval forcing.
+    const ps: ResolvedPipelineState = precomputedDescriptor !== undefined
+      ? {
+          topology:  precomputedDescriptor.topology,
+          cullMode:  precomputedDescriptor.cullMode,
+          frontFace: precomputedDescriptor.frontFace,
+          ...(precomputedDescriptor.depth !== undefined
+            ? { depth: { write: precomputedDescriptor.depth.write, compare: precomputedDescriptor.depth.compare } }
+            : {}),
+        }
+      : resolvePipelineState(pipelineState);
 
     const layout: BucketLayout = fam.schema.drawHeaderUnion;
     const isAtlasBucket = layout.atlasTextureBindings.size > 0;
@@ -1800,7 +1851,24 @@ export function buildHeapScene(
     const perInstanceAttributes = spec.instanceAttributes !== undefined
       ? new Set(Object.keys(spec.instanceAttributes))
       : new Set<string>();
-    const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState);
+
+    // If the spec has modeRules, pre-snapshot the rule-evaluated
+    // descriptor so the bucket key + pipeline reflect post-rule
+    // values. Without this, two ROs with identical PS but different
+    // rule outputs would collide on the same bucket.
+    let precomputedDescriptor: PipelineStateDescriptor | undefined;
+    if (spec.modeRules !== undefined) {
+      const uAvals = new Map<string, aval<unknown>>();
+      for (const [name, val] of Object.entries(spec.inputs)) {
+        uAvals.set(name, asAval(val as aval<unknown> | unknown));
+      }
+      precomputedDescriptor = snapshotDescriptor(spec.pipelineState, sig, {
+        modeRules:    spec.modeRules,
+        uniformAvals: uAvals,
+        token:        outerTok,
+      });
+    }
+    const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, precomputedDescriptor);
     const fam = familyFor(spec.effect);
     const effectFields = fam.fieldsForEffect.get(spec.effect.id)!;
 
@@ -1985,10 +2053,25 @@ export function buildHeapScene(
     // skipSubscribe: this tracker doesn't install its own callbacks.
     // The scene-level `modeAvalToDrawIds` does it once per unique aval
     // (the 20k-ROs-share-one-cullCval optimization).
+    // If the spec has modeRules, pre-build a uniforms-aval map the
+    // rule closures will read against; the tracker auto-discovers
+    // which avals each rule reads and surfaces them via forEachLeaf.
+    let uniformAvals: ReadonlyMap<string, aval<unknown>> | undefined;
+    if (spec.modeRules !== undefined) {
+      const m = new Map<string, aval<unknown>>();
+      for (const [name, val] of Object.entries(spec.inputs)) {
+        m.set(name, asAval(val as aval<unknown> | unknown));
+      }
+      uniformAvals = m;
+    }
     const tracker = new ModeKeyTracker(
       spec.pipelineState, sig,
       () => { dirtyModeKeyDrawIds.add(drawId); },
-      { skipSubscribe: true },
+      {
+        skipSubscribe: true,
+        ...(spec.modeRules  !== undefined ? { modeRules: spec.modeRules } : {}),
+        ...(uniformAvals    !== undefined ? { uniformAvals } : {}),
+      },
     );
     drawIdToModeTracker[drawId] = tracker;
     tracker.forEachLeaf((av) => subscribeModeLeaf(av, drawId));
