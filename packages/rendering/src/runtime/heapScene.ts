@@ -203,6 +203,22 @@ interface BucketSlot {
   scanDirty: boolean;
 }
 
+/**
+ * One distinct derived-mode rule registered on a GPU-routed bucket.
+ * Multiple ROs in the same bucket may carry different rules; each
+ * gets its own RuleEntry with a bucket-unique `ruleId` baked into
+ * the master-pool records the partition kernel reads.
+ */
+interface RuleEntry {
+  readonly ruleId: number;
+  readonly contentHash: string;
+  readonly rule: DerivedModeRule<ModeAxis>;
+  readonly body: Stmt;
+  /** Last declared u32 we re-specialised against — drives the
+   *  dispatch-time "needs re-specialise?" check. */
+  lastDeclaredU32: number | undefined;
+}
+
 interface Bucket {
   readonly label: string;
   readonly textures: HeapTextureSet | undefined;
@@ -313,30 +329,22 @@ interface Bucket {
    */
   recordToDrawId: number[] | undefined;
   /**
-   * The rules carried by the first RO (one per axis), in the canonical
-   * axis order. Used at dispatch time to resolve `declared` for each
-   * axis and to size the partition kernel's params buffer.
+   * Distinct rules registered on this bucket, keyed by content hash
+   * (axis + expr.id + declared identity). Each entry has a bucket-
+   * unique `ruleId` baked into master-pool records — the partition
+   * kernel switches on `r.ruleId` to pick which rule body runs.
+   * ROs sharing the same effect+textureSet but carrying DIFFERENT
+   * rules each get their own ruleId here.
    */
-  rules: ReadonlyArray<DerivedModeRule<ModeAxis>> | undefined;
-  /**
-   * Seed PipelineStateDescriptor — the descriptor of the first GPU-
-   * routed RO. Used to build per-slot pipeline descriptors by swapping
-   * each rule-controlled axis field with the rule's domain entries.
-   */
+  rulesById: Map<string, RuleEntry> | undefined;
+  /** `ruleId` → contentHash (= key into rulesById). Index = ruleId. */
+  ruleOrder: string[] | undefined;
+  /** drawId → ruleId. Master records carry the ruleId; this is the
+   *  CPU-side mirror used when an RO is removed. */
+  drawIdToRuleId: Map<number, number> | undefined;
+  /** Seed PipelineStateDescriptor (the descriptor of the first GPU-
+   *  routed RO). Used as the base for slot descriptors. */
   baseDescriptor: PipelineStateDescriptor | undefined;
-  /**
-   * Last `declared` u32 we built the kernel + slots for. When a new
-   * dispatch reads a different value from the declared aval, we
-   * re-specialise (re-codegen kernel, refresh slot pipelines).
-   */
-  lastDeclaredU32: number | undefined;
-  /**
-   * Rule body Stmt (extracted from RuleExpr.template) for the
-   * single-axis-with-rule. Cached so dispatchPartition can re-run
-   * analyseOutputSet + evaluateSet on declared mark without
-   * re-traversing the Module.
-   */
-  ruleBody: Stmt | undefined;
   /**
    * Has the partition kernel's inputs (records or rule deps)
    * changed since last dispatch? Set true on addRO / removeDraw /
@@ -1888,74 +1896,150 @@ export function buildHeapScene(
    *      slot index.
    *   6. emitPartitionKernel produces the WGSL.
    */
-  function specialiseRule(
-    rule: DerivedModeRule<ModeAxis>,
-    body: Stmt,
-    declaredU32: number,
+  /** WeakMap-based stable identity for aval objects. Two `cval`s
+   *  have different identity; the same cval observed twice has the
+   *  same identity. Used in `ruleContentHash` so rules differing
+   *  only in their `declared` aval are recognised as distinct. */
+  const avalIdentityMap = new WeakMap<object, number>();
+  let nextAvalIdentity = 0;
+  function avalIdentity(av: object): number {
+    let id = avalIdentityMap.get(av);
+    if (id === undefined) {
+      id = ++nextAvalIdentity;
+      avalIdentityMap.set(av, id);
+    }
+    return id;
+  }
+
+  /** Content hash for rule identity within a bucket. Two rules
+   *  hashing the same can share a `ruleId` and one body; rules
+   *  hashing differently get distinct ids. */
+  function ruleContentHash(rule: DerivedModeRule<ModeAxis>): string {
+    const dec = rule.declared;
+    let dKey: string;
+    if (dec === undefined) {
+      dKey = "u";
+    } else if (typeof dec === "object" && dec !== null && "getValue" in (dec as object)) {
+      dKey = `a${avalIdentity(dec as object)}`;
+    } else {
+      dKey = `v${String(dec)}`;
+    }
+    return `${rule.axis}|${rule.expr.id}|${dKey}`;
+  }
+
+  /**
+   * Specialise the WHOLE bucket against every registered rule's
+   * current declared value:
+   *   1. For each rule: bake declared as Const, analyse the body,
+   *      `evaluateStructuralSet` to fold each return Expr to a JS
+   *      value.
+   *   2. UNION the per-rule resolved JS values across all rules
+   *      (dedup by `stableStringify`-content equality, sort
+   *      deterministically). That's the bucket's global slot table.
+   *   3. For each rule: rewrite the body so every `ReturnValue`
+   *      emits a `Const u32` GLOBAL slot index.
+   *   4. Emit a single kernel with one `rule_<axis>_<ruleId>` fn per
+   *      rule plus a `dispatch_<axis>(r)` that switches on r.ruleId.
+   *
+   * Returns the rewritten kernel + the global resolved set.
+   */
+  function specialiseBucket(
+    bucket: Bucket,
   ): { resolved: ReadonlyArray<unknown>; kernelWGSL: string } {
     const Tu32 = { kind: "Int", signed: false, width: 32 } as const;
-    // Bake declared as a const so the kernel has no per-dispatch uniform.
-    const declaredConst: Expr = {
-      kind: "Const",
-      type: Tu32 as never,
-      value: { kind: "Int", value: declaredU32 >>> 0, signed: false } as never,
-    } as Expr;
-    const bakedBody = substituteReadInputInStmt(body, "Uniform", "declared", declaredConst);
-    const symbolic = analyseOutputSet(bakedBody);
-    const env = new Map<string, number>([["declared", declaredU32]]);
-    const { resolved, unresolvedCount } = evaluateStructuralSet(symbolic, env, new Map());
-    let outputs = resolved.slice();
-    if (outputs.length === 0 || unresolvedCount > 0) {
-      const table = AXIS_ENUM_TABLE[rule.axis];
-      if (table.length > 0 && unresolvedCount > 0) {
-        outputs = table.map((_, i) => i);
-      } else if (outputs.length === 0) {
-        throw new Error(
-          `heapScene/gpuRouting: rule on axis '${rule.axis}' could not be ` +
-          `statically resolved AND the axis has no canonical enum table. ` +
-          `Simplify the rule body so analyseOutputSet can fold each branch.`,
-        );
+    const ruleOrder = bucket.ruleOrder!;
+    const rulesById = bucket.rulesById!;
+    if (ruleOrder.length === 0) {
+      throw new Error("heapScene/gpuRouting: specialiseBucket called with no registered rules");
+    }
+    // Step 1: per-rule analyse + evaluate.
+    const perRule: Array<{
+      entry: RuleEntry;
+      bakedBody: Stmt;
+      resolved: ReadonlyArray<unknown>;
+      declaredU32: number;
+    }> = [];
+    for (const hash of ruleOrder) {
+      const entry = rulesById.get(hash)!;
+      const declaredU32 = resolveDeclaredU32(entry.rule, AdaptiveToken.top);
+      const declaredConst: Expr = {
+        kind: "Const", type: Tu32 as never,
+        value: { kind: "Int", value: declaredU32 >>> 0, signed: false } as never,
+      } as Expr;
+      const bakedBody = substituteReadInputInStmt(entry.body, "Uniform", "declared", declaredConst);
+      const symbolic = analyseOutputSet(bakedBody);
+      const env = new Map<string, number>([["declared", declaredU32]]);
+      const { resolved, unresolvedCount } = evaluateStructuralSet(symbolic, env, new Map());
+      let outputs = resolved.slice();
+      if (outputs.length === 0 || unresolvedCount > 0) {
+        const table = AXIS_ENUM_TABLE[entry.rule.axis];
+        if (table.length > 0 && unresolvedCount > 0) {
+          outputs = table.map((_, i) => i);
+        } else if (outputs.length === 0) {
+          throw new Error(
+            `heapScene/gpuRouting: rule on axis '${entry.rule.axis}' could not be ` +
+            `statically resolved AND the axis has no canonical enum table. ` +
+            `Simplify the rule body so analyseOutputSet can fold each branch.`,
+          );
+        }
+      }
+      perRule.push({ entry, bakedBody, resolved: outputs, declaredU32 });
+      entry.lastDeclaredU32 = declaredU32;
+    }
+    // Step 2: union dedup by stableStringify; deterministic order.
+    const globalSlotByKey = new Map<string, { value: unknown; idx: number }>();
+    for (const p of perRule) {
+      for (const v of p.resolved) {
+        const key = stableStringify(v);
+        if (!globalSlotByKey.has(key)) {
+          globalSlotByKey.set(key, { value: v, idx: 0 });
+        }
       }
     }
-    // Build exprId → slotIdx via stableStringify. Each Expr in the
-    // symbolic set resolved to a JS value; that value's position in
-    // the deduped `outputs` array is its slot index.
-    const valueKeyToSlot = new Map<string, number>();
-    outputs.forEach((v, i) => valueKeyToSlot.set(stableStringify(v), i));
-    const exprToSlot = (e: Expr): number | undefined => {
-      const v = evaluateStructural(e, env, new Map());
-      if (v === undefined) return undefined;
-      return valueKeyToSlot.get(stableStringify(v));
-    };
-    const rewrittenBody = rewriteOutputsToSlotIndices(bakedBody, exprToSlot);
-    const kernelWGSL = emitPartitionKernel({
-      rules: [{
-        axis: rule.axis,
+    const sortedKeys = [...globalSlotByKey.keys()].sort();
+    sortedKeys.forEach((k, i) => globalSlotByKey.get(k)!.idx = i);
+    const globalResolved: ReadonlyArray<unknown> = sortedKeys.map(k => globalSlotByKey.get(k)!.value);
+    // Step 3: per-rule body rewrite with GLOBAL slot indices.
+    const codegenRules = perRule.map(p => {
+      const env = new Map<string, number>([["declared", p.declaredU32]]);
+      const exprToSlot = (e: Expr): number | undefined => {
+        const v = evaluateStructural(e, env, new Map());
+        if (v === undefined) return undefined;
+        return globalSlotByKey.get(stableStringify(v))?.idx;
+      };
+      const rewrittenBody = rewriteOutputsToSlotIndices(p.bakedBody, exprToSlot);
+      return {
+        axis: p.entry.rule.axis,
+        ruleId: p.entry.ruleId,
         body: rewrittenBody,
-        slotCount: outputs.length,
         intrinsics: new Map(),
         helpersWGSL: "",
         inputUniforms: ["ModelTrafo"],
-      }],
-      totalSlots: outputs.length,
+      };
     });
-    return { resolved: outputs, kernelWGSL };
+    const kernelWGSL = emitPartitionKernel({
+      rules: codegenRules,
+      totalSlots: globalResolved.length,
+    });
+    return { resolved: globalResolved, kernelWGSL };
   }
 
-  /** Refresh `bucket.slots[i].pipeline` to match the resolved-set
-   *  axis enum value at position `i`. Slot 0's createSlot already
-   *  exists from findOrCreateBucket; slots 1..N are created lazily. */
+  /** Build pipeline + slot for each global resolved value. The axis
+   *  is shared across all rules in the bucket (v1 single-axis). */
   function ensureSlotsForResolved(
     bucket: Bucket,
-    rule: DerivedModeRule<ModeAxis>,
     resolved: ReadonlyArray<unknown>,
   ): void {
     const fam = familyForBucket.get(bucket)!;
     const base = bucket.baseDescriptor!;
+    const axis = bucket.ruleOrder!.length > 0
+      ? bucket.rulesById!.get(bucket.ruleOrder![0]!)!.rule.axis
+      : ("cull" as ModeAxis);
+    const dummyRule = { axis } as DerivedModeRule<ModeAxis>;
     for (let slotIdx = 0; slotIdx < resolved.length; slotIdx++) {
       const slotValue = resolved[slotIdx];
-      const axisValue = resolveAxisValue(rule, slotValue);
-      const desc = patchDescriptor(base, rule.axis, axisValue);
+      const axisValue = resolveAxisValue(dummyRule, slotValue);
+      const desc = patchDescriptor(base, axis, axisValue);
       const key = encodeModeKey(desc);
       if (slotIdx < bucket.slots.length) {
         const slot = bucket.slots[slotIdx]!;
@@ -1970,71 +2054,108 @@ export function buildHeapScene(
   }
 
   /**
-   * Phase 5c.3 — promote `bucket` to GPU-routed.
+   * Register a rule on a GPU-routed bucket (or promote the bucket
+   * to GPU-routed on the first rule). Returns the bucket-unique
+   * `ruleId` to bake into master-pool records.
    *
-   * Pipeline:
-   *   1. extract the rule body Stmt from `rule.expr.template`
-   *   2. resolve current declared aval value → u32 index
-   *   3. analyseOutputSet + evaluateSet → resolved u32 set
-   *   4. create one slot per resolved enum value (pipeline = axis
-   *      value at that enum index)
-   *   5. emitPartitionKernel → WGSL string
-   *   6. create GpuPartitionScene with the kernel string
-   *
-   * Single-axis only for v1. Declared marks trigger a re-specialise
-   * via `dispatchPartition`'s mid-flight cache check.
+   * If the rule's content hash is new to this bucket, the bucket is
+   * re-specialised (rebuilds the kernel and may grow the slot table
+   * to accommodate the rule's outputs).
    */
-  function initGpuRouting(
+  function registerRule(
     bucket: Bucket,
-    rules: DerivedModeRule<ModeAxis>[],
+    rule: DerivedModeRule<ModeAxis>,
     baseDesc: PipelineStateDescriptor,
-    tok: AdaptiveToken,
-  ): void {
-    if (bucket.gpuRouted) return;
-    if (rules.length === 0) return;
-    if (rules.length > 1) {
-      throw new Error(
-        `heapScene: multi-axis derived-mode rules not yet supported (got ${rules.length} axes)`,
-      );
+  ): number {
+    const hash = ruleContentHash(rule);
+    // First rule on this bucket: lazy-init the multi-rule machinery.
+    if (!bucket.gpuRouted) {
+      bucket.baseDescriptor = baseDesc;
+      bucket.rulesById      = new Map<string, RuleEntry>();
+      bucket.ruleOrder      = [];
+      bucket.drawIdToRuleId = new Map<number, number>();
+      bucket.drawIdToRecord = new Map<number, number>();
+      bucket.recordToDrawId = [];
     }
-    const rule = rules[0]!;
-    bucket.baseDescriptor = baseDesc;
-    bucket.rules          = rules;
-    bucket.ruleBody       = ruleBodyOf(rule);
-    const declaredU32 = resolveDeclaredU32(rule, tok);
-    const { resolved, kernelWGSL } = specialiseRule(rule, bucket.ruleBody!, declaredU32);
-    bucket.lastDeclaredU32 = declaredU32;
-    ensureSlotsForResolved(bucket, rule, resolved);
-    const partition = new GpuPartitionScene(device, `${bucket.label}/partition`, {
-      totalSlots: resolved.length,
-      slotDrawBufs: bucket.slots.map(s => s.drawTableBuf!.buffer),
-      kernelWGSL,
-      initialRecords: 16,
-    });
-    bucket.gpuRouted      = true;
-    bucket.partitionScene = partition;
-    bucket.drawIdToRecord = new Map<number, number>();
-    bucket.recordToDrawId = [];
-    bucket.partitionDirty = true;
+    let entry = bucket.rulesById!.get(hash);
+    let newRule = false;
+    if (entry === undefined) {
+      const ruleId = bucket.ruleOrder!.length;
+      entry = {
+        ruleId, contentHash: hash, rule,
+        body: ruleBodyOf(rule),
+        lastDeclaredU32: undefined,
+      };
+      bucket.rulesById!.set(hash, entry);
+      bucket.ruleOrder!.push(hash);
+      newRule = true;
+    } else {
+      // Cross-axis sanity (multi-axis rules in one bucket are a
+      // future lift).
+      if (entry.rule.axis !== rule.axis) {
+        throw new Error(
+          `heapScene/gpuRouting: bucket already has rule on axis '${entry.rule.axis}'; ` +
+          `cannot mix with axis '${rule.axis}'`,
+        );
+      }
+    }
+    // First time gpuRouted? Build the partition scene now.
+    if (!bucket.gpuRouted) {
+      const { resolved, kernelWGSL } = specialiseBucket(bucket);
+      ensureSlotsForResolved(bucket, resolved);
+      const partition = new GpuPartitionScene(device, `${bucket.label}/partition`, {
+        totalSlots: resolved.length,
+        slotDrawBufs: bucket.slots.map(s => s.drawTableBuf!.buffer),
+        kernelWGSL,
+        initialRecords: 16,
+      });
+      bucket.gpuRouted      = true;
+      bucket.partitionScene = partition;
+      bucket.partitionDirty = true;
+    } else if (newRule) {
+      // Extending an existing GPU bucket with a fresh rule — re-
+      // specialise (may grow the slot table + needs new kernel).
+      const { resolved, kernelWGSL } = specialiseBucket(bucket);
+      ensureSlotsForResolved(bucket, resolved);
+      const newCount = bucket.slots.length;
+      const draws = bucket.slots.map(s => s.drawTableBuf!.buffer);
+      if (newCount > bucket.partitionScene!.totalSlots) {
+        bucket.partitionScene!.growSlots(newCount, draws);
+      } else {
+        bucket.partitionScene!.rebindSlotDrawBufs(draws);
+      }
+      bucket.partitionScene!.rebuildKernel(kernelWGSL);
+      bucket.partitionDirty = true;
+    }
+    return entry.ruleId;
   }
 
   /**
-   * Phase 5c.3 — per-frame partition dispatch.
-   *
-   * Re-resolves the rule's `declared` aval. If it changed since the
-   * last dispatch, re-runs `specialiseRule` (analyse + evaluate +
-   * codegen) and swaps the partition kernel + slot pipelines. Then
-   * encodes the dispatch + `copyBufferToBuffer` per slot.
+   * Per-frame partition dispatch. Detects per-rule `declared`
+   * changes and re-specialises the whole bucket if any rule's
+   * declared value differs from what was used at the last
+   * dispatch (cheap — analysis runs on cached IR).
    */
   function dispatchPartition(bucket: Bucket, enc: GPUCommandEncoder, tok: AdaptiveToken): void {
     if (!bucket.gpuRouted || bucket.partitionScene === undefined) return;
-    const rule = bucket.rules![0]!;
-    const declaredU32 = resolveDeclaredU32(rule, tok);
-    if (declaredU32 !== bucket.lastDeclaredU32) {
-      const { resolved, kernelWGSL } = specialiseRule(rule, bucket.ruleBody!, declaredU32);
-      ensureSlotsForResolved(bucket, rule, resolved);
+    // Detect any rule whose declared changed.
+    let needRespec = false;
+    for (const hash of bucket.ruleOrder!) {
+      const entry = bucket.rulesById!.get(hash)!;
+      const declaredU32 = resolveDeclaredU32(entry.rule, tok);
+      if (declaredU32 !== entry.lastDeclaredU32) { needRespec = true; break; }
+    }
+    if (needRespec) {
+      const { resolved, kernelWGSL } = specialiseBucket(bucket);
+      ensureSlotsForResolved(bucket, resolved);
+      const newCount = bucket.slots.length;
+      const draws = bucket.slots.map(s => s.drawTableBuf!.buffer);
+      if (newCount > bucket.partitionScene.totalSlots) {
+        bucket.partitionScene.growSlots(newCount, draws);
+      } else {
+        bucket.partitionScene.rebindSlotDrawBufs(draws);
+      }
       bucket.partitionScene.rebuildKernel(kernelWGSL);
-      bucket.lastDeclaredU32 = declaredU32;
     }
     bucket.partitionScene.flush();
     bucket.partitionScene.dispatch(arena.attrs.buffer, enc);
@@ -2101,10 +2222,10 @@ export function buildHeapScene(
       partitionScene: undefined,
       drawIdToRecord: undefined,
       recordToDrawId: undefined,
-      rules: undefined,
+      rulesById: undefined,
+      ruleOrder: undefined,
+      drawIdToRuleId: undefined,
       baseDescriptor: undefined,
-      lastDeclaredU32: undefined,
-      ruleBody: undefined,
       partitionDirty: false,
     };
     familyForBucket.set(bucket, fam);
@@ -2340,14 +2461,22 @@ export function buildHeapScene(
       });
     }
     const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, precomputedDescriptor);
-    // Phase 5c.3 — first RO carrying ANY derived-mode rule promotes the
-    // bucket to GPU routing. Subsequent ROs in the same bucket are
-    // assumed to carry the SAME rule set (mixed-mode buckets are
-    // rejected: see the check below).
+    // Phase 5c.3 — every RO carrying a derived-mode rule is registered
+    // on the bucket (lazy-promoting it to GPU-routed on the first
+    // call). ROs may carry DIFFERENT rules even when they share the
+    // bucket's `(effect, textureSet)` — each gets its own `ruleId`
+    // baked into the master-pool record and the partition kernel's
+    // dispatch switch picks the right body per record.
     const collectedRules = spec.modeRules !== undefined ? collectRules(spec.modeRules) : [];
     const roDescriptor = precomputedDescriptor ?? snapshotDescriptor(spec.pipelineState, sig);
-    if (!bucket.gpuRouted && collectedRules.length > 0) {
-      initGpuRouting(bucket, collectedRules, roDescriptor, outerTok);
+    let roRuleId = 0;
+    if (collectedRules.length > 0) {
+      if (collectedRules.length > 1) {
+        throw new Error(
+          `heapScene: multi-axis rules on one RO not yet supported (got ${collectedRules.length} axes)`,
+        );
+      }
+      roRuleId = registerRule(bucket, collectedRules[0]!, roDescriptor);
     }
     // Phase 5c.2: route this RO to the bucket's slot covering its
     // current descriptor. ensureSlot creates a new slot on miss; the
@@ -2509,14 +2638,14 @@ export function buildHeapScene(
           `heapScene: GPU-routed bucket exceeds SCAN_MAX_RECORDS (${SCAN_MAX_RECORDS})`,
         );
       }
-      // Pending M6/M7: the modelRef wiring for the new rule shape
-      // will inspect the rule body's `ReadInput("Uniform", X)`
-      // leaves and resolve each to its arena byte offset. For now
-      // `initGpuRouting` throws before we reach here.
+      // modelRef = arena byte offset of the rule body's input
+      // uniform (today fixed to ModelTrafo until rules with multiple
+      // arena inputs land).
       const modelRef = perDrawRefs.get("ModelTrafo") ?? 0;
-      partition.appendRecord(localSlot, idxAlloc.firstIndex, idxAlloc.count, instanceCount, modelRef);
+      partition.appendRecord(localSlot, idxAlloc.firstIndex, idxAlloc.count, instanceCount, modelRef, roRuleId);
       bucket.drawIdToRecord!.set(drawId, recIdx);
       bucket.recordToDrawId![recIdx] = drawId;
+      bucket.drawIdToRuleId!.set(drawId, roRuleId);
       // Master grew? Invalidate partition's bind group so it picks
       // up the new masterBuf.  (rebindSlotDrawBufs nulls bindGroup.)
       // grow() inside appendRecord already does this when capacity

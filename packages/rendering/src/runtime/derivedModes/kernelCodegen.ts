@@ -23,69 +23,81 @@ import type { Expr, Stmt, Type, Literal, IntrinsicEvalTable } from "@aardworx/wo
 import { stableStringify } from "@aardworx/wombat.shader/ir";
 import type { ModeAxis } from "./rule.js";
 
-/** Per-axis rule spec consumed by the codegen. */
+/** One traced+rewritten rule body, ready for codegen. */
 export interface RuleCodegenSpec {
   readonly axis: ModeAxis;
+  /** Bucket-unique id. Master-pool records carry this in their
+   *  `ruleId` field; the partition kernel switches on it. */
+  readonly ruleId: number;
   /**
-   * The rule body — already rewritten by `rewriteOutputsToSlotIndices`
-   * so every `ReturnValue` returns a `Const u32` slot index. The
-   * codegen never sees the original `__record:*` intrinsics.
+   * The rule body — already rewritten so every `ReturnValue` returns
+   * a `Const u32` GLOBAL slot index (into the bucket's union resolved
+   * set across all rules). The codegen never sees the original
+   * `__record:*` intrinsics.
    */
   readonly body: Stmt;
-  /** Total slot count (= number of distinct outputs the rule's
-   *  symbolic set resolved to under the current declared). */
-  readonly slotCount: number;
-  /**
-   * Axis-specific intrinsic table. The codegen emits direct
-   * `intrinsicName(args)` calls in WGSL — the caller must ensure
-   * the intrinsic is available in WGSL OR provide it as a helper.
-   */
   readonly intrinsics: IntrinsicEvalTable;
-  /**
-   * Pre-emitted WGSL helper functions referenced by the rule body.
-   * One block per axis; concatenated into the kernel.
-   */
+  /** Per-rule WGSL helpers (concatenated into the kernel). */
   readonly helpersWGSL: string;
-  /** Names of `u.<X>` uniform leaves the body reads, in declaration
-   *  order. Maps to per-RO arena byte offsets at codegen time —
-   *  currently fixed to one input (modelRef) until the dispatcher
-   *  generalises to multi-input rules. */
   readonly inputUniforms: ReadonlyArray<string>;
 }
 
 export interface KernelCodegenSpec {
+  /** One per distinct rule in the bucket. Each record's `ruleId`
+   *  selects which rule body runs at partition time. */
   readonly rules: ReadonlyArray<RuleCodegenSpec>;
-  /** Total slot count across the bucket — product of per-axis
-   *  resolved-set sizes (for multi-axis rules) or just the single
-   *  axis's `resolved.length` (for one-axis rules). */
+  /** Total slot count = size of the UNION resolved set across every
+   *  rule, deduped by structural-value equality. */
   readonly totalSlots: number;
 }
 
-/** Emit the WGSL partition kernel for the given rules. */
+/** Emit the WGSL partition kernel for the given rules. Per-record
+ *  dispatch: `switch(r.ruleId) { case 0u: { … rule body 0 …; case 1u:
+ *  { … rule body 1 …; … }` — each body has been pre-rewritten so
+ *  its `ReturnValue`s emit GLOBAL slot indices (across all rules in
+ *  the bucket). */
 export function emitPartitionKernel(spec: KernelCodegenSpec): string {
   if (spec.rules.length === 0) {
     throw new Error("kernelCodegen: at least one rule is required");
   }
-  if (spec.rules.length > 1) {
-    throw new Error("kernelCodegen: multi-axis rules not yet supported (single-axis only for now)");
-  }
   if (spec.totalSlots > 16) {
     throw new Error(`kernelCodegen: totalSlots ${spec.totalSlots} exceeds the v1 limit of 16`);
   }
-
-  const rule = spec.rules[0]!;
-  const N = spec.totalSlots;
-  if (N !== rule.slotCount) {
-    throw new Error(
-      `kernelCodegen: totalSlots (${N}) != rule.slotCount (${rule.slotCount})`,
-    );
+  // Sanity: rules must share an axis for the v1 single-axis bucket
+  // assumption to hold. Multi-axis (cartesian product) is a future lift.
+  const axis = spec.rules[0]!.axis;
+  for (const r of spec.rules) {
+    if (r.axis !== axis) {
+      throw new Error(`kernelCodegen: all rules must target the same axis (v1) — got ${r.axis} and ${axis}`);
+    }
   }
+  const N = spec.totalSlots;
 
-  // The body's ReturnValues have already been rewritten to emit a
-  // `Const u32` slot index directly (one per dedup'd output), so
-  // the kernel's partition entry uses `rule_<axis>(r)` as the slot
-  // index without any lookup-table indirection.
-  const ruleFnBody = emitStmtAsWgslFn(rule);
+  // Emit one `rule_<axis>_<ruleId>(r) -> u32` per rule, plus a
+  // dispatcher that switches on r.ruleId. The dispatcher's default
+  // returns OOB (record skipped). Helpers are deduped by string
+  // equality so two rules sharing the same WGSL helper don't
+  // double-emit (rule_<axis>_X and rule_<axis>_Y can both use a
+  // user-defined `flipCull` etc. that the shader frontend lifted
+  // into module scope).
+  const helperSet = new Set<string>();
+  const ruleFns: string[] = [];
+  const dispatchCases: string[] = [];
+  for (const r of spec.rules) {
+    if (r.helpersWGSL.trim().length > 0) helperSet.add(r.helpersWGSL);
+    ruleFns.push(emitStmtAsWgslFn(r));
+    dispatchCases.push(`    case ${r.ruleId}u: { return rule_${r.axis}_${r.ruleId}(r); }`);
+  }
+  const helpersWGSL = [...helperSet].join("\n");
+  const ruleFnsWGSL = ruleFns.join("\n");
+  const dispatcherWGSL = `
+fn dispatch_${axis}(r: Record) -> u32 {
+  switch (r.ruleId) {
+${dispatchCases.join("\n")}
+    default: { return ${N}u; }
+  }
+}
+`;
 
   const slotCases = new Array(N).fill(0).map((_, slotIdx) =>
     `    case ${slotIdx}u: { let off = atomicAdd(&slot${slotIdx}Count[0], 1u); let base = off * SCAN_REC_U32;` +
@@ -117,6 +129,7 @@ struct Record {
   indexCount:    u32,
   instanceCount: u32,
   modelRef:      u32,
+  ruleId:        u32,
 };
 struct PartitionParams { numRecords: u32 };
 
@@ -130,9 +143,11 @@ const SCAN_REC_U32: u32 = 5u;
 
 ${LOADERS}
 
-${rule.helpersWGSL}
+${helpersWGSL}
 
-${ruleFnBody}
+${ruleFnsWGSL}
+
+${dispatcherWGSL}
 
 @compute @workgroup_size(64)
 fn clear(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -145,7 +160,7 @@ fn partitionRecords(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= params.numRecords) { return; }
   let r = masterRecords[i];
-  let slotIdx = rule_${rule.axis}(r);
+  let slotIdx = dispatch_${axis}(r);
   if (slotIdx >= ${N}u) { return; }
   switch (slotIdx) {
 ${slotCases}
@@ -186,7 +201,7 @@ function emitStmtAsWgslFn(rule: RuleCodegenSpec): string {
     localCounter: 0,
   };
   const bodyWgsl = emitStmt(rule.body, ctx, "  ");
-  return `fn rule_${rule.axis}(r: Record) -> u32 {\n${bodyWgsl}\n  return 0u;\n}\n`;
+  return `fn rule_${rule.axis}_${rule.ruleId}(r: Record) -> u32 {\n${bodyWgsl}\n  return 0u;\n}\n`;
 }
 
 interface EmitCtx {

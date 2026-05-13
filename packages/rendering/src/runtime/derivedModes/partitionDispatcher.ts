@@ -37,15 +37,19 @@ export interface PartitionSceneSpec {
 export class GpuPartitionScene {
   readonly device: GPUDevice;
   readonly label: string;
-  readonly totalSlots: number;
+  get totalSlots(): number { return this._totalSlots; }
 
   masterBuf: GPUBuffer;
   masterShadow: Uint32Array;
   numRecords = 0;
   capacity = 0;
 
-  readonly slotCountBufs: GPUBuffer[];
+  slotCountBufs: GPUBuffer[];
   slotDrawBufs: GPUBuffer[];
+  // `totalSlots` is mutable — `growSlots(...)` extends both the
+  // dispatcher and the kernel layout to accommodate new pipeline
+  // slots that appear when a new rule is registered on the bucket.
+  private _totalSlots: number;
 
   /** params: [numRecords] — single u32 (padded to 16 bytes for WGSL
    *  uniform alignment). `declared` is no longer carried here; the
@@ -67,7 +71,7 @@ export class GpuPartitionScene {
     }
     this.device = device;
     this.label = label;
-    this.totalSlots = spec.totalSlots;
+    this._totalSlots = spec.totalSlots;
     this.capacity = POW2(spec.initialRecords ?? 16);
     const bytes = this.capacity * PARTITION_RECORD_BYTES;
     this.masterBuf = device.createBuffer({
@@ -103,10 +107,37 @@ export class GpuPartitionScene {
   }
 
   rebindSlotDrawBufs(slotDraws: ReadonlyArray<GPUBuffer>): void {
-    if (slotDraws.length !== this.totalSlots) {
-      throw new Error(`rebindSlotDrawBufs: expected ${this.totalSlots} buffers, got ${slotDraws.length}`);
+    if (slotDraws.length !== this._totalSlots) {
+      throw new Error(`rebindSlotDrawBufs: expected ${this._totalSlots} buffers, got ${slotDraws.length}`);
     }
     this.slotDrawBufs = [...slotDraws];
+    this.bindGroup = null;
+  }
+
+  /** Grow the bucket's slot count when a new rule registers and the
+   *  union of its outputs introduces fresh slots. Allocates the
+   *  additional atomic-count buffers and discards the bind-group
+   *  layout (different N = different binding shape). The caller
+   *  must follow up with `rebuildKernel(...)` so the new kernel
+   *  knows about the new slot count. */
+  growSlots(newCount: number, newSlotDraws: ReadonlyArray<GPUBuffer>): void {
+    if (newCount < this._totalSlots) {
+      throw new Error(`growSlots: cannot shrink (have ${this._totalSlots}, asked for ${newCount})`);
+    }
+    if (newSlotDraws.length !== newCount) {
+      throw new Error(`growSlots: slotDraws.length ${newSlotDraws.length} != newCount ${newCount}`);
+    }
+    for (let i = this._totalSlots; i < newCount; i++) {
+      this.slotCountBufs.push(this.device.createBuffer({
+        label: `${this.label}/slot${i}Count`, size: 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      }));
+    }
+    this._totalSlots = newCount;
+    this.slotDrawBufs = [...newSlotDraws];
+    this.layout = null;
+    this.clearPipeline = null;
+    this.partitionPipeline = null;
     this.bindGroup = null;
   }
 
@@ -174,6 +205,7 @@ export class GpuPartitionScene {
     indexCount: number,
     instanceCount: number,
     modelRef: number,
+    ruleId = 0,
   ): number {
     if (this.numRecords >= this.capacity) this.grow();
     const i = this.numRecords;
@@ -184,8 +216,17 @@ export class GpuPartitionScene {
     this.masterShadow[o + 3] = indexCount;
     this.masterShadow[o + 4] = instanceCount;
     this.masterShadow[o + 5] = modelRef;
+    this.masterShadow[o + 6] = ruleId >>> 0;
     this.numRecords = i + 1;
     return i;
+  }
+
+  /** Update an existing record's ruleId. Used when an RO already
+   *  in the master is re-classified (rare; only when rule rebucket
+   *  fires on aval marks). */
+  setRecordRuleId(recordIdx: number, ruleId: number): void {
+    if (recordIdx < 0 || recordIdx >= this.numRecords) return;
+    this.masterShadow[recordIdx * PARTITION_RECORD_U32 + 6] = ruleId >>> 0;
   }
 
   removeRecord(recordIdx: number): number {
