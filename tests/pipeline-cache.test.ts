@@ -5,7 +5,7 @@ import {
   encodeModeKey,
   type PipelineBuilder,
   type PipelineStateDescriptor,
-} from "../src/runtime/pipelineCache/index.js";
+} from "@aardworx/wombat.rendering/runtime";
 
 function mockBuilder(): PipelineBuilder & { syncCalls: number; asyncCalls: number } {
   let syncCalls = 0;

@@ -86,3 +86,29 @@ export {
   type AtlasAcquisition,
   type AtlasSource,
 } from "./textureAtlas/atlasPool.js";
+
+// Pipeline-state cache + bitfield encoding (Task 1 of derived-modes).
+export {
+  PipelineCache,
+  encodeModeKey,
+  decodeModeKey,
+  MAX_ATTACHMENTS,
+  DEFAULT_DESCRIPTOR,
+  DEFAULT_ATTACHMENT_BLEND,
+  descriptorEquals,
+  type PipelineBuilder,
+  type PipelineStateDescriptor,
+  type AttachmentBlend,
+  type BlendComponent,
+  type DepthSlice,
+  type StencilSlice,
+  type StencilFace,
+  type CullMode as PipelineCullMode,
+  type FrontFace as PipelineFrontFace,
+  type Topology as PipelineTopology,
+} from "./pipelineCache/index.js";
+
+export {
+  ModeKeyTracker,
+  snapshotDescriptor,
+} from "./derivedModes/modeKeyCpu.js";

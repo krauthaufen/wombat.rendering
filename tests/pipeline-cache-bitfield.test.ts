@@ -6,7 +6,7 @@ import {
   DEFAULT_DESCRIPTOR,
   DEFAULT_ATTACHMENT_BLEND,
   type PipelineStateDescriptor,
-} from "../src/runtime/pipelineCache/index.js";
+} from "@aardworx/wombat.rendering/runtime";
 
 const variants: PipelineStateDescriptor[] = [
   DEFAULT_DESCRIPTOR,
