@@ -2097,6 +2097,13 @@ export function buildHeapScene(
         if (inputRef !== undefined) {
           if (gpuModesScene === undefined) gpuModesScene = new GpuDerivedModesScene(device);
           gpuModesScene.registerRo(drawId, inputRef, gpuRule.declared);
+          if (drawId < 3 || drawId % 20 === 0) {
+            // Sparse logging so we can confirm registration without
+            // spamming for big scenes.
+            console.debug(`[heapScene] GPU rule registered drawId=${drawId} input='${gpuRule.inputUniform}' ref=${inputRef} declared=${gpuRule.declared}`);
+          }
+        } else {
+          console.warn(`[heapScene] GPU rule input '${gpuRule.inputUniform}' not in spec.inputs for drawId=${drawId}; rule disabled`);
         }
       }
     }
@@ -2605,11 +2612,13 @@ export function buildHeapScene(
       // copy-to-staging with "buffer used in submit while mapped".
       Promise.resolve().then(() => gpuModesScene!.finish(numROs)).then(() => {
         const out = gpuModesScene!.lastOutput;
+        let changes = 0;
         for (let i = 0; i < numROs; i++) {
           const cur = out[i] ?? 0xFFFFFFFF;
           const prev = gpuModesLastKey.get(i);
           if (cur === 0xFFFFFFFF) continue;       // no rule on this RO
           if (prev === cur) continue;
+          changes++;
           gpuModesLastKey.set(i, cur);
           // Project the kernel's u32 enum back to a CullMode value,
           // store on the tracker's modeRules so the next snapshot
@@ -2631,6 +2640,9 @@ export function buildHeapScene(
           };
           (spec as { modeRules?: typeof spec.modeRules }).modeRules = patched;
           dirtyModeKeyDrawIds.add(i);
+        }
+        if (changes > 0) {
+          console.debug(`[heapScene] GPU rule readback: ${changes}/${numROs} ROs changed modeKey`);
         }
       }).catch((e) => {
         // mapAsync can reject if the device was lost or the scene was
