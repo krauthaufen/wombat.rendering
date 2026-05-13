@@ -2401,9 +2401,25 @@ export function buildHeapScene(
           arr.push(drawId);
         }
 
+        // Two-phase rebucket: collect all proposed renames first, then
+        // commit them atomically. Avoids the "two buckets swap names"
+        // conflict (e.g. cullModeC flip with both 'back' and 'front'
+        // buckets present — A wants 'front', B wants 'back', they
+        // collide). After phase 1 every fast-path bucket is removed
+        // from bucketByKey, freeing both keys for phase 2's atomic
+        // re-insertion. Slow per-RO rebuckets handle anything that
+        // still conflicts (rare).
+        type Rename = {
+          bucket: Bucket;
+          repId: number;
+          newKey: bigint;
+          newBk: string;
+          oldBk: string;
+        };
+        const renames: Rename[] = [];
+        const slowChanged: number[] = []; // ROs going through per-RO
+
         for (const [bucket, ids] of byBucket) {
-          // First recompute every dirty tracker so .modeKey is fresh.
-          // Filter out ones whose value didn't actually change.
           const changed: number[] = [];
           for (const drawId of ids) {
             const tracker = drawIdToModeTracker[drawId];
@@ -2415,60 +2431,72 @@ export function buildHeapScene(
           }
           if (changed.length === 0) continue;
 
-          // Try the all-together fast path.
           const wholeBucket = changed.length === bucket.drawSlots.size;
           if (wholeBucket) {
             const repId = changed[0]!;
             const repTracker = drawIdToModeTracker[repId]!;
-            const newKey  = repTracker.modeKey;
-            // Compute the new bucketByKey string; we need the family.
             const sample = drawIdToSpec[repId]!;
             const fam = familyFor(sample.effect);
+            const newKey  = repTracker.modeKey;
             const newBk = `family#${fam.schema.id}|mk#${newKey.toString(16)}`;
-            const existing = bucketByKey.get(newBk);
-            if (existing === undefined) {
-              // No conflict — rename + rebuild pipeline in place.
-              // Find this bucket's current key by linear scan
-              // (buckets ≤ ~100 typically, so this is cheap).
-              let oldBk: string | undefined;
-              for (const [k, v] of bucketByKey) {
-                if (v === bucket) { oldBk = k; break; }
-              }
-              if (oldBk !== undefined) bucketByKey.delete(oldBk);
-              bucketByKey.set(newBk, bucket);
-              // Build the new pipeline with the snapshotted PS.
-              const desc = repTracker.descriptor;
-              const { pipelineLayout } = getBgl(bucket.layout, bucket.isAtlasBucket);
-              const newPipeline = device.createRenderPipeline({
-                label: `heapScene/${newBk}/pipeline`,
-                layout: pipelineLayout,
-                vertex:   { module: familyFor(sample.effect).vsModule, entryPoint: familyFor(sample.effect).vsEntryName, buffers: [] },
-                fragment: { module: familyFor(sample.effect).fsModule, entryPoint: familyFor(sample.effect).fsEntryName, targets: colorTargets },
-                primitive: { topology: desc.topology, cullMode: desc.cullMode, frontFace: desc.frontFace },
-                ...(depthFormat !== undefined && desc.depth !== undefined
-                  ? { depthStencil: { format: depthFormat, depthWriteEnabled: desc.depth.write, depthCompare: desc.depth.compare } }
-                  : depthFormat !== undefined
-                    ? { depthStencil: { format: depthFormat, depthWriteEnabled: false, depthCompare: "always" as GPUCompareFunction } }
-                    : {}),
-              });
-              // Swap pipeline reference on the bucket's single slot.
-              // (Multi-slot Phase 5c would update one slot at a time.)
-              (bucket.slots[0] as { pipeline: GPURenderPipeline }).pipeline = newPipeline;
-              continue; // done with this bucket
+            let oldBk: string | undefined;
+            for (const [k, v] of bucketByKey) {
+              if (v === bucket) { oldBk = k; break; }
             }
-            // Conflict: another bucket already owns newBk. Fall through
-            // to per-RO rebucket below, which will merge into `existing`.
+            if (oldBk !== undefined && oldBk !== newBk) {
+              renames.push({ bucket, repId, newKey, newBk, oldBk });
+              continue;
+            }
+            if (oldBk === newBk) continue; // shouldn't happen but safe
           }
-          // Slow path — per-RO rebucket (used when partial transition
-          // OR when a merge with an existing destination bucket is
-          // required).
-          for (const drawId of changed) {
-            const spec = drawIdToSpec[drawId];
-            if (spec === undefined) continue;
-            removeDraw(drawId);
-            const newId = addDrawImpl(spec, tok);
-            void newId;
+          // Partial transition: per-RO slow path.
+          for (const c of changed) slowChanged.push(c);
+        }
+
+        if (renames.length > 0) {
+          // Phase 1: remove all old keys. After this, the renames' new
+          // keys are free unless they collide with a NON-rename
+          // bucket's current key.
+          for (const r of renames) bucketByKey.delete(r.oldBk);
+          // Phase 2: assign new keys, building new pipelines. If a
+          // collision still exists after phase 1 (against a stale
+          // bucket that's NOT being renamed), restore old key + fall
+          // back to per-RO for that bucket's records.
+          for (const r of renames) {
+            if (bucketByKey.has(r.newBk)) {
+              // Collision with a stale bucket. Restore + flag for slow.
+              bucketByKey.set(r.oldBk, r.bucket);
+              for (const id of r.bucket.drawSlots) slowChanged.push(id);
+              continue;
+            }
+            bucketByKey.set(r.newBk, r.bucket);
+            const tracker = drawIdToModeTracker[r.repId]!;
+            const sample = drawIdToSpec[r.repId]!;
+            const desc = tracker.descriptor;
+            const { pipelineLayout } = getBgl(r.bucket.layout, r.bucket.isAtlasBucket);
+            const newPipeline = device.createRenderPipeline({
+              label: `heapScene/${r.newBk}/pipeline`,
+              layout: pipelineLayout,
+              vertex:   { module: familyFor(sample.effect).vsModule, entryPoint: familyFor(sample.effect).vsEntryName, buffers: [] },
+              fragment: { module: familyFor(sample.effect).fsModule, entryPoint: familyFor(sample.effect).fsEntryName, targets: colorTargets },
+              primitive: { topology: desc.topology, cullMode: desc.cullMode, frontFace: desc.frontFace },
+              ...(depthFormat !== undefined && desc.depth !== undefined
+                ? { depthStencil: { format: depthFormat, depthWriteEnabled: desc.depth.write, depthCompare: desc.depth.compare } }
+                : depthFormat !== undefined
+                  ? { depthStencil: { format: depthFormat, depthWriteEnabled: false, depthCompare: "always" as GPUCompareFunction } }
+                  : {}),
+            });
+            (r.bucket.slots[0] as { pipeline: GPURenderPipeline }).pipeline = newPipeline;
           }
+        }
+
+        // Slow per-RO rebucket for the leftover cases.
+        for (const drawId of slowChanged) {
+          const spec = drawIdToSpec[drawId];
+          if (spec === undefined) continue;
+          removeDraw(drawId);
+          const newId = addDrawImpl(spec, tok);
+          void newId;
         }
       }
 
@@ -2626,45 +2654,19 @@ export function buildHeapScene(
       // submitted the enc. Without this deferral, mapAsync fires
       // before submit and WebGPU rejects the next dispatch's
       // copy-to-staging with "buffer used in submit while mapped".
-      Promise.resolve().then(() => gpuModesScene!.finish(numROs)).then(() => {
-        const out = gpuModesScene!.lastOutput;
-        let changes = 0;
-        for (let i = 0; i < numROs; i++) {
-          const cur = out[i] ?? 0xFFFFFFFF;
-          const prev = gpuModesLastKey.get(i);
-          if (cur === 0xFFFFFFFF) continue;       // no rule on this RO
-          if (prev === cur) continue;
-          changes++;
-          gpuModesLastKey.set(i, cur);
-          // Project the kernel's u32 enum back to a CullMode value,
-          // store on the tracker's modeRules so the next snapshot
-          // picks it up, then schedule a rebucket.
-          const tracker = drawIdToModeTracker[i];
-          const spec    = drawIdToSpec[i];
-          if (tracker === undefined || spec === undefined) continue;
-          const cull = U32_TO_CULL[cur];
-          if (cull === undefined) continue;
-          // Inject the GPU result by patching the spec's CPU rule to
-          // return a constant. Slightly hacky but contained: the next
-          // recompute() will read this and route to the right bucket.
-          const patched: typeof spec.modeRules = {
-            ...spec.modeRules,
-            cull: {
-              __derivedModeRule: true, axis: "cull",
-              evaluate: () => cull,
-            },
-          };
-          (spec as { modeRules?: typeof spec.modeRules }).modeRules = patched;
-          dirtyModeKeyDrawIds.add(i);
-        }
-        if (changes > 0) {
-          console.debug(`[heapScene] GPU rule readback: ${changes}/${numROs} ROs changed modeKey`);
-        }
-      }).catch((e) => {
-        // mapAsync can reject if the device was lost or the scene was
-        // disposed mid-readback. Log but don't crash the frame.
-        console.warn("gpuModesScene readback failed:", e);
-      });
+      // No readback: v1's patch-spec.modeRules approach broke
+      // reactivity (a second cullModeC flip stopped re-bucketing
+      // because the patched constant closure never produces a new
+      // modeKey). The CPU fallback is authoritative for now —
+      // tracker.recompute drives the rebucket flow correctly.
+      //
+      // Phase 5c.2 (no-readback by design): pre-warm all slot
+      // pipelines at scene-build via static analysis; kernel writes
+      // per-RO slot index; partition kernel produces per-slot
+      // indirect args; encode iterates fixed slots. The
+      // GpuDerivedModesScene kernel dispatch stays here as a
+      // demonstration of the GPU path — its output is currently
+      // unused but proves the kernel runs against arena data.
     }
 
     // §7: derived-uniforms dispatch first — writes into per-bucket
