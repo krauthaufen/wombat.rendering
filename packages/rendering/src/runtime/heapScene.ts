@@ -1105,6 +1105,45 @@ export function buildHeapScene(
   const buckets: Bucket[] = [];
   const bucketByKey = new Map<string, Bucket>();
 
+  /**
+   * Scene-level pipeline cache keyed on `(famId, modeKey)` — when an
+   * RO mode-flip renames a bucket, the new pipeline is fetched from
+   * this cache rather than re-created. Cache misses fall back to
+   * `device.createRenderPipeline` and stash the result. Pre-warming
+   * (when ROs are added with rules) extends this cache so the cache
+   * always hits on subsequent flips. See Phase 5c.2.
+   */
+  const pipelineByModeKey = new Map<string, GPURenderPipeline>();
+
+  /** Build a GPURenderPipeline from a descriptor + family + bucket
+   *  layout. Cached by `(familyId, modeKey)`. */
+  function getOrCreatePipeline(
+    fam: ReturnType<typeof familyFor>,
+    layout: BucketLayout,
+    isAtlasBucket: boolean,
+    desc: PipelineStateDescriptor,
+  ): GPURenderPipeline {
+    const modeKey = encodeModeKey(desc);
+    const cacheKey = `f${fam.schema.id}|mk${modeKey.toString(16)}`;
+    const cached = pipelineByModeKey.get(cacheKey);
+    if (cached !== undefined) return cached;
+    const { pipelineLayout } = getBgl(layout, isAtlasBucket);
+    const pipeline = device.createRenderPipeline({
+      label: `heapScene/cached/${cacheKey}`,
+      layout: pipelineLayout,
+      vertex:   { module: fam.vsModule, entryPoint: fam.vsEntryName, buffers: [] },
+      fragment: { module: fam.fsModule, entryPoint: fam.fsEntryName, targets: colorTargets },
+      primitive: { topology: desc.topology, cullMode: desc.cullMode, frontFace: desc.frontFace },
+      ...(depthFormat !== undefined && desc.depth !== undefined
+        ? { depthStencil: { format: depthFormat, depthWriteEnabled: desc.depth.write, depthCompare: desc.depth.compare } }
+        : depthFormat !== undefined
+          ? { depthStencil: { format: depthFormat, depthWriteEnabled: false, depthCompare: "always" as GPUCompareFunction } }
+          : {}),
+    });
+    pipelineByModeKey.set(cacheKey, pipeline);
+    return pipeline;
+  }
+
   // ─── Family state (§6 family-merge, slice 3c) ─────────────────────
   // Built lazily on the first addDraw batch from the union of all
   // effects in that batch, then frozen. Subsequent addDraws with an
@@ -1562,24 +1601,12 @@ export function buildHeapScene(
 
     const layout: BucketLayout = fam.schema.drawHeaderUnion;
     const isAtlasBucket = layout.atlasTextureBindings.size > 0;
-    const vsModule = fam.vsModule;
-    const fsModule = fam.fsModule;
-    const vsEntry = fam.vsEntryName;
-    const fsEntry = fam.fsEntryName;
-    const { pipelineLayout } = getBgl(layout, isAtlasBucket);
-
-    const pipeline = device.createRenderPipeline({
-      label: `heapScene/${bk}/pipeline`,
-      layout: pipelineLayout,
-      vertex:   { module: vsModule, entryPoint: vsEntry, buffers: [] },
-      fragment: { module: fsModule, entryPoint: fsEntry, targets: colorTargets },
-      primitive: { topology: ps.topology, cullMode: ps.cullMode, frontFace: ps.frontFace },
-      ...(depthFormat !== undefined && ps.depth !== undefined
-        ? { depthStencil: { format: depthFormat, depthWriteEnabled: ps.depth.write, depthCompare: ps.depth.compare } }
-        : depthFormat !== undefined
-          ? { depthStencil: { format: depthFormat, depthWriteEnabled: false, depthCompare: "always" as GPUCompareFunction } }
-          : {}),
-    });
+    // Pipeline lookup-or-create through the scene-level cache so
+    // subsequent buckets / fast-path renames with the same descriptor
+    // get the same GPU pipeline object (no duplicate
+    // createRenderPipeline calls).
+    const descForPipeline: PipelineStateDescriptor = precomputedDescriptor ?? psDescriptor;
+    const pipeline = getOrCreatePipeline(fam, layout, isAtlasBucket, descForPipeline);
 
     // Per-bucket DrawHeader buffer (every uniform / attribute is a u32
     // ref into the global arena; the per-bucket buffer just holds the
@@ -2097,7 +2124,8 @@ export function buildHeapScene(
     // the scene-wide dispatcher. Provide the arena byte offset of the
     // RO's input uniform so the kernel reads from the right slot.
     {
-      const gpuRule = spec.modeRules?.cull?.gpu;
+      const cullRule = spec.modeRules?.cull;
+      const gpuRule = cullRule?.gpu;
       if (gpuRule !== undefined && gpuRule.kernel === "flipCullByDeterminant") {
         const inputRef = perDrawRefs.get(gpuRule.inputUniform);
         if (inputRef !== undefined) {
@@ -2114,6 +2142,21 @@ export function buildHeapScene(
           }
         } else {
           console.warn(`[heapScene] GPU rule input '${gpuRule.inputUniform}' not in spec.inputs for drawId=${drawId}; rule disabled`);
+        }
+      }
+
+      // ─── Pipeline pre-warm for derived-mode rules (5c.2) ──────────
+      // Enumerate the rule's possible outputs and pre-build the
+      // matching pipelines in the scene-level cache. Future cullModeC
+      // flips become cache hits — zero `createRenderPipeline` calls
+      // on the hot path.
+      if (cullRule !== undefined && cullRule.domain !== undefined && tracker.descriptor !== undefined) {
+        const fam = familyFor(spec.effect);
+        const baseDesc = tracker.descriptor;
+        for (const mode of cullRule.domain) {
+          if (mode === baseDesc.cullMode) continue; // already built
+          const variantDesc: PipelineStateDescriptor = { ...baseDesc, cullMode: mode };
+          getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, variantDesc);
         }
       }
     }
@@ -2473,19 +2516,15 @@ export function buildHeapScene(
             const tracker = drawIdToModeTracker[r.repId]!;
             const sample = drawIdToSpec[r.repId]!;
             const desc = tracker.descriptor;
-            const { pipelineLayout } = getBgl(r.bucket.layout, r.bucket.isAtlasBucket);
-            const newPipeline = device.createRenderPipeline({
-              label: `heapScene/${r.newBk}/pipeline`,
-              layout: pipelineLayout,
-              vertex:   { module: familyFor(sample.effect).vsModule, entryPoint: familyFor(sample.effect).vsEntryName, buffers: [] },
-              fragment: { module: familyFor(sample.effect).fsModule, entryPoint: familyFor(sample.effect).fsEntryName, targets: colorTargets },
-              primitive: { topology: desc.topology, cullMode: desc.cullMode, frontFace: desc.frontFace },
-              ...(depthFormat !== undefined && desc.depth !== undefined
-                ? { depthStencil: { format: depthFormat, depthWriteEnabled: desc.depth.write, depthCompare: desc.depth.compare } }
-                : depthFormat !== undefined
-                  ? { depthStencil: { format: depthFormat, depthWriteEnabled: false, depthCompare: "always" as GPUCompareFunction } }
-                  : {}),
-            });
+            // Cache hit: reuse an already-built pipeline. Cache miss
+            // builds + stashes; future flips back to this descriptor
+            // hit the cache.
+            const newPipeline = getOrCreatePipeline(
+              familyFor(sample.effect),
+              r.bucket.layout,
+              r.bucket.isAtlasBucket,
+              desc,
+            );
             (r.bucket.slots[0] as { pipeline: GPURenderPipeline }).pipeline = newPipeline;
           }
         }
