@@ -117,3 +117,12 @@ export {
   SlotTable,
   type SlotTableEntry,
 } from "./derivedModes/slotTable.js";
+
+export {
+  partitionCPU,
+  PARTITION_HISTOGRAM_WGSL,
+  PARTITION_SCATTER_WGSL,
+  MAX_SLOTS_PER_BUCKET,
+  type PartitionInput,
+  type PartitionResult,
+} from "./derivedModes/partition.js";
