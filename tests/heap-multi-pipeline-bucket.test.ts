@@ -151,11 +151,10 @@ describe("Phase 5b — bucket key uses modeKey VALUE, not aval identity", () => 
     scene.update(AdaptiveToken.top);
     expect(scene.stats.groups).toBe(2); // A and B now in distinct buckets.
 
-    // Flip B to also front; both end up in the same bucket again.
+    // Flip B to also front; both end up in the same bucket again
+    // and the now-empty 'back' bucket is GC'd by removeDraw.
     transact(() => { cullB.value = "front"; });
     scene.update(AdaptiveToken.top);
-    expect(scene.stats.groups).toBe(2); // 'back' bucket lingers but empty
-    // (v1 doesn't yet GC empty buckets — stats.groups counts the
-    // bucket list verbatim. The non-empty count would be 1.)
+    expect(scene.stats.groups).toBe(1);
   });
 });

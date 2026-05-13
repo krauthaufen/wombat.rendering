@@ -2112,6 +2112,10 @@ export function buildHeapScene(
 
     stats.totalDraws--;
     stats.geometryBytes = arenaBytes(arena);
+
+    // GC the bucket if it just emptied (common after reactive
+    // PS rebucket leaves the source bucket with zero live ROs).
+    gcBucket(bucket);
   }
 
   // ─── Aset reader (pull-driven on each frame) ──────────────────────
@@ -2454,18 +2458,38 @@ export function buildHeapScene(
     device.queue.submit([enc.finish()]);
   }
 
+  function destroyBucketResources(b: Bucket): void {
+    b.drawHeap.destroy();
+    for (const slot of b.slots) {
+      slot.drawTableBuf?.destroy();
+      slot.blockSumsBuf?.destroy();
+      slot.blockOffsetsBuf?.destroy();
+      slot.firstDrawInTileBuf?.destroy();
+      slot.indirectBuf?.destroy();
+      slot.paramsBuf?.destroy();
+    }
+  }
+
+  /**
+   * Remove an empty bucket from the scene's bucket list + key index +
+   * destroy its GPU resources. Called from removeDraw when an RO's
+   * removal leaves the bucket with zero live slots — common after
+   * reactive PS rebucket leaves the source bucket empty.
+   */
+  function gcBucket(b: Bucket): void {
+    if (b.drawSlots.size !== 0) return;
+    const idx = buckets.indexOf(b);
+    if (idx >= 0) buckets.splice(idx, 1);
+    for (const [k, v] of bucketByKey) {
+      if (v === b) { bucketByKey.delete(k); break; }
+    }
+    destroyBucketResources(b);
+  }
+
   function dispose(): void {
     arena.attrs.destroy();
     arena.indices.destroy();
-    for (const b of buckets) {
-      b.drawHeap.destroy();
-      b.slots[0]!.drawTableBuf?.destroy();
-      b.slots[0]!.blockSumsBuf?.destroy();
-      b.slots[0]!.blockOffsetsBuf?.destroy();
-      b.slots[0]!.firstDrawInTileBuf?.destroy();
-      b.slots[0]!.indirectBuf?.destroy();
-      b.slots[0]!.paramsBuf?.destroy();
-    }
+    for (const b of buckets) destroyBucketResources(b);
   }
 
   // Test-only escape hatch for inspecting megacall bucket state. Not
