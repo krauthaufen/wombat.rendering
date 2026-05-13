@@ -2649,16 +2649,19 @@ export function buildHeapScene(
         bucket.headerDirtyMin = Infinity;
         bucket.headerDirtyMax = 0;
       }
-      if (bucket.slots[0]!.drawTableDirtyMax > bucket.slots[0]!.drawTableDirtyMin) {
-        const shadow = bucket.slots[0]!.drawTableShadow!;
+      // Phase 5c.2: each slot has its own drawTable + shadow. Upload
+      // the dirty range of every slot, not just slots[0].
+      for (const slot of bucket.slots) {
+        if (slot.drawTableDirtyMax <= slot.drawTableDirtyMin) continue;
+        const shadow = slot.drawTableShadow!;
         device.queue.writeBuffer(
-          bucket.slots[0]!.drawTableBuf!.buffer, bucket.slots[0]!.drawTableDirtyMin,
+          slot.drawTableBuf!.buffer, slot.drawTableDirtyMin,
           shadow.buffer,
-          shadow.byteOffset + bucket.slots[0]!.drawTableDirtyMin,
-          bucket.slots[0]!.drawTableDirtyMax - bucket.slots[0]!.drawTableDirtyMin,
+          shadow.byteOffset + slot.drawTableDirtyMin,
+          slot.drawTableDirtyMax - slot.drawTableDirtyMin,
         );
-        bucket.slots[0]!.drawTableDirtyMin = Infinity;
-        bucket.slots[0]!.drawTableDirtyMax = 0;
+        slot.drawTableDirtyMin = Infinity;
+        slot.drawTableDirtyMax = 0;
       }
     }
   }
