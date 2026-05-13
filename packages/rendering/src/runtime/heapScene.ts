@@ -157,8 +157,13 @@ export interface HeapGeometry {
  * slot owns its own drawTable + scan buffers + indirect + pipeline.
  */
 interface BucketSlot {
-  /** The render pipeline this slot draws with. */
-  readonly pipeline: GPURenderPipeline;
+  /** The render pipeline this slot draws with. Replaced when a rule
+   *  output changes for this slot (typically via the pipeline cache). */
+  pipeline: GPURenderPipeline;
+  /** modeKey this slot covers — the bitfield-encoded descriptor. */
+  modeKey: bigint;
+  /** Render bind group (drawTable + firstDrawInTile are per-slot). */
+  bindGroup?: GPUBindGroup;
 
   // ─── drawTable / megacall state ────────────────────────────────────
   drawTableBuf?: GrowBuffer;
@@ -379,6 +384,11 @@ export interface HeapDrawSpec {
 
 export interface HeapSceneStats {
   readonly groups: number;
+  /** Total pipeline slots across all buckets — one per realized
+   *  (effect, textureSet, modeKey) combination. Phase 5c.2 brings
+   *  this divergence: groups counts (effect, textureSet) only,
+   *  slotCount counts the per-bucket modeKey splits. */
+  readonly slotCount: number;
   totalDraws: number;
   drawBytes: number;
   geometryBytes: number;
@@ -604,6 +614,10 @@ export function buildHeapScene(
   // ─── Per-draw global bookkeeping (sparse, indexed by drawId) ──────
   const drawIdToBucket:    (Bucket | undefined)[] = [];
   const drawIdToLocalSlot: (number | undefined)[] = [];
+  /** Per-draw slot index within its bucket. Phase 5c.2: each bucket
+   *  holds multiple BucketSlots (one per realized modeKey); this map
+   *  tells each removeDraw / record write which slot to touch. */
+  const drawIdToSlotIdx:   (number | undefined)[] = [];
   /** Per-draw index aval — for `indexPool.release` on removeDraw. */
   const drawIdToIndexAval: (aval<Uint32Array> | undefined)[] = [];
   /**
@@ -1085,18 +1099,19 @@ export function buildHeapScene(
     });
   }
 
-  function buildScanBindGroup(bucket: Bucket): GPUBindGroup {
+  function buildScanBindGroup(bucket: Bucket, slotIdx = 0): GPUBindGroup {
     if (scanBgl === undefined) throw new Error("heapScene: scan BGL missing");
+    const s = bucket.slots[slotIdx]!;
     return device.createBindGroup({
-      label: `heapScene/${bucket.label}/scanBg`,
+      label: `heapScene/${bucket.label}/slot${slotIdx}/scanBg`,
       layout: scanBgl,
       entries: [
-        { binding: 0, resource: { buffer: bucket.slots[0]!.drawTableBuf!.buffer } },
-        { binding: 1, resource: { buffer: bucket.slots[0]!.blockSumsBuf!.buffer } },
-        { binding: 2, resource: { buffer: bucket.slots[0]!.blockOffsetsBuf!.buffer } },
-        { binding: 3, resource: { buffer: bucket.slots[0]!.indirectBuf! } },
-        { binding: 4, resource: { buffer: bucket.slots[0]!.paramsBuf! } },
-        { binding: 5, resource: { buffer: bucket.slots[0]!.firstDrawInTileBuf!.buffer } },
+        { binding: 0, resource: { buffer: s.drawTableBuf!.buffer } },
+        { binding: 1, resource: { buffer: s.blockSumsBuf!.buffer } },
+        { binding: 2, resource: { buffer: s.blockOffsetsBuf!.buffer } },
+        { binding: 3, resource: { buffer: s.indirectBuf! } },
+        { binding: 4, resource: { buffer: s.paramsBuf! } },
+        { binding: 5, resource: { buffer: s.firstDrawInTileBuf!.buffer } },
       ],
     });
   }
@@ -1401,7 +1416,7 @@ export function buildHeapScene(
   // pipelines via noTexBgl/texBgl; the bind-group itself binds this
   // bucket's drawHeap (binding 1) + its globals UBO (binding 0) +
   // the global arena's heapF32 view (binding 2) + textures if any.
-  function buildBucketBindGroup(bucket: Bucket): GPUBindGroup {
+  function buildBucketBindGroup(bucket: Bucket, slotIdx = 0): GPUBindGroup {
     // heapU32 / heapF32 / heapV4f are different typed views of the
     // SAME global arena GPUBuffer (emscripten-style aliasing). The
     // WGSL prelude declares one binding per view; the shader picks
@@ -1413,7 +1428,8 @@ export function buildHeapScene(
       { binding: 3, resource: { buffer: arena.attrs.buffer } },          // heapV4f
     ];
     {
-      if (bucket.slots[0]!.drawTableBuf === undefined) {
+      const s = bucket.slots[slotIdx]!;
+      if (s.drawTableBuf === undefined) {
         throw new Error("heapScene: megacall bucket without drawTableBuf");
       }
       // Bind drawTable with size = recordCount * RECORD_BYTES so the VS
@@ -1421,13 +1437,13 @@ export function buildHeapScene(
       // the live record count — keeps stale tail entries out of the
       // binary search. Minimum one zero-record to satisfy WebGPU non-
       // zero size constraint when the bucket is empty.
-      const dtBytes = Math.max(RECORD_BYTES, bucket.slots[0]!.recordCount * RECORD_BYTES);
+      const dtBytes = Math.max(RECORD_BYTES, s.recordCount * RECORD_BYTES);
       entries.push(
-        { binding: 4, resource: { buffer: bucket.slots[0]!.drawTableBuf.buffer, offset: 0, size: dtBytes } },
+        { binding: 4, resource: { buffer: s.drawTableBuf.buffer, offset: 0, size: dtBytes } },
         { binding: 5, resource: { buffer: arena.indices.buffer } },
-        { binding: 6, resource: { buffer: bucket.slots[0]!.firstDrawInTileBuf!.buffer } },
+        { binding: 6, resource: { buffer: s.firstDrawInTileBuf!.buffer } },
       );
-      bucket.slots[0]!.renderBoundRecordCount = bucket.slots[0]!.recordCount;
+      s.renderBoundRecordCount = s.recordCount;
     }
     // Schema-driven texture + sampler entries. v1 user surface still
     // accepts a single (texture, sampler) pair via HeapTextureSet —
@@ -1522,32 +1538,28 @@ export function buildHeapScene(
   // carry strong refcount handles (`localAtlasReleases`) that drive
   // `pool.release` on removeDraw.
 
-  // When the global arena reallocates, every bucket's bind group
-  // needs rebuilding (its binding 2 buffer reference is stale).
-  arena.attrs.onResize(() => {
-    for (const b of buckets) b.bindGroup = buildBucketBindGroup(b);
-    // §7 dispatcher targets arena.attrs.buffer; rebind on grow.
-    if (derivedScene !== undefined) derivedScene.rebindMainHeap(arena.attrs.buffer);
-  });
-  // Same when the atlas pool allocates a fresh page — its slot in the
-  // BGL ladder transitions from placeholder to the real GPUTexture.
-  // Every atlas bucket rebuilds (cheap; just N+N+1 entries each).
-  if (atlasPool !== undefined) {
-    for (const f of ATLAS_PAGE_FORMATS) {
-      atlasPool.onPageAdded(f, () => {
-        for (const b of buckets) {
-          if (b.isAtlasBucket) b.bindGroup = buildBucketBindGroup(b);
-        }
-      });
+  /** Rebuild every slot's render bind group across every bucket.
+   *  Used when a global resource (arena.attrs, arena.indices, atlas
+   *  page set) reallocates and invalidates every bind group at once. */
+  function rebuildAllBindGroups(filterAtlasOnly = false): void {
+    for (const b of buckets) {
+      if (filterAtlasOnly && !b.isAtlasBucket) continue;
+      for (let i = 0; i < b.slots.length; i++) {
+        b.slots[i]!.bindGroup = buildBucketBindGroup(b, i);
+      }
     }
   }
-  // indexStorage is bound at slot 5 from arena.indices, so a grow there
-  // also invalidates every bucket's bind group.
-  {
-    arena.indices.onResize(() => {
-      for (const b of buckets) b.bindGroup = buildBucketBindGroup(b);
-    });
+
+  arena.attrs.onResize(() => {
+    rebuildAllBindGroups();
+    if (derivedScene !== undefined) derivedScene.rebindMainHeap(arena.attrs.buffer);
+  });
+  if (atlasPool !== undefined) {
+    for (const f of ATLAS_PAGE_FORMATS) {
+      atlasPool.onPageAdded(f, () => rebuildAllBindGroups(true));
+    }
   }
+  arena.indices.onResize(() => rebuildAllBindGroups());
 
   // ─── findOrCreateBucket ───────────────────────────────────────────
   // Slice 3c: the bucket key collapses to (familyId, pipelineState).
@@ -1556,6 +1568,95 @@ export function buildHeapScene(
   // right per-effect helper at draw time. Atlas-binding shape follows
   // from `family.drawHeaderUnion.atlasTextureBindings.size > 0`.
   void texIdOf; // retained for future per-bucket diagnostics
+  /**
+   * Allocate a brand-new BucketSlot inside `bucket` covering
+   * `descriptor` (modeKey = encode(descriptor)). Builds the per-slot
+   * GPU resources: pipeline (via cache), drawTable + scan buffers +
+   * indirect + paramsBuf, and the slot's render/scan bind groups
+   * (the latter rebuilt on resize). The bucket's drawHeap +
+   * texture bindings are shared across slots.
+   */
+  function createSlot(bucket: Bucket, descriptor: PipelineStateDescriptor): BucketSlot {
+    const fam = familyForBucket.get(bucket)!;
+    const pipeline = getOrCreatePipeline(fam, bucket.layout, bucket.isAtlasBucket, descriptor);
+    const modeKey = encodeModeKey(descriptor);
+    const slotIdx = bucket.slots.length;
+    const slotLabel = `${bucket.label}/slot${slotIdx}`;
+
+    const dtBuf = new GrowBuffer(
+      device, `heapScene/${slotLabel}/drawTable`,
+      GPUBufferUsage.STORAGE, 1024,
+    );
+    const blockSumsBuf = new GrowBuffer(
+      device, `heapScene/${slotLabel}/blockSums`,
+      GPUBufferUsage.STORAGE,
+      4 * Math.max(1, Math.ceil((dtBuf.capacity / RECORD_BYTES) / SCAN_TILE_SIZE)),
+    );
+    const blockOffsetsBuf = new GrowBuffer(
+      device, `heapScene/${slotLabel}/blockOffsets`,
+      GPUBufferUsage.STORAGE,
+      4 * Math.max(1, Math.ceil((dtBuf.capacity / RECORD_BYTES) / SCAN_TILE_SIZE)),
+    );
+    const firstDrawInTileBuf = new GrowBuffer(
+      device, `heapScene/${slotLabel}/firstDrawInTile`,
+      GPUBufferUsage.STORAGE, 128,
+    );
+    const indirectBuf = device.createBuffer({
+      label: `heapScene/${slotLabel}/indirect`, size: 16,
+      usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    device.queue.writeBuffer(indirectBuf, 0, new Uint32Array([0, 1, 0, 0]));
+    const paramsBuf = device.createBuffer({
+      label: `heapScene/${slotLabel}/params`, size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    const slot: BucketSlot = {
+      pipeline, modeKey,
+      drawTableDirtyMin: Infinity, drawTableDirtyMax: 0,
+      recordCount: 0, slotToRecord: [], recordToSlot: [],
+      totalEmitEstimate: 0, scanDirty: false,
+      drawTableBuf: dtBuf,
+      drawTableShadow: new Uint32Array(dtBuf.capacity / 4),
+      blockSumsBuf, blockOffsetsBuf, firstDrawInTileBuf,
+      indirectBuf, paramsBuf,
+    };
+    bucket.slots.push(slot);
+    const thisSlotIdx = bucket.slots.length - 1;
+
+    const ensureScanBuffers = (): void => {
+      const needBlocks = Math.max(1, Math.ceil(slot.recordCount / SCAN_TILE_SIZE));
+      blockSumsBuf.ensureCapacity(needBlocks * 4);
+      blockOffsetsBuf.ensureCapacity(needBlocks * 4);
+    };
+    const rebuildScanBg = (): void => {
+      slot.scanBindGroup = buildScanBindGroup(bucket, thisSlotIdx);
+    };
+    dtBuf.onResize(() => {
+      const grown = new Uint32Array(dtBuf.capacity / 4);
+      grown.set(slot.drawTableShadow!);
+      slot.drawTableShadow = grown;
+      ensureScanBuffers();
+      slot.bindGroup = buildBucketBindGroup(bucket, thisSlotIdx);
+      rebuildScanBg();
+      slot.drawTableDirtyMin = 0;
+      slot.drawTableDirtyMax = slot.recordCount * RECORD_BYTES;
+    });
+    blockSumsBuf.onResize(rebuildScanBg);
+    blockOffsetsBuf.onResize(rebuildScanBg);
+    firstDrawInTileBuf.onResize(() => {
+      rebuildScanBg();
+      slot.bindGroup = buildBucketBindGroup(bucket, thisSlotIdx);
+    });
+    slot.scanBindGroup = buildScanBindGroup(bucket, thisSlotIdx);
+    slot.bindGroup = buildBucketBindGroup(bucket, thisSlotIdx);
+
+    return slot;
+  }
+
+  /** Side map from Bucket → family. Populated by findOrCreateBucket. */
+  const familyForBucket = new WeakMap<Bucket, ReturnType<typeof familyFor>>();
+
   function findOrCreateBucket(
     effect: Effect,
     _textures: HeapTextureSet | undefined,
@@ -1572,67 +1673,27 @@ export function buildHeapScene(
       throw new Error("heapScene: findOrCreateBucket called before family build");
     }
     const fam = familyFor(effect);
-    // ─── PS keying — VALUE based, not identity based ───────────────
-    // psIdOf used to hash by aval identity. That meant 20k ROs each
-    // constructed with `cval("back")` for cullMode hashed to 20k
-    // distinct keys → 20k buckets, all rendering with bitwise-
-    // identical state. Now the key is the bitfield-encoded modeKey
-    // (the actual value-set in the descriptor), so identical-value
-    // cvals collapse to ONE bucket. See docs/derived-modes.md and
-    // tests/heap-multi-pipeline-bucket.test.ts.
-    const psDescriptor = precomputedDescriptor ?? snapshotDescriptor(pipelineState, sig);
-    const psModeKey    = encodeModeKey(psDescriptor);
-    const bk = `family#${fam.schema.id}|mk#${psModeKey.toString(16)}`;
+    // Phase 5c.2: bucket key drops modeKey. All ROs with the same
+    // (effect, textureSet) share one bucket; per-modeKey slots live
+    // inside the bucket and route records via `ensureSlot`. Pipeline
+    // pre-warm + the scene-level pipelineByModeKey cache mean every
+    // realized slot lookup hits the cache.
+    const bk = `family#${fam.schema.id}`;
     const existing = bucketByKey.get(bk);
     if (existing !== undefined) return existing;
-    // If a precomputed descriptor is supplied (rule-evaluated path),
-    // use its post-rule axis values so the pipeline reflects what the
-    // RO actually wants. Otherwise fall through to PS-aval forcing.
-    const ps: ResolvedPipelineState = precomputedDescriptor !== undefined
-      ? {
-          topology:  precomputedDescriptor.topology,
-          cullMode:  precomputedDescriptor.cullMode,
-          frontFace: precomputedDescriptor.frontFace,
-          ...(precomputedDescriptor.depth !== undefined
-            ? { depth: { write: precomputedDescriptor.depth.write, compare: precomputedDescriptor.depth.compare } }
-            : {}),
-        }
-      : resolvePipelineState(pipelineState);
 
     const layout: BucketLayout = fam.schema.drawHeaderUnion;
     const isAtlasBucket = layout.atlasTextureBindings.size > 0;
-    // Pipeline lookup-or-create through the scene-level cache so
-    // subsequent buckets / fast-path renames with the same descriptor
-    // get the same GPU pipeline object (no duplicate
-    // createRenderPipeline calls).
-    const descForPipeline: PipelineStateDescriptor = precomputedDescriptor ?? psDescriptor;
-    const pipeline = getOrCreatePipeline(fam, layout, isAtlasBucket, descForPipeline);
-
-    // Per-bucket DrawHeader buffer (every uniform / attribute is a u32
-    // ref into the global arena; the per-bucket buffer just holds the
-    // refs).
     const drawHeapBuf = new GrowBuffer(
       device, `heapScene/${bk}/drawHeap`, GPUBufferUsage.STORAGE,
       Math.max(layout.drawHeaderBytes, 64),
     );
     const drawHeap = new DrawHeap(drawHeapBuf, layout.drawHeaderBytes);
 
-    const slot0: BucketSlot = {
-      pipeline,
-      drawTableDirtyMin: Infinity, drawTableDirtyMax: 0,
-      recordCount: 0, slotToRecord: [], recordToSlot: [],
-      totalEmitEstimate: 0,
-      scanDirty: false,
-    };
     const bucket: Bucket = {
-      // §6 family-merge: family buckets aren't keyed on a specific
-      // texture set — atlas placements are addressed per-RO via
-      // drawHeader fields (`pageRef` + `formatBits` + `origin` +
-      // `size`), and the bucket's atlas-binding ladder is driven by
-      // `atlasPool.pagesFor(format)`. Leave `textures` undefined.
       label: bk, textures: undefined, layout,
-      slots: [slot0],
-      bindGroup: null as unknown as GPUBindGroup,
+      slots: [],  // populated lazily by ensureSlot per modeKey
+      bindGroup: null as unknown as GPUBindGroup,  // legacy field; slot.bindGroup is the real one
       drawHeap,
       drawHeaderStaging: new Float32Array(drawHeapBuf.capacity / 4),
       headerDirtyMin: Infinity, headerDirtyMax: 0,
@@ -1645,90 +1706,47 @@ export function buildHeapScene(
       localAtlasTextures: [],
       localAtlasArrIdx: [],
     };
-    {
-      const dtBuf = new GrowBuffer(
-        device, `heapScene/${bk}/drawTable`,
-        GPUBufferUsage.STORAGE,
-        1024,
-      );
-      const blockSumsBuf = new GrowBuffer(
-        device, `heapScene/${bk}/blockSums`,
-        GPUBufferUsage.STORAGE,
-        4 * Math.max(1, Math.ceil((dtBuf.capacity / RECORD_BYTES) / SCAN_TILE_SIZE)),
-      );
-      const blockOffsetsBuf = new GrowBuffer(
-        device, `heapScene/${bk}/blockOffsets`,
-        GPUBufferUsage.STORAGE,
-        4 * Math.max(1, Math.ceil((dtBuf.capacity / RECORD_BYTES) / SCAN_TILE_SIZE)),
-      );
-      // 32 u32 = 128 bytes is the floor; pow2-grown by ensureCapacity
-      // as totalEmitEstimate grows.
-      const firstDrawInTileBuf = new GrowBuffer(
-        device, `heapScene/${bk}/firstDrawInTile`,
-        GPUBufferUsage.STORAGE,
-        128,
-      );
-      const indirectBuf = device.createBuffer({
-        label: `heapScene/${bk}/indirect`, size: 16,
-        usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-      });
-      // Initialize to (0, 1, 0, 0) so an unscanned/empty bucket draws
-      // nothing safely.
-      device.queue.writeBuffer(indirectBuf, 0, new Uint32Array([0, 1, 0, 0]));
-      const paramsBuf = device.createBuffer({
-        label: `heapScene/${bk}/params`, size: 16,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      });
-      bucket.slots[0]!.drawTableBuf = dtBuf;
-      bucket.slots[0]!.drawTableShadow = new Uint32Array(dtBuf.capacity / 4);
-      bucket.slots[0]!.blockSumsBuf = blockSumsBuf;
-      bucket.slots[0]!.blockOffsetsBuf = blockOffsetsBuf;
-      bucket.slots[0]!.firstDrawInTileBuf = firstDrawInTileBuf;
-      bucket.slots[0]!.indirectBuf = indirectBuf;
-      bucket.slots[0]!.paramsBuf = paramsBuf;
-      const ensureScanBuffers = (): void => {
-        const needBlocks = Math.max(1, Math.ceil(bucket.slots[0]!.recordCount / SCAN_TILE_SIZE));
-        blockSumsBuf.ensureCapacity(needBlocks * 4);
-        blockOffsetsBuf.ensureCapacity(needBlocks * 4);
-      };
-      const rebuildScanBg = (): void => {
-        bucket.slots[0]!.scanBindGroup = buildScanBindGroup(bucket);
-      };
-      dtBuf.onResize(() => {
-        const grown = new Uint32Array(dtBuf.capacity / 4);
-        grown.set(bucket.slots[0]!.drawTableShadow!);
-        bucket.slots[0]!.drawTableShadow = grown;
-        ensureScanBuffers();
-        bucket.bindGroup = buildBucketBindGroup(bucket);
-        rebuildScanBg();
-        bucket.slots[0]!.drawTableDirtyMin = 0;
-        bucket.slots[0]!.drawTableDirtyMax = bucket.slots[0]!.recordCount * RECORD_BYTES;
-      });
-      blockSumsBuf.onResize(rebuildScanBg);
-      blockOffsetsBuf.onResize(rebuildScanBg);
-      firstDrawInTileBuf.onResize(() => {
-        rebuildScanBg();
-        bucket.bindGroup = buildBucketBindGroup(bucket);
-      });
-      bucket.slots[0]!.scanBindGroup = buildScanBindGroup(bucket);
-    }
-    bucket.bindGroup = buildBucketBindGroup(bucket);
+    familyForBucket.set(bucket, fam);
+
     drawHeap.onResize(() => {
       bucket.drawHeaderStaging = new Float32Array(drawHeapBuf.capacity / 4);
-      // GPU-side data was copied by the GrowBuffer's resize, but our
-      // CPU mirror is fresh — mark all live local slots dirty so
-      // their headers get re-packed and re-uploaded next frame.
       for (const s of bucket.drawSlots) bucket.dirty.add(s);
-      bucket.bindGroup = buildBucketBindGroup(bucket);
-      // §7's main heap is arena.attrs.buffer (not drawHeap) — the
-      // arena.attrs.onResize handler at the scene level handles its
-      // rebind. drawHeap resize doesn't touch §7.
+      // Rebuild every slot's render bind group (binding 1 = drawHeap
+      // points at the new buffer).
+      for (let i = 0; i < bucket.slots.length; i++) {
+        bucket.slots[i]!.bindGroup = buildBucketBindGroup(bucket, i);
+      }
     });
-    // §7 has one scene-wide records buffer + dispatcher (all buckets
-    // target arena.attrs.buffer), so nothing per-bucket to set up here.
+
+    // Ensure the bucket has a slot for the supplied descriptor — at
+    // bucket-creation time we eagerly seed slot 0 from the caller's
+    // descriptor so the first addDraw doesn't pay a slot-create cost.
+    const seedDescriptor = precomputedDescriptor ?? snapshotDescriptor(pipelineState, sig);
+    createSlot(bucket, seedDescriptor);
+
     buckets.push(bucket);
     bucketByKey.set(bk, bucket);
     return bucket;
+  }
+
+  /**
+   * Return the existing BucketSlot for `descriptor` inside `bucket`,
+   * or create one on miss. The mode-flip hot path calls this when an
+   * RO's tracker.modeKey lands on a slot that doesn't exist yet.
+   */
+  function ensureSlot(bucket: Bucket, descriptor: PipelineStateDescriptor): BucketSlot {
+    const wanted = encodeModeKey(descriptor);
+    for (const s of bucket.slots) {
+      if (s.modeKey === wanted) return s;
+    }
+    return createSlot(bucket, descriptor);
+  }
+  /** Find an RO's slot by drawId; null if the drawId is dead. */
+  function slotForDrawId(drawId: number): BucketSlot | null {
+    const idx = drawIdToSlotIdx[drawId];
+    const bucket = drawIdToBucket[drawId];
+    if (idx === undefined || bucket === undefined) return null;
+    return bucket.slots[idx] ?? null;
   }
 
   // ─── Per-bucket header writer (refs only, post step 3) ────────────
@@ -1854,6 +1872,7 @@ export function buildHeapScene(
   // ─── Stats (declared early so addDraw/removeDraw can mutate it) ───
   const stats: HeapSceneStats = {
     groups: 0,
+    slotCount: 0,
     totalDraws: 0,
     drawBytes: 0,
     geometryBytes: 0,
@@ -1863,6 +1882,14 @@ export function buildHeapScene(
     derivedRecords:  0,
   };
   Object.defineProperty(stats, "groups", { get: () => buckets.length, configurable: true });
+  Object.defineProperty(stats, "slotCount", {
+    get: () => {
+      let n = 0;
+      for (const b of buckets) n += b.slots.length;
+      return n;
+    },
+    configurable: true,
+  });
 
   // ─── addDraw / removeDraw ─────────────────────────────────────────
   // Public addDraw wrapper. Establishes a sceneObj.evaluateAlways
@@ -1912,6 +1939,12 @@ export function buildHeapScene(
       });
     }
     const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, precomputedDescriptor);
+    // Phase 5c.2: route this RO to the bucket's slot covering its
+    // current descriptor. ensureSlot creates a new slot on miss; the
+    // pipeline lookup hits the scene-level cache.
+    const roDescriptor = precomputedDescriptor ?? snapshotDescriptor(spec.pipelineState, sig);
+    const roSlot       = ensureSlot(bucket, roDescriptor);
+    const roSlotIdx    = bucket.slots.indexOf(roSlot);
     const fam = familyFor(spec.effect);
     const effectFields = fam.fieldsForEffect.get(spec.effect.id)!;
 
@@ -2049,8 +2082,8 @@ export function buildHeapScene(
     if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
 
     {
-      const dtBuf = bucket.slots[0]!.drawTableBuf!;
-      const recIdx = bucket.slots[0]!.recordCount;
+      const dtBuf = roSlot.drawTableBuf!;
+      const recIdx = roSlot.recordCount;
       if (recIdx >= SCAN_MAX_RECORDS) {
         throw new Error(
           `heapScene: bucket exceeds SCAN_MAX_RECORDS (${SCAN_MAX_RECORDS}); ` +
@@ -2062,28 +2095,29 @@ export function buildHeapScene(
       dtBuf.setUsed(Math.max(dtBuf.usedBytes, byteOff + RECORD_BYTES));
       // Grow scan-side buffers if recordCount crosses a tile boundary.
       const needBlocks = Math.max(1, Math.ceil((recIdx + 1) / SCAN_TILE_SIZE));
-      bucket.slots[0]!.blockSumsBuf!.ensureCapacity(needBlocks * 4);
-      bucket.slots[0]!.blockOffsetsBuf!.ensureCapacity(needBlocks * 4);
-      const shadow = bucket.slots[0]!.drawTableShadow!;
+      roSlot.blockSumsBuf!.ensureCapacity(needBlocks * 4);
+      roSlot.blockOffsetsBuf!.ensureCapacity(needBlocks * 4);
+      const shadow = roSlot.drawTableShadow!;
       // firstEmit is GPU-overwritten by the prefix-sum pass; 0 is fine.
       shadow[recIdx * RECORD_U32 + 0] = 0;
       shadow[recIdx * RECORD_U32 + 1] = localSlot;
       shadow[recIdx * RECORD_U32 + 2] = idxAlloc.firstIndex;
       shadow[recIdx * RECORD_U32 + 3] = idxAlloc.count;
       shadow[recIdx * RECORD_U32 + 4] = instanceCount;
-      bucket.slots[0]!.recordCount = recIdx + 1;
-      bucket.slots[0]!.slotToRecord[localSlot] = recIdx;
-      bucket.slots[0]!.recordToSlot[recIdx] = localSlot;
-      if (byteOff < bucket.slots[0]!.drawTableDirtyMin) bucket.slots[0]!.drawTableDirtyMin = byteOff;
-      if (byteOff + RECORD_BYTES > bucket.slots[0]!.drawTableDirtyMax) bucket.slots[0]!.drawTableDirtyMax = byteOff + RECORD_BYTES;
-      bucket.slots[0]!.totalEmitEstimate += idxAlloc.count * instanceCount;
-      const newNumTiles = Math.max(1, Math.ceil(bucket.slots[0]!.totalEmitEstimate / TILE_K));
-      bucket.slots[0]!.firstDrawInTileBuf!.ensureCapacity((newNumTiles + 1) * 4);
-      bucket.slots[0]!.scanDirty = true;
+      roSlot.recordCount = recIdx + 1;
+      roSlot.slotToRecord[localSlot] = recIdx;
+      roSlot.recordToSlot[recIdx] = localSlot;
+      if (byteOff < roSlot.drawTableDirtyMin) roSlot.drawTableDirtyMin = byteOff;
+      if (byteOff + RECORD_BYTES > roSlot.drawTableDirtyMax) roSlot.drawTableDirtyMax = byteOff + RECORD_BYTES;
+      roSlot.totalEmitEstimate += idxAlloc.count * instanceCount;
+      const newNumTiles = Math.max(1, Math.ceil(roSlot.totalEmitEstimate / TILE_K));
+      roSlot.firstDrawInTileBuf!.ensureCapacity((newNumTiles + 1) * 4);
+      roSlot.scanDirty = true;
     }
 
     drawIdToBucket[drawId]    = bucket;
     drawIdToLocalSlot[drawId] = localSlot;
+    drawIdToSlotIdx[drawId]   = roSlotIdx;
     drawIdToIndexAval[drawId] = indicesAval;
 
     // ─── Reactive rebucket: track PS-modeKey changes ────────────────
@@ -2231,17 +2265,19 @@ export function buildHeapScene(
       }
     }
     {
+      const slotIdx = drawIdToSlotIdx[drawId];
+      const slot = slotIdx !== undefined ? bucket.slots[slotIdx]! : bucket.slots[0]!;
       const removedEntry = bucket.localEntries[localSlot];
       const removedCount = removedEntry !== undefined
         ? removedEntry.indexCount * removedEntry.instanceCount
         : 0;
-      bucket.slots[0]!.totalEmitEstimate = Math.max(0, bucket.slots[0]!.totalEmitEstimate - removedCount);
+      slot.totalEmitEstimate = Math.max(0, slot.totalEmitEstimate - removedCount);
       // Swap-pop: move the last record into the freed slot, decrement
       // recordCount. firstEmit is GPU-rewritten by the next scan, so
       // we only fix (drawIdx, indexStart, indexCount, instanceCount).
-      const recIdx     = bucket.slots[0]!.slotToRecord[localSlot]!;
-      const lastRecIdx = bucket.slots[0]!.recordCount - 1;
-      const shadow = bucket.slots[0]!.drawTableShadow!;
+      const recIdx     = slot.slotToRecord[localSlot]!;
+      const lastRecIdx = slot.recordCount - 1;
+      const shadow = slot.drawTableShadow!;
       if (recIdx !== lastRecIdx) {
         const dst = recIdx * RECORD_U32;
         const src = lastRecIdx * RECORD_U32;
@@ -2250,17 +2286,17 @@ export function buildHeapScene(
         shadow[dst + 2] = shadow[src + 2]!;
         shadow[dst + 3] = shadow[src + 3]!;
         shadow[dst + 4] = shadow[src + 4]!;
-        const movedSlot = bucket.slots[0]!.recordToSlot[lastRecIdx]!;
-        bucket.slots[0]!.slotToRecord[movedSlot] = recIdx;
-        bucket.slots[0]!.recordToSlot[recIdx] = movedSlot;
+        const movedSlot = slot.recordToSlot[lastRecIdx]!;
+        slot.slotToRecord[movedSlot] = recIdx;
+        slot.recordToSlot[recIdx] = movedSlot;
         const byteOff = recIdx * RECORD_BYTES;
-        if (byteOff < bucket.slots[0]!.drawTableDirtyMin) bucket.slots[0]!.drawTableDirtyMin = byteOff;
-        if (byteOff + RECORD_BYTES > bucket.slots[0]!.drawTableDirtyMax) bucket.slots[0]!.drawTableDirtyMax = byteOff + RECORD_BYTES;
+        if (byteOff < slot.drawTableDirtyMin) slot.drawTableDirtyMin = byteOff;
+        if (byteOff + RECORD_BYTES > slot.drawTableDirtyMax) slot.drawTableDirtyMax = byteOff + RECORD_BYTES;
       }
-      bucket.slots[0]!.slotToRecord[localSlot] = -1;
-      bucket.slots[0]!.recordToSlot[lastRecIdx] = -1;
-      bucket.slots[0]!.recordCount = lastRecIdx;
-      bucket.slots[0]!.scanDirty = true;
+      slot.slotToRecord[localSlot] = -1;
+      slot.recordToSlot[lastRecIdx] = -1;
+      slot.recordCount = lastRecIdx;
+      slot.scanDirty = true;
     }
 
     // Release pool entries — refcount drops; if zero, allocation freed.
@@ -2312,6 +2348,7 @@ export function buildHeapScene(
 
     drawIdToBucket[drawId]    = undefined;
     drawIdToLocalSlot[drawId] = undefined;
+    drawIdToSlotIdx[drawId]   = undefined;
     drawIdToIndexAval[drawId] = undefined;
     drawIdToSpec[drawId]      = undefined;
     const oldTracker = drawIdToModeTracker[drawId];
@@ -2429,113 +2466,88 @@ export function buildHeapScene(
         const dirty = [...dirtyModeKeyDrawIds];
         dirtyModeKeyDrawIds.clear();
 
-        // Bucket-level fast path: group dirty drawIds by bucket. If
-        // ALL of a bucket's ROs are dirty (typical SG case where one
-        // shared aval drives every leaf — e.g. <Sg CullMode={cullC}>
-        // wrapping 20k leaves), the whole bucket transitions together.
-        // Rebuild the bucket's pipeline + rename in bucketByKey,
-        // O(1) work instead of N remove+add cycles.
-        const byBucket = new Map<Bucket, number[]>();
+        // Phase 5c.2 reslot pass. For each dirty drawId whose
+        // tracker.modeKey changed:
+        //   1. Find its bucket + current slot.
+        //   2. ensureSlot for the new modeKey (within the same bucket).
+        //   3. Move the record from oldSlot.drawTable to
+        //      newSlot.drawTable (swap-pop + push). Bucket-shared
+        //      drawHeap + pool entries stay put.
+        //   4. Update drawIdToSlotIdx.
+        // No bucket rename, no createRenderPipeline (pre-warm + cache
+        // mean ensureSlot is a hit). No removeDraw+addDraw arena
+        // churn.
+
         for (const drawId of dirty) {
-          const b = drawIdToBucket[drawId];
-          if (b === undefined) continue; // RO removed since mark
-          let arr = byBucket.get(b);
-          if (arr === undefined) { arr = []; byBucket.set(b, arr); }
-          arr.push(drawId);
-        }
+          const tracker = drawIdToModeTracker[drawId];
+          if (tracker === undefined) continue;
+          const oldKey = tracker.modeKey;
+          if (!tracker.recompute()) continue;
+          if (tracker.modeKey === oldKey) continue;
 
-        // Two-phase rebucket: collect all proposed renames first, then
-        // commit them atomically. Avoids the "two buckets swap names"
-        // conflict (e.g. cullModeC flip with both 'back' and 'front'
-        // buckets present — A wants 'front', B wants 'back', they
-        // collide). After phase 1 every fast-path bucket is removed
-        // from bucketByKey, freeing both keys for phase 2's atomic
-        // re-insertion. Slow per-RO rebuckets handle anything that
-        // still conflicts (rare).
-        type Rename = {
-          bucket: Bucket;
-          repId: number;
-          newKey: bigint;
-          newBk: string;
-          oldBk: string;
-        };
-        const renames: Rename[] = [];
-        const slowChanged: number[] = []; // ROs going through per-RO
+          const bucket = drawIdToBucket[drawId];
+          const localSlot = drawIdToLocalSlot[drawId];
+          const oldSlotIdx = drawIdToSlotIdx[drawId];
+          if (bucket === undefined || localSlot === undefined || oldSlotIdx === undefined) continue;
 
-        for (const [bucket, ids] of byBucket) {
-          const changed: number[] = [];
-          for (const drawId of ids) {
-            const tracker = drawIdToModeTracker[drawId];
-            if (tracker === undefined) continue;
-            const oldKey = tracker.modeKey;
-            if (!tracker.recompute()) continue;
-            if (tracker.modeKey === oldKey) continue;
-            changed.push(drawId);
+          const newSlot = ensureSlot(bucket, tracker.descriptor);
+          const newSlotIdx = bucket.slots.indexOf(newSlot);
+          if (newSlotIdx === oldSlotIdx) continue;
+
+          // Swap-pop from old slot's drawTable.
+          const oldSlot = bucket.slots[oldSlotIdx]!;
+          const entry = bucket.localEntries[localSlot];
+          const emit = entry !== undefined ? entry.indexCount * entry.instanceCount : 0;
+          const oldRecIdx = oldSlot.slotToRecord[localSlot]!;
+          const lastRecIdx = oldSlot.recordCount - 1;
+          const oldShadow = oldSlot.drawTableShadow!;
+          if (oldRecIdx !== lastRecIdx) {
+            const dst = oldRecIdx * RECORD_U32;
+            const src = lastRecIdx * RECORD_U32;
+            oldShadow[dst + 0] = 0;
+            oldShadow[dst + 1] = oldShadow[src + 1]!;
+            oldShadow[dst + 2] = oldShadow[src + 2]!;
+            oldShadow[dst + 3] = oldShadow[src + 3]!;
+            oldShadow[dst + 4] = oldShadow[src + 4]!;
+            const movedLocal = oldSlot.recordToSlot[lastRecIdx]!;
+            oldSlot.slotToRecord[movedLocal] = oldRecIdx;
+            oldSlot.recordToSlot[oldRecIdx] = movedLocal;
+            const off = oldRecIdx * RECORD_BYTES;
+            if (off < oldSlot.drawTableDirtyMin) oldSlot.drawTableDirtyMin = off;
+            if (off + RECORD_BYTES > oldSlot.drawTableDirtyMax) oldSlot.drawTableDirtyMax = off + RECORD_BYTES;
           }
-          if (changed.length === 0) continue;
+          oldSlot.slotToRecord[localSlot] = -1;
+          oldSlot.recordToSlot[lastRecIdx] = -1;
+          oldSlot.recordCount = lastRecIdx;
+          oldSlot.totalEmitEstimate = Math.max(0, oldSlot.totalEmitEstimate - emit);
+          oldSlot.scanDirty = true;
 
-          const wholeBucket = changed.length === bucket.drawSlots.size;
-          if (wholeBucket) {
-            const repId = changed[0]!;
-            const repTracker = drawIdToModeTracker[repId]!;
-            const sample = drawIdToSpec[repId]!;
-            const fam = familyFor(sample.effect);
-            const newKey  = repTracker.modeKey;
-            const newBk = `family#${fam.schema.id}|mk#${newKey.toString(16)}`;
-            let oldBk: string | undefined;
-            for (const [k, v] of bucketByKey) {
-              if (v === bucket) { oldBk = k; break; }
-            }
-            if (oldBk !== undefined && oldBk !== newBk) {
-              renames.push({ bucket, repId, newKey, newBk, oldBk });
-              continue;
-            }
-            if (oldBk === newBk) continue; // shouldn't happen but safe
-          }
-          // Partial transition: per-RO slow path.
-          for (const c of changed) slowChanged.push(c);
-        }
+          // Push into new slot's drawTable.
+          const newRecIdx = newSlot.recordCount;
+          const dtBuf = newSlot.drawTableBuf!;
+          const byteOff = newRecIdx * RECORD_BYTES;
+          dtBuf.ensureCapacity(byteOff + RECORD_BYTES);
+          dtBuf.setUsed(Math.max(dtBuf.usedBytes, byteOff + RECORD_BYTES));
+          const needBlocks = Math.max(1, Math.ceil((newRecIdx + 1) / SCAN_TILE_SIZE));
+          newSlot.blockSumsBuf!.ensureCapacity(needBlocks * 4);
+          newSlot.blockOffsetsBuf!.ensureCapacity(needBlocks * 4);
+          const newShadow = newSlot.drawTableShadow!;
+          newShadow[newRecIdx * RECORD_U32 + 0] = 0;
+          newShadow[newRecIdx * RECORD_U32 + 1] = localSlot;
+          newShadow[newRecIdx * RECORD_U32 + 2] = entry !== undefined ? entry.firstIndex : 0;
+          newShadow[newRecIdx * RECORD_U32 + 3] = entry !== undefined ? entry.indexCount : 0;
+          newShadow[newRecIdx * RECORD_U32 + 4] = entry !== undefined ? entry.instanceCount : 0;
+          newSlot.recordCount = newRecIdx + 1;
+          newSlot.slotToRecord[localSlot] = newRecIdx;
+          newSlot.recordToSlot[newRecIdx] = localSlot;
+          if (byteOff < newSlot.drawTableDirtyMin) newSlot.drawTableDirtyMin = byteOff;
+          if (byteOff + RECORD_BYTES > newSlot.drawTableDirtyMax) newSlot.drawTableDirtyMax = byteOff + RECORD_BYTES;
+          newSlot.totalEmitEstimate += emit;
+          const newNumTiles = Math.max(1, Math.ceil(newSlot.totalEmitEstimate / TILE_K));
+          newSlot.firstDrawInTileBuf!.ensureCapacity((newNumTiles + 1) * 4);
+          newSlot.scanDirty = true;
 
-        if (renames.length > 0) {
-          // Phase 1: remove all old keys. After this, the renames' new
-          // keys are free unless they collide with a NON-rename
-          // bucket's current key.
-          for (const r of renames) bucketByKey.delete(r.oldBk);
-          // Phase 2: assign new keys, building new pipelines. If a
-          // collision still exists after phase 1 (against a stale
-          // bucket that's NOT being renamed), restore old key + fall
-          // back to per-RO for that bucket's records.
-          for (const r of renames) {
-            if (bucketByKey.has(r.newBk)) {
-              // Collision with a stale bucket. Restore + flag for slow.
-              bucketByKey.set(r.oldBk, r.bucket);
-              for (const id of r.bucket.drawSlots) slowChanged.push(id);
-              continue;
-            }
-            bucketByKey.set(r.newBk, r.bucket);
-            const tracker = drawIdToModeTracker[r.repId]!;
-            const sample = drawIdToSpec[r.repId]!;
-            const desc = tracker.descriptor;
-            // Cache hit: reuse an already-built pipeline. Cache miss
-            // builds + stashes; future flips back to this descriptor
-            // hit the cache.
-            const newPipeline = getOrCreatePipeline(
-              familyFor(sample.effect),
-              r.bucket.layout,
-              r.bucket.isAtlasBucket,
-              desc,
-            );
-            (r.bucket.slots[0] as { pipeline: GPURenderPipeline }).pipeline = newPipeline;
-          }
-        }
-
-        // Slow per-RO rebucket for the leftover cases.
-        for (const drawId of slowChanged) {
-          const spec = drawIdToSpec[drawId];
-          if (spec === undefined) continue;
-          removeDraw(drawId);
-          const newId = addDrawImpl(spec, tok);
-          void newId;
+          drawIdToSlotIdx[drawId] = newSlotIdx;
         }
       }
 
@@ -2656,9 +2668,19 @@ export function buildHeapScene(
   function encodeIntoPass(pass: GPURenderPassEncoder): void {
     let curBg: GPUBindGroup | null = null;
     for (const b of buckets) {
-      if (b.bindGroup !== curBg) { pass.setBindGroup(0, b.bindGroup); curBg = b.bindGroup; }
-      pass.setPipeline(b.slots[0]!.pipeline);
-      if (b.slots[0]!.recordCount > 0) pass.drawIndirect(b.slots[0]!.indirectBuf!, 0);
+      // Phase 5c.2: iterate the bucket's slots, drawIndirect per
+      // non-empty slot. Empty slots draw zero (skip — saves the
+      // setPipeline/setBindGroup overhead).
+      for (const slot of b.slots) {
+        if (slot.recordCount === 0) continue;
+        const bg = slot.bindGroup;
+        if (bg !== undefined && bg !== curBg) {
+          pass.setBindGroup(0, bg);
+          curBg = bg;
+        }
+        pass.setPipeline(slot.pipeline);
+        if (slot.indirectBuf !== undefined) pass.drawIndirect(slot.indirectBuf, 0);
+      }
     }
   }
 
@@ -2734,38 +2756,42 @@ export function buildHeapScene(
       stats.derivedRecords  = derivedScene.records.recordCount;
     }
     let anyDirty = false;
-    for (const b of buckets) { if (b.slots[0]!.scanDirty) { anyDirty = true; break; } }
+    outer: for (const b of buckets) {
+      for (const s of b.slots) {
+        if (s.scanDirty) { anyDirty = true; break outer; }
+      }
+    }
     if (!anyDirty) return;
     const pass = enc.beginComputePass({ label: "heapScene/scan" });
     for (const b of buckets) {
-      if (!b.slots[0]!.scanDirty) continue;
-      // Rebuild render bind group if recordCount changed — its
-      // drawTable binding is sized to recordCount * 16.
-      if (b.slots[0]!.renderBoundRecordCount !== b.slots[0]!.recordCount) {
-        b.bindGroup = buildBucketBindGroup(b);
+      for (let i = 0; i < b.slots.length; i++) {
+        const slot = b.slots[i]!;
+        if (!slot.scanDirty) continue;
+        // Rebuild render bind group if recordCount changed — drawTable
+        // binding is sized to recordCount * RECORD_BYTES.
+        if (slot.renderBoundRecordCount !== slot.recordCount) {
+          slot.bindGroup = buildBucketBindGroup(b, i);
+        }
+        const numRecords = slot.recordCount;
+        const numBlocks = Math.max(1, Math.ceil(numRecords / SCAN_TILE_SIZE));
+        device.queue.writeBuffer(
+          slot.paramsBuf!, 0,
+          new Uint32Array([numRecords, numBlocks, 0, 0]),
+        );
+        pass.setBindGroup(0, slot.scanBindGroup!);
+        pass.setPipeline(scanPipeTile!);
+        pass.dispatchWorkgroups(numBlocks, 1, 1);
+        pass.setPipeline(scanPipeBlocks!);
+        pass.dispatchWorkgroups(1, 1, 1);
+        pass.setPipeline(scanPipeAdd!);
+        pass.dispatchWorkgroups(numBlocks, 1, 1);
+        const SCAN_WG_SIZE = 256;
+        const numTilesCap = Math.max(1, Math.ceil(slot.totalEmitEstimate / TILE_K));
+        const tileWgs = Math.max(1, Math.ceil((numTilesCap + 1) / SCAN_WG_SIZE));
+        pass.setPipeline(scanPipeBuildTileIndex!);
+        pass.dispatchWorkgroups(tileWgs, 1, 1);
+        slot.scanDirty = false;
       }
-      const numRecords = b.slots[0]!.recordCount;
-      const numBlocks = Math.max(1, Math.ceil(numRecords / SCAN_TILE_SIZE));
-      device.queue.writeBuffer(
-        b.slots[0]!.paramsBuf!, 0,
-        new Uint32Array([numRecords, numBlocks, 0, 0]),
-      );
-      pass.setBindGroup(0, b.slots[0]!.scanBindGroup!);
-      pass.setPipeline(scanPipeTile!);
-      pass.dispatchWorkgroups(numBlocks, 1, 1);
-      pass.setPipeline(scanPipeBlocks!);
-      pass.dispatchWorkgroups(1, 1, 1);
-      pass.setPipeline(scanPipeAdd!);
-      pass.dispatchWorkgroups(numBlocks, 1, 1);
-      // numTiles is computed on GPU from indirect[0]; CPU dispatch
-      // must cover the worst-case totalEmit. Each WG handles WG_SIZE
-      // tiles; +1 for the sentinel slot.
-      const SCAN_WG_SIZE = 256;
-      const numTilesCap = Math.max(1, Math.ceil(b.slots[0]!.totalEmitEstimate / TILE_K));
-      const tileWgs = Math.max(1, Math.ceil((numTilesCap + 1) / SCAN_WG_SIZE));
-      pass.setPipeline(scanPipeBuildTileIndex!);
-      pass.dispatchWorkgroups(tileWgs, 1, 1);
-      b.slots[0]!.scanDirty = false;
     }
     pass.end();
   }

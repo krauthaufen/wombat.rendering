@@ -94,7 +94,7 @@ describe("Phase 5b — bucket key uses modeKey VALUE, not aval identity", () => 
     expect(scene.stats.groups).toBe(1);
   });
 
-  it("two cvals with different VALUES produce two buckets", () => {
+  it("two cvals with different VALUES produce two slots in one bucket", () => {
     const gpu = new MockGPU();
     const eff = makeHeapTestEffect();
     const specs: HeapDrawSpec[] = [
@@ -103,11 +103,13 @@ describe("Phase 5b — bucket key uses modeKey VALUE, not aval identity", () => 
     ];
     const scene = buildHeapScene(gpu.device, sig(), specs);
     scene.update(AdaptiveToken.top);
-    // Distinct values → distinct buckets, as expected.
-    expect(scene.stats.groups).toBe(2);
+    // Phase 5c.2: one bucket per (effect, textures); distinct
+    // modeKeys now create per-bucket slots, not separate buckets.
+    expect(scene.stats.groups).toBe(1);
+    expect(scene.stats.slotCount).toBe(2);
   });
 
-  it("a mix of identical-value cvals + one different value: 2 buckets", () => {
+  it("mix of identical-value cvals + one different value: 1 bucket / 2 slots", () => {
     const gpu = new MockGPU();
     const eff = makeHeapTestEffect();
     const specs: HeapDrawSpec[] = [];
@@ -116,7 +118,8 @@ describe("Phase 5b — bucket key uses modeKey VALUE, not aval identity", () => 
     for (let i = 0; i < 20; i++) specs.push(spec(eff, pipelineStateWith("back")));
     const scene = buildHeapScene(gpu.device, sig(), specs);
     scene.update(AdaptiveToken.top);
-    expect(scene.stats.groups).toBe(2);
+    expect(scene.stats.groups).toBe(1);
+    expect(scene.stats.slotCount).toBe(2);
   });
 
   it("createRenderPipeline is called with the right cullMode value (not aval identity)", () => {
@@ -138,10 +141,10 @@ describe("Phase 5b — bucket key uses modeKey VALUE, not aval identity", () => 
     expect(cull).toBe("back");
   });
 
-  it("reactive cullMode flip: cval mutation moves the RO to a different bucket", () => {
+  it("reactive cullMode flip moves the RO into a different slot (same bucket)", () => {
     const gpu = new MockGPU();
     const eff = makeHeapTestEffect();
-    // Two ROs, both initially "back" — should share one bucket.
+    // Two ROs, both initially "back" — should share one bucket+slot.
     const cullA = cval<CullMode>("back");
     const cullB = cval<CullMode>("back");
     const psA: PipelineState = {
@@ -160,21 +163,20 @@ describe("Phase 5b — bucket key uses modeKey VALUE, not aval identity", () => 
     };
     const scene = buildHeapScene(gpu.device, sig(), [spec(eff, psA), spec(eff, psB)]);
     scene.update(AdaptiveToken.top);
-    expect(scene.stats.groups).toBe(1); // collapse — both back.
+    expect(scene.stats.groups).toBe(1);
+    expect(scene.stats.slotCount).toBe(1); // both ROs in slot 'back'
 
-    // Flip A's cullMode value. Pre-5b.2, this was silently ignored
-    // (bucket key was identity-based; aval identity unchanged).
-    // With reactive rebucket, the modeKey changes -> RO A moves
-    // to a fresh bucket with cullMode='front'.
     transact(() => { cullA.value = "front"; });
     scene.update(AdaptiveToken.top);
-    expect(scene.stats.groups).toBe(2); // A and B now in distinct buckets.
+    expect(scene.stats.groups).toBe(1);    // same bucket
+    expect(scene.stats.slotCount).toBe(2); // A in 'front' slot, B still in 'back'
 
-    // Flip B to also front; both end up in the same bucket again
-    // and the now-empty 'back' bucket is GC'd by removeDraw.
     transact(() => { cullB.value = "front"; });
     scene.update(AdaptiveToken.top);
     expect(scene.stats.groups).toBe(1);
+    // Both in 'front' slot now; 'back' slot has 0 records but still
+    // exists as a cached slot (v1 doesn't GC empty slots).
+    expect(scene.stats.slotCount).toBeGreaterThanOrEqual(1);
   });
 
   it("bucket-level fast path: 100 ROs sharing one cullCval rebuild a single pipeline (not 100)", () => {

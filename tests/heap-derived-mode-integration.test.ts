@@ -89,8 +89,10 @@ describe("Task 2: derivedMode integration through heap scene", () => {
       specWithRule(eff, b),
     ]);
     scene.update(AdaptiveToken.top);
-    // Distinct rule outputs -> distinct buckets.
-    expect(scene.stats.groups).toBe(2);
+    // Phase 5c.2: one bucket per (effect, textures); distinct rule
+    // outputs split into per-bucket slots.
+    expect(scene.stats.groups).toBe(1);
+    expect(scene.stats.slotCount).toBe(2);
     // Pipelines reflect rule output.
     const culls = gpu.pipelines.map(p => p.primitive!.cullMode).filter(c => c === "back" || c === "front");
     expect(new Set(culls)).toEqual(new Set(["back", "front"]));
