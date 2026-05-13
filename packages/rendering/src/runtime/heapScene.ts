@@ -637,6 +637,12 @@ export function buildHeapScene(
       modeAvalToDrawIds.set(av, set);
       modeAvalCallbacks.set(av, addMarkingCallback(av, () => {
         for (const id of set!) dirtyModeKeyDrawIds.add(id);
+        // Mark the GPU mode-rules dispatcher dirty too — at least one
+        // of those drawIds may carry a GPU rule whose input changed.
+        // The dispatch path checks consumeDirty() before encoding, so
+        // an unrelated aval mark (e.g. Color change on hover) leaves
+        // the kernel quiet.
+        gpuModesScene?.markDirty();
       }));
     }
     set.add(drawId);
@@ -2097,10 +2103,14 @@ export function buildHeapScene(
         if (inputRef !== undefined) {
           if (gpuModesScene === undefined) gpuModesScene = new GpuDerivedModesScene(device);
           gpuModesScene.registerRo(drawId, inputRef, gpuRule.declared);
+          // If declared is reactive (e.g. a shared cullModeC cval),
+          // subscribe so flipping it marks the dispatcher dirty.
+          // Plain values: no subscription needed.
+          if (typeof gpuRule.declared !== "string") {
+            subscribeModeLeaf(gpuRule.declared as aval<unknown>, drawId);
+          }
           if (drawId < 3 || drawId % 20 === 0) {
-            // Sparse logging so we can confirm registration without
-            // spamming for big scenes.
-            console.debug(`[heapScene] GPU rule registered drawId=${drawId} input='${gpuRule.inputUniform}' ref=${inputRef} declared=${gpuRule.declared}`);
+            console.debug(`[heapScene] GPU rule registered drawId=${drawId} input='${gpuRule.inputUniform}' ref=${inputRef} declared=${typeof gpuRule.declared === "string" ? gpuRule.declared : "<aval>"}`);
           }
         } else {
           console.warn(`[heapScene] GPU rule input '${gpuRule.inputUniform}' not in spec.inputs for drawId=${drawId}; rule disabled`);
@@ -2601,7 +2611,13 @@ export function buildHeapScene(
     // Resolved on the next frame's update() — one-frame lag for the
     // first appearance of a state transition. CPU fallback runs at
     // addDraw time so the initial bucket assignment is still correct.
-    if (gpuModesScene !== undefined && gpuModesScene.registered > 0) {
+    if (gpuModesScene !== undefined
+        && gpuModesScene.registered > 0
+        && gpuModesScene.consumeDirty()) {
+      // Dirty-gate: skip the kernel + readback when no rule input
+      // changed since the last dispatch. Unrelated avals (Color on
+      // hover, etc.) don't trigger dirty, so steady state has zero
+      // GPU mode-rule work per frame.
       const numROs = nextDrawId; // upper bound; sparse entries are skipped via 0xFFFFFFFF sentinel
       gpuModesScene.dispatch(arena.attrs.buffer, numROs, enc);
       // mapAsync the staging buffer AFTER the caller's submit. The

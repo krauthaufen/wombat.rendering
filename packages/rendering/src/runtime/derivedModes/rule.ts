@@ -67,8 +67,16 @@ export interface GpuRuleSpec<A extends ModeAxis = ModeAxis> {
   readonly kernel: "flipCullByDeterminant";
   /** Name of the input uniform the kernel reads (e.g. "ModelTrafo"). */
   readonly inputUniform: string;
-  /** Declared (SG-scope) value the kernel mutates by. */
-  readonly declared: ModeValue<A>;
+  /**
+   * Declared (SG-scope) value the kernel mutates by. Either a plain
+   * mode value (baked at scene-build) or an `aval` for reactive
+   * declared — the dispatcher re-uploads the kernel uniform on each
+   * dispatch from the aval's current value, so flipping it via a UI
+   * cval re-runs the rule with the new declared.
+   */
+  readonly declared:
+    | ModeValue<A>
+    | import("@aardworx/wombat.adaptive").aval<ModeValue<A>>;
 }
 
 export interface DerivedModeRule<A extends ModeAxis = ModeAxis> {
@@ -144,7 +152,10 @@ export function flipCull(c: CullMode): CullMode {
  */
 export function gpuFlipCullByDeterminant(
   inputUniform: string,
-  declared: CullMode = "back",
+  declared:
+    | CullMode
+    | import("@aardworx/wombat.adaptive").aval<CullMode>
+    = "back",
 ): DerivedModeRule<"cull"> {
   return {
     __derivedModeRule: true,

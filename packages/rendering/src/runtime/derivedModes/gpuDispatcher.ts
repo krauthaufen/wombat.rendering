@@ -23,14 +23,17 @@
 
 import { GPU_FLIP_CULL_BY_DET_WGSL, CULL_TO_U32 } from "./gpuKernel.js";
 import type { CullMode } from "../pipelineCache/index.js";
+import type { aval } from "@aardworx/wombat.adaptive";
+import { AdaptiveToken } from "@aardworx/wombat.adaptive";
 
 const NO_RULE = 0xFFFFFFFF;
 
 interface RoEntry {
   /** Byte offset of the RO's ModelTrafo mat4 in the arena. */
   modelRef: number;
-  /** SG-declared cull mode, encoded as u32 (0=none/1=front/2=back). */
-  declaredU32: number;
+  /** SG-declared cull mode — either a plain value or an aval whose
+   *  current value the dispatcher reads each frame. */
+  declared: CullMode | aval<CullMode>;
 }
 
 const WG_SIZE = 64;
@@ -55,9 +58,6 @@ export class GpuDerivedModesScene {
   private capacity = 0;
   /** Last-known arena buffer, used to detect bind-group invalidation. */
   private arenaBuf: GPUBuffer | null = null;
-  /** Last-known declared (for kernel uniform). Common case: all RO
-   *  rules share the same declared (= the SG scope's value). */
-  private declared: number = CULL_TO_U32.back;
   /** True while the staging buffer's mapAsync is in flight. We must
    *  not enqueue a new copyBufferToBuffer into it until it's been
    *  unmapped (mapAsync resolved + unmap called). */
@@ -73,11 +73,14 @@ export class GpuDerivedModesScene {
 
   get registered(): number { return this.liveCount; }
 
-  registerRo(drawId: number, modelRef: number, declared: CullMode): void {
-    this.entries[drawId] = { modelRef, declaredU32: CULL_TO_U32[declared] };
+  registerRo(
+    drawId: number,
+    modelRef: number,
+    declared: CullMode | aval<CullMode>,
+  ): void {
+    this.entries[drawId] = { modelRef, declared };
     this.liveCount++;
     this.dirty = true;
-    this.declared = CULL_TO_U32[declared];
   }
 
   deregisterRo(drawId: number): void {
@@ -144,12 +147,28 @@ export class GpuDerivedModesScene {
   /** Upload current per-RO input refs + params; called when dirty. */
   private uploadInputs(numROs: number): void {
     const refs = new Uint32Array(this.capacity).fill(NO_RULE);
+    let declaredU32: number = CULL_TO_U32.back;
     for (let i = 0; i < numROs; i++) {
       const e = this.entries[i];
-      if (e !== undefined) refs[i] = e.modelRef;
+      if (e !== undefined) {
+        refs[i] = e.modelRef;
+        // Resolve the declared each dispatch. v1 supports one shared
+        // declared per kernel (single uniform in the WGSL). Last
+        // registered entry's declared wins. For the typical SG shape
+        // where a single `<Sg CullMode={cv}>` wraps every leaf, every
+        // entry's declared is the same aval — so picking the last is
+        // equivalent to picking any. If the user genuinely binds
+        // distinct declareds across the scene, an axis-domain
+        // analyzer would be the correct generalization.
+        const d = e.declared;
+        const v = typeof d === "string"
+          ? d
+          : (d as aval<CullMode>).getValue(AdaptiveToken.top);
+        declaredU32 = CULL_TO_U32[v];
+      }
     }
     this.device.queue.writeBuffer(this.inputBuf!, 0, refs.buffer, refs.byteOffset, refs.byteLength);
-    const params = new Uint32Array([numROs, this.declared, 0, 0]);
+    const params = new Uint32Array([numROs, declaredU32, 0, 0]);
     this.device.queue.writeBuffer(this.paramsBuf!, 0, params.buffer, params.byteOffset, params.byteLength);
   }
 
