@@ -131,7 +131,6 @@ export {
   derivedMode,
   isDerivedModeRule,
   type DerivedModeRule,
-  type DerivedModeOptions,
   type ModeAxis,
   type ModeValue,
 } from "./derivedModes/rule.js";

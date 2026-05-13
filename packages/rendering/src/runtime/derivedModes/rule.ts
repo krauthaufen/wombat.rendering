@@ -59,9 +59,17 @@ export interface DerivedModeRule<A extends ModeAxis = ModeAxis> {
    *  slot indices. For enum axes (cull etc.) the body returns u32
    *  enum indices that the renderer maps via the canonical table. */
   readonly expr: RuleExpr<ModeValue<A> | number>;
-  /** SG-context declared value for this axis. May be a reactive aval
-   *  — heapScene re-specialises + swaps cached kernels on mark. */
-  readonly declared: aval<ModeValue<A>> | ModeValue<A>;
+  /**
+   * SG-context value for this axis. Filled in by `<Sg CullMode>` /
+   * `<Sg DepthTest>` / etc. at traversal time — users never write
+   * it. The rule body's `declared` ambient leaf resolves to this;
+   * when the underlying aval marks, heapScene re-specialises +
+   * swaps the cached kernel + pipeline set.
+   *
+   * `undefined` is the initial state right after `derivedMode(...)`;
+   * the SG fills it in before the rule reaches the renderer.
+   */
+  readonly declared: aval<ModeValue<A>> | ModeValue<A> | undefined;
 }
 
 export function isDerivedModeRule(x: unknown): x is DerivedModeRule {
@@ -69,9 +77,6 @@ export function isDerivedModeRule(x: unknown): x is DerivedModeRule {
       && (x as { __derivedModeRule?: unknown }).__derivedModeRule === true;
 }
 
-export interface DerivedModeOptions<A extends ModeAxis> {
-  readonly declared: aval<ModeValue<A>> | ModeValue<A>;
-}
 
 /**
  * Brand a `RuleExpr` (the shader-IR artefact emitted by the
@@ -89,12 +94,11 @@ export interface DerivedModeOptions<A extends ModeAxis> {
 export function derivedMode<A extends ModeAxis>(
   axis: A,
   expr: RuleExpr<ModeValue<A> | number>,
-  options: DerivedModeOptions<A>,
 ): DerivedModeRule<A> {
   return {
     __derivedModeRule: true,
     axis,
     expr,
-    declared: options.declared,
+    declared: undefined,  // SG fills this in at traversal time
   };
 }

@@ -1829,13 +1829,17 @@ export function buildHeapScene(
     return value;
   }
 
-  /** Resolve an axis's `declared` value to a u32 index. For enum
-   *  axes (cull etc.), looks up the canonical enum table. For
-   *  structured axes (blend), the declared value is expected to be
-   *  a u32 directly (the index that the rule's resolve() maps back
-   *  to a full mode object). */
+  /**
+   * Resolve an axis's `declared` value to a u32 index.
+   *
+   *  - omitted: `0` (the rule body either doesn't reference `declared`
+   *    or wants the canonical zero of its axis as the default).
+   *  - number: passed through directly (e.g. `declared: 2` for cull "back").
+   *  - aval / string / boolean: looked up in the canonical enum table.
+   */
   function resolveDeclaredU32<A extends ModeAxis>(rule: DerivedModeRule<A>, tok: AdaptiveToken): number {
     const d = rule.declared;
+    if (d === undefined) return 0;
     const v = (typeof d === "object" && d !== null && "getValue" in (d as object))
       ? (d as aval<unknown>).getValue(tok)
       : d;
@@ -1844,7 +1848,7 @@ export function buildHeapScene(
     if (table.length === 0) {
       throw new Error(
         `heapScene/gpuRouting: axis '${rule.axis}' has no canonical enum table; ` +
-        `pass \`declared\` as a u32 index that aligns with the rule's resolve callback`,
+        `pass \`declared\` as a u32 index or omit it`,
       );
     }
     const i = table.indexOf(v);
