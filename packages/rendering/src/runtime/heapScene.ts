@@ -174,6 +174,10 @@ interface BucketSlot {
   pipeline: GPURenderPipeline;
   /** modeKey this slot covers — the bitfield-encoded descriptor. */
   modeKey: bigint;
+  /** Snapshotted full descriptor the slot was created with. Used by
+   *  CPU→GPU promotion to synthesise per-distinct-descriptor combos
+   *  for pre-existing CPU-routed ROs. */
+  cpuDescriptor?: PipelineStateDescriptor;
   /** Render bind group (drawTable + firstDrawInTile are per-slot). */
   bindGroup?: GPUBindGroup;
 
@@ -235,9 +239,14 @@ interface AxisRuleEntry {
 interface ComboEntry {
   readonly comboId: number;
   readonly comboKey: string;
-  /** axis → axisRuleId for axes this combo has a rule on. Axes
-   *  not present in the map use baseDescriptor's value. */
+  /** axis → axisRuleId for axes this combo has a rule on. */
   readonly axisRules: ReadonlyMap<ModeAxis, number>;
+  /** axis → explicit fixed value for axes the combo has no rule on
+   *  but wants to override baseDescriptor's value (e.g. pre-existing
+   *  CPU-routed ROs whose pipelineState differs from baseDescriptor
+   *  on a non-ruled axis). Axes absent from both maps fall back to
+   *  baseDescriptor at codegen time. */
+  readonly axisFixedValues: ReadonlyMap<ModeAxis, unknown>;
 }
 
 interface Bucket {
@@ -1715,6 +1724,7 @@ export function buildHeapScene(
 
     const slot: BucketSlot = {
       pipeline, modeKey,
+      cpuDescriptor: descriptor,
       drawTableDirtyMin: Infinity, drawTableDirtyMax: 0,
       recordCount: 0, slotToRecord: [], recordToSlot: [],
       totalEmitEstimate: 0, scanDirty: false,
@@ -2000,7 +2010,21 @@ export function buildHeapScene(
       throw new Error("heapScene/gpuRouting: specialiseBucket called with no registered combos");
     }
     const base = bucket.baseDescriptor!;
-    const activeAxes: ModeAxis[] = AXIS_ORDER.filter(a => (rulesByAxis.get(a)?.size ?? 0) > 0);
+    // An axis is "active" (gets cartesian-product cardinality) if it
+    // has at least one rule, OR any combo overrides baseDesc with a
+    // distinct fixed value. Both grow the per-axis value union.
+    const baseAxisValues = new Map<ModeAxis, unknown>(AXIS_ORDER.map(a => [a, axisValueOfDesc(base, a)] as const));
+    const activeAxes: ModeAxis[] = AXIS_ORDER.filter(a => {
+      if ((rulesByAxis.get(a)?.size ?? 0) > 0) return true;
+      const baseVal = baseAxisValues.get(a);
+      const baseKey = stableStringify(baseVal);
+      for (const k of comboOrder) {
+        const c = combosByKey.get(k)!;
+        const fixed = c.axisFixedValues.get(a);
+        if (fixed !== undefined && stableStringify(fixed) !== baseKey) return true;
+      }
+      return false;
+    });
 
     // Step 1: per-axis-rule analyse + collect per-axis union.
     interface PerRule {
@@ -2042,10 +2066,10 @@ export function buildHeapScene(
       perAxisRules.set(axis, list);
     }
 
-    // Per axis: union of resolved values (resolveAxisValue'd so
-    // numeric enum indices collapse with canonical-table strings).
-    // Also include baseDesc.value for the axis if any combo lacks a
-    // rule on it.
+    // Per axis: union of resolved values across rules + each combo's
+    // effective value when it has no rule on this axis. Combos that
+    // declare an explicit `axisFixedValues[axis]` contribute that
+    // value; combos without an entry default to baseDesc.value.
     interface AxisInfo {
       readonly axis: ModeAxis;
       readonly values: ReadonlyArray<unknown>;          // resolved axis values, sorted
@@ -2055,7 +2079,7 @@ export function buildHeapScene(
     }
     const axisInfos: AxisInfo[] = [];
     for (const axis of activeAxes) {
-      const list = perAxisRules.get(axis)!;
+      const list = perAxisRules.get(axis) ?? [];
       const dummyRule = { axis } as DerivedModeRule<ModeAxis>;
       const byKey = new Map<string, unknown>();
       for (const p of list) {
@@ -2064,10 +2088,14 @@ export function buildHeapScene(
           byKey.set(stableStringify(av), av);
         }
       }
-      const baseValue = axisValueOfDesc(base, axis);
-      const someComboLacksAxis = comboOrder.some(k => !combosByKey.get(k)!.axisRules.has(axis));
-      if (someComboLacksAxis) {
-        byKey.set(stableStringify(baseValue), baseValue);
+      const baseValue = baseAxisValues.get(axis);
+      // Include every combo's effective value for this axis (so
+      // const-source idx lookups always succeed).
+      for (const k of comboOrder) {
+        const c = combosByKey.get(k)!;
+        if (c.axisRules.has(axis)) continue;
+        const effective = c.axisFixedValues.has(axis) ? c.axisFixedValues.get(axis) : baseValue;
+        byKey.set(stableStringify(effective), effective);
       }
       const sortedKeys = [...byKey.keys()].sort();
       const values = sortedKeys.map(k => byKey.get(k)!);
@@ -2105,18 +2133,29 @@ export function buildHeapScene(
       }
     }
 
-    // Step 4: per-combo axis sources.
+    // Step 4: per-combo axis sources. Rule axes → rule source.
+    // Non-rule axes → const idx of (axisFixedValues.get(axis)
+    // ?? baseValue) within the axis's sorted union.
     const comboSpecs: import("./derivedModes/kernelCodegen.js").ComboCodegenSpec[] = [];
     for (const comboKey of comboOrder) {
       const combo = combosByKey.get(comboKey)!;
       const axes = axisInfos.map(info => {
         const axisRuleId = combo.axisRules.get(info.axis);
+        if (axisRuleId !== undefined) {
+          return {
+            axis: info.axis,
+            cardinality: info.values.length,
+            source: { kind: "rule" as const, axisRuleId },
+          };
+        }
+        const effective = combo.axisFixedValues.has(info.axis)
+          ? combo.axisFixedValues.get(info.axis)
+          : info.baseValue;
+        const idx = info.keyToIdx.get(stableStringify(effective)) ?? info.baseIdx;
         return {
           axis: info.axis,
           cardinality: info.values.length,
-          source: axisRuleId !== undefined
-            ? { kind: "rule" as const, axisRuleId }
-            : { kind: "const" as const, idx: info.baseIdx },
+          source: { kind: "const" as const, idx },
         };
       });
       comboSpecs.push({ comboId: combo.comboId, axes });
@@ -2181,13 +2220,10 @@ export function buildHeapScene(
   ): number {
     // CPU→GPU promotion: capture pre-existing CPU-routed ROs so they
     // can be migrated into the master pool after the partition is up.
-    // The cartesian slot layout demands every CPU RO use a descriptor
-    // that survives within it — for the trivial all-fixed combo to
-    // route them correctly, every CPU RO's pipeline state must equal
-    // baseDescriptor. (Mixed pre-existing descriptors would need the
-    // non-ruled axes to *also* enumerate those values, which means
-    // synthesising trivial per-axis rules; defer until the case
-    // matters in practice and surface a clear error in the meantime.)
+    // Each RO is tagged with its CPU descriptor (read off the slot's
+    // `cpuDescriptor` snapshot); we synthesise a const-source combo
+    // per distinct descriptor below, with `axisFixedValues` set on
+    // any axis the descriptor differs from baseDescriptor on.
     interface CpuMigration {
       localSlot: number;
       drawId: number;
@@ -2195,33 +2231,38 @@ export function buildHeapScene(
       indexCount: number;
       instanceCount: number;
       perDrawRefs: Map<string, number>;
+      descriptor: PipelineStateDescriptor;
+      /** Filled in below after synthetic combos are registered. */
+      targetComboId: number;
     }
     let cpuMigration: CpuMigration[] | undefined;
-    if (!bucket.gpuRouted) {
-      if (bucket.drawSlots.size > 0) {
-        const baseDescKey = encodeModeKey(baseDesc);
-        for (const s of bucket.slots) {
-          if (s.modeKey !== baseDescKey) {
-            throw new Error(
-              `heapScene/gpuRouting: cannot promote bucket '${bucket.label}' to GPU-routed — ` +
-              `pre-existing CPU-routed ROs use a descriptor different from the ruled RO's baseDescriptor. ` +
-              `Unify pipelineState across the bucket or add the first ruled RO first.`,
-            );
-          }
+    if (!bucket.gpuRouted && bucket.drawSlots.size > 0) {
+      cpuMigration = [];
+      for (const ls of bucket.drawSlots) {
+        const e = bucket.localEntries[ls]!;
+        const drawId = bucket.localToDrawId[ls]!;
+        const slotIdx = drawIdToSlotIdx[drawId];
+        const slot = slotIdx !== undefined ? bucket.slots[slotIdx] : undefined;
+        const descriptor = slot?.cpuDescriptor;
+        if (descriptor === undefined) {
+          throw new Error(
+            `heapScene/gpuRouting: pre-existing CPU RO (drawId=${drawId}, localSlot=${ls}) ` +
+            `has no captured descriptor — bucket promotion cannot synthesise a migration combo.`,
+          );
         }
-        cpuMigration = [];
-        for (const ls of bucket.drawSlots) {
-          const e = bucket.localEntries[ls]!;
-          cpuMigration.push({
-            localSlot:     ls,
-            drawId:        bucket.localToDrawId[ls]!,
-            firstIndex:    e.firstIndex,
-            indexCount:    e.indexCount,
-            instanceCount: e.instanceCount,
-            perDrawRefs:   bucket.localPerDrawRefs[ls]!,
-          });
-        }
+        cpuMigration.push({
+          localSlot:     ls,
+          drawId,
+          firstIndex:    e.firstIndex,
+          indexCount:    e.indexCount,
+          instanceCount: e.instanceCount,
+          perDrawRefs:   bucket.localPerDrawRefs[ls]!,
+          descriptor,
+          targetComboId: 0,
+        });
       }
+    }
+    if (!bucket.gpuRouted) {
       bucket.baseDescriptor = baseDesc;
       bucket.rulesByAxis    = new Map();
       bucket.axisRuleOrder  = new Map();
@@ -2232,14 +2273,43 @@ export function buildHeapScene(
       bucket.drawIdToComboId = new Map();
       bucket.drawIdToRecord = new Map();
       bucket.recordToDrawId = [];
-      // Pre-register the trivial all-fixed combo (comboId 0) so
-      // migrated CPU ROs have a stable target. Skip if there's
-      // nothing to migrate — keeping combo 0 = the user's actual
-      // combo for the common case where ruled ROs land first.
+      // Synthesise one combo per distinct pre-existing CPU
+      // descriptor. Each carries `axisFixedValues` on axes where the
+      // descriptor differs from baseDescriptor; specialiseBucket
+      // expands the per-axis union to include each variant value
+      // and emits a const-source combo fn that routes to the right
+      // cartesian slot.
       if (cpuMigration !== undefined) {
-        const trivialKey = AXIS_ORDER.map(a => `${a}:_`).join("|");
-        bucket.combosByKey.set(trivialKey, { comboId: 0, comboKey: trivialKey, axisRules: new Map() });
-        bucket.comboOrder.push(trivialKey);
+        const baseVals = new Map<ModeAxis, unknown>(AXIS_ORDER.map(a => [a, axisValueOfDesc(baseDesc, a)] as const));
+        const synthByKey = new Map<string, number>();
+        for (const m of cpuMigration) {
+          const axisFixedValues = new Map<ModeAxis, unknown>();
+          const keyParts: string[] = [];
+          for (const a of AXIS_ORDER) {
+            const v = axisValueOfDesc(m.descriptor, a);
+            const baseKey = stableStringify(baseVals.get(a));
+            const vKey = stableStringify(v);
+            if (vKey !== baseKey) {
+              axisFixedValues.set(a, v);
+              keyParts.push(`${a}:_:fixed:${vKey}`);
+            } else {
+              keyParts.push(`${a}:_`);
+            }
+          }
+          const comboKey = keyParts.join("|");
+          let comboId = synthByKey.get(comboKey);
+          if (comboId === undefined) {
+            comboId = bucket.comboOrder.length;
+            bucket.combosByKey.set(comboKey, {
+              comboId, comboKey,
+              axisRules:       new Map(),
+              axisFixedValues,
+            });
+            bucket.comboOrder.push(comboKey);
+            synthByKey.set(comboKey, comboId);
+          }
+          m.targetComboId = comboId;
+        }
       }
     }
     // Per-axis: dedupe rule by content hash; assign axisRuleId.
@@ -2304,7 +2374,7 @@ export function buildHeapScene(
       const comboId = bucket.comboOrder!.length;
       const axisRules = new Map<ModeAxis, number>();
       for (const [axis, id] of perAxisRuleId) axisRules.set(axis, id);
-      combo = { comboId, comboKey, axisRules };
+      combo = { comboId, comboKey, axisRules, axisFixedValues: new Map() };
       bucket.combosByKey!.set(comboKey, combo);
       bucket.comboOrder!.push(comboKey);
       respec = true;
@@ -2323,18 +2393,18 @@ export function buildHeapScene(
       bucket.gpuRouted      = true;
       bucket.partitionScene = partition;
       bucket.partitionDirty = true;
-      // Migrate any captured CPU records into the master pool with
-      // comboId=0 (the trivial all-fixed combo registered above).
+      // Migrate any captured CPU records into the master pool, each
+      // using the synthetic combo registered for its CPU descriptor.
       if (cpuMigration !== undefined) {
         let totalEmit = 0;
         for (const m of cpuMigration) {
           const uRefs = bucket.uniformOrder!.map(n => m.perDrawRefs.get(n) ?? 0);
           const recIdx = partition.appendRecord(
-            m.localSlot, m.firstIndex, m.indexCount, m.instanceCount, 0, uRefs,
+            m.localSlot, m.firstIndex, m.indexCount, m.instanceCount, m.targetComboId, uRefs,
           );
           bucket.drawIdToRecord!.set(m.drawId, recIdx);
           bucket.recordToDrawId![recIdx] = m.drawId;
-          bucket.drawIdToComboId!.set(m.drawId, 0);
+          bucket.drawIdToComboId!.set(m.drawId, m.targetComboId);
           totalEmit += m.indexCount * m.instanceCount;
         }
         const numRecords = partition.numRecords;

@@ -236,22 +236,39 @@ function emitComboFn(c: ComboCodegenSpec): string {
   return `fn combo_${c.comboId}(r: Record) -> u32 {\n${idxLines.join("\n")}\n  return ${sumTerms.join(" + ")};\n}\n`;
 }
 
+// Arena-uniform load helpers. Every entry has a 16-byte header
+// `(typeId u32, length u32, pad u32, pad u32)`; the value's
+// tightly-packed bytes follow. Scalars start at +16, vec/mat at
+// +16 contiguous in WGSL row-vector × column-major layout matching
+// the corresponding packer in `heapScene/packers.ts`.
 const LOADERS = `
-fn load_mat3_upper(refBytes: u32) -> mat3x3<f32> {
-  let baseU32 = (refBytes + 16u) >> 2u;
+fn load_f32(r: u32) -> f32 { return bitcast<f32>(arena[(r + 16u) >> 2u]); }
+fn load_u32(r: u32) -> u32 { return arena[(r + 16u) >> 2u]; }
+fn load_i32(r: u32) -> i32 { return bitcast<i32>(arena[(r + 16u) >> 2u]); }
+fn load_vec2f(r: u32) -> vec2<f32> { let i = (r + 16u) >> 2u; return vec2<f32>(bitcast<f32>(arena[i]), bitcast<f32>(arena[i + 1u])); }
+fn load_vec3f(r: u32) -> vec3<f32> { let i = (r + 16u) >> 2u; return vec3<f32>(bitcast<f32>(arena[i]), bitcast<f32>(arena[i + 1u]), bitcast<f32>(arena[i + 2u])); }
+fn load_vec4f(r: u32) -> vec4<f32> { let i = (r + 16u) >> 2u; return vec4<f32>(bitcast<f32>(arena[i]), bitcast<f32>(arena[i + 1u]), bitcast<f32>(arena[i + 2u]), bitcast<f32>(arena[i + 3u])); }
+fn load_vec2u(r: u32) -> vec2<u32> { let i = (r + 16u) >> 2u; return vec2<u32>(arena[i], arena[i + 1u]); }
+fn load_vec3u(r: u32) -> vec3<u32> { let i = (r + 16u) >> 2u; return vec3<u32>(arena[i], arena[i + 1u], arena[i + 2u]); }
+fn load_vec4u(r: u32) -> vec4<u32> { let i = (r + 16u) >> 2u; return vec4<u32>(arena[i], arena[i + 1u], arena[i + 2u], arena[i + 3u]); }
+fn load_vec2i(r: u32) -> vec2<i32> { let i = (r + 16u) >> 2u; return vec2<i32>(bitcast<i32>(arena[i]), bitcast<i32>(arena[i + 1u])); }
+fn load_vec3i(r: u32) -> vec3<i32> { let i = (r + 16u) >> 2u; return vec3<i32>(bitcast<i32>(arena[i]), bitcast<i32>(arena[i + 1u]), bitcast<i32>(arena[i + 2u])); }
+fn load_vec4i(r: u32) -> vec4<i32> { let i = (r + 16u) >> 2u; return vec4<i32>(bitcast<i32>(arena[i]), bitcast<i32>(arena[i + 1u]), bitcast<i32>(arena[i + 2u]), bitcast<i32>(arena[i + 3u])); }
+fn load_mat3_upper(r: u32) -> mat3x3<f32> {
+  let b = (r + 16u) >> 2u;
   return mat3x3<f32>(
-    vec3<f32>(bitcast<f32>(arena[baseU32 +  0u]), bitcast<f32>(arena[baseU32 +  4u]), bitcast<f32>(arena[baseU32 +  8u])),
-    vec3<f32>(bitcast<f32>(arena[baseU32 +  1u]), bitcast<f32>(arena[baseU32 +  5u]), bitcast<f32>(arena[baseU32 +  9u])),
-    vec3<f32>(bitcast<f32>(arena[baseU32 +  2u]), bitcast<f32>(arena[baseU32 +  6u]), bitcast<f32>(arena[baseU32 + 10u])),
+    vec3<f32>(bitcast<f32>(arena[b +  0u]), bitcast<f32>(arena[b +  4u]), bitcast<f32>(arena[b +  8u])),
+    vec3<f32>(bitcast<f32>(arena[b +  1u]), bitcast<f32>(arena[b +  5u]), bitcast<f32>(arena[b +  9u])),
+    vec3<f32>(bitcast<f32>(arena[b +  2u]), bitcast<f32>(arena[b +  6u]), bitcast<f32>(arena[b + 10u])),
   );
 }
-fn load_mat4(refBytes: u32) -> mat4x4<f32> {
-  let baseU32 = (refBytes + 16u) >> 2u;
+fn load_mat4(r: u32) -> mat4x4<f32> {
+  let b = (r + 16u) >> 2u;
   return mat4x4<f32>(
-    vec4<f32>(bitcast<f32>(arena[baseU32 +  0u]), bitcast<f32>(arena[baseU32 +  4u]), bitcast<f32>(arena[baseU32 +  8u]), bitcast<f32>(arena[baseU32 + 12u])),
-    vec4<f32>(bitcast<f32>(arena[baseU32 +  1u]), bitcast<f32>(arena[baseU32 +  5u]), bitcast<f32>(arena[baseU32 +  9u]), bitcast<f32>(arena[baseU32 + 13u])),
-    vec4<f32>(bitcast<f32>(arena[baseU32 +  2u]), bitcast<f32>(arena[baseU32 +  6u]), bitcast<f32>(arena[baseU32 + 10u]), bitcast<f32>(arena[baseU32 + 14u])),
-    vec4<f32>(bitcast<f32>(arena[baseU32 +  3u]), bitcast<f32>(arena[baseU32 +  7u]), bitcast<f32>(arena[baseU32 + 11u]), bitcast<f32>(arena[baseU32 + 15u])),
+    vec4<f32>(bitcast<f32>(arena[b +  0u]), bitcast<f32>(arena[b +  4u]), bitcast<f32>(arena[b +  8u]), bitcast<f32>(arena[b + 12u])),
+    vec4<f32>(bitcast<f32>(arena[b +  1u]), bitcast<f32>(arena[b +  5u]), bitcast<f32>(arena[b +  9u]), bitcast<f32>(arena[b + 13u])),
+    vec4<f32>(bitcast<f32>(arena[b +  2u]), bitcast<f32>(arena[b +  6u]), bitcast<f32>(arena[b + 10u]), bitcast<f32>(arena[b + 14u])),
+    vec4<f32>(bitcast<f32>(arena[b +  3u]), bitcast<f32>(arena[b +  7u]), bitcast<f32>(arena[b + 11u]), bitcast<f32>(arena[b + 15u])),
   );
 }
 `;
@@ -560,8 +577,22 @@ function emitExpr(e: Expr, ctx: EmitCtx): string {
         );
       }
       const refExpr = `r.ref${idx}`;
-      if (r.type.kind === "Matrix" && r.type.rows === 3 && r.type.cols === 3) return `load_mat3_upper(${refExpr})`;
-      if (r.type.kind === "Matrix" && r.type.rows === 4 && r.type.cols === 4) return `load_mat4(${refExpr})`;
+      const t = r.type;
+      if (t.kind === "Float")  return `load_f32(${refExpr})`;
+      if (t.kind === "Int")    return t.signed ? `load_i32(${refExpr})` : `load_u32(${refExpr})`;
+      if (t.kind === "Vector") {
+        const dim = t.dim;
+        if (dim < 2 || dim > 4) throw new Error(`kernelCodegen: unsupported vector dim ${dim} for uniform '${r.name}'`);
+        const elt = t.element;
+        if (elt.kind === "Float") return `load_vec${dim}f(${refExpr})`;
+        if (elt.kind === "Int")   return elt.signed ? `load_vec${dim}i(${refExpr})` : `load_vec${dim}u(${refExpr})`;
+        throw new Error(`kernelCodegen: unsupported vector element type ${elt.kind} for uniform '${r.name}'`);
+      }
+      if (t.kind === "Matrix") {
+        if (t.rows === 3 && t.cols === 3) return `load_mat3_upper(${refExpr})`;
+        if (t.rows === 4 && t.cols === 4) return `load_mat4(${refExpr})`;
+        throw new Error(`kernelCodegen: matrix ${t.cols}x${t.rows} not yet supported for uniform '${r.name}'`);
+      }
       throw new Error(
         `kernelCodegen: rule body reads uniform '${r.name}' of unsupported arena type ${JSON.stringify(r.type)}`,
       );
