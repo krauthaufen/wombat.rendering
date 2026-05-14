@@ -562,6 +562,7 @@ function emitStmt(s: Stmt, ctx: EmitCtx, indent: string): string {
 function emitExpr(e: Expr, ctx: EmitCtx): string {
   const k = (e as { kind: string }).kind;
   switch (k) {
+    case "Expr":   return emitExpr((e as { value: Expr }).value, ctx);  // RExpr wrapper from Declare/Write
     case "Const":  return wgslLiteral((e as { value: Literal }).value);
     case "Var":    return (e as { var: { name: string } }).var.name;
     case "ReadInput": {
