@@ -2181,6 +2181,22 @@ export function buildHeapScene(
   ): number {
     // First combo on this bucket: lazy-init the multi-rule machinery.
     if (!bucket.gpuRouted) {
+      // CPU→GPU promotion: any pre-existing CPU ROs (added before
+      // the first ruled RO joined) live in `bucket.slots` but
+      // wouldn't be in the master pool the partition kernel reads
+      // from — they'd silently vanish from the render. We don't
+      // migrate them (the bucket's slot layout reshapes to reflect
+      // the cartesian, so per-RO pipeline-state assignments would
+      // need rerouting). Surface this as a clear error so callers
+      // know to add the ruled RO first, or to give every RO at
+      // least a placeholder rule.
+      if (bucket.drawSlots.size > 0) {
+        throw new Error(
+          `heapScene/gpuRouting: cannot promote bucket '${bucket.label}' to GPU-routed ` +
+          `— it already has ${bucket.drawSlots.size} CPU-routed RO(s). ` +
+          `Add the first ruled RO before any unruled RO in this bucket.`,
+        );
+      }
       bucket.baseDescriptor = baseDesc;
       bucket.rulesByAxis    = new Map();
       bucket.axisRuleOrder  = new Map();
@@ -2641,6 +2657,14 @@ export function buildHeapScene(
     let roComboId = 0;
     if (collectedRules.length > 0) {
       roComboId = registerCombo(bucket, collectedRules, roDescriptor);
+    } else if (bucket.gpuRouted) {
+      // An unruled RO joining an already-GPU-routed bucket needs a
+      // real combo to land on. Register the trivial all-fixed combo
+      // (every axis falls back to baseDescriptor) so this record's
+      // `comboId` doesn't silently alias to combo 0 (which is
+      // whichever combo was registered first — almost never the
+      // "no rules" intent).
+      roComboId = registerCombo(bucket, [], roDescriptor);
     }
     // Phase 5c.2: route this RO to the bucket's slot covering its
     // current descriptor. ensureSlot creates a new slot on miss; the
