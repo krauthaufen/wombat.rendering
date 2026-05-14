@@ -1,5 +1,25 @@
 # Derived mode rules — implementation plan
 
+**Status (wombat.rendering 0.16.1) — SHIPPED.** See the status banner
+at the top of `derived-modes.md` for the implementation map and what
+diverges from the plan below. Headlines:
+
+- The "per-bucket pipeline domain enumerated at scene build"
+  framing was replaced by a **per-RO combo registry**. ROs sharing
+  an effect can each carry an arbitrary subset of axis rules; the
+  partition kernel emits one composer fn per combo, dispatched on
+  `r.comboId`.
+- Multi-axis combos in one bucket via mixed-radix-encoded cartesian.
+- Rules read any number of arena uniforms (every packer type).
+- `static-enumeration + scene.ready()` pre-warm is NOT shipped —
+  pipelines are created synchronously as combos register. The
+  runtime-mutation stall behaviour described below still applies
+  to first-use compilation.
+
+The body below is preserved as the original Task 2 plan.
+
+---
+
 **Task 2 of 2** for the derived-modes design (`derived-modes.md`).
 Layered on **Task 1** (`multi-pipeline-buckets-plan.md`) which must
 ship first.

@@ -784,7 +784,17 @@ addition. Worst case (no buckets ever cross the threshold) costs
 nothing. Best case (heavy material variety) collapses encode to
 near-O(family) regardless of effect count.
 
-## 7a. Derived uniforms as a first-class DSL primitive
+## 7a. Derived uniforms as a first-class DSL primitive ✅ SHIPPED
+
+**Status:** the `derivedUniform(u => …)` author-facing marker is shipped
+(see `runtime/derivedUniforms/{marker,rule,codegen,dispatch,registry,
+sceneIntegration,recipes,slots,records,flatten}.ts`). wombat.shader-vite
+recognises the marker and threads leaf-type hints from `UniformScope`;
+heapScene wires each registered rule into the compute pre-pass with
+per-class dirty-list tracking. The body below is the original design
+sketch.
+
+---
 
 The implementation in §7 (next) handwrites a WGSL compute kernel,
 wires it manually into a bucket, and declares its dependencies in
@@ -863,7 +873,16 @@ The implementation backbone (§7) is what this DSL extension lowers
 to. Build §7 first; this section is the user-facing API once the
 machinery exists.
 
-## 7. GPU-computed derived uniforms (ModelView, df32 geodetic)
+## 7. GPU-computed derived uniforms (ModelView, df32 geodetic) ✅ SHIPPED
+
+**Status:** the compute-pre-pass machinery — per-class dirty list,
+GPU-side rule kernel codegen, per-frame dispatch, scene integration —
+is shipped under `runtime/derivedUniforms/`. The df32 / geodetic
+precision case isn't yet wired as a standard recipe but the
+framework supports plugging it in (see `recipes.ts`). The body
+below is the original design.
+
+---
 
 Aardvark has a "derived uniforms" concept: ModelView, NormalMatrix,
 etc. are not stored per-RO but computed from base inputs. The
@@ -1202,4 +1221,37 @@ errors. The heap-demo's `instancedSurface` now uses proper composition
 
 See `~/claude/wombat-shader-composition.md` for the broader composition
 mechanism + design rationale.
+
+
+## 12. Derived modes (pipeline state as a fn of uniforms) ✅ SHIPPED
+
+**Status (wombat.rendering 0.16.1):** see `derived-modes.md` for the
+full status banner. Headlines:
+
+- Per-RO rule combos within one bucket: master record carries
+  `comboId`; partition kernel emits one composer fn per combo,
+  dispatched via WGSL switch.
+- Multi-axis cartesian per bucket — rules combine across axes
+  per RO; cardinalities encoded via mixed-radix.
+- Rules read any number of arena uniforms (variable-width record
+  tail; load helpers for every packer type — f32 / u32 / i32 /
+  vec{2,3,4}<{f,u,i}> / mat3x3 / mat4x4).
+- Mixed-descriptor CPU→GPU bucket promotion with per-distinct-
+  descriptor synthetic combos.
+- Matrix intrinsics in rule bodies (e.g. `uniform.ModelTrafo.determinant()`).
+
+**Remaining:**
+- Lift the `totalSlots ≤ 16` kernel cap (mechanical — bind-group
+  layout widening + chunked slot-count buffers).
+- Static `scene.ready()` pre-warm of the cartesian pipeline domain
+  (the design's enumeration story; today pipelines are created sync
+  on first registerCombo).
+- Build-time vite-plugin diagnostics on open output domains /
+  per-frame rule construction.
+- GPU-side rule chaining (a mode rule reading a §7-derived uniform's
+  output rather than a raw arena uniform).
+- Stencil-axis rules.
+
+Demo: `wombat.dom/examples/heap-demo-sg` — `?gpurule=1`,
+`?split=1`, `?multi=1`, `?mix=1/2/3`, `?det=1`.
 

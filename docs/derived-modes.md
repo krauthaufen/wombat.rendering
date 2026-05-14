@@ -11,6 +11,97 @@ values on the GPU into drawHeader slots. Derived modes is the
 **discrete-output sibling**: per-RO output is a small mode key, used
 to bucket records into pre-bound pipeline slots at encode.
 
+## Status — SHIPPED through wombat.rendering 0.16.1
+
+The current implementation extends the original design in several
+directions; the design body below is the architectural baseline,
+this section maps it to the actual code.
+
+**Code:**
+- `runtime/derivedModes/rule.ts` — `derivedMode(axis, expr, declared?)`
+- `runtime/derivedModes/partitionKernelLayout.ts` — fixed 6-u32
+  prefix + per-bucket variable uniform-ref tail
+  (`partitionRecordU32(K) = 6 + K`).
+- `runtime/derivedModes/partitionDispatcher.ts` — `GpuPartitionScene`
+  owns the master pool, slot count atomics, dynamic record schema;
+  `appendRecord(comboId, refs[])`, `growSlots`, `growUniforms`.
+- `runtime/derivedModes/kernelCodegen.ts` — emits `rule_<axis>_<id>`
+  per axis-rule + `combo_<id>` per combo composing per-axis indices
+  via mixed-radix; top-level `dispatch(r)` switches on `r.comboId`.
+- `runtime/heapScene.ts` — bucket carries `rulesByAxis`, `combosByKey`,
+  `uniformOrder`; `registerCombo`, `specialiseBucket`,
+  `ensureSlotsForResolved`, `dispatchPartition`.
+
+**Implemented model — diverges from the design below:**
+
+The shipped design is **per-RO combo-driven**, not just
+per-bucket-mode-domain. ROs sharing one effect can each carry an
+arbitrary subset of axis rules; each RO's master-pool record stores
+a `comboId` selecting one of the bucket's combos; the partition
+kernel emits one composer fn per combo and the kernel switches on
+`r.comboId`. Concretely:
+
+- **Multi-axis cartesian per bucket** — bucket axes that any rule
+  touches expand to the union of (rule outputs ∪ baseDesc fallback ∪
+  per-combo fixed-value overrides). Slots = ∏ cardinalities (cap 16
+  for v1; see "open" below). Per-combo composer uses mixed-radix
+  encoding to emit a single slot index from per-axis indices.
+- **Per-RO rule combos** — multiple ROs in the same bucket may
+  carry different (axis → rule) tuples; each distinct tuple is a
+  `ComboEntry` with its own combo fn. ROs without any rules joining
+  a GPU-routed bucket get a trivial all-fixed combo synthesised
+  automatically.
+- **CPU → GPU promotion with migration** — a bucket that gathered
+  CPU-routed ROs first (no rules) and only later sees a ruled RO
+  is promoted: each distinct pre-existing CPU descriptor
+  synthesises a `const`-source combo with `axisFixedValues`
+  overriding baseDesc on the differing axes, and records migrate
+  into the master pool.
+- **Rules read any number of arena uniforms** — bucket maintains an
+  ordered `uniformOrder` of distinct `ReadInput("Uniform", name)`s
+  across all rule bodies. The master record's variable tail carries
+  one `refK` per uniform; rule bodies emit `r.ref<i>` for each
+  named read. `growUniforms` widens existing records in-place when
+  a new rule introduces an unseen uniform.
+- **Uniform load helpers** — `load_f32`, `load_u32`, `load_i32`,
+  `load_vec{2,3,4}<{f,u,i}>`, `load_mat3_upper`, `load_mat4` —
+  every type the heap-arena packer produces.
+- **Matrix intrinsics** — rule bodies can call
+  `uniform.ModelTrafo.determinant()` (the canonical handedness-flip
+  case) directly; the shader-IR frontend lowers `.determinant()` →
+  `Determinant`, and the kernel codegen emits WGSL
+  `determinant(...)`.
+
+**Demo coverage** (`wombat.dom/examples/heap-demo-sg`):
+`?gpurule=1` basic, `?split=1` two rules / one effect, `?multi=1`
+mixed-axis combos in one bucket, `?mix=1`/`?mix=2`/`?mix=3` mixed
+ruled+unruled ROs (both arrival orders, same and differing
+descriptors), `?det=1` determinant-driven cull flip.
+
+**Diverged from the original design:**
+- The "static enumeration at scene build" + `scene.ready()` pre-warm
+  is _not_ wired up. Pipelines are created synchronously as combos
+  register. The runtime-mutation stall section still applies.
+- The build-time analyzer's "fail compile on open domains" check
+  isn't surfaced as an authoring diagnostic. Rules whose outputs
+  can't fold get the canonical-enum-table fallback (every value in
+  the axis becomes a possible slot).
+- v1 cap is `totalSlots ≤ 16` (kernel codegen ceiling), not the
+  ~256 cross-product cap the design envisioned. Bigger cartesians
+  need bind-group widening; mechanical lift.
+
+**Open / deferred** (see also the bottom of this doc):
+- Lift `totalSlots ≤ 16`.
+- Static enumeration + `scene.ready()` pre-warm path.
+- Build-time vite-plugin diagnostics on open domains / per-frame
+  `derivedMode(...)` construction.
+- GPU-side rule chaining (rule reads a §7-derived uniform output).
+- Stencil-axis rules.
+
+---
+
+The remainder of this doc is the original architectural design.
+
 ## Two-task split
 
 This design ships in two independent pieces:

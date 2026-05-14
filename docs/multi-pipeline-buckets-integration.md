@@ -1,5 +1,14 @@
 # Multi-pipeline buckets — Phase 5 integration notes
 
+**Status (wombat.rendering 0.16.1) — SHIPPED.** The Phase 5
+integration is done; see `multi-pipeline-buckets-plan.md` and the
+status banner at the top of `derived-modes.md` for the
+implementation map and what diverged.
+
+The body below is the original integration sketch.
+
+---
+
 Captured at the boundary between the standalone Phase 1–4 modules and
 the heapScene wiring. Foundation findings from reading
 `packages/rendering/src/runtime/heapScene.ts` at commit `7203e8d`.

@@ -21,6 +21,26 @@ What's NOT yet implemented. DONE markers pruned periodically.
   via `pipelineState.alphaToCoverage`, no end-to-end pixel
   validation yet.
 
+## Derived-modes close-out (heap path)
+
+The derived-modes architecture is shipped (see `docs/derived-modes.md`
+status banner — wombat.rendering 0.16.1). Open items, none urgent:
+
+- **`totalSlots ≤ 16` kernel cap.** Lift mechanically: widen the
+  partition's bind-group layout (one BGL entry per slot count +
+  draw table). At present the cartesian over active axes can
+  exceed 16 quickly (cull(3) × depthCompare(8) = 24 already).
+- **Static `scene.ready()` pre-warm** of the cartesian pipeline
+  domain. Today pipelines are created sync on first `registerCombo`;
+  first use of a freshly-introduced pipeline still stalls the GPU
+  queue while the driver compiles. The design's enumeration story
+  would let `await scene.ready()` cover everything.
+- **Build-time vite-plugin diagnostics**: warn on open output
+  domains, per-frame `derivedMode(...)` construction.
+- **GPU-side rule chaining**: a derived-mode rule reading a
+  §7-derived uniform's output rather than a raw arena uniform.
+- **Stencil-axis rules** when stencil is enabled.
+
 ## Out-of-scope (recorded so they don't surprise us)
 
 - **Multiple queues / async submission.** WebGPU's spec exposes one

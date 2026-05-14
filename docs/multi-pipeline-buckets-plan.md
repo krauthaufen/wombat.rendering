@@ -1,17 +1,19 @@
 # Multi-pipeline buckets — implementation plan
 
-**Status (2026-05-13)**: the **correctness story** of this task is
-SHIPPED through commits `57d949e` … `266fdba`. The 20k-cvals-→20k-
-buckets pathology is fixed and reactive cullMode flips correctly
-move ROs to their new bucket. See "Phase 5a/5b/5b.2 — shipped"
-below.
+**Status (2026-05-14, wombat.rendering 0.16.1) — SHIPPED, including
+Phase 5c.**
 
-What remains deferred is the **perf collapse**: today, two ROs
-with the same effect but different PS values land in two
-different buckets, each with its own arena and pipeline. The full
-design (Phase 5c) would collapse them into ONE bucket with N slots
-sharing arena + bindGroup. That's pure perf for scenes with many
-distinct PS combos; no user-visible bug is open without it.
+- Phase 5a/5b/5b.2 (correctness): cullMode reactivity + value-keyed
+  bucket key. The 20k-cvals → 20k-buckets pathology is fixed.
+- Phase 5c (perf collapse): multi-slot buckets sharing arena +
+  bindGroup, partition kernel routing per-RO records to slots. See
+  `phase-5c3-partition-routing.md` for the GPU-routing piece.
+- Layered on top, Task 2 (`derived-mode-rules-plan.md`) ships
+  per-RO rule combos + multi-axis cartesian + variable per-bucket
+  uniform-ref tail. See the status banner at the top of
+  `derived-modes.md` for the full implementation map.
+
+The body below is the original Task 1 plan.
 
 ---
 

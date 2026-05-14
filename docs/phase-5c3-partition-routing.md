@@ -1,5 +1,28 @@
 # Phase 5c.3 — GPU-driven routing via a partition kernel
 
+**Status (wombat.rendering 0.16.1) — SHIPPED.** Routing runs on the
+GPU; the master pool is authoritative. Subsequent work generalised
+the kernel further:
+
+- The single-rule per-bucket model became multi-rule per axis +
+  per-RO combos (each master record carries `comboId`; the kernel
+  emits one `combo_<id>` fn per combo composing per-axis indices
+  via mixed-radix encoding). See `derived-modes.md` status banner.
+- The fixed-width record (originally `[firstEmit, drawIdx,
+  indexStart, indexCount, instanceCount, modelRef]`) became
+  `[…prefix(6 u32), refK…]` — a per-bucket variable uniform-ref
+  tail so rules can read any number of arena uniforms.
+- Code lives in:
+  - `runtime/derivedModes/partitionKernelLayout.ts` — record width.
+  - `runtime/derivedModes/partitionDispatcher.ts` — `GpuPartitionScene`.
+  - `runtime/derivedModes/kernelCodegen.ts` — WGSL emit.
+  - `runtime/heapScene.ts` — bucket promotion, registration,
+    dispatch.
+
+The body below is the original Phase 5c.3 plan.
+
+---
+
 The remaining piece to make the derived-modes path "everything on
 GPU". Today (0.9.33) the routing decision — "which slot does an RO
 belong to" — is computed CPU-side by `ModeKeyTracker.recompute()`
