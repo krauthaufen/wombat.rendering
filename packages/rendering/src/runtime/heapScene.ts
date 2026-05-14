@@ -2179,23 +2179,48 @@ export function buildHeapScene(
     axisRules: ReadonlyArray<DerivedModeRule<ModeAxis>>,
     baseDesc: PipelineStateDescriptor,
   ): number {
-    // First combo on this bucket: lazy-init the multi-rule machinery.
+    // CPU→GPU promotion: capture pre-existing CPU-routed ROs so they
+    // can be migrated into the master pool after the partition is up.
+    // The cartesian slot layout demands every CPU RO use a descriptor
+    // that survives within it — for the trivial all-fixed combo to
+    // route them correctly, every CPU RO's pipeline state must equal
+    // baseDescriptor. (Mixed pre-existing descriptors would need the
+    // non-ruled axes to *also* enumerate those values, which means
+    // synthesising trivial per-axis rules; defer until the case
+    // matters in practice and surface a clear error in the meantime.)
+    interface CpuMigration {
+      localSlot: number;
+      drawId: number;
+      firstIndex: number;
+      indexCount: number;
+      instanceCount: number;
+      perDrawRefs: Map<string, number>;
+    }
+    let cpuMigration: CpuMigration[] | undefined;
     if (!bucket.gpuRouted) {
-      // CPU→GPU promotion: any pre-existing CPU ROs (added before
-      // the first ruled RO joined) live in `bucket.slots` but
-      // wouldn't be in the master pool the partition kernel reads
-      // from — they'd silently vanish from the render. We don't
-      // migrate them (the bucket's slot layout reshapes to reflect
-      // the cartesian, so per-RO pipeline-state assignments would
-      // need rerouting). Surface this as a clear error so callers
-      // know to add the ruled RO first, or to give every RO at
-      // least a placeholder rule.
       if (bucket.drawSlots.size > 0) {
-        throw new Error(
-          `heapScene/gpuRouting: cannot promote bucket '${bucket.label}' to GPU-routed ` +
-          `— it already has ${bucket.drawSlots.size} CPU-routed RO(s). ` +
-          `Add the first ruled RO before any unruled RO in this bucket.`,
-        );
+        const baseDescKey = encodeModeKey(baseDesc);
+        for (const s of bucket.slots) {
+          if (s.modeKey !== baseDescKey) {
+            throw new Error(
+              `heapScene/gpuRouting: cannot promote bucket '${bucket.label}' to GPU-routed — ` +
+              `pre-existing CPU-routed ROs use a descriptor different from the ruled RO's baseDescriptor. ` +
+              `Unify pipelineState across the bucket or add the first ruled RO first.`,
+            );
+          }
+        }
+        cpuMigration = [];
+        for (const ls of bucket.drawSlots) {
+          const e = bucket.localEntries[ls]!;
+          cpuMigration.push({
+            localSlot:     ls,
+            drawId:        bucket.localToDrawId[ls]!,
+            firstIndex:    e.firstIndex,
+            indexCount:    e.indexCount,
+            instanceCount: e.instanceCount,
+            perDrawRefs:   bucket.localPerDrawRefs[ls]!,
+          });
+        }
       }
       bucket.baseDescriptor = baseDesc;
       bucket.rulesByAxis    = new Map();
@@ -2207,6 +2232,15 @@ export function buildHeapScene(
       bucket.drawIdToComboId = new Map();
       bucket.drawIdToRecord = new Map();
       bucket.recordToDrawId = [];
+      // Pre-register the trivial all-fixed combo (comboId 0) so
+      // migrated CPU ROs have a stable target. Skip if there's
+      // nothing to migrate — keeping combo 0 = the user's actual
+      // combo for the common case where ruled ROs land first.
+      if (cpuMigration !== undefined) {
+        const trivialKey = AXIS_ORDER.map(a => `${a}:_`).join("|");
+        bucket.combosByKey.set(trivialKey, { comboId: 0, comboKey: trivialKey, axisRules: new Map() });
+        bucket.comboOrder.push(trivialKey);
+      }
     }
     // Per-axis: dedupe rule by content hash; assign axisRuleId.
     const perAxisRuleId = new Map<ModeAxis, number>();
@@ -2283,12 +2317,41 @@ export function buildHeapScene(
         totalSlots: slotDescs.length,
         slotDrawBufs: bucket.slots.map(s => s.drawTableBuf!.buffer),
         kernelWGSL,
-        initialRecords: 16,
+        initialRecords: Math.max(16, (cpuMigration?.length ?? 0) + 16),
         numUniforms: bucket.uniformOrder!.length,
       });
       bucket.gpuRouted      = true;
       bucket.partitionScene = partition;
       bucket.partitionDirty = true;
+      // Migrate any captured CPU records into the master pool with
+      // comboId=0 (the trivial all-fixed combo registered above).
+      if (cpuMigration !== undefined) {
+        let totalEmit = 0;
+        for (const m of cpuMigration) {
+          const uRefs = bucket.uniformOrder!.map(n => m.perDrawRefs.get(n) ?? 0);
+          const recIdx = partition.appendRecord(
+            m.localSlot, m.firstIndex, m.indexCount, m.instanceCount, 0, uRefs,
+          );
+          bucket.drawIdToRecord!.set(m.drawId, recIdx);
+          bucket.recordToDrawId![recIdx] = m.drawId;
+          bucket.drawIdToComboId!.set(m.drawId, 0);
+          totalEmit += m.indexCount * m.instanceCount;
+        }
+        const numRecords = partition.numRecords;
+        const recBytes = numRecords * RECORD_BYTES;
+        const needBlocks = Math.max(1, Math.ceil(numRecords / SCAN_TILE_SIZE));
+        for (const s of bucket.slots) {
+          s.drawTableBuf!.ensureCapacity(recBytes);
+          s.drawTableBuf!.setUsed(Math.max(s.drawTableBuf!.usedBytes, recBytes));
+          s.blockSumsBuf!.ensureCapacity(needBlocks * 4);
+          s.blockOffsetsBuf!.ensureCapacity(needBlocks * 4);
+          s.recordCount = numRecords;
+          s.totalEmitEstimate += totalEmit;
+          const newNumTiles = Math.max(1, Math.ceil(s.totalEmitEstimate / TILE_K));
+          s.firstDrawInTileBuf!.ensureCapacity((newNumTiles + 1) * 4);
+          s.scanDirty = true;
+        }
+      }
     } else if (respec) {
       const { slotDescs, kernelWGSL } = specialiseBucket(bucket);
       ensureSlotsForResolved(bucket, slotDescs);
