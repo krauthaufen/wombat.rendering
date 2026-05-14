@@ -17,7 +17,7 @@
 // After dispatch the existing scan kernel runs per slot, reading the
 // slot's drawTable that the partition just populated.
 
-import { PARTITION_RECORD_BYTES, PARTITION_RECORD_U32 } from "./partitionKernelLayout.js";
+import { partitionRecordU32, partitionRecordBytes, PARTITION_RECORD_PREFIX_U32 } from "./partitionKernelLayout.js";
 
 const WG_SIZE = 64;
 const POW2 = (n: number): number => { let p = 1; while (p < n) p <<= 1; return Math.max(64, p); };
@@ -32,6 +32,11 @@ export interface PartitionSceneSpec {
   /** Codegen'd kernel WGSL. Embeds `declared` as a Const + the
    *  SLOT_LOOKUP table. Swap via `rebuildKernel(...)` on declared mark. */
   readonly kernelWGSL: string;
+  /** Number of per-record uniform refs (= bucket.uniformOrder.length).
+   *  The master record's width is `6 + numUniforms` u32s. Grow with
+   *  `growUniforms(...)` when a new rule reads a uniform not yet in
+   *  the bucket's order. */
+  readonly numUniforms: number;
 }
 
 export class GpuPartitionScene {
@@ -50,6 +55,13 @@ export class GpuPartitionScene {
   // dispatcher and the kernel layout to accommodate new pipeline
   // slots that appear when a new rule is registered on the bucket.
   private _totalSlots: number;
+  // Per-bucket master record width = 6 + numUniforms. Mutable —
+  // `growUniforms(...)` widens existing records in-place so a rule
+  // reading a new uniform can land without rebuilding the master.
+  private _numUniforms: number;
+  get numUniforms(): number { return this._numUniforms; }
+  get recordU32(): number { return partitionRecordU32(this._numUniforms); }
+  get recordBytes(): number { return partitionRecordBytes(this._numUniforms); }
 
   /** params: [numRecords] — single u32 (padded to 16 bytes for WGSL
    *  uniform alignment). `declared` is no longer carried here; the
@@ -72,8 +84,9 @@ export class GpuPartitionScene {
     this.device = device;
     this.label = label;
     this._totalSlots = spec.totalSlots;
+    this._numUniforms = spec.numUniforms;
     this.capacity = POW2(spec.initialRecords ?? 16);
-    const bytes = this.capacity * PARTITION_RECORD_BYTES;
+    const bytes = this.capacity * partitionRecordBytes(this._numUniforms);
     this.masterBuf = device.createBuffer({
       label: `${label}/master`, size: bytes,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -204,19 +217,25 @@ export class GpuPartitionScene {
     indexStart: number,
     indexCount: number,
     instanceCount: number,
-    modelRef: number,
-    comboId = 0,
+    comboId: number,
+    uniformRefs: ReadonlyArray<number>,
   ): number {
+    if (uniformRefs.length !== this._numUniforms) {
+      throw new Error(`GpuPartitionScene/appendRecord: expected ${this._numUniforms} uniform refs, got ${uniformRefs.length}`);
+    }
     if (this.numRecords >= this.capacity) this.grow();
     const i = this.numRecords;
-    const o = i * PARTITION_RECORD_U32;
+    const ru32 = this.recordU32;
+    const o = i * ru32;
     this.masterShadow[o + 0] = 0;
     this.masterShadow[o + 1] = drawIdx;
     this.masterShadow[o + 2] = indexStart;
     this.masterShadow[o + 3] = indexCount;
     this.masterShadow[o + 4] = instanceCount;
-    this.masterShadow[o + 5] = modelRef;
-    this.masterShadow[o + 6] = comboId >>> 0;
+    this.masterShadow[o + 5] = comboId >>> 0;
+    for (let k = 0; k < this._numUniforms; k++) {
+      this.masterShadow[o + PARTITION_RECORD_PREFIX_U32 + k] = (uniformRefs[k] ?? 0) >>> 0;
+    }
     this.numRecords = i + 1;
     return i;
   }
@@ -226,16 +245,24 @@ export class GpuPartitionScene {
    *  fires on aval marks). */
   setRecordComboId(recordIdx: number, comboId: number): void {
     if (recordIdx < 0 || recordIdx >= this.numRecords) return;
-    this.masterShadow[recordIdx * PARTITION_RECORD_U32 + 6] = comboId >>> 0;
+    this.masterShadow[recordIdx * this.recordU32 + 5] = comboId >>> 0;
+  }
+
+  /** Update an existing record's uniform ref by uniform index. */
+  setRecordUniformRef(recordIdx: number, uniformIdx: number, ref: number): void {
+    if (recordIdx < 0 || recordIdx >= this.numRecords) return;
+    if (uniformIdx < 0 || uniformIdx >= this._numUniforms) return;
+    this.masterShadow[recordIdx * this.recordU32 + PARTITION_RECORD_PREFIX_U32 + uniformIdx] = ref >>> 0;
   }
 
   removeRecord(recordIdx: number): number {
     if (recordIdx < 0 || recordIdx >= this.numRecords) return -1;
     const last = this.numRecords - 1;
+    const ru32 = this.recordU32;
     if (recordIdx !== last) {
-      const dst = recordIdx * PARTITION_RECORD_U32;
-      const src = last * PARTITION_RECORD_U32;
-      for (let k = 0; k < PARTITION_RECORD_U32; k++) {
+      const dst = recordIdx * ru32;
+      const src = last * ru32;
+      for (let k = 0; k < ru32; k++) {
         this.masterShadow[dst + k] = this.masterShadow[src + k]!;
       }
     }
@@ -243,9 +270,38 @@ export class GpuPartitionScene {
     return recordIdx !== last ? last : -1;
   }
 
+  /** Widen the per-record uniform tail from `_numUniforms` to
+   *  `newNumUniforms`. Existing records are restrided in-place; the
+   *  new tail slots are zero-filled (rules added later that read
+   *  the new uniform will only do so under their own combo, where
+   *  records carry real refs). The kernel WGSL must be rebuilt
+   *  separately (`rebuildKernel`). */
+  growUniforms(newNumUniforms: number): void {
+    if (newNumUniforms <= this._numUniforms) return;
+    const oldU32 = partitionRecordU32(this._numUniforms);
+    const newU32 = partitionRecordU32(newNumUniforms);
+    const newBytes = this.capacity * newU32 * 4;
+    const grown = new Uint32Array(newBytes / 4);
+    // Restride existing records into the wider layout.
+    for (let i = 0; i < this.numRecords; i++) {
+      const oldOff = i * oldU32;
+      const newOff = i * newU32;
+      for (let k = 0; k < oldU32; k++) grown[newOff + k] = this.masterShadow[oldOff + k]!;
+      // Trailing newU32-oldU32 slots stay 0.
+    }
+    this.masterShadow = grown;
+    this.masterBuf.destroy();
+    this.masterBuf = this.device.createBuffer({
+      label: `${this.label}/master`, size: newBytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this._numUniforms = newNumUniforms;
+    this.bindGroup = null;
+  }
+
   private grow(): void {
     const newCap = POW2(this.numRecords + 1);
-    const bytes = newCap * PARTITION_RECORD_BYTES;
+    const bytes = newCap * this.recordBytes;
     const grown = new Uint32Array(bytes / 4);
     grown.set(this.masterShadow);
     this.masterShadow = grown;
@@ -260,7 +316,7 @@ export class GpuPartitionScene {
 
   flush(): void {
     if (this.numRecords === 0) return;
-    const bytes = this.numRecords * PARTITION_RECORD_BYTES;
+    const bytes = this.numRecords * this.recordBytes;
     this.device.queue.writeBuffer(
       this.masterBuf, 0,
       this.masterShadow.buffer, this.masterShadow.byteOffset, bytes,

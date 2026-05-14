@@ -30,9 +30,7 @@ export interface RuleCodegenSpec {
   readonly axisRuleId: number;
   /**
    * The rule body — already rewritten so every `ReturnValue` returns
-   * a `Const u32` PER-AXIS index into this axis's union value table
-   * (`axisCardinality` below). The codegen never sees the original
-   * `__record:*` intrinsics.
+   * a `Const u32` PER-AXIS index into this axis's union value table.
    */
   readonly body: Stmt;
   readonly intrinsics: IntrinsicEvalTable;
@@ -73,6 +71,11 @@ export interface KernelCodegenSpec {
   readonly combos: ReadonlyArray<ComboCodegenSpec>;
   /** Total slot count = ∏ cardinality across active axes. */
   readonly totalSlots: number;
+  /** Bucket-wide ordered list of uniform names that any rule body
+   *  reads (`ReadInput("Uniform", name)`). Each one becomes a
+   *  `refK: u32` field in the Record struct + a tail slot in master
+   *  records; rules dereference their named reads as `r.refK`. */
+  readonly uniformOrder: ReadonlyArray<string>;
 }
 
 /** Emit the WGSL partition kernel for the given rules + combos.
@@ -91,6 +94,13 @@ export function emitPartitionKernel(spec: KernelCodegenSpec): string {
   }
   const N = spec.totalSlots;
 
+  // Bucket-wide uniform name → index (== refK position in the record
+  // tail). Rule bodies emit `r.ref<i>` for each `ReadInput("Uniform",
+  // name)`. Names not present in `uniformOrder` are a codegen bug —
+  // heapScene must have appended every distinct uniform read.
+  const uniformIdx = new Map<string, number>();
+  for (let i = 0; i < spec.uniformOrder.length; i++) uniformIdx.set(spec.uniformOrder[i]!, i);
+
   // Emit one `rule_<axis>_<axisRuleId>(r) -> u32` per axis-rule.
   // Helpers are deduped by string equality so two rules sharing the
   // same WGSL helper don't double-emit (rule_<axis>_X and
@@ -100,7 +110,7 @@ export function emitPartitionKernel(spec: KernelCodegenSpec): string {
   const ruleFns: string[] = [];
   for (const r of spec.rules) {
     if (r.helpersWGSL.trim().length > 0) helperSet.add(r.helpersWGSL);
-    ruleFns.push(emitStmtAsWgslFn(r));
+    ruleFns.push(emitStmtAsWgslFn(r, uniformIdx));
   }
   const helpersWGSL = [...helperSet].join("\n");
   const ruleFnsWGSL = ruleFns.join("\n");
@@ -145,6 +155,7 @@ ${dispatchCases.join("\n")}
     `@group(0) @binding(${nextBinding + i}) var<storage, read_write> slot${i}DrawTable: array<u32>;`,
   ).join("\n");
 
+  const refFields = spec.uniformOrder.map((_, i) => `  ref${i}:         u32,`).join("\n");
   return `
 struct Record {
   firstEmit:     u32,
@@ -152,8 +163,8 @@ struct Record {
   indexStart:    u32,
   indexCount:    u32,
   instanceCount: u32,
-  modelRef:      u32,
   comboId:       u32,
+${refFields}
 };
 struct PartitionParams { numRecords: u32 };
 
@@ -249,10 +260,11 @@ fn load_mat4(refBytes: u32) -> mat4x4<f32> {
 //     bodies can express: ReturnValue / If / Sequential / Declare /
 //     Write / Expression / For / While, plus the full Expr lattice). ──
 
-function emitStmtAsWgslFn(rule: RuleCodegenSpec): string {
+function emitStmtAsWgslFn(rule: RuleCodegenSpec, uniformIdx: ReadonlyMap<string, number>): string {
   const ctx: EmitCtx = {
     axis: rule.axis,
     inputUniforms: rule.inputUniforms,
+    uniformIdx,
     localCounter: 0,
   };
   const bodyWgsl = emitStmt(rule.body, ctx, "  ");
@@ -262,6 +274,7 @@ function emitStmtAsWgslFn(rule: RuleCodegenSpec): string {
 interface EmitCtx {
   readonly axis: ModeAxis;
   readonly inputUniforms: ReadonlyArray<string>;
+  readonly uniformIdx: ReadonlyMap<string, number>;
   localCounter: number;
 }
 
@@ -291,6 +304,57 @@ export function substituteReadInputInStmt(
   s: Stmt, scope: string, name: string, replacement: Expr,
 ): Stmt {
   return mapStmtExprs(s, (e) => substituteReadInput(e, scope, name, replacement));
+}
+
+/** Walk `s` and collect the names of every `ReadInput("Uniform", name)`
+ *  it contains (in DFS order, deduped). heapScene uses this to size
+ *  the bucket's `uniformOrder` + master-record uniform-ref tail. */
+export function collectUniformReadsInStmt(s: Stmt): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  walkExprs(s, (e) => {
+    const r = e as { kind: string; scope?: string; name?: string };
+    if (r.kind === "ReadInput" && r.scope === "Uniform" && typeof r.name === "string") {
+      if (!seen.has(r.name)) { seen.add(r.name); out.push(r.name); }
+    }
+  });
+  return out;
+}
+function walkExprs(s: Stmt, fn: (e: Expr) => void): void {
+  const obj = s as unknown as Record<string, unknown>;
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (v !== null && typeof v === "object") {
+      if ("kind" in (v as object) && !Array.isArray(v)) {
+        const kind = (v as { kind: string }).kind;
+        const isStmt = /^(Nop|Expression|Declare|Write|Sequential|Isolated|Return|ReturnValue|Break|Continue|If|For|While|DoWhile|Loop|Switch|Discard|Barrier|WriteOutput|Increment|Decrement)$/.test(kind);
+        if (isStmt) walkExprs(v as Stmt, fn);
+        else walkExprInner(v as Expr, fn);
+      } else if (Array.isArray(v)) {
+        for (const c of v) {
+          if (c !== null && typeof c === "object" && "kind" in (c as object)) {
+            const kind = (c as { kind: string }).kind;
+            const isStmt = /^(Nop|Expression|Declare|Write|Sequential|Isolated|Return|ReturnValue|Break|Continue|If|For|While|DoWhile|Loop|Switch|Discard|Barrier|WriteOutput|Increment|Decrement)$/.test(kind);
+            if (isStmt) walkExprs(c as Stmt, fn);
+            else walkExprInner(c as Expr, fn);
+          }
+        }
+      }
+    }
+  }
+}
+function walkExprInner(e: Expr, fn: (e: Expr) => void): void {
+  fn(e);
+  const obj = e as unknown as Record<string, unknown>;
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (v !== null && typeof v === "object") {
+      if ("kind" in (v as object) && !Array.isArray(v)) walkExprInner(v as Expr, fn);
+      else if (Array.isArray(v)) {
+        for (const c of v) if (c !== null && typeof c === "object" && "kind" in (c as object)) walkExprInner(c as Expr, fn);
+      }
+    }
+  }
 }
 
 /**
@@ -485,16 +549,19 @@ function emitExpr(e: Expr, ctx: EmitCtx): string {
     case "Var":    return (e as { var: { name: string } }).var.name;
     case "ReadInput": {
       const r = e as { scope: string; name: string; type: Type };
-      void ctx;
       // `declared` is pre-substituted by heapScene before codegen,
       // so any surviving ReadInput at this point is a `u.<X>` read
-      // from arena via the record's modelRef.
-      if (r.type.kind === "Matrix" && r.type.rows === 3 && r.type.cols === 3) {
-        return `load_mat3_upper(r.modelRef)`;
+      // from arena via this record's per-uniform ref tail slot.
+      const idx = ctx.uniformIdx.get(r.name);
+      if (idx === undefined) {
+        throw new Error(
+          `kernelCodegen: rule body reads uniform '${r.name}' but it isn't in the bucket's uniformOrder ` +
+          `(heapScene must collect every ReadInput before codegen)`,
+        );
       }
-      if (r.type.kind === "Matrix" && r.type.rows === 4 && r.type.cols === 4) {
-        return `load_mat4(r.modelRef)`;
-      }
+      const refExpr = `r.ref${idx}`;
+      if (r.type.kind === "Matrix" && r.type.rows === 3 && r.type.cols === 3) return `load_mat3_upper(${refExpr})`;
+      if (r.type.kind === "Matrix" && r.type.rows === 4 && r.type.cols === 4) return `load_mat4(${refExpr})`;
       throw new Error(
         `kernelCodegen: rule body reads uniform '${r.name}' of unsupported arena type ${JSON.stringify(r.type)}`,
       );

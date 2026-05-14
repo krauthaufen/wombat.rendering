@@ -98,6 +98,7 @@ import { GpuPartitionScene } from "./derivedModes/partitionDispatcher.js";
 import {
   emitPartitionKernel,
   substituteReadInputInStmt,
+  collectUniformReadsInStmt,
   rewriteOutputsToSlotIndices,
 } from "./derivedModes/kernelCodegen.js";
 import { type DerivedModeRule, type ModeAxis } from "./derivedModes/rule.js";
@@ -358,6 +359,11 @@ interface Bucket {
   /** Per-axis ordered list of registered rule hashes; index =
    *  `axisRuleId` for that axis. */
   axisRuleOrder: Map<ModeAxis, string[]> | undefined;
+  /** Bucket-wide ordered list of arena uniform names read by any
+   *  rule body. Each entry maps to a `ref<i>: u32` field in the
+   *  master-record uniform tail; appendRecord packs them per RO. */
+  uniformOrder: string[] | undefined;
+  uniformIdx: Map<string, number> | undefined;
   /** Distinct combos appearing on ROs in this bucket. */
   combosByKey: Map<string, ComboEntry> | undefined;
   /** `comboId` → comboKey. Index = comboId. */
@@ -2139,6 +2145,7 @@ export function buildHeapScene(
       rules: ruleSpecs,
       combos: comboSpecs,
       totalSlots,
+      uniformOrder: bucket.uniformOrder ?? [],
     });
     return { slotDescs, kernelWGSL };
   }
@@ -2177,6 +2184,8 @@ export function buildHeapScene(
       bucket.baseDescriptor = baseDesc;
       bucket.rulesByAxis    = new Map();
       bucket.axisRuleOrder  = new Map();
+      bucket.uniformOrder   = [];
+      bucket.uniformIdx     = new Map();
       bucket.combosByKey    = new Map();
       bucket.comboOrder     = [];
       bucket.drawIdToComboId = new Map();
@@ -2202,16 +2211,29 @@ export function buildHeapScene(
       let entry = axisMap.get(hash);
       if (entry === undefined) {
         const order = bucket.axisRuleOrder!.get(rule.axis)!;
+        const body = ruleBodyOf(rule);
         entry = {
           axis: rule.axis,
           axisRuleId: order.length,
           contentHash: hash,
           rule,
-          body: ruleBodyOf(rule),
+          body,
           lastDeclaredU32: undefined,
         };
         axisMap.set(hash, entry);
         order.push(hash);
+        // Discover the arena uniforms this rule reads — append unseen
+        // ones to the bucket-wide uniformOrder so master records
+        // carry refs for them. `declared` is a CPU-baked Const, not
+        // an arena uniform; skip it.
+        for (const uName of collectUniformReadsInStmt(body)) {
+          if (uName === "declared") continue;
+          if (!bucket.uniformIdx!.has(uName)) {
+            const idx = bucket.uniformOrder!.length;
+            bucket.uniformOrder!.push(uName);
+            bucket.uniformIdx!.set(uName, idx);
+          }
+        }
         respec = true;
       }
       perAxisRuleId.set(rule.axis, entry.axisRuleId);
@@ -2246,6 +2268,7 @@ export function buildHeapScene(
         slotDrawBufs: bucket.slots.map(s => s.drawTableBuf!.buffer),
         kernelWGSL,
         initialRecords: 16,
+        numUniforms: bucket.uniformOrder!.length,
       });
       bucket.gpuRouted      = true;
       bucket.partitionScene = partition;
@@ -2259,6 +2282,12 @@ export function buildHeapScene(
         bucket.partitionScene!.growSlots(newCount, draws);
       } else {
         bucket.partitionScene!.rebindSlotDrawBufs(draws);
+      }
+      // Bucket-wide uniformOrder may have grown (a new rule reads a
+      // previously-unseen uniform). Widen master records before
+      // rebuilding the kernel — the WGSL struct width changes too.
+      if (bucket.uniformOrder!.length > bucket.partitionScene!.numUniforms) {
+        bucket.partitionScene!.growUniforms(bucket.uniformOrder!.length);
       }
       bucket.partitionScene!.rebuildKernel(kernelWGSL);
       bucket.partitionDirty = true;
@@ -2360,6 +2389,8 @@ export function buildHeapScene(
       recordToDrawId: undefined,
       rulesByAxis: undefined,
       axisRuleOrder: undefined,
+      uniformOrder: undefined,
+      uniformIdx: undefined,
       combosByKey: undefined,
       comboOrder: undefined,
       drawIdToComboId: undefined,
@@ -2771,11 +2802,15 @@ export function buildHeapScene(
           `heapScene: GPU-routed bucket exceeds SCAN_MAX_RECORDS (${SCAN_MAX_RECORDS})`,
         );
       }
-      // modelRef = arena byte offset of the rule body's input
-      // uniform (today fixed to ModelTrafo until rules with multiple
-      // arena inputs land).
-      const modelRef = perDrawRefs.get("ModelTrafo") ?? 0;
-      partition.appendRecord(localSlot, idxAlloc.firstIndex, idxAlloc.count, instanceCount, modelRef, roComboId);
+      // Pack the bucket's per-RO uniform refs (arena byte offsets) in
+      // the same order as `bucket.uniformOrder`. ROs whose perDrawRefs
+      // don't carry a given name (e.g. their effect doesn't declare
+      // it) get 0 — the kernel only reads refs through combo fns that
+      // gate on `r.comboId`, so an unread 0 is harmless.
+      const uniformRefs: number[] = (bucket.uniformOrder ?? []).map(
+        name => perDrawRefs.get(name) ?? 0,
+      );
+      partition.appendRecord(localSlot, idxAlloc.firstIndex, idxAlloc.count, instanceCount, roComboId, uniformRefs);
       bucket.drawIdToRecord!.set(drawId, recIdx);
       bucket.recordToDrawId![recIdx] = drawId;
       bucket.drawIdToComboId!.set(drawId, roComboId);

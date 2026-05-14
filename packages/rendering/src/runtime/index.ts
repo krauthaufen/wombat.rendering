@@ -136,13 +136,15 @@ export {
 } from "./derivedModes/rule.js";
 
 export {
-  PARTITION_RECORD_U32,
-  PARTITION_RECORD_BYTES,
+  PARTITION_RECORD_PREFIX_U32,
+  partitionRecordU32,
+  partitionRecordBytes,
 } from "./derivedModes/partitionKernelLayout.js";
 export { GpuPartitionScene, type PartitionSceneSpec } from "./derivedModes/partitionDispatcher.js";
 export {
   emitPartitionKernel,
   substituteReadInput, substituteReadInputInStmt,
+  collectUniformReadsInStmt,
   rewriteOutputsToSlotIndices,
   type RuleCodegenSpec, type KernelCodegenSpec,
 } from "./derivedModes/kernelCodegen.js";
