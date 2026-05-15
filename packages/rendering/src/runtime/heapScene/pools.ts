@@ -19,7 +19,7 @@ import { AVal } from "@aardworx/wombat.adaptive";
 import type { aval, IDisposable } from "@aardworx/wombat.adaptive";
 import type { BufferView } from "../../core/bufferView.js";
 import type { HostBufferSource } from "../../core/buffer.js";
-import { GrowBuffer, ALIGN16 } from "./growBuffer.js";
+import { GrowBuffer, ALIGN16, DEFAULT_MAX_BUFFER_BYTES } from "./growBuffer.js";
 import { Freelist } from "./freelist.js";
 
 // ─── Per-allocation header layout ──────────────────────────────────────
@@ -310,6 +310,16 @@ export class AttributeArena {
   release(ref: number, dataBytes: number): void {
     const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
     this.freelist.release(ref, allocBytes);
+    // §5: shrink the bump cursor back if release exposed a free
+    // tail touching it (cascading — `freelist.release` may have
+    // coalesced into a single block ending at `cursor`). Reclaims
+    // the high-watermark over time in long-lived high-churn scenes.
+    while (true) {
+      const top = this.freelist.takeBlockEndingAt(this.cursor);
+      if (top === undefined) break;
+      this.cursor = top.off;
+      this.buf.setUsed(this.cursor);
+    }
   }
   onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
   destroy(): void { this.buf.destroy(); }
@@ -365,6 +375,15 @@ export class IndexAllocator {
   }
   release(off: number, elements: number): void {
     this.freelist.release(off, elements);
+    // §5: cursor-shrink mirror of AttributeArena.release. Cursor
+    // is in u32 elements here, and setUsed on the GrowBuffer
+    // expects bytes — multiply by 4.
+    while (true) {
+      const top = this.freelist.takeBlockEndingAt(this.cursor);
+      if (top === undefined) break;
+      this.cursor = top.off;
+      this.buf.setUsed(this.cursor * 4);
+    }
   }
   onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
   destroy(): void { this.buf.destroy(); }
@@ -388,14 +407,22 @@ export function buildArenaState(
   idxBytesHint: number,
   label: string,
   idxExtraUsage: GPUBufferUsageFlags = 0,
+  maxChunkBytes: number | undefined = undefined,
 ): ArenaState {
+  // §3: cap chunk size at min(adapter's maxStorageBufferBindingSize,
+  // GrowBuffer's DEFAULT_MAX_BUFFER_BYTES). Lets us grow as far as
+  // the hardware lets us (typically 2 GiB+ on desktop, ≥ 256 MB on
+  // mobile/integrated) while keeping a sensible internal ceiling.
+  // Caller can override.
+  const adapterCap = device.limits.maxStorageBufferBindingSize;
+  const cap = maxChunkBytes ?? Math.min(adapterCap, DEFAULT_MAX_BUFFER_BYTES);
   const attrs = new AttributeArena(new GrowBuffer(
     device, `${label}/attrs`, GPUBufferUsage.STORAGE,
-    attrBytesHint,
+    attrBytesHint, cap,
   ));
   const indices = new IndexAllocator(new GrowBuffer(
     device, `${label}/idx`, GPUBufferUsage.INDEX | idxExtraUsage,
-    idxBytesHint,
+    idxBytesHint, cap,
   ));
   return { attrs, indices };
 }

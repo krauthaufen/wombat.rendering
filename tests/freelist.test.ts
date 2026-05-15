@@ -76,6 +76,17 @@ describe("Freelist", () => {
     expect(fl.alloc(33)).toBeUndefined();
   });
 
+  it("takeBlockEndingAt returns and removes the block whose end matches", () => {
+    const fl = new Freelist();
+    fl.release(0, 32);
+    fl.release(64, 32);
+    expect(fl.takeBlockEndingAt(32)).toEqual({ off: 0, size: 32 });
+    expect(fl.toArray()).toEqual([{ off: 64, size: 32 }]);
+    expect(fl.takeBlockEndingAt(32)).toBeUndefined();
+    expect(fl.takeBlockEndingAt(96)).toEqual({ off: 64, size: 32 });
+    expect(fl.blockCount).toBe(0);
+  });
+
   it("invariant sweep under randomised alloc/release", () => {
     // Verify the structural invariants every Freelist must hold,
     // through ~5000 random ops:

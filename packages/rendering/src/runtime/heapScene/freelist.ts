@@ -91,6 +91,21 @@ export class Freelist {
     this.addBlock(mergeOff, mergeSize);
   }
 
+  /**
+   * Take and remove the free block whose end offset is exactly
+   * `endOff`, if any exists. Used by `AttributeArena` /
+   * `IndexAllocator` to shrink the bump cursor back when releases
+   * expose a free tail (§5 — cursor-shrink hygiene for long-lived
+   * high-churn scenes).
+   */
+  takeBlockEndingAt(endOff: number): { off: number; size: number } | undefined {
+    const off = this.byEnd.get(endOff);
+    if (off === undefined) return undefined;
+    const size = this.byStart.get(off)!;
+    this.removeBlock(off, size);
+    return { off, size };
+  }
+
   /** Drop every block. */
   clear(): void {
     this.bySize.clear();

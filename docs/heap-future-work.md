@@ -67,7 +67,19 @@ var hi = firstDrawInTile[tileIdx + 1u];
 
 Default K=64. Configurable per scene if a workload wants to tune.
 
-## 2. Large-object eject
+## 2. Large-object eject ✅ SHIPPED
+
+**Status (wombat.rendering 0.17.0):** `isHeapEligible` (in
+`runtime/heapEligibility.ts`) now sums vertex + instance + index
+host-buffer bytes during the reactive eligibility check and ejects
+ROs whose total exceeds `HEAP_PAYLOAD_EJECT_BYTES` (default 16 MB).
+Such ROs route through the legacy per-RO renderer with their own
+dedicated GPUBuffers, sidestepping the arena's pow2 grow on
+multi-MB allocations.
+
+The body below is the original sketch.
+
+---
 
 Single huge meshes (terrain, point clouds, photogrammetry) embedded in
 the heap arena force the arena's pow2 grow to allocate gigantic
@@ -80,7 +92,37 @@ attribute+index byte payload exceeds a threshold (e.g. 16 MB) route
 through the legacy per-RO renderer with their own dedicated
 GPUBuffers. ~5 LOC change in `heapEligibility.ts`.
 
-## 3. Chunked arena heaps
+## 3. Chunked arena heaps — partial (hardware-aware cap shipped)
+
+**Status (wombat.rendering 0.17.0):** the **hardware-aware
+chunk-size cap** is shipped. `GrowBuffer` accepts a `maxBytes` cap
+(default `DEFAULT_MAX_BUFFER_BYTES = 256 MB`); `buildArenaState`
+threads `device.limits.maxStorageBufferBindingSize` through so
+chunks grow as far as the adapter supports (typically 2 GiB+ on
+desktop, ≥ 256 MB on mobile/integrated). When `ensureCapacity`
+would exceed the cap, `GrowBuffer` throws a clear error pointing
+to the multi-draw-call follow-up below — no silent overflow.
+
+**Deferred:** the actual multi-chunk allocator + multi-draw-call
+encode path. Proposed shape (agreed with @krauthaufen 2026-05-15):
+
+- Per chunk: separate `GPUBuffer` + own freelist.
+- Each chunk binds in its OWN draw call — shaders bind one chunk
+  at a time, so refs don't need to encode chunkIdx (it's implicit
+  in the active bind group).
+- Pool entries key by `(aval, chunkIdx)` — shared avals across
+  chunks duplicate. Acceptable cost.
+- Bucket gains per-chunk `chunkParts`; encode iterates
+  `bucket × chunkPart × slot`.
+
+This is the right scaling work once a workload pushes total arena
+past a single chunk's cap. The §2 large-object eject means typical
+UI/SG scenes won't hit it (only photogrammetry / terrain / dense
+pointcloud workloads). Land when a real workload demands it.
+
+The body below is the original chunking sketch.
+
+---
 
 Right design once we cross ~64 MB total arena. Replaces the single
 GrowBuffer with a list of chunks.
@@ -119,7 +161,21 @@ A single draw never spans chunks — drawTable records are partitioned
 by chunk trivially, and each chunk's bind group only references its
 own buffers. Simpler than striping.
 
-## 4. Free-block management
+## 4. Free-block management ✅ SHIPPED
+
+**Status (wombat.rendering 0.17.0):** the sorted-by-offset
+`{off,size}[]` is replaced by `runtime/heapScene/freelist.ts` — a
+best-fit allocator backed by `(size→Set<off>)` exact-size buckets
++ a sorted-ascending `distinctSizes` array for `lower_bound`
+lookups + `byStart` / `byEnd` maps for O(1) adjacency probing
+during release. Alloc is O(log K) over distinct sizes K (typically
+dozens); release is O(log K) for the size-array maintenance +
+O(1) for the coalesce probes. Both `AttributeArena` and
+`IndexAllocator` share the implementation.
+
+The body below is the original sketch.
+
+---
 
 Today each arena holds a freelist `{off, size}[]` sorted by offset.
 `alloc(size)` is O(N) first-fit; `release` is O(N log N) (splice +
@@ -139,7 +195,29 @@ O(1) alloc/release. Trades external fragmentation for some internal
 fragmentation. Worth swapping in only if profiling shows the BST as
 hot.
 
-## 5. Defrag / compaction
+## 5. Defrag / compaction — partial (cursor-shrink shipped)
+
+**Status (wombat.rendering 0.17.0):** the **cursor-shrink**
+hygiene is shipped. After every `release`, both `AttributeArena`
+and `IndexAllocator` probe their freelist for a block whose end
+touches the bump cursor; if found, it's reclaimed back into the
+bump region (cascading — coalesce may have produced a single
+block ending at `cursor`). Long-lived high-churn scenes now
+recover their high-watermark over time instead of accumulating
+peak-live-ever-bytes permanently.
+
+**Deferred:**
+- **Periodic compaction**: walk live allocations, relocate them
+  to fill the freelist, fix all refs. Real "defrag." Invasive —
+  refs live in drawHeaders, master records, derived-uniform
+  input slots. Land when long-lived high-churn workloads show
+  visible fragmentation that cursor-shrink alone can't address.
+- **Drop-empty-chunks**: trivially pairs with the full §3
+  multi-chunk path (no chunks today → nothing to drop).
+
+The body below is the original sketch.
+
+---
 
 The cursor-only-grows model means a long-lived scene with high churn
 ends up with a high watermark = peak live bytes ever, even if the

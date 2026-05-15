@@ -21,6 +21,28 @@ What's NOT yet implemented. DONE markers pruned periodically.
   via `pipelineState.alphaToCoverage`, no end-to-end pixel
   validation yet.
 
+## Heap scaling (post-0.17.0)
+
+See `docs/heap-future-work.md` §2-§5. Shipped this round: large-object
+eject, best-fit Freelist, hardware-aware chunk cap, cursor-shrink.
+Still open:
+
+- **§3 full multi-chunk + multi-draw-call.** Bucket gains per-chunk
+  `chunkParts`; allocator opens a new chunk when the current one
+  hits its hardware-cap; encode iterates `bucket × chunkPart × slot`.
+  Pool entries key by `(aval, chunkIdx)` so shared avals across
+  chunks duplicate (acceptable cost). Trigger: when a real
+  workload's arena steady-state crosses a single chunk's adapter
+  cap (post-§2 eject, this is photogrammetry / dense pointcloud
+  territory only).
+- **§5 periodic compaction.** Walks live allocs, relocates them to
+  fill the freelist, patches refs in drawHeaders + master records
+  + derived-uniform input slots. Real defrag, not just
+  cursor-shrink. Land when a high-churn workload shows visible
+  fragmentation that cursor-shrink alone doesn't address.
+- **§5 drop-empty-chunks.** Pairs with §3 — trivially "do nothing"
+  in the single-chunk world.
+
 ## Derived-modes close-out (heap path)
 
 The derived-modes architecture is shipped (see `docs/derived-modes.md`
