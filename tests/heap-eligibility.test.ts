@@ -186,3 +186,41 @@ describe("isHeapEligible — per-RO instancing", () => {
     expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(false);
   });
 });
+
+describe("isHeapEligible — large-object eject (§2)", () => {
+  it("RO with payload under the budget stays heap-eligible", () => {
+    // baseRO() carries ~36 B + 12 B — trivially under the 16 MB eject.
+    const ro = baseRO();
+    expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(true);
+  });
+
+  it("RO whose vertex-attribute buffer alone exceeds the budget ejects", () => {
+    // 17 MB host buffer — above the 16 MB eject threshold.
+    const vbuf = cval<IBuffer>(IBuffer.fromHost(new ArrayBuffer(17 * 1024 * 1024)));
+    const view: BufferView = {
+      buffer: vbuf, offset: 0, stride: 12, elementType: ElementType.V3f,
+    };
+    const ro = baseRO({
+      vertexAttributes: AttributeProvider.ofObject({ position: view }),
+    });
+    expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(false);
+  });
+
+  it("RO whose summed (vertex + index) payload busts the budget ejects", () => {
+    // Two ~10 MB chunks — neither alone busts the budget, but the
+    // sum (~20 MB) does. Confirms the predicate accumulates.
+    const vbuf = cval<IBuffer>(IBuffer.fromHost(new ArrayBuffer(10 * 1024 * 1024)));
+    const ibuf = cval<IBuffer>(IBuffer.fromHost(new ArrayBuffer(10 * 1024 * 1024)));
+    const vview: BufferView = {
+      buffer: vbuf, offset: 0, stride: 12, elementType: ElementType.V3f,
+    };
+    const iview: BufferView = {
+      buffer: ibuf, offset: 0, stride: 4, elementType: ElementType.U32,
+    };
+    const ro = baseRO({
+      vertexAttributes: AttributeProvider.ofObject({ position: vview }),
+      indices: iview,
+    });
+    expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(false);
+  });
+});

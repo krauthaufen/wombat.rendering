@@ -51,6 +51,19 @@ import { asAttributeProvider } from "../core/provider.js";
  */
 const LEGACY_MAX_DIM = 4096;
 
+/**
+ * Total per-RO payload (attribute + instance + index bytes) above
+ * which the heap path ejects the RO to the legacy renderer. The
+ * heap path's value is collapsing many small ROs into one
+ * drawIndirect; a single-RO bucket emits the same drawIndexed it
+ * would have under legacy, AND a multi-MB allocation forces the
+ * arena's pow2 GrowBuffer to allocate (and re-copy on grow) a
+ * giant contiguous GPUBuffer. Default 16 MB — picked so typical
+ * UI/SG geometry (a few hundred kB) sails through and only
+ * terrain/photogrammetry/dense-pointcloud meshes eject.
+ */
+const HEAP_PAYLOAD_EJECT_BYTES = 16 * 1024 * 1024;
+
 const isHostBuffer = (b: IBuffer): boolean => b.kind === "host";
 // Samplers: accept both descriptor-form (`kind: "host"`) and resolved
 // (`kind: "gpu"`). The heap atlas path uses ONE shared GPU sampler for
@@ -204,7 +217,15 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
   // can flip; if they violate heap constraints the RO routes to the
   // legacy path that frame).
   return AVal.custom(token => {
-    for (const av of buffers)  if (!isHostBuffer(av.getValue(token)))         return false;
+    let payloadBytes = 0;
+    for (const av of buffers) {
+      const b = av.getValue(token);
+      if (!isHostBuffer(b)) return false;
+      payloadBytes += b.sizeBytes;
+      // Early-out if any single RO already busts the budget — avoids
+      // walking the rest of the buffer list for a guaranteed reject.
+      if (payloadBytes > HEAP_PAYLOAD_EJECT_BYTES) return false;
+    }
     for (const av of textures) if (!isHeapServableTexture(av.getValue(token))) return false;
     for (const av of samplers) if (!isHeapServableSampler(av.getValue(token))) return false;
     const dc = ro.drawCall.getValue(token);

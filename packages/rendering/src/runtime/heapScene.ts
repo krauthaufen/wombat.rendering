@@ -85,7 +85,7 @@ import {
 } from "./heapScene/growBuffer.js";
 import {
   UniformPool, IndexPool, DrawHeap,
-  AttributeArena, IndexAllocator, insertSortedFreeBlock,
+  AttributeArena, IndexAllocator,
   buildArenaState, arenaBytes, writeAttribute,
   asAval, isBufferView, asFloat32,
   ALLOC_HEADER_BYTES, ALLOC_HEADER_PAD_TO,

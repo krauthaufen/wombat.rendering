@@ -20,6 +20,7 @@ import type { aval, IDisposable } from "@aardworx/wombat.adaptive";
 import type { BufferView } from "../../core/bufferView.js";
 import type { HostBufferSource } from "../../core/buffer.js";
 import { GrowBuffer, ALIGN16 } from "./growBuffer.js";
+import { Freelist } from "./freelist.js";
 
 // ─── Per-allocation header layout ──────────────────────────────────────
 
@@ -259,7 +260,7 @@ export class DrawHeap {
  */
 export class AttributeArena {
   private cursor = 0;
-  private freeList: { off: number; size: number }[] = [];
+  private readonly freelist = new Freelist();
   /** CPU shadow of the entire GPU buffer; writes go here first then
    *  flush() emits one writeBuffer per dirty contiguous range. */
   private shadow: Uint8Array;
@@ -298,16 +299,8 @@ export class AttributeArena {
    */
   alloc(dataBytes: number): number {
     const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
-    // First-fit reuse from free list.
-    for (let i = 0; i < this.freeList.length; i++) {
-      const f = this.freeList[i]!;
-      if (f.size >= allocBytes) {
-        const ref = f.off;
-        if (f.size === allocBytes) this.freeList.splice(i, 1);
-        else { f.off += allocBytes; f.size -= allocBytes; }
-        return ref;
-      }
-    }
+    const reused = this.freelist.alloc(allocBytes);
+    if (reused !== undefined) return reused;
     const ref = this.cursor;
     this.cursor += allocBytes;
     this.buf.ensureCapacity(this.cursor);
@@ -316,44 +309,10 @@ export class AttributeArena {
   }
   release(ref: number, dataBytes: number): void {
     const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
-    insertSortedFreeBlock(this.freeList, ref, allocBytes);
+    this.freelist.release(ref, allocBytes);
   }
   onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
   destroy(): void { this.buf.destroy(); }
-}
-
-/**
- * Insert `{off, size}` into a free-list kept sorted by `off`, then
- * coalesce with the two immediate neighbours.
- */
-export function insertSortedFreeBlock(
-  freeList: { off: number; size: number }[],
-  off: number,
-  size: number,
-): void {
-  let lo = 0, hi = freeList.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if (freeList[mid]!.off <= off) lo = mid + 1;
-    else hi = mid;
-  }
-  const prev = lo > 0 ? freeList[lo - 1] : undefined;
-  if (prev !== undefined && prev.off + prev.size === off) {
-    prev.size += size;
-    const next = freeList[lo];
-    if (next !== undefined && prev.off + prev.size === next.off) {
-      prev.size += next.size;
-      freeList.splice(lo, 1);
-    }
-    return;
-  }
-  const next = freeList[lo];
-  if (next !== undefined && off + size === next.off) {
-    next.off = off;
-    next.size += size;
-    return;
-  }
-  freeList.splice(lo, 0, { off, size });
 }
 
 // ─── IndexAllocator (element-bump) ─────────────────────────────────────
@@ -361,11 +320,11 @@ export function insertSortedFreeBlock(
 /**
  * Element-bump allocator over an index GrowBuffer (units = u32). Each
  * draw's index range is allocated as one block; on release the block
- * is returned to a free list and can be reused first-fit.
+ * is returned to a Freelist and can be reused best-fit.
  */
 export class IndexAllocator {
   private cursor = 0;     // in u32s, not bytes
-  private freeList: { off: number; size: number }[] = [];
+  private readonly freelist = new Freelist();
   private shadow: Uint8Array;
   private dirtyMin = Infinity;
   private dirtyMax = 0;
@@ -396,15 +355,8 @@ export class IndexAllocator {
     this.dirtyMax = 0;
   }
   alloc(elements: number): number {
-    for (let i = 0; i < this.freeList.length; i++) {
-      const f = this.freeList[i]!;
-      if (f.size >= elements) {
-        const off = f.off;
-        if (f.size === elements) this.freeList.splice(i, 1);
-        else { f.off += elements; f.size -= elements; }
-        return off;
-      }
-    }
+    const reused = this.freelist.alloc(elements);
+    if (reused !== undefined) return reused;
     const off = this.cursor;
     this.cursor += elements;
     this.buf.ensureCapacity(this.cursor * 4);
@@ -412,7 +364,7 @@ export class IndexAllocator {
     return off;
   }
   release(off: number, elements: number): void {
-    insertSortedFreeBlock(this.freeList, off, elements);
+    this.freelist.release(off, elements);
   }
   onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
   destroy(): void { this.buf.destroy(); }
