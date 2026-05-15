@@ -92,33 +92,59 @@ attribute+index byte payload exceeds a threshold (e.g. 16 MB) route
 through the legacy per-RO renderer with their own dedicated
 GPUBuffers. ~5 LOC change in `heapEligibility.ts`.
 
-## 3. Chunked arena heaps — partial (hardware-aware cap shipped)
+## 3. Chunked arena heaps ✅ SHIPPED
 
-**Status (wombat.rendering 0.17.0):** the **hardware-aware
-chunk-size cap** is shipped. `GrowBuffer` accepts a `maxBytes` cap
-(default `DEFAULT_MAX_BUFFER_BYTES = 256 MB`); `buildArenaState`
-threads `device.limits.maxStorageBufferBindingSize` through so
-chunks grow as far as the adapter supports (typically 2 GiB+ on
-desktop, ≥ 256 MB on mobile/integrated). When `ensureCapacity`
-would exceed the cap, `GrowBuffer` throws a clear error pointing
-to the multi-draw-call follow-up below — no silent overflow.
+**Status (wombat.rendering 0.18.0):** full multi-chunk + multi-draw-
+call path shipped.
 
-**Deferred:** the actual multi-chunk allocator + multi-draw-call
-encode path. Proposed shape (agreed with @krauthaufen 2026-05-15):
+- `ChunkedAttributeArena` / `ChunkedIndexAllocator` in
+  `runtime/heapScene/chunkedArena.ts`: each chunk owns a separate
+  GPUBuffer + Freelist. `alloc(size, hint?) → { chunkIdx, off }`;
+  newest-chunk-first fallback; opens a new chunk when none fits.
+  Per-chunk cap honours `device.limits.maxStorageBufferBindingSize`
+  (capped at `DEFAULT_MAX_BUFFER_BYTES = 256 MB`); demos can pass
+  smaller (e.g. 4 MB) to exercise multi-chunk without huge
+  workloads.
+- `UniformPool` / `IndexPool` keyed by `(aval, chunkIdx)`. The
+  same aval acquired in two chunks duplicates — accepted cost of
+  one-bind-group-per-chunk shaders. Within a single chunk, ROs
+  sharing an aval still share.
+- `Bucket.chunkIdx`: the bucket lives in ONE chunk. Two ROs with
+  the same effect that land in different chunks live in
+  DIFFERENT buckets. `findOrCreateBucket(effect, chunkIdx)`.
+- Bind groups reference `arena.attrs.chunk(bucket.chunkIdx).buffer`
+  and `arena.indices.chunk(bucket.chunkIdx).buffer`. Shaders are
+  unchanged — refs are byte offsets within whichever chunk's
+  buffer is currently bound; chunkIdx is implicit in the active
+  bind group.
+- addRO chunk routing: pool-checks for shared avals already in
+  some chunk (co-locate to avoid duplication), then falls back to
+  newest chunk. Derived-uniform ROs force chunk 0 (the
+  derivedScene's main-heap binding is currently fixed there —
+  multi-chunk-aware derivedScene is a follow-up).
+- Resize listeners: `ChunkedArena.onAnyResize(cb)` wires the
+  callback to every current chunk's `onResize` AND every future
+  chunk added via `onChunkAdded`, fires once for each new chunk
+  so per-bucket bind groups rebuild.
+- Per-frame encode iterates buckets — buckets ARE already
+  per-chunk, so this is naturally one draw call per (effect,
+  chunkIdx). Total CPU encode cost stays low (chunks are typically
+  1–4).
+- Wired through `BuildHeapSceneOptions.maxChunkBytes` →
+  `HybridSceneOptions.maxChunkBytes` → `RuntimeOptions.maxChunkBytes`
+  → `<RenderControl maxChunkBytes={...}>`. Demo flag: `?chunk=N`
+  (megabytes).
 
-- Per chunk: separate `GPUBuffer` + own freelist.
-- Each chunk binds in its OWN draw call — shaders bind one chunk
-  at a time, so refs don't need to encode chunkIdx (it's implicit
-  in the active bind group).
-- Pool entries key by `(aval, chunkIdx)` — shared avals across
-  chunks duplicate. Acceptable cost.
-- Bucket gains per-chunk `chunkParts`; encode iterates
-  `bucket × chunkPart × slot`.
+**Open follow-ups:**
+- `validateHeap` / `simulateDraws` / `checkTriangleCoherence`
+  diagnostics throw on multi-chunk (chunk-0-only for now); the
+  ref-tracing logic needs per-bucket-chunkIdx staging to handle
+  the chunked case. Not blocking for production use.
+- Multi-chunk-aware `DerivedUniformsScene` — its main-heap
+  binding is currently fixed to chunk 0. ROs with derived
+  uniforms route to chunk 0 as a workaround.
 
-This is the right scaling work once a workload pushes total arena
-past a single chunk's cap. The §2 large-object eject means typical
-UI/SG scenes won't hit it (only photogrammetry / terrain / dense
-pointcloud workloads). Land when a real workload demands it.
+The body below is the original chunking sketch.
 
 The body below is the original chunking sketch.
 

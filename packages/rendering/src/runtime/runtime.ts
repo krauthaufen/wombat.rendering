@@ -41,6 +41,12 @@ export interface RuntimeOptions {
    * ProjTrafo as `aval<Trafo3d>` for any derived they consume.
    */
   readonly enableDerivedUniforms?: boolean;
+  /**
+   * §3 — per-arena-chunk byte cap for the heap path. Threaded into
+   * `HybridSceneOptions.maxChunkBytes`. Pass a small value (e.g. 4 MB)
+   * from a demo / test to exercise multi-chunk routing.
+   */
+  readonly maxChunkBytes?: number;
 }
 
 /**
@@ -77,6 +83,7 @@ export class Runtime {
       ...(opts.heapEnabled !== undefined ? { heapEnabled: opts.heapEnabled } : {}),
       ...(opts.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
       ...(opts.enableDerivedUniforms === false ? { enableDerivedUniforms: false } : {}),
+      ...(opts.maxChunkBytes !== undefined ? { maxChunkBytes: opts.maxChunkBytes } : {}),
     };
     // `device.lost` is a real-WebGPU promise; mock devices may not
     // expose it. Treat as "never lost" in that case.

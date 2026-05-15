@@ -85,6 +85,13 @@ export interface CompileHybridSceneOptions {
    * §7 derived-uniforms opt-in — pass-through to `BuildHeapSceneOptions`.
    */
   readonly enableDerivedUniforms?: boolean;
+  /**
+   * §3 — per-arena-chunk byte cap. Pass-through to
+   * `BuildHeapSceneOptions.maxChunkBytes`. Demo / test value
+   * (e.g. 4 MB) exercises multi-chunk routing without needing
+   * massive workloads.
+   */
+  readonly maxChunkBytes?: number;
 }
 
 export interface HybridScene {
@@ -226,6 +233,7 @@ export function compileHybridScene(
     atlasPool,
     ...(opts.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
     ...(opts.enableDerivedUniforms === false ? { enableDerivedUniforms: false } : {}),
+    ...(opts.maxChunkBytes !== undefined ? { maxChunkBytes: opts.maxChunkBytes } : {}),
   });
 
   // ─── Legacy subset → RenderTree → ScenePass ──────────────────────

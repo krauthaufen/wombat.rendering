@@ -21,6 +21,7 @@ import type { BufferView } from "../../core/bufferView.js";
 import type { HostBufferSource } from "../../core/buffer.js";
 import { GrowBuffer, ALIGN16, DEFAULT_MAX_BUFFER_BYTES } from "./growBuffer.js";
 import { Freelist } from "./freelist.js";
+import { ChunkedAttributeArena, ChunkedIndexAllocator } from "./chunkedArena.js";
 
 // ─── Per-allocation header layout ──────────────────────────────────────
 
@@ -40,99 +41,146 @@ export const SEM_NORMALS   = 2;
 
 // ─── UniformPool ───────────────────────────────────────────────────────
 
+/**
+ * One pool entry tracks a single (aval, chunkIdx) pair. Refs are
+ * byte offsets within the chunk's GPUBuffer; chunkIdx is implicit
+ * in which chunk's bind group is active at draw time (shaders
+ * never decode it).
+ */
 interface PoolEntry {
-  /** Byte offset into the arena. Data starts at ref + ALLOC_HEADER_PAD_TO. */
+  readonly chunkIdx: number;
   readonly ref: number;
   readonly dataBytes: number;
   readonly typeId: number;
-  /** Packer used to refresh the data region on aval marks. */
   readonly pack: (val: unknown, dst: Float32Array, off: number) => void;
   refcount: number;
 }
 
 /**
- * Aval-keyed pool of arena allocations. One allocation per unique
- * aval (object identity). Two draws referencing the same aval share
- * the allocation; their DrawHeaders carry the same u32 ref. Holds
- * uniforms (fixed-size scalars/vectors/matrices) AND attribute arrays
- * (variable-size). The caller decides `dataBytes` + `length` per
- * acquisition — the pool just keys on aval identity and refcounts.
- *
- * Sharing emerges from aval identity — no separate "frequency"
- * declaration needed. A `cval` shared by all draws → 1 alloc.
- * A static positions array shared across instanced draws → 1 alloc.
- * Same code path either way.
+ * `(aval, chunkIdx)`-keyed pool of chunked-arena allocations. An
+ * aval that's referenced from multiple chunks (e.g. two ROs sharing
+ * a uniform but landing in different chunks) gets one entry per
+ * chunk — accepted duplication cost of the multi-draw-call
+ * per-chunk render path (§3). Within a single chunk, ROs sharing
+ * an aval still share the underlying allocation.
  */
 export class UniformPool {
-  // Keyed by `aval<unknown>` *by reference* (a plain JS `Map`). These
-  // keys are overwhelmingly reactive `cval`s (per-object trafos,
-  // colours, …) and the hot path is `acquire`/`release` ~once per
-  // drawHeader field per RO.
-  private readonly byAval = new Map<aval<unknown>, PoolEntry>();
+  private readonly byAval = new Map<aval<unknown>, Map<number, PoolEntry>>();
 
-  has(av: aval<unknown>): boolean { return this.byAval.has(av); }
-  entry(av: aval<unknown>): PoolEntry | undefined { return this.byAval.get(av); }
+  has(av: aval<unknown>, chunkIdx: number): boolean {
+    return this.byAval.get(av)?.has(chunkIdx) ?? false;
+  }
+  /** True when the pool holds at least one entry for `av` in any
+   *  chunk. Used by the scene's `inputChanged` dispatch to decide
+   *  whether a marking aval is one of our tracked allocations. */
+  hasAny(av: aval<unknown>): boolean {
+    return (this.byAval.get(av)?.size ?? 0) > 0;
+  }
+  entry(av: aval<unknown>, chunkIdx: number): PoolEntry | undefined {
+    return this.byAval.get(av)?.get(chunkIdx);
+  }
+  /** First chunk this aval is allocated in, if any. Used by `addRO`
+   *  to prefer co-locating a new RO with its already-allocated
+   *  shared inputs (avoids unnecessary duplication). */
+  firstChunkContaining(av: aval<unknown>): number | undefined {
+    const byChunk = this.byAval.get(av);
+    if (byChunk === undefined || byChunk.size === 0) return undefined;
+    return byChunk.keys().next().value as number;
+  }
 
   /**
-   * Acquire (or share) an allocation for `aval`. Caller passes the
-   * pre-read `value` (so the pool doesn't need a token) plus the
-   * (`dataBytes`, `typeId`, `length`, `pack`) describing how to lay
-   * it out. If a new allocation is made, the value is packed and
-   * uploaded immediately.
+   * Acquire (or share) an allocation for `aval` in `chunkIdx`.
+   * Returns the byte offset within that chunk's GPUBuffer. If a
+   * fresh allocation is made, the value is packed + uploaded
+   * immediately into the chunk's CPU shadow.
    */
   acquire(
     device: GPUDevice,
-    arena: AttributeArena,
+    arena: ChunkedAttributeArena,
     av: aval<unknown>,
+    chunkIdx: number,
     value: unknown,
     dataBytes: number,
     typeId: number,
     length: number,
     pack: (val: unknown, dst: Float32Array, off: number) => void,
   ): number {
-    const existing = this.byAval.get(av);
+    let byChunk = this.byAval.get(av);
+    const existing = byChunk?.get(chunkIdx);
     if (existing !== undefined) {
       existing.refcount++;
       return existing.ref;
     }
-    const ref = arena.alloc(dataBytes);
+    const r = arena.alloc(dataBytes, chunkIdx);
+    // The alloc may have spilled into a different chunk if `chunkIdx`
+    // was full. Honour wherever it landed — addRO's chunk-routing
+    // commits the RO to the spill chunk too.
+    const finalChunk = r.chunkIdx;
     const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
     const buf = new ArrayBuffer(allocBytes);
     const u32 = new Uint32Array(buf);
     const f32 = new Float32Array(buf);
     u32[0] = typeId;
     u32[1] = length;
-    // stride_bytes (offset 8): bytes per element. Lets the VS decode
-    // pick V3- vs V4-tight load expressions for vec4 attributes.
     u32[2] = length > 0 ? Math.floor(dataBytes / length) : 0;
     pack(value, f32, ALLOC_HEADER_PAD_TO / 4);
-    arena.write(ref, new Uint8Array(buf));
+    arena.write(finalChunk, r.off, new Uint8Array(buf));
     void device;
-    this.byAval.set(av, { ref, dataBytes, typeId, pack, refcount: 1 });
-    return ref;
+    if (byChunk === undefined) {
+      byChunk = new Map();
+      this.byAval.set(av, byChunk);
+    }
+    byChunk.set(finalChunk, {
+      chunkIdx: finalChunk, ref: r.off, dataBytes, typeId, pack, refcount: 1,
+    });
+    return r.off;
   }
 
-  /** Decrement refcount; if zero, free the arena allocation. */
-  release(arena: AttributeArena, av: aval<unknown>): void {
-    const e = this.byAval.get(av);
+  release(arena: ChunkedAttributeArena, av: aval<unknown>, chunkIdx: number): void {
+    const byChunk = this.byAval.get(av);
+    const e = byChunk?.get(chunkIdx);
     if (e === undefined) return;
     e.refcount--;
     if (e.refcount > 0) return;
-    arena.release(e.ref, ALIGN16(ALLOC_HEADER_PAD_TO + e.dataBytes));
-    this.byAval.delete(av);
+    arena.release(e.chunkIdx, e.ref, ALIGN16(ALLOC_HEADER_PAD_TO + e.dataBytes));
+    byChunk!.delete(chunkIdx);
+    if (byChunk!.size === 0) this.byAval.delete(av);
   }
 
-  /** Re-pack one entry's data region into the arena's CPU shadow. */
-  repack(device: GPUDevice, arena: AttributeArena, av: aval<unknown>, val: unknown): void {
-    const e = this.byAval.get(av);
-    if (e === undefined) return;
-    const dst = new Float32Array(e.dataBytes / 4);
-    e.pack(val, dst, 0);
-    arena.write(
-      e.ref + ALLOC_HEADER_PAD_TO,
-      new Uint8Array(dst.buffer, dst.byteOffset, e.dataBytes),
-    );
+  /** Re-pack one entry's data region into every chunk that holds
+   *  this aval. When an aval is shared across N chunks (each chunk
+   *  has its own duplicate alloc), every duplicate needs the
+   *  refresh so all the chunks' ROs see the new value. */
+  repack(
+    device: GPUDevice,
+    arena: ChunkedAttributeArena,
+    av: aval<unknown>,
+    val: unknown,
+  ): void {
+    const byChunk = this.byAval.get(av);
+    if (byChunk === undefined) return;
+    let dst: Float32Array | undefined;
+    for (const e of byChunk.values()) {
+      if (dst === undefined || dst.length !== e.dataBytes / 4) {
+        dst = new Float32Array(e.dataBytes / 4);
+      }
+      e.pack(val, dst, 0);
+      arena.write(
+        e.chunkIdx,
+        e.ref + ALLOC_HEADER_PAD_TO,
+        new Uint8Array(dst.buffer, dst.byteOffset, e.dataBytes),
+      );
+    }
     void device;
+  }
+  /** Total bytes touched by `repack` for this aval — sum across
+   *  chunks. Used by the dirty-bytes diagnostics. */
+  totalDataBytes(av: aval<unknown>): number {
+    const byChunk = this.byAval.get(av);
+    if (byChunk === undefined) return 0;
+    let s = 0;
+    for (const e of byChunk.values()) s += e.dataBytes;
+    return s;
   }
 }
 
@@ -151,10 +199,13 @@ export class UniformPool {
  * `Uint32Array` view collapse to one allocation.
  */
 export class IndexPool {
+  /** Per-aval, per-chunk bookkeeping. Same aval acquired in two
+   *  chunks gets two entries (accepted §3 duplication). */
   private readonly byAval = new Map<
     aval<Uint32Array>,
-    { entry: IndexPoolEntry; perAvalCount: number }
+    Map<number, { entry: IndexPoolEntry; perAvalCount: number }>
   >();
+  /** Per-chunk constant-aval value-dedup (§5b in-chunk). */
   private readonly byValueKey = new Map<string, IndexPoolEntry>();
   private readonly bufferIds = new WeakMap<ArrayBufferLike, number>();
   private nextBufferId = 1;
@@ -167,48 +218,75 @@ export class IndexPool {
     return id;
   }
 
+  firstChunkContaining(av: aval<Uint32Array>): number | undefined {
+    const byChunk = this.byAval.get(av);
+    if (byChunk === undefined || byChunk.size === 0) return undefined;
+    return byChunk.keys().next().value as number;
+  }
+
   acquire(
     device: GPUDevice,
-    indices: IndexAllocator,
+    indices: ChunkedIndexAllocator,
     av: aval<Uint32Array>,
+    chunkIdx: number,
     arr: Uint32Array,
-  ): { firstIndex: number; count: number } {
-    const bound = this.byAval.get(av);
+  ): { chunkIdx: number; firstIndex: number; count: number } {
+    let byChunk = this.byAval.get(av);
+    const bound = byChunk?.get(chunkIdx);
     if (bound !== undefined) {
       bound.perAvalCount++;
       bound.entry.totalRefcount++;
-      return { firstIndex: bound.entry.firstIndex, count: bound.entry.count };
+      return { chunkIdx: bound.entry.chunkIdx, firstIndex: bound.entry.firstIndex, count: bound.entry.count };
     }
     let valueKey: string | undefined;
     if (av.isConstant) {
-      valueKey = `${this.bufferIdOf(arr.buffer)}:${arr.byteOffset}:${arr.byteLength}`;
+      // Value-dedup is scoped per chunk — two constant avals in the
+      // same chunk collapse to one allocation; two constant avals in
+      // DIFFERENT chunks each get their own (we can't share across
+      // chunks since the index range lives in the chunk's GPUBuffer).
+      valueKey = `${chunkIdx}:${this.bufferIdOf(arr.buffer)}:${arr.byteOffset}:${arr.byteLength}`;
       const shared = this.byValueKey.get(valueKey);
       if (shared !== undefined) {
         shared.totalRefcount++;
-        this.byAval.set(av, { entry: shared, perAvalCount: 1 });
-        return { firstIndex: shared.firstIndex, count: shared.count };
+        if (byChunk === undefined) {
+          byChunk = new Map();
+          this.byAval.set(av, byChunk);
+        }
+        byChunk.set(chunkIdx, { entry: shared, perAvalCount: 1 });
+        return { chunkIdx: shared.chunkIdx, firstIndex: shared.firstIndex, count: shared.count };
       }
     }
-    const firstIndex = indices.alloc(arr.length);
+    const r = indices.alloc(arr.length, chunkIdx);
     indices.write(
-      firstIndex * 4,
+      r.chunkIdx, r.off * 4,
       new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength),
     );
     void device;
-    const entry: IndexPoolEntry = { firstIndex, count: arr.length, totalRefcount: 1, valueKey };
-    this.byAval.set(av, { entry, perAvalCount: 1 });
+    const entry: IndexPoolEntry = {
+      chunkIdx: r.chunkIdx, firstIndex: r.off, count: arr.length,
+      totalRefcount: 1, valueKey,
+    };
+    if (byChunk === undefined) {
+      byChunk = new Map();
+      this.byAval.set(av, byChunk);
+    }
+    byChunk.set(r.chunkIdx, { entry, perAvalCount: 1 });
     if (valueKey !== undefined) this.byValueKey.set(valueKey, entry);
-    return { firstIndex, count: arr.length };
+    return { chunkIdx: r.chunkIdx, firstIndex: r.off, count: arr.length };
   }
 
-  release(indices: IndexAllocator, av: aval<Uint32Array>): void {
-    const bound = this.byAval.get(av);
+  release(indices: ChunkedIndexAllocator, av: aval<Uint32Array>, chunkIdx: number): void {
+    const byChunk = this.byAval.get(av);
+    const bound = byChunk?.get(chunkIdx);
     if (bound === undefined) return;
     bound.perAvalCount--;
     bound.entry.totalRefcount--;
-    if (bound.perAvalCount === 0) this.byAval.delete(av);
+    if (bound.perAvalCount === 0) {
+      byChunk!.delete(chunkIdx);
+      if (byChunk!.size === 0) this.byAval.delete(av);
+    }
     if (bound.entry.totalRefcount > 0) return;
-    indices.release(bound.entry.firstIndex, bound.entry.count);
+    indices.release(bound.entry.chunkIdx, bound.entry.firstIndex, bound.entry.count);
     if (bound.entry.valueKey !== undefined) {
       this.byValueKey.delete(bound.entry.valueKey);
     }
@@ -216,6 +294,7 @@ export class IndexPool {
 }
 
 interface IndexPoolEntry {
+  chunkIdx: number;
   firstIndex: number;
   count: number;
   totalRefcount: number;
@@ -419,11 +498,15 @@ export class IndexAllocator {
 /**
  * Global arena state: attribute / uniform data lives in `attrs`
  * (multi-typed-view storage); indices live in `indices` (separate
- * INDEX-usage buffer).
+ * INDEX-usage buffer). Both are chunked: each chunk owns a separate
+ * GPUBuffer + Freelist. Refs that downstream code stores are byte
+ * offsets within a chunk; the chunk identity is carried alongside
+ * (via bucket.chunkIdx in heapScene) and made implicit at draw
+ * time by which chunk's bind group is active.
  */
 export interface ArenaState {
-  readonly attrs:    AttributeArena;
-  readonly indices:  IndexAllocator;
+  readonly attrs:    ChunkedAttributeArena;
+  readonly indices:  ChunkedIndexAllocator;
 }
 
 export function buildArenaState(
@@ -435,25 +518,26 @@ export function buildArenaState(
   maxChunkBytes: number | undefined = undefined,
 ): ArenaState {
   // §3: cap chunk size at min(adapter's maxStorageBufferBindingSize,
-  // GrowBuffer's DEFAULT_MAX_BUFFER_BYTES). Lets us grow as far as
-  // the hardware lets us (typically 2 GiB+ on desktop, ≥ 256 MB on
-  // mobile/integrated) while keeping a sensible internal ceiling.
-  // Caller can override.
+  // GrowBuffer's DEFAULT_MAX_BUFFER_BYTES). Lets chunks grow as far
+  // as the hardware lets us (typically 2 GiB+ on desktop, ≥ 256 MB
+  // on mobile/integrated) while keeping a sensible internal ceiling.
+  // Caller can override (the heap-demo uses a tiny 4 MB cap to
+  // exercise multi-chunk routing).
   const adapterCap = device.limits.maxStorageBufferBindingSize;
   const cap = maxChunkBytes ?? Math.min(adapterCap, DEFAULT_MAX_BUFFER_BYTES);
-  const attrs = new AttributeArena(new GrowBuffer(
+  const attrs = new ChunkedAttributeArena(
     device, `${label}/attrs`, GPUBufferUsage.STORAGE,
     attrBytesHint, cap,
-  ));
-  const indices = new IndexAllocator(new GrowBuffer(
+  );
+  const indices = new ChunkedIndexAllocator(
     device, `${label}/idx`, GPUBufferUsage.INDEX | idxExtraUsage,
     idxBytesHint, cap,
-  ));
+  );
   return { attrs, indices };
 }
 
 export function arenaBytes(arena: ArenaState): number {
-  return arena.attrs.usedBytes + arena.indices.usedElements * 4;
+  return arena.attrs.totalUsedBytes() + arena.indices.totalUsedElements() * 4;
 }
 
 /** Upload a single attribute — header (typeId, length) + data — into the arena at byte offset `ref`. */

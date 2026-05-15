@@ -54,6 +54,11 @@ export interface RuntimeContext {
    * compiled against this context.
    */
   readonly enableDerivedUniforms?: boolean;
+  /**
+   * §3 — per-arena-chunk byte cap, propagated to every HybridScene
+   * compiled against this context. Default unset → adapter limit.
+   */
+  readonly maxChunkBytes?: number;
 }
 
 class RenderTask implements IRenderTask {
@@ -256,6 +261,7 @@ class RenderTask implements IRenderTask {
         ...(this.ctx.heapEnabled !== undefined ? { heapEnabled: this.ctx.heapEnabled } : {}),
         ...(this.ctx.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
         ...(this.ctx.enableDerivedUniforms === false ? { enableDerivedUniforms: false } : {}),
+        ...(this.ctx.maxChunkBytes !== undefined ? { maxChunkBytes: this.ctx.maxChunkBytes } : {}),
       });
       this._scenes.set(cmd, s);
     }

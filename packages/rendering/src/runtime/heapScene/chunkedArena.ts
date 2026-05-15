@@ -98,6 +98,25 @@ export class ChunkedAttributeArena {
     return { dispose: () => { this.onChunkAddedCbs.delete(cb); } };
   }
 
+  /** Subscribe to "any chunk resized (incl. brand-new chunk)" events.
+   *  Wires the callback to every current chunk's `onResize` AND
+   *  fires it for each future-added chunk after subscribing.
+   *  Used by the scene-level rebuild path that follows arena growth. */
+  onAnyResize(cb: (chunkIdx: number) => void): IDisposable {
+    const disposables: IDisposable[] = [];
+    for (let i = 0; i < this._chunks.length; i++) {
+      const idx = i;
+      disposables.push(this._chunks[i]!.onResize(() => cb(idx)));
+    }
+    disposables.push(this.onChunkAdded((idx) => {
+      disposables.push(this._chunks[idx]!.onResize(() => cb(idx)));
+      // Also fire once for the new chunk so listeners can wire bind
+      // groups to it.
+      cb(idx);
+    }));
+    return { dispose: () => { for (const d of disposables) d.dispose(); } };
+  }
+
   /** Total bytes used across all chunks (high-watermark sum). */
   totalUsedBytes(): number {
     let s = 0;
@@ -180,6 +199,19 @@ export class ChunkedIndexAllocator {
   onChunkAdded(cb: (chunkIdx: number) => void): IDisposable {
     this.onChunkAddedCbs.add(cb);
     return { dispose: () => { this.onChunkAddedCbs.delete(cb); } };
+  }
+
+  onAnyResize(cb: (chunkIdx: number) => void): IDisposable {
+    const disposables: IDisposable[] = [];
+    for (let i = 0; i < this._chunks.length; i++) {
+      const idx = i;
+      disposables.push(this._chunks[i]!.onResize(() => cb(idx)));
+    }
+    disposables.push(this.onChunkAdded((idx) => {
+      disposables.push(this._chunks[idx]!.onResize(() => cb(idx)));
+      cb(idx);
+    }));
+    return { dispose: () => { for (const d of disposables) d.dispose(); } };
   }
 
   totalUsedElements(): number {

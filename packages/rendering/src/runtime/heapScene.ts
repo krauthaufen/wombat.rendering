@@ -253,6 +253,12 @@ interface Bucket {
   readonly label: string;
   readonly textures: HeapTextureSet | undefined;
   readonly layout: BucketLayout;
+  /** §3: which arena chunk this bucket's ROs live in. The bucket's
+   *  bind groups reference `arena.attrs.chunk(chunkIdx).buffer` and
+   *  `arena.indices.chunk(chunkIdx).buffer`. Two ROs sharing an
+   *  effect that landed in different chunks live in DIFFERENT
+   *  buckets — encode emits a draw per (effect, chunkIdx). */
+  readonly chunkIdx: number;
   /**
    * One entry per distinct pipeline state. Phase 5a: always length 1
    * (per-RO pipeline-state still keyed at the bucket level).
@@ -683,6 +689,18 @@ export interface BuildHeapSceneOptions {
    * effect's `spec.inputs[name]` like any other uniform.
    */
   readonly enableDerivedUniforms?: boolean;
+  /**
+   * §3 — per-arena-chunk size cap in bytes. When omitted, falls
+   * back to `min(device.limits.maxStorageBufferBindingSize,
+   * DEFAULT_MAX_BUFFER_BYTES = 256 MB)` so chunks grow as far as
+   * the hardware allows. Demos / tests can pass a small value
+   * (e.g. 4 MB) to exercise multi-chunk routing without realistic
+   * workload pressure. Each chunk lives in its own GPUBuffer;
+   * buckets bind exactly one chunk and emit one draw call per
+   * (effect, chunkIdx). Shared-aval avals that land in different
+   * chunks duplicate their pool entries (accepted trade-off).
+   */
+  readonly maxChunkBytes?: number;
 }
 
 export function buildHeapScene(
@@ -720,6 +738,7 @@ export function buildHeapScene(
   const arena = buildArenaState(
     device, 64 * 1024, 16 * 1024, "heapScene",
     GPUBufferUsage.STORAGE,
+    opts.maxChunkBytes,
   );
 
   // ─── Per-draw global bookkeeping (sparse, indexed by drawId) ──────
@@ -980,7 +999,7 @@ export function buildHeapScene(
     override inputChanged(_t: unknown, o: IAdaptiveObject): void {
       // Pool avals are stored as `aval<unknown>`; the IAdaptiveObject
       // identity matches.
-      if (pool.has(o as unknown as aval<unknown>)) {
+      if (pool.hasAny(o as unknown as aval<unknown>)) {
         allocDirty.add(o as unknown as aval<unknown>);
         return;
       }
@@ -1005,7 +1024,7 @@ export function buildHeapScene(
   // `enableDerivedUniforms: false` to opt out.
   const enableDerivedUniforms = opts.enableDerivedUniforms !== false;
   const derivedScene: DerivedUniformsScene | undefined = enableDerivedUniforms
-    ? new DerivedUniformsScene(device, arena.attrs.buffer, {
+    ? new DerivedUniformsScene(device, arena.attrs.chunk(0).buffer, {
         // Larger initial capacity reduces grow-during-first-frame churn.
         initialConstituentSlots: 4096,
       })
@@ -1525,11 +1544,12 @@ export function buildHeapScene(
     // SAME global arena GPUBuffer (emscripten-style aliasing). The
     // WGSL prelude declares one binding per view; the shader picks
     // whichever matches its read.
+    const attrsBuf = arena.attrs.chunk(bucket.chunkIdx).buffer;
     const entries: GPUBindGroupEntry[] = [
-      { binding: 0, resource: { buffer: arena.attrs.buffer } },          // heapU32
+      { binding: 0, resource: { buffer: attrsBuf } },                    // heapU32
       { binding: 1, resource: { buffer: bucket.drawHeap.buffer } },      // headersU32
-      { binding: 2, resource: { buffer: arena.attrs.buffer } },          // heapF32
-      { binding: 3, resource: { buffer: arena.attrs.buffer } },          // heapV4f
+      { binding: 2, resource: { buffer: attrsBuf } },                    // heapF32
+      { binding: 3, resource: { buffer: attrsBuf } },                    // heapV4f
     ];
     {
       const s = bucket.slots[slotIdx]!;
@@ -1544,7 +1564,7 @@ export function buildHeapScene(
       const dtBytes = Math.max(RECORD_BYTES, s.recordCount * RECORD_BYTES);
       entries.push(
         { binding: 4, resource: { buffer: s.drawTableBuf.buffer, offset: 0, size: dtBytes } },
-        { binding: 5, resource: { buffer: arena.indices.buffer } },
+        { binding: 5, resource: { buffer: arena.indices.chunk(bucket.chunkIdx).buffer } },
         { binding: 6, resource: { buffer: s.firstDrawInTileBuf!.buffer } },
       );
       s.renderBoundRecordCount = s.recordCount;
@@ -1654,15 +1674,23 @@ export function buildHeapScene(
     }
   }
 
-  arena.attrs.onResize(() => {
-    rebuildAllBindGroups();
-    if (derivedScene !== undefined) derivedScene.rebindMainHeap(arena.attrs.buffer);
-    // Phase 5c.3: partition kernels bind arena.attrs as their input.
-    // Force a bind group rebuild on next dispatch for every GPU bucket.
+  arena.attrs.onAnyResize((resizedChunkIdx) => {
+    // Only rebuild bind groups for buckets that bind THIS chunk —
+    // a resize in chunk K doesn't affect a bucket reading chunk N≠K.
     for (const b of buckets) {
+      if (b.chunkIdx !== resizedChunkIdx) continue;
+      for (let i = 0; i < b.slots.length; i++) {
+        b.slots[i]!.bindGroup = buildBucketBindGroup(b, i);
+      }
       if (b.gpuRouted && b.partitionScene !== undefined) {
         b.partitionScene.rebindSlotDrawBufs(b.slots.map(s => s.drawTableBuf!.buffer));
       }
+    }
+    // §7: derivedScene's main-heap binding is currently fixed to
+    // chunk 0 (derived-uniform ROs must land there — see addRO's
+    // chunk-routing). Only rebind on chunk-0 resize.
+    if (resizedChunkIdx === 0 && derivedScene !== undefined) {
+      derivedScene.rebindMainHeap(arena.attrs.chunk(0).buffer);
     }
   });
   if (atlasPool !== undefined) {
@@ -1670,7 +1698,14 @@ export function buildHeapScene(
       atlasPool.onPageAdded(f, () => rebuildAllBindGroups(true));
     }
   }
-  arena.indices.onResize(() => rebuildAllBindGroups());
+  arena.indices.onAnyResize((resizedChunkIdx) => {
+    for (const b of buckets) {
+      if (b.chunkIdx !== resizedChunkIdx) continue;
+      for (let i = 0; i < b.slots.length; i++) {
+        b.slots[i]!.bindGroup = buildBucketBindGroup(b, i);
+      }
+    }
+  });
 
   // ─── findOrCreateBucket ───────────────────────────────────────────
   // Slice 3c: the bucket key collapses to (familyId, pipelineState).
@@ -2472,7 +2507,7 @@ export function buildHeapScene(
       bucket.partitionScene.rebuildKernel(kernelWGSL);
     }
     bucket.partitionScene.flush();
-    bucket.partitionScene.dispatch(arena.attrs.buffer, enc);
+    bucket.partitionScene.dispatch(arena.attrs.chunk(bucket.chunkIdx).buffer, enc);
     for (let i = 0; i < bucket.slots.length; i++) {
       enc.copyBufferToBuffer(
         bucket.partitionScene.slotCountBufs[i]!, 0,
@@ -2488,6 +2523,7 @@ export function buildHeapScene(
     effect: Effect,
     _textures: HeapTextureSet | undefined,
     pipelineState: PipelineState | undefined,
+    chunkIdx: number,
     /**
      * Optional precomputed descriptor. addDrawImpl passes this when
      * the spec carries `modeRules` so the bucket key reflects the
@@ -2500,12 +2536,13 @@ export function buildHeapScene(
       throw new Error("heapScene: findOrCreateBucket called before family build");
     }
     const fam = familyFor(effect);
-    // Phase 5c.2: bucket key drops modeKey. All ROs with the same
-    // (effect, textureSet) share one bucket; per-modeKey slots live
-    // inside the bucket and route records via `ensureSlot`. Pipeline
-    // pre-warm + the scene-level pipelineByModeKey cache mean every
-    // realized slot lookup hits the cache.
-    const bk = `family#${fam.schema.id}`;
+    // §3: bucket key includes `chunkIdx` — two ROs with the same
+    // effect/family that landed in different arena chunks live in
+    // separate buckets so each bucket can bind exactly one chunk's
+    // GPUBuffers in its draw call. The shaders are unchanged
+    // (refs are byte offsets within whichever chunk's buffer is
+    // currently bound).
+    const bk = `family#${fam.schema.id}/c${chunkIdx}`;
     const existing = bucketByKey.get(bk);
     if (existing !== undefined) return existing;
 
@@ -2518,7 +2555,7 @@ export function buildHeapScene(
     const drawHeap = new DrawHeap(drawHeapBuf, layout.drawHeaderBytes);
 
     const bucket: Bucket = {
-      label: bk, textures: undefined, layout,
+      label: bk, textures: undefined, layout, chunkIdx,
       slots: [],  // populated lazily by ensureSlot per modeKey
       bindGroup: null as unknown as GPUBindGroup,  // legacy field; slot.bindGroup is the real one
       drawHeap,
@@ -2778,7 +2815,43 @@ export function buildHeapScene(
         token:        outerTok,
       });
     }
-    const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, precomputedDescriptor);
+    // §3 chunk routing — pick which arena chunk this RO's allocations
+    // land in. Preference order:
+    //   1. If the RO has derived-uniform inputs, FORCE chunk 0 — the
+    //      derivedScene currently binds chunk 0 as its main heap
+    //      (multi-chunk-aware derivedScene is a follow-up).
+    //   2. If any of the RO's bindings is an aval that's already
+    //      allocated in some chunk via the uniform pool, prefer that
+    //      chunk to avoid duplication.
+    //   3. Otherwise, use the newest open chunk (highest chunkIdx).
+    //      ChunkedArena.alloc spills to the next chunk automatically
+    //      when this one is full; the spill ends up driving the
+    //      pool's `finalChunk` selection so all of the RO's
+    //      allocations land in one chunk consistently.
+    let chunkIdx: number;
+    {
+      let forced = -1;
+      if (derivedScene !== undefined) {
+        for (const name of Object.keys(spec.inputs)) {
+          if (ruleForUniform(spec, name) !== undefined) { forced = 0; break; }
+        }
+      }
+      if (forced < 0) {
+        let preferred: number | undefined;
+        for (const [, val] of Object.entries(spec.inputs)) {
+          const av = (typeof val === "object" && val !== null && "getValue" in (val as object))
+            ? (val as aval<unknown>) : undefined;
+          if (av !== undefined) {
+            const where = pool.firstChunkContaining(av);
+            if (where !== undefined) { preferred = where; break; }
+          }
+        }
+        chunkIdx = preferred ?? Math.max(0, arena.attrs.chunkCount - 1);
+      } else {
+        chunkIdx = forced;
+      }
+    }
+    const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, chunkIdx, precomputedDescriptor);
     // Phase 5c.3 — every RO carrying a derived-mode rule is registered
     // on the bucket (lazy-promoting it to GPU-routed on the first
     // call). ROs may carry DIFFERENT rules even when they share the
@@ -2817,7 +2890,7 @@ export function buildHeapScene(
     // index allocation + one upload.
     const indicesAval = asAval(spec.indices) as aval<Uint32Array>;
     const indicesArr = readPlain(spec.indices) as Uint32Array;
-    const idxAlloc = indexPool.acquire(device, arena.indices, indicesAval, indicesArr);
+    const idxAlloc = indexPool.acquire(device, arena.indices, indicesAval, bucket.chunkIdx, indicesArr);
 
     const localSlot = bucket.drawHeap.alloc();
     // Per-RO instancing: read `spec.instanceCount` (defaults to 1).
@@ -2850,7 +2923,7 @@ export function buildHeapScene(
         if (ruleForUniform(spec, f.name) !== undefined) {
           const dummyAval = AVal.constant<M44d>(M44d.zero);
           const ref = pool.acquire(
-            device, arena.attrs, dummyAval, M44d.zero,
+            device, arena.attrs, dummyAval, bucket.chunkIdx, M44d.zero,
             PACKER_MAT4.dataBytes, PACKER_MAT4.typeId, 1, PACKER_MAT4.pack,
           );
           perDrawRefs.set(f.name, ref);
@@ -2899,7 +2972,7 @@ export function buildHeapScene(
             : poolPlacementFor(f, value);
         }
         const ref = pool.acquire(
-          device, arena.attrs, av, value,
+          device, arena.attrs, av, bucket.chunkIdx, value,
           placement.dataBytes, placement.typeId, placement.length, placement.pack,
         );
         perDrawRefs.set(f.name, ref);
@@ -3214,9 +3287,9 @@ export function buildHeapScene(
 
     // Release pool entries — refcount drops; if zero, allocation freed.
     const avals = bucket.localPerDrawAvals[localSlot];
-    if (avals !== undefined) for (const av of avals) pool.release(arena.attrs, av);
+    if (avals !== undefined) for (const av of avals) pool.release(arena.attrs, av, bucket.chunkIdx);
     const idxAval = drawIdToIndexAval[drawId];
-    if (idxAval !== undefined) indexPool.release(arena.indices, idxAval);
+    if (idxAval !== undefined) indexPool.release(arena.indices, idxAval, bucket.chunkIdx);
     const atlasRel = bucket.localAtlasReleases[localSlot];
     if (atlasRel !== undefined) atlasRel();
     // Drop atlas-aval ref (if any). When the last ref is dropped we
@@ -3474,8 +3547,7 @@ export function buildHeapScene(
       if (allocDirty.size > 0) {
         for (const av of allocDirty) {
           pool.repack(device, arena.attrs, av, av.getValue(tok));
-          const e = pool.entry(av);
-          if (e !== undefined) totalDirtyBytes += e.dataBytes;
+          totalDirtyBytes += pool.totalDataBytes(av);
         }
         allocDirty.clear();
       }
@@ -3819,8 +3891,18 @@ export function buildHeapScene(
       let tilesChecked = 0, tilesBad = 0;
       let vidChecks = 0, vidBad = 0;
       const push = (s: string) => { if (issues.length < 60) issues.push(s); };
-      const arenaSize = arena.attrs.buffer.size;
-      const indicesSize = arena.indices.buffer.size;
+      // §3 v1: validateHeap currently only diagnoses chunk 0 — a
+      // multi-chunk-aware validator needs per-bucket-chunkIdx
+      // staging which is a bigger refactor; assert for now so
+      // multi-chunk callers don't get false-passes.
+      if (arena.attrs.chunkCount > 1 || arena.indices.chunkCount > 1) {
+        throw new Error(
+          "heapScene/validateHeap: multi-chunk arenas not yet supported by this validator (chunk-0-only). " +
+          "Run with the default chunk cap (no second chunk opened) for now.",
+        );
+      }
+      const arenaSize = arena.attrs.chunk(0).buffer.size;
+      const indicesSize = arena.indices.chunk(0).buffer.size;
 
       const enc = device.createCommandEncoder({ label: "validateHeap" });
       const stage = (src: GPUBuffer, size: number): GPUBuffer => {
@@ -3832,8 +3914,8 @@ export function buildHeapScene(
         return c;
       };
 
-      const arenaCopy = stage(arena.attrs.buffer, arenaSize);
-      const indicesCopy = indicesSize > 0 ? stage(arena.indices.buffer, indicesSize) : undefined;
+      const arenaCopy = stage(arena.attrs.chunk(0).buffer, arenaSize);
+      const indicesCopy = indicesSize > 0 ? stage(arena.indices.chunk(0).buffer, indicesSize) : undefined;
       type DC = {
         bucket: typeof buckets[number];
         drawHeap: GPUBuffer;
@@ -4122,8 +4204,12 @@ export function buildHeapScene(
       let emitsChecked = 0;
       const push = (s: string) => { if (issues.length < 30) issues.push(s); };
 
-      const arenaSize = arena.attrs.buffer.size;
-      const indicesSize = arena.indices.buffer.size;
+      // §3 v1: chunk-0-only like validateHeap.
+      if (arena.attrs.chunkCount > 1 || arena.indices.chunkCount > 1) {
+        throw new Error("heapScene/simulateDraws: multi-chunk arenas not yet supported (chunk-0-only).");
+      }
+      const arenaSize = arena.attrs.chunk(0).buffer.size;
+      const indicesSize = arena.indices.chunk(0).buffer.size;
 
       // Stage all buffers we'll need.
       const enc = device.createCommandEncoder({ label: "simulateDraws" });
@@ -4134,8 +4220,8 @@ export function buildHeapScene(
         enc.copyBufferToBuffer(src, 0, c, 0, size);
         return c;
       };
-      const arenaCopy = stage(arena.attrs.buffer, arenaSize);
-      const indicesCopy = indicesSize > 0 ? stage(arena.indices.buffer, indicesSize) : undefined;
+      const arenaCopy = stage(arena.attrs.chunk(0).buffer, arenaSize);
+      const indicesCopy = indicesSize > 0 ? stage(arena.indices.chunk(0).buffer, indicesSize) : undefined;
       type DC = {
         bucket: typeof buckets[number];
         drawHeap: GPUBuffer;
@@ -4405,19 +4491,25 @@ export function buildHeapScene(
       // cross-RO triangle symptom.
       const allocClaims: { ref: number; bytes: number; owner: string }[] = [];
 
+      // §3 v1: chunk-0-only (see validateHeap).
+      if (arena.attrs.chunkCount > 1 || arena.indices.chunkCount > 1) {
+        throw new Error("heapScene/checkTriangleCoherence: multi-chunk arenas not yet supported (chunk-0-only).");
+      }
+      const arenaBuf0 = arena.attrs.chunk(0).buffer;
+      const indicesBuf0 = arena.indices.chunk(0).buffer;
       // Stage arena + arena.indices once (shared across buckets).
       const arenaCopy = device.createBuffer({
-        size: arena.attrs.buffer.size,
+        size: arenaBuf0.size,
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
       });
-      const indicesCopy = arena.indices.buffer.size > 0 ? device.createBuffer({
-        size: arena.indices.buffer.size,
+      const indicesCopy = indicesBuf0.size > 0 ? device.createBuffer({
+        size: indicesBuf0.size,
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
       }) : undefined;
       {
         const enc = device.createCommandEncoder({ label: "checkTriangleCoherence.arena" });
-        enc.copyBufferToBuffer(arena.attrs.buffer, 0, arenaCopy, 0, arena.attrs.buffer.size);
-        if (indicesCopy !== undefined) enc.copyBufferToBuffer(arena.indices.buffer, 0, indicesCopy, 0, arena.indices.buffer.size);
+        enc.copyBufferToBuffer(arenaBuf0, 0, arenaCopy, 0, arenaBuf0.size);
+        if (indicesCopy !== undefined) enc.copyBufferToBuffer(indicesBuf0, 0, indicesCopy, 0, indicesBuf0.size);
         device.queue.submit([enc.finish()]);
       }
       await arenaCopy.mapAsync(GPUMapMode.READ);
@@ -4850,7 +4942,7 @@ export function buildHeapScene(
           { binding: 0, resource: { buffer: target.slots[0]!.drawTableBuf!.buffer } },
           { binding: 1, resource: { buffer: target.slots[0]!.firstDrawInTileBuf!.buffer } },
           { binding: 2, resource: { buffer: sampleBuf } },
-          { binding: 3, resource: { buffer: arena.indices.buffer } },
+          { binding: 3, resource: { buffer: arena.indices.chunk(target.chunkIdx).buffer } },
           { binding: 4, resource: { buffer: outBuf } },
           { binding: 5, resource: { buffer: paramBuf } },
         ],
@@ -4873,12 +4965,13 @@ export function buildHeapScene(
       sampleBuf.destroy(); outBuf.destroy(); paramBuf.destroy();
 
       // Read drawTable + indices for CPU expectation.
+      const idxBuf = arena.indices.chunk(target.chunkIdx).buffer;
       const indicesCopy2 = device.createBuffer({
-        size: arena.indices.buffer.size,
+        size: idxBuf.size,
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
       });
       const enc2 = device.createCommandEncoder();
-      enc2.copyBufferToBuffer(arena.indices.buffer, 0, indicesCopy2, 0, arena.indices.buffer.size);
+      enc2.copyBufferToBuffer(idxBuf, 0, indicesCopy2, 0, idxBuf.size);
       device.queue.submit([enc2.finish()]);
       await indicesCopy2.mapAsync(GPUMapMode.READ);
       const indicesU32 = new Uint32Array(indicesCopy2.getMappedRange().slice(0));
