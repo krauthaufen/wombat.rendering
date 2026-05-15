@@ -140,9 +140,13 @@ call path shipped.
   diagnostics throw on multi-chunk (chunk-0-only for now); the
   ref-tracing logic needs per-bucket-chunkIdx staging to handle
   the chunked case. Not blocking for production use.
-- Multi-chunk-aware `DerivedUniformsScene` — its main-heap
-  binding is currently fixed to chunk 0. ROs with derived
-  uniforms route to chunk 0 as a workaround.
+
+**Resolved follow-ups:**
+- ~~Multi-chunk-aware `DerivedUniformsScene`~~ — SHIPPED (0.18.1).
+  The scene now holds a `RecordsBuffer` per chunk + per-chunk
+  main-heap getters; `encode()` dispatches once per chunk binding
+  that chunk's buffer. `registerRoDerivations` takes
+  `chunkIdx`. addRO's "force chunk 0 for derived" guard removed.
 
 The body below is the original chunking sketch.
 

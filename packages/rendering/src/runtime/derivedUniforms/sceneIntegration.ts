@@ -1,15 +1,19 @@
 // §7 v2 — heap-scene integration.
 //
-// One DerivedUniformsScene per heap scene: owns the rule registry, the (single,
-// scene-wide) records buffer, the constituent-slots heap (df32 trafo halves), the
-// constituents GPU buffer, and the dispatcher. Per RO: flatten each rule against the
-// RO's rule set, register it, resolve every input leaf to a tagged slot handle
-// (constituent fwd/bwd / host drawHeader byte), and push one record.
+// One DerivedUniformsScene per heap scene: owns the rule registry, a per-chunk
+// records buffer (§3), the constituent-slots heap (df32 trafo halves, scene-
+// wide), the constituents GPU buffer, and the dispatcher.
+//
+// Multi-chunk (§3): each arena chunk has its own GPUBuffer for drawHeaders.
+// Derived-uniform records reference HostHeap slots by absolute byte offset
+// within ONE buffer — so a record must be bound to its bucket's chunk at
+// dispatch. We partition records by chunkIdx: one RecordsBuffer per chunk,
+// one dispatch per chunk binding that chunk's main heap.
 //
 // Per frame, inside the heap scene's `evaluateAlways(token, …)` scope:
 //   const dirty = scene.pullDirty(token);   // drains changed trafo avals (re-subscribes)
 //   scene.uploadDirty(dirty);               // O(changed) value uploads
-//   scene.encode(enc);                      // one compute dispatch
+//   scene.encode(enc);                      // one compute dispatch per chunk
 // Clean frames: zero CPU work, records buffer static.
 // See docs/derived-uniforms-extensible.md.
 
@@ -33,16 +37,20 @@ export class DerivedUniformsScene {
   readonly device: GPUDevice;
   readonly constituents: ConstituentSlots;
   readonly registry = new DerivedUniformRegistry();
-  /** Single scene-wide records buffer — all buckets share constituents AND the main heap, so per-bucket records would just multiply dispatch overhead. */
-  readonly records = new RecordsBuffer();
+  /** Per-chunk records buffers (§3). Constituents + registry are
+   *  scene-wide; records partition by chunk so each dispatch binds
+   *  the right chunk's main heap. */
+  private readonly recordsByChunk = new Map<number, RecordsBuffer>();
   readonly dispatcher: DerivedUniformsDispatcher;
   /** Constituents storage GPU buffer (`array<vec2<f32>>` — df32 mat4 halves). */
   constituentsBuf: GPUBuffer;
-  private readonly mainHeapRef: { current: GPUBuffer };
+  /** Per-chunk main-heap GPUBuffer getters. Populated as chunks are
+   *  registered via `setMainHeapForChunk` from the scene factory. */
+  private readonly mainHeapByChunk = new Map<number, () => GPUBuffer>();
   /** Bumped each time a shared GPU buffer is replaced. */
   bufferEpoch = 0;
 
-  constructor(device: GPUDevice, mainHeapBuf: GPUBuffer, opts?: DerivedUniformsSceneOptions) {
+  constructor(device: GPUDevice, opts?: DerivedUniformsSceneOptions) {
     this.device = device;
     const initial = opts?.initialConstituentSlots ?? 64;
     this.constituents = new ConstituentSlots(() => {}, initial);
@@ -51,15 +59,34 @@ export class DerivedUniformsScene {
       size: initial * DF32_MAT4_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
-    this.mainHeapRef = { current: mainHeapBuf };
     this.dispatcher = new DerivedUniformsDispatcher(device, {
       constituentsBuf: () => this.constituentsBuf,
-      mainHeapBuf: () => this.mainHeapRef.current,
     });
   }
 
-  rebindMainHeap(mainHeapBuf: GPUBuffer): void {
-    this.mainHeapRef.current = mainHeapBuf;
+  /** Register (or replace) the GPUBuffer getter for a chunk's main
+   *  heap. Called by the scene factory at construction and whenever
+   *  a new chunk opens or an existing chunk's buffer reallocates. */
+  setMainHeapForChunk(chunkIdx: number, getter: () => GPUBuffer): void {
+    this.mainHeapByChunk.set(chunkIdx, getter);
+  }
+
+  /** Get-or-create the records buffer for `chunkIdx`. */
+  recordsFor(chunkIdx: number): RecordsBuffer {
+    let r = this.recordsByChunk.get(chunkIdx);
+    if (r === undefined) {
+      r = new RecordsBuffer();
+      this.recordsByChunk.set(chunkIdx, r);
+    }
+    return r;
+  }
+
+  /** Total record count summed across every chunk's records buffer.
+   *  Used by the scene's stats / diagnostics. */
+  get totalRecordCount(): number {
+    let n = 0;
+    for (const r of this.recordsByChunk.values()) n += r.recordCount;
+    return n;
   }
 
   ensureConstituentsCapacity(requiredBytes: number): void {
@@ -102,9 +129,23 @@ export class DerivedUniformsScene {
     uploadConstituentsRange(this.device, this.constituentsBuf, this.constituents.cpuMirror, dirty);
   }
 
-  /** Run the uber-kernel. No-op if there are no records. */
+  /** Run the uber-kernel once per chunk that holds records. No-op
+   *  when no chunk has records. Each dispatch binds that chunk's
+   *  main heap buffer. */
   encode(enc: GPUCommandEncoder): boolean {
-    return this.dispatcher.encode(enc, this.registry, this.records);
+    let any = false;
+    for (const [chunkIdx, records] of this.recordsByChunk) {
+      if (records.recordCount === 0) continue;
+      const heapGetter = this.mainHeapByChunk.get(chunkIdx);
+      if (heapGetter === undefined) {
+        throw new Error(
+          `derivedUniforms.encode: no main-heap binding registered for chunkIdx=${chunkIdx}. ` +
+          `Call setMainHeapForChunk(idx, getter) when each chunk opens.`,
+        );
+      }
+      if (this.dispatcher.encodeChunk(enc, this.registry, records, heapGetter)) any = true;
+    }
+    return any;
   }
 
   dispose(): void {
@@ -126,6 +167,9 @@ export interface RoDerivedRequest {
   readonly outputOffset: (name: string) => number | undefined;
   /** Absolute byte offset of this RO's drawHeader within the main heap. */
   readonly drawHeaderBaseByte: number;
+  /** §3: which arena chunk this RO lives in. Records are partitioned
+   *  by chunk so each dispatch binds the right main-heap buffer. */
+  readonly chunkIdx: number;
 }
 
 export interface RoRegistration {
@@ -134,6 +178,8 @@ export interface RoRegistration {
   readonly constituentAvals: readonly aval<Trafo3d>[];
   /** Flattened-rule hashes — for `registry.release` on teardown. */
   readonly ruleHashes: readonly string[];
+  /** Chunk this registration was placed into — used by deregister. */
+  readonly chunkIdx: number;
 }
 
 export function registerRoDerivations(
@@ -141,7 +187,8 @@ export function registerRoDerivations(
   owner: object,
   req: RoDerivedRequest,
 ): RoRegistration {
-  if (req.rules.size === 0) return { owner, constituentAvals: [], ruleHashes: [] };
+  if (req.rules.size === 0) return { owner, constituentAvals: [], ruleHashes: [], chunkIdx: req.chunkIdx };
+  const records = scene.recordsFor(req.chunkIdx);
 
   const acquiredAvals: aval<Trafo3d>[] = [];
   const ruleHashes: string[] = [];
@@ -192,14 +239,14 @@ export function registerRoDerivations(
     if (outOff === undefined) {
       throw new Error(`derivedUniforms: no drawHeader slot for derived uniform '${outName}' on this RO`);
     }
-    scene.records.add(owner, id, makeHandle(SlotTag.HostHeap, req.drawHeaderBaseByte + outOff), inSlots);
+    records.add(owner, id, makeHandle(SlotTag.HostHeap, req.drawHeaderBaseByte + outOff), inSlots);
   }
   scene.ensureConstituentsCapacity(scene.constituents.slotCount * DF32_MAT4_BYTES);
-  return { owner, constituentAvals: acquiredAvals, ruleHashes };
+  return { owner, constituentAvals: acquiredAvals, ruleHashes, chunkIdx: req.chunkIdx };
 }
 
 export function deregisterRoDerivations(scene: DerivedUniformsScene, reg: RoRegistration): void {
-  scene.records.removeAllForOwner(reg.owner);
+  scene.recordsFor(reg.chunkIdx).removeAllForOwner(reg.owner);
   for (const h of reg.ruleHashes) scene.registry.release(h);
   for (const av of reg.constituentAvals) scene.constituents.release(av);
 }

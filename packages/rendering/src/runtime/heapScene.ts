@@ -1024,11 +1024,21 @@ export function buildHeapScene(
   // `enableDerivedUniforms: false` to opt out.
   const enableDerivedUniforms = opts.enableDerivedUniforms !== false;
   const derivedScene: DerivedUniformsScene | undefined = enableDerivedUniforms
-    ? new DerivedUniformsScene(device, arena.attrs.chunk(0).buffer, {
+    ? new DerivedUniformsScene(device, {
         // Larger initial capacity reduces grow-during-first-frame churn.
         initialConstituentSlots: 4096,
       })
     : undefined;
+  // §3: register each arena chunk's main-heap buffer with the
+  // derived-uniforms scene; refresh the binding when chunks open or
+  // a chunk's GrowBuffer reallocates.
+  if (derivedScene !== undefined) {
+    const wireChunk = (idx: number): void => {
+      derivedScene.setMainHeapForChunk(idx, () => arena.attrs.chunk(idx).buffer);
+    };
+    for (let i = 0; i < arena.attrs.chunkCount; i++) wireChunk(i);
+    arena.attrs.onChunkAdded(wireChunk);
+  }
   /** Per-RO §7 registration handles, keyed by global drawId.
    *  Drained on removeDraw to release slots + records. */
   const derivedByDrawId = new Map<number, RoRegistration>();
@@ -1686,12 +1696,11 @@ export function buildHeapScene(
         b.partitionScene.rebindSlotDrawBufs(b.slots.map(s => s.drawTableBuf!.buffer));
       }
     }
-    // §7: derivedScene's main-heap binding is currently fixed to
-    // chunk 0 (derived-uniform ROs must land there — see addRO's
-    // chunk-routing). Only rebind on chunk-0 resize.
-    if (resizedChunkIdx === 0 && derivedScene !== undefined) {
-      derivedScene.rebindMainHeap(arena.attrs.chunk(0).buffer);
-    }
+    // §7: each chunk's main-heap getter is registered via
+    // `derivedScene.setMainHeapForChunk` (at construction + on
+    // onChunkAdded). The getter returns the chunk's current
+    // GPUBuffer; the dispatcher's bind groups consult it per
+    // dispatch, so no explicit rebind needed here.
   });
   if (atlasPool !== undefined) {
     for (const f of ATLAS_PAGE_FORMATS) {
@@ -2817,39 +2826,26 @@ export function buildHeapScene(
     }
     // §3 chunk routing — pick which arena chunk this RO's allocations
     // land in. Preference order:
-    //   1. If the RO has derived-uniform inputs, FORCE chunk 0 — the
-    //      derivedScene currently binds chunk 0 as its main heap
-    //      (multi-chunk-aware derivedScene is a follow-up).
-    //   2. If any of the RO's bindings is an aval that's already
+    //   1. If any of the RO's bindings is an aval that's already
     //      allocated in some chunk via the uniform pool, prefer that
     //      chunk to avoid duplication.
-    //   3. Otherwise, use the newest open chunk (highest chunkIdx).
+    //   2. Otherwise, use the newest open chunk (highest chunkIdx).
     //      ChunkedArena.alloc spills to the next chunk automatically
     //      when this one is full; the spill ends up driving the
     //      pool's `finalChunk` selection so all of the RO's
     //      allocations land in one chunk consistently.
     let chunkIdx: number;
     {
-      let forced = -1;
-      if (derivedScene !== undefined) {
-        for (const name of Object.keys(spec.inputs)) {
-          if (ruleForUniform(spec, name) !== undefined) { forced = 0; break; }
+      let preferred: number | undefined;
+      for (const [, val] of Object.entries(spec.inputs)) {
+        const av = (typeof val === "object" && val !== null && "getValue" in (val as object))
+          ? (val as aval<unknown>) : undefined;
+        if (av !== undefined) {
+          const where = pool.firstChunkContaining(av);
+          if (where !== undefined) { preferred = where; break; }
         }
       }
-      if (forced < 0) {
-        let preferred: number | undefined;
-        for (const [, val] of Object.entries(spec.inputs)) {
-          const av = (typeof val === "object" && val !== null && "getValue" in (val as object))
-            ? (val as aval<unknown>) : undefined;
-          if (av !== undefined) {
-            const where = pool.firstChunkContaining(av);
-            if (where !== undefined) { preferred = where; break; }
-          }
-        }
-        chunkIdx = preferred ?? Math.max(0, arena.attrs.chunkCount - 1);
-      } else {
-        chunkIdx = forced;
-      }
+      chunkIdx = preferred ?? Math.max(0, arena.attrs.chunkCount - 1);
     }
     const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, chunkIdx, precomputedDescriptor);
     // Phase 5c.3 — every RO carrying a derived-mode rule is registered
@@ -3189,16 +3185,13 @@ export function buildHeapScene(
         const reg = registerRoDerivations(derivedScene, {}, {
           rules: ruleSubset,
           trafoAvals,
-          // A non-trafo rule leaf reads the uniform's data straight from this RO's
-          // drawHeader region in the arena (= its pool ref + the alloc-header pad).
-          // Only resolvable if the uniform was actually packed (i.e. it's a drawHeader
-          // field of the effect too) — undefined otherwise, which `resolveSource` rejects.
           hostUniformOffset: (n) => {
             const r = perDrawRefs.get(n);
             return r === undefined ? undefined : r + ALLOC_HEADER_PAD_TO;
           },
           outputOffset: (n) => outOffsetByName.get(n),
           drawHeaderBaseByte: 0,
+          chunkIdx: bucket.chunkIdx,
         });
         derivedByDrawId.set(drawId, reg);
       }
@@ -3713,7 +3706,7 @@ export function buildHeapScene(
       stats.derivedPullMs   = _t1 - _t0;
       stats.derivedUploadMs = _t2 - _t1;
       stats.derivedEncodeMs = _t3 - _t2;
-      stats.derivedRecords  = derivedScene.records.recordCount;
+      stats.derivedRecords  = derivedScene.totalRecordCount;
     }
     let anyDirty = false;
     outer: for (const b of buckets) {

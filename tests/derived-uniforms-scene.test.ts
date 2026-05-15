@@ -26,6 +26,7 @@ function req(overrides: Partial<RoDerivedRequest> & Pick<RoDerivedRequest, "rule
     hostUniformOffset: () => undefined,
     outputOffset: (n) => OUT.get(n),
     drawHeaderBaseByte: 1024,
+    chunkIdx: 0,
     ...overrides,
   };
 }
@@ -35,7 +36,7 @@ const OUT = new Map<string, number>([
 
 describe("derived-uniforms: sceneIntegration", () => {
   it("registers a 2-matmul rule: one record, two constituent input slots, output to drawHeader", () => {
-    const scene = new DerivedUniformsScene(fakeDevice(), fakeBuf());
+    const scene = new DerivedUniformsScene(fakeDevice());
     const view = fakeAval(), model = fakeAval();
     const rules = new Map<string, DerivedRule>([["ViewProjTrafo", ruleFromIR(mul(u("View"), u("Model")))]]);
     const ro = {};
@@ -43,9 +44,9 @@ describe("derived-uniforms: sceneIntegration", () => {
       rules,
       trafoAvals: new Map([["View", view], ["Model", model]]),
     }));
-    expect(scene.records.recordCount).toBe(1);
-    const s = scene.records.strideWords;
-    const rec = Array.from(scene.records.data.subarray(0, s));
+    expect(scene.recordsFor(0).recordCount).toBe(1);
+    const s = scene.recordsFor(0).strideWords;
+    const rec = Array.from(scene.recordsFor(0).data.subarray(0, s));
     // [rule_id, out_handle, in0, in1, pad]
     expect(handleTag(rec[1]!)).toBe(SlotTag.HostHeap);
     expect(handlePayload(rec[1]!)).toBe(1024 + 128); // drawHeaderBaseByte + outputOffset("ViewProjTrafo")
@@ -56,12 +57,12 @@ describe("derived-uniforms: sceneIntegration", () => {
   });
 
   it("Inverse(trafo) leaf resolves to the trafo's backward (.inv) constituent slot", () => {
-    const scene = new DerivedUniformsScene(fakeDevice(), fakeBuf());
+    const scene = new DerivedUniformsScene(fakeDevice());
     const model = fakeAval();
     const rules = new Map<string, DerivedRule>([["ModelTrafoInv", ruleFromIR(inv(u("Model")))]]);
     registerRoDerivations(scene, {}, req({ rules, trafoAvals: new Map([["Model", model]]) }));
-    const s = scene.records.strideWords;
-    const rec = Array.from(scene.records.data.subarray(0, s));
+    const s = scene.recordsFor(0).strideWords;
+    const rec = Array.from(scene.recordsFor(0).data.subarray(0, s));
     expect(handleTag(rec[2]!)).toBe(SlotTag.Constituent);
     // ConstituentSlots allocates fwd then inv adjacently; inv === fwd + 1.
     const fwd = handlePayload(rec[2]!) - 1; // the inv slot we got back
@@ -69,7 +70,7 @@ describe("derived-uniforms: sceneIntegration", () => {
   });
 
   it("flattens a chained rule (MVP from ViewProj·Model) before registering", () => {
-    const scene = new DerivedUniformsScene(fakeDevice(), fakeBuf());
+    const scene = new DerivedUniformsScene(fakeDevice());
     const rules = new Map<string, DerivedRule>([
       ["ViewProjTrafo", ruleFromIR(mul(u("Proj"), u("View")))],
       ["ModelViewProjTrafo", ruleFromIR(mul(u("ViewProjTrafo"), u("Model")))],
@@ -78,13 +79,13 @@ describe("derived-uniforms: sceneIntegration", () => {
       rules,
       trafoAvals: new Map([["Proj", fakeAval()], ["View", fakeAval()], ["Model", fakeAval()]]),
     }));
-    expect(scene.records.recordCount).toBe(2);
+    expect(scene.recordsFor(0).recordCount).toBe(2);
     expect(scene.registry.size).toBe(2);
     // The MVP record must reference a 3-input flattened rule (Proj, View, Model), all constituents.
-    const s = scene.records.strideWords;
+    const s = scene.recordsFor(0).strideWords;
     let mvp: number[] | undefined;
     for (let i = 0; i < 2; i++) {
-      const r = Array.from(scene.records.data.subarray(i * s, i * s + s));
+      const r = Array.from(scene.recordsFor(0).data.subarray(i * s, i * s + s));
       if (scene.registry.get(r[0]!)!.inputs.length === 3) mvp = r;
     }
     expect(mvp).toBeDefined();
@@ -94,15 +95,15 @@ describe("derived-uniforms: sceneIntegration", () => {
   });
 
   it("resolves a non-trafo leaf to a host drawHeader byte offset", () => {
-    const scene = new DerivedUniformsScene(fakeDevice(), fakeBuf());
+    const scene = new DerivedUniformsScene(fakeDevice());
     const rules = new Map<string, DerivedRule>([["ModelViewProjTrafo", ruleFromIR(mul(u("SomeHostMat"), u("Model")))]]);
     registerRoDerivations(scene, {}, req({
       rules,
       trafoAvals: new Map([["Model", fakeAval()]]),
       hostUniformOffset: (n) => (n === "SomeHostMat" ? 32 : undefined),
     }));
-    const s = scene.records.strideWords;
-    const rec = Array.from(scene.records.data.subarray(0, s));
+    const s = scene.recordsFor(0).strideWords;
+    const rec = Array.from(scene.recordsFor(0).data.subarray(0, s));
     // in0 = SomeHostMat (host heap), in1 = ModelTrafo (constituent)
     expect(handleTag(rec[2]!)).toBe(SlotTag.HostHeap);
     expect(handlePayload(rec[2]!)).toBe(1024 + 32);
@@ -110,7 +111,7 @@ describe("derived-uniforms: sceneIntegration", () => {
   });
 
   it("deregister removes all of an RO's records and releases its constituents", () => {
-    const scene = new DerivedUniformsScene(fakeDevice(), fakeBuf());
+    const scene = new DerivedUniformsScene(fakeDevice());
     const ro = {};
     const reg = registerRoDerivations(scene, ro, req({
       rules: new Map([
@@ -119,13 +120,13 @@ describe("derived-uniforms: sceneIntegration", () => {
       ]),
       trafoAvals: new Map([["Model", fakeAval()], ["Proj", fakeAval()], ["View", fakeAval()]]),
     }));
-    expect(scene.records.recordCount).toBe(2);
+    expect(scene.recordsFor(0).recordCount).toBe(2);
     deregisterRoDerivations(scene, reg);
-    expect(scene.records.recordCount).toBe(0);
+    expect(scene.recordsFor(0).recordCount).toBe(0);
   });
 
   it("throws when a rule references an input the RO can't supply", () => {
-    const scene = new DerivedUniformsScene(fakeDevice(), fakeBuf());
+    const scene = new DerivedUniformsScene(fakeDevice());
     expect(() =>
       registerRoDerivations(scene, {}, req({
         rules: new Map([["ModelTrafo", ruleFromIR(u("Mystery"))]]),

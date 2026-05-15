@@ -32,12 +32,13 @@ export function uploadConstituentsRange(
   device.queue.writeBuffer(buf, startByte, mirror.buffer, mirror.byteOffset + startByte, endByte - startByte);
 }
 
-/** Live getters for the GPU buffers the kernel binds (scene may grow/replace them). */
+/** Live getters for the scene-wide GPU buffers the kernel binds. The
+ *  main-heap binding is per-dispatch and supplied to `encodeChunk`,
+ *  since one DerivedUniformsScene now serves multiple arena chunks
+ *  (§3) and each chunk has its own main-heap GPUBuffer. */
 export interface DerivedUniformsResources {
   /** `array<vec2<f32>>` — df32 trafo halves (the constituents heap). */
   readonly constituentsBuf: () => GPUBuffer;
-  /** `array<f32>` — the main heap (drawHeaders); written by the kernel. */
-  readonly mainHeapBuf: () => GPUBuffer;
 }
 
 function bglEntries(): GPUBindGroupLayoutEntry[] {
@@ -145,57 +146,83 @@ class UberPipeline {
   }
 }
 
+/** Per-chunk dispatch state: GPU mirror of that chunk's records +
+ *  a cached bind group keyed on (consts, heap, recs). */
+interface ChunkState {
+  readonly gpu: RecordsGpu;
+  cachedBg: GPUBindGroup | undefined;
+  bgKey: [GPUBuffer | undefined, GPUBuffer | undefined, GPUBuffer | undefined];
+}
+
 export class DerivedUniformsDispatcher {
   private readonly device: GPUDevice;
   private readonly resources: DerivedUniformsResources;
-  private readonly gpu: RecordsGpu;
   private readonly pipe: UberPipeline;
-  private cachedBg: GPUBindGroup | undefined;
-  private bgKey: [GPUBuffer | undefined, GPUBuffer | undefined, GPUBuffer | undefined] = [undefined, undefined, undefined];
+  private readonly byChunk = new Map<RecordsBuffer, ChunkState>();
 
   constructor(device: GPUDevice, resources: DerivedUniformsResources) {
     this.device = device;
     this.resources = resources;
-    this.gpu = new RecordsGpu(device);
     this.pipe = new UberPipeline(device);
   }
 
-  /** Open a compute pass and run the uber-kernel. No-ops if there are no records / no rules. */
-  encode(enc: GPUCommandEncoder, registry: DerivedUniformRegistry, records: RecordsBuffer): boolean {
+  /** Run the uber-kernel for ONE chunk's records, binding
+   *  `mainHeapGetter()` as the heap target. No-op if the chunk's
+   *  records buffer is empty or the registry has no rules. */
+  encodeChunk(
+    enc: GPUCommandEncoder,
+    registry: DerivedUniformRegistry,
+    records: RecordsBuffer,
+    mainHeapGetter: () => GPUBuffer,
+  ): boolean {
     if (records.recordCount === 0) return false;
     const pipeline = this.pipe.pipeline(registry, records.strideWords);
     if (pipeline === undefined) return false;
-    this.gpu.sync(records);
+    const state = this.stateFor(records);
+    state.gpu.sync(records);
     const pass = enc.beginComputePass({ label: "derivedUniforms.uber" });
     pass.setPipeline(pipeline);
-    pass.setBindGroup(0, this.bindGroup());
+    pass.setBindGroup(0, this.bindGroup(state, mainHeapGetter()));
     pass.dispatchWorkgroups(Math.ceil(records.recordCount / 64));
     pass.end();
     return true;
   }
 
   dispose(): void {
-    this.gpu.dispose();
+    for (const s of this.byChunk.values()) s.gpu.dispose();
+    this.byChunk.clear();
   }
 
-  private bindGroup(): GPUBindGroup {
-    const consts = this.resources.constituentsBuf();
-    const heap = this.resources.mainHeapBuf();
-    const recs = this.gpu.buffer();
-    if (this.cachedBg !== undefined && this.bgKey[0] === consts && this.bgKey[1] === heap && this.bgKey[2] === recs) {
-      return this.cachedBg;
+  private stateFor(records: RecordsBuffer): ChunkState {
+    let s = this.byChunk.get(records);
+    if (s === undefined) {
+      s = {
+        gpu: new RecordsGpu(this.device),
+        cachedBg: undefined,
+        bgKey: [undefined, undefined, undefined],
+      };
+      this.byChunk.set(records, s);
     }
-    this.cachedBg = this.device.createBindGroup({
+    return s;
+  }
+
+  private bindGroup(state: ChunkState, heap: GPUBuffer): GPUBindGroup {
+    const consts = this.resources.constituentsBuf();
+    const recs = state.gpu.buffer();
+    if (state.cachedBg !== undefined && state.bgKey[0] === consts && state.bgKey[1] === heap && state.bgKey[2] === recs) {
+      return state.cachedBg;
+    }
+    state.cachedBg = this.device.createBindGroup({
       label: "derivedUniforms.uber",
       layout: this.pipe.bgl,
       entries: [
         { binding: 0, resource: { buffer: consts } },
         { binding: 1, resource: { buffer: heap } },
         { binding: 2, resource: { buffer: recs } },
-        { binding: 3, resource: { buffer: this.gpu.countBuf } },
+        { binding: 3, resource: { buffer: state.gpu.countBuf } },
       ],
     });
-    this.bgKey = [consts, heap, recs];
-    return this.cachedBg;
+    state.bgKey = [consts, heap, recs];
+    return state.cachedBg;
   }
 }
