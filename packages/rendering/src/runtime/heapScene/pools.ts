@@ -297,15 +297,29 @@ export class AttributeArena {
    * Allocate space for one attribute. Returns the byte ref (offset
    * to the header — data lives at ref + 16).
    */
-  alloc(dataBytes: number): number {
+  /** Non-throwing alloc — returns `undefined` when the request
+   *  would exceed the underlying GrowBuffer's `maxCapacity` cap.
+   *  Used by `ChunkedAttributeArena` to probe before spilling to
+   *  the next chunk. */
+  tryAlloc(dataBytes: number): number | undefined {
     const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
     const reused = this.freelist.alloc(allocBytes);
     if (reused !== undefined) return reused;
-    const ref = this.cursor;
-    this.cursor += allocBytes;
-    this.buf.ensureCapacity(this.cursor);
-    this.buf.setUsed(this.cursor);
-    return ref;
+    const next = this.cursor + allocBytes;
+    if (next > this.buf.maxCapacity) return undefined;
+    this.cursor = next;
+    this.buf.ensureCapacity(next);
+    this.buf.setUsed(next);
+    return next - allocBytes;
+  }
+  alloc(dataBytes: number): number {
+    const r = this.tryAlloc(dataBytes);
+    if (r === undefined) {
+      throw new Error(
+        `AttributeArena: allocation of ${dataBytes}B (with header alignment) exceeds chunk cap`,
+      );
+    }
+    return r;
   }
   release(ref: number, dataBytes: number): void {
     const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
@@ -364,14 +378,25 @@ export class IndexAllocator {
     this.dirtyMin = Infinity;
     this.dirtyMax = 0;
   }
-  alloc(elements: number): number {
+  /** Non-throwing alloc — returns `undefined` when the request
+   *  would exceed the underlying GrowBuffer's `maxCapacity` cap.
+   *  Used by `ChunkedIndexAllocator` to probe before spilling. */
+  tryAlloc(elements: number): number | undefined {
     const reused = this.freelist.alloc(elements);
     if (reused !== undefined) return reused;
-    const off = this.cursor;
-    this.cursor += elements;
-    this.buf.ensureCapacity(this.cursor * 4);
-    this.buf.setUsed(this.cursor * 4);
-    return off;
+    const nextElts = this.cursor + elements;
+    if (nextElts * 4 > this.buf.maxCapacity) return undefined;
+    this.cursor = nextElts;
+    this.buf.ensureCapacity(nextElts * 4);
+    this.buf.setUsed(nextElts * 4);
+    return nextElts - elements;
+  }
+  alloc(elements: number): number {
+    const r = this.tryAlloc(elements);
+    if (r === undefined) {
+      throw new Error(`IndexAllocator: allocation of ${elements} elements exceeds chunk cap`);
+    }
+    return r;
   }
   release(off: number, elements: number): void {
     this.freelist.release(off, elements);
