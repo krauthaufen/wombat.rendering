@@ -68,6 +68,22 @@ export interface RenderObject {
   readonly indices?: BufferView;
   readonly drawCall: aval<DrawCall>;
   /**
+   * Optional gate: when `active` ticks to `false`, the runtime must
+   * skip drawing this RO this frame **without** releasing pool
+   * allocations or evicting it from the scene. When it ticks back
+   * to `true`, the existing data renders again (no re-upload, no
+   * re-bucket). Designed for streaming workloads (e.g. 3D Tiles
+   * LOD walkers) where the same tile flips in and out of view
+   * many times per second — full add/remove cycles would churn
+   * arena pool entries pointlessly.
+   *
+   * Omit (or pass a constant `true`) for always-drawn ROs; the
+   * runtime takes a fast path when this is structurally constant.
+   * Constant `false` ⇒ the RO is effectively excluded from the
+   * scene at compile time (no allocations, no draw).
+   */
+  readonly active?: aval<boolean>;
+  /**
    * Per-axis derived-mode rules — `(u, declared) => modeValue`
    * closures evaluated against this RO's uniforms at scene-build
    * (and on reactive marks). See

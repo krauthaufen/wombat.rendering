@@ -124,6 +124,14 @@ export interface HybridScene {
    * pipelineState. Useful for status / dev-overlay text.
    */
   heapBucketCount(): number;
+  /** DEBUG: outstanding live ROs in the heap path. */
+  heapTotalDraws(): number;
+  /** DEBUG: cumulative addDraw invocations on the heap scene. */
+  __addDrawCalls(): number;
+  /** DEBUG: cumulative removeDraw invocations on the heap scene. */
+  __removeDrawCalls(): number;
+  /** DEBUG: current legacy-path RO count. */
+  __legacyCount(): number;
   /** Per-frame breakdown of §7 derived-uniforms work (CPU). */
   heapDerivedTimings(): {
     pullMs: number; uploadMs: number; encodeMs: number; records: number;
@@ -211,6 +219,7 @@ export function compileHybridScene(
   // comments) — the pool is wired here so the next PR can add Tier-S
   // classification without touching this file.
   const atlasPool = new AtlasPool(device);
+  (globalThis as { __atlasDebug?: AtlasPool }).__atlasDebug = atlasPool;
 
   // ─── Heap subset → HeapDrawSpec aset ─────────────────────────────
   // Memoize the adapter: aset removal must identify the SAME spec
@@ -267,6 +276,20 @@ export function compileHybridScene(
     },
     heapBucketCount(): number {
       return heapScene.stats.groups;
+    },
+    heapTotalDraws(): number {
+      return heapScene.stats.totalDraws;
+    },
+    __addDrawCalls(): number {
+      const fn = (heapScene as unknown as { __addDrawCalls?: () => number }).__addDrawCalls;
+      return fn ? fn() : -1;
+    },
+    __removeDrawCalls(): number {
+      const fn = (heapScene as unknown as { __removeDrawCalls?: () => number }).__removeDrawCalls;
+      return fn ? fn() : -1;
+    },
+    __legacyCount(): number {
+      return scenePass.collect().length;
     },
     heapDerivedTimings() {
       const s = heapScene.stats;

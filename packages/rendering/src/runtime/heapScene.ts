@@ -439,6 +439,18 @@ export interface HeapDrawSpec {
    */
   readonly instanceCount?: aval<number> | number;
   /**
+   * Optional visibility gate. When ticks to `false`, this RO emits
+   * 0 vertices that frame — its drawTable record gets effective
+   * `indexCount = 0`, the scan kernel's prefix sum skips past it,
+   * and no fragment shader invocations fire. Pool allocations,
+   * arena uploads, and bucket membership all stay intact, so the
+   * `true → false → true` round-trip is a pair of small drawTable
+   * writes plus a scan-pass re-issue — no `addDraw`/`removeDraw`
+   * churn. Designed for `<Sg Active={cval}>` driven by LOD walkers
+   * that flip many tiles per camera move.
+   */
+  readonly active?: aval<boolean>;
+  /**
    * Index buffer for this draw. Indices live in their own `INDEX`-
    * usage `GPUBuffer` (WebGPU forces this), separate from the arena.
    */
@@ -773,6 +785,90 @@ export function buildHeapScene(
    */
   const modeAvalToDrawIds  = new Map<aval<unknown>, Set<number>>();
   const modeAvalCallbacks  = new Map<aval<unknown>, IDisposable>();
+
+  // ─── HeapDrawSpec.active subscription ────────────────────────────────
+  // Per-drawId state for the "skip without re-allocating" path. When a
+  // tile (or any RO) flips visibility many times per second (e.g. an
+  // LOD walker culling/uncrossing the frustum), pool churn would be
+  // prohibitive. Instead we keep the RO in the bucket and flip its
+  // drawTable record's `indexCount` field between the original count
+  // (visible) and 0 (hidden). The scan kernel's prefix sum naturally
+  // skips a record with 0 emit count, so this costs one drawTable
+  // write + a re-scan dispatch — no arena/freelist activity.
+  const drawIdToActiveAval = new Map<number, aval<boolean>>();
+  const drawIdToOrigIndexCount = new Map<number, number>();
+  const drawIdToActiveCallback = new Map<number, IDisposable>();
+  const activeAvalToDrawIds = new Map<aval<boolean>, Set<number>>();
+  const activeDirty = new Set<number>();
+
+  function subscribeActive(av: aval<boolean>, drawId: number): void {
+    let set = activeAvalToDrawIds.get(av);
+    if (set === undefined) {
+      set = new Set<number>();
+      activeAvalToDrawIds.set(av, set);
+    }
+    set.add(drawId);
+    const cb = addMarkingCallback(av, () => { activeDirty.add(drawId); });
+    drawIdToActiveCallback.set(drawId, cb);
+  }
+
+  function unsubscribeActive(drawId: number): void {
+    const av = drawIdToActiveAval.get(drawId);
+    if (av === undefined) return;
+    const cb = drawIdToActiveCallback.get(drawId);
+    cb?.dispose();
+    drawIdToActiveCallback.delete(drawId);
+    const set = activeAvalToDrawIds.get(av);
+    if (set !== undefined) {
+      set.delete(drawId);
+      if (set.size === 0) activeAvalToDrawIds.delete(av);
+    }
+    drawIdToActiveAval.delete(drawId);
+    drawIdToOrigIndexCount.delete(drawId);
+    activeDirty.delete(drawId);
+  }
+
+  /** Update the drawTable record's effective indexCount in place
+   *  (GPU-routed: masterShadow + partition re-dispatch; legacy:
+   *  drawTableShadow + scan re-dispatch). Common helper used by the
+   *  active-aval drain in `update()`. */
+  function setEffectiveIndexCount(drawId: number, newIndexCount: number): void {
+    const bucket = drawIdToBucket[drawId];
+    if (bucket === undefined) return;
+    if (bucket.gpuRouted) {
+      const partition = bucket.partitionScene!;
+      const recIdx = bucket.drawIdToRecord!.get(drawId);
+      if (recIdx === undefined) return;
+      const ru32 = partition.recordU32;
+      const oldIndexCount = partition.masterShadow[recIdx * ru32 + 3]!;
+      const instanceCount = partition.masterShadow[recIdx * ru32 + 4]!;
+      partition.masterShadow[recIdx * ru32 + 3] = newIndexCount >>> 0;
+      const delta = (newIndexCount - oldIndexCount) * instanceCount;
+      bucket.partitionDirty = true;
+      for (const s of bucket.slots) {
+        s.totalEmitEstimate = Math.max(0, s.totalEmitEstimate + delta);
+        s.scanDirty = true;
+      }
+    } else {
+      const slotIdx = drawIdToSlotIdx[drawId];
+      const slot = slotIdx !== undefined ? bucket.slots[slotIdx] : bucket.slots[0];
+      if (slot === undefined) return;
+      const localSlot = drawIdToLocalSlot[drawId];
+      if (localSlot === undefined) return;
+      const recIdx = slot.slotToRecord[localSlot];
+      if (recIdx === undefined || recIdx < 0) return;
+      const shadow = slot.drawTableShadow!;
+      const oldIndexCount = shadow[recIdx * RECORD_U32 + 3]!;
+      const instanceCount = shadow[recIdx * RECORD_U32 + 4]!;
+      shadow[recIdx * RECORD_U32 + 3] = newIndexCount >>> 0;
+      const byteOff = recIdx * RECORD_BYTES + 3 * 4;
+      if (byteOff < slot.drawTableDirtyMin) slot.drawTableDirtyMin = byteOff;
+      if (byteOff + 4 > slot.drawTableDirtyMax) slot.drawTableDirtyMax = byteOff + 4;
+      const delta = (newIndexCount - oldIndexCount) * instanceCount;
+      slot.totalEmitEstimate = Math.max(0, slot.totalEmitEstimate + delta);
+      slot.scanDirty = true;
+    }
+  }
 
   function subscribeModeLeaf(av: aval<unknown>, drawId: number): void {
     let set = modeAvalToDrawIds.get(av);
@@ -2785,6 +2881,11 @@ export function buildHeapScene(
   // inside a single outer evaluateAlways and invoke addDrawImpl
   // directly with their token — collapsing 1000× nested
   // evaluateAlways into 1× outer.
+  // DEBUG counters.
+  let __addDrawCalls = 0;
+  let __removeDrawCalls = 0;
+  (sceneObj as unknown as { __addDrawCalls: () => number }).__addDrawCalls = () => __addDrawCalls;
+  (sceneObj as unknown as { __removeDrawCalls: () => number }).__removeDrawCalls = () => __removeDrawCalls;
   function addDraw(spec: HeapDrawSpec): number {
     let id = -1;
     sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
@@ -2793,6 +2894,7 @@ export function buildHeapScene(
     return id;
   }
   function addDrawImpl(spec: HeapDrawSpec, outerTok: AdaptiveToken): number {
+    __addDrawCalls++;
     const drawId = nextDrawId++;
     // Family-merge (slice 3c): build the family lazily from this
     // single spec when no batched lazy-build occurred earlier (e.g.
@@ -2991,6 +3093,51 @@ export function buildHeapScene(
     packBucketHeader(bucket, localSlot, perDrawRefs, layoutId);
     if (bucket.isAtlasBucket && spec.textures !== undefined && spec.textures.kind === "atlas") {
       packAtlasTextureFields(bucket, localSlot, spec.textures);
+      // Pair this addDraw with one atlas refcount bump. The spec's
+      // release closure (stored below, fired in removeDraw) decrements
+      // exactly once per add/remove cycle; without this incRef the
+      // refcount underflows when the same cached spec is re-introduced
+      // across multiple aset add/remove cycles (e.g., a tile flipping
+      // in and out of the heap-eligible subset).
+      //
+      // Falls back to a full re-acquire if the entry was already
+      // evicted (incRef returns false): in that case the spec's stored
+      // (pageId, origin, size) are stale and the new acquire's values
+      // overwrite them before packAtlasTextureFields is re-called.
+      if (atlasPool !== undefined) {
+        const ok = atlasPool.incRef(spec.textures.poolRef);
+        if (!ok) {
+          // Entry was evicted while the cached spec was idle in heap-
+          // remove state. Acquire a fresh sub-rect, redirect the spec
+          // (and the per-aval cell behind its release closure) to the
+          // new ref, and re-emit the drawHeader fields.
+          const acq = atlasPool.acquire(
+            spec.textures.page.format,
+            spec.textures.sourceAval as aval<ITexture>,
+            spec.textures.size.x, spec.textures.size.y,
+            { wantsMips: spec.textures.numMips > 1 },
+          );
+          (spec.textures as { pageId: number }).pageId = acq.pageId;
+          (spec.textures as { origin: V2f }).origin = acq.origin;
+          (spec.textures as { size: V2f }).size = acq.size;
+          (spec.textures as { numMips: number }).numMips = acq.numMips;
+          (spec.textures as { page: AtlasPage }).page = acq.page;
+          (spec.textures as { poolRef: number }).poolRef = acq.ref;
+          // The release closure captures a per-aval cell whose `ref`
+          // must track the LATEST acquired sub-rect; otherwise the
+          // closure releases a long-evicted ref (no-op leak).
+          if (spec.textures.repack !== undefined) {
+            // repack updates the per-aval cell to the new ref as a
+            // side effect of its own atlas-mark drain path. Re-using
+            // it here would free the entry we just acquired; instead
+            // mirror the same effect with a tiny helper attached to
+            // the spec at adapter time (`__retarget`).
+          }
+          const retarget = (spec.textures as unknown as { __retarget?: (ref: number) => void }).__retarget;
+          if (retarget !== undefined) retarget(acq.ref);
+          packAtlasTextureFields(bucket, localSlot, spec.textures);
+        }
+      }
       bucket.localAtlasReleases[localSlot] = spec.textures.release;
       bucket.localAtlasTextures[localSlot] = spec.textures;
       // Reactivity wire-up: subscribe to `sourceAval` (so sceneObj.inputChanged
@@ -3099,6 +3246,23 @@ export function buildHeapScene(
     drawIdToSlotIdx[drawId]   = roSlotIdx;
     drawIdToIndexAval[drawId] = indicesAval;
 
+    // ─── HeapDrawSpec.active wire-up ──────────────────────────────────
+    // Track the visibility aval (if any) and apply its initial value
+    // immediately. After this point, ticks on the aval are routed via
+    // `subscribeActive` → `activeDirty` and drained in `update()`.
+    if (spec.active !== undefined) {
+      drawIdToActiveAval.set(drawId, spec.active);
+      drawIdToOrigIndexCount.set(drawId, idxAlloc.count);
+      const initial = spec.active.getValue(outerTok);
+      subscribeActive(spec.active, drawId);
+      if (initial === false) {
+        // Apply the off state synchronously so the very first frame
+        // already skips this RO (no flash of un-gated geometry while
+        // we wait for the next update tick).
+        setEffectiveIndexCount(drawId, 0);
+      }
+    }
+
     // ─── Reactive rebucket: track PS-modeKey changes ────────────────
     // When any mode-axis aval marks (e.g. cullCval.value = 'front'),
     // schedule this RO for rebucket on the next update(). Today's
@@ -3203,9 +3367,13 @@ export function buildHeapScene(
   }
 
   function removeDraw(drawId: number): void {
+    __removeDrawCalls++;
     const bucket    = drawIdToBucket[drawId];
     const localSlot = drawIdToLocalSlot[drawId];
     if (bucket === undefined || localSlot === undefined) return;
+    // Tear down `active` subscription (if any) so its callback won't
+    // fire after the underlying drawTable record is gone.
+    unsubscribeActive(drawId);
     // §7: deregister this RO's derivation records and release slots.
     if (derivedScene !== undefined) {
       const reg = derivedByDrawId.get(drawId);
@@ -3218,9 +3386,15 @@ export function buildHeapScene(
       const partition = bucket.partitionScene!;
       const recIdx = bucket.drawIdToRecord!.get(drawId);
       const removedEntry = bucket.localEntries[localSlot];
-      const removedCount = removedEntry !== undefined
-        ? removedEntry.indexCount * removedEntry.instanceCount
-        : 0;
+      // Read the EFFECTIVE indexCount from masterShadow (already 0 for
+      // an inactive draw via setEffectiveIndexCount). Using the original
+      // count from localEntries would double-subtract for inactive draws
+      // (whose contribution was already removed when active flipped false).
+      const effectiveIndexCount = recIdx !== undefined
+        ? partition.masterShadow[recIdx * partition.recordU32 + 3]!
+        : (removedEntry?.indexCount ?? 0);
+      const instanceCount = removedEntry?.instanceCount ?? 0;
+      const removedCount = effectiveIndexCount * instanceCount;
       if (recIdx !== undefined) {
         const moved = partition.removeRecord(recIdx);
         if (moved >= 0) {
@@ -3247,9 +3421,15 @@ export function buildHeapScene(
       const slotIdx = drawIdToSlotIdx[drawId];
       const slot = slotIdx !== undefined ? bucket.slots[slotIdx]! : bucket.slots[0]!;
       const removedEntry = bucket.localEntries[localSlot];
-      const removedCount = removedEntry !== undefined
-        ? removedEntry.indexCount * removedEntry.instanceCount
-        : 0;
+      const localSlotRec = slot.slotToRecord[localSlot];
+      // Effective (post-active) indexCount, read from shadow so that
+      // inactive draws contribute 0 here (their contribution was
+      // already removed when active flipped false).
+      const effectiveIndexCount = localSlotRec !== undefined && localSlotRec >= 0
+        ? slot.drawTableShadow![localSlotRec * RECORD_U32 + 3]!
+        : (removedEntry?.indexCount ?? 0);
+      const instanceCount = removedEntry?.instanceCount ?? 0;
+      const removedCount = effectiveIndexCount * instanceCount;
       slot.totalEmitEstimate = Math.max(0, slot.totalEmitEstimate - removedCount);
       // Swap-pop: move the last record into the freed slot, decrement
       // recordCount. firstEmit is GPU-rewritten by the next scan, so
@@ -3543,6 +3723,22 @@ export function buildHeapScene(
           totalDirtyBytes += pool.totalDataBytes(av);
         }
         allocDirty.clear();
+      }
+
+      // 1c. HeapDrawSpec.active drain — flip drawTable.indexCount
+      //     between origIndexCount (visible) and 0 (hidden) for any RO
+      //     whose active aval ticked since last frame. Set is small in
+      //     steady state (only the ROs whose visibility actually
+      //     changed). No pool / arena / freelist activity.
+      if (activeDirty.size > 0) {
+        for (const did of activeDirty) {
+          const av = drawIdToActiveAval.get(did);
+          if (av === undefined) continue;
+          const a = av.getValue(tok);
+          const orig = drawIdToOrigIndexCount.get(did) ?? 0;
+          setEffectiveIndexCount(did, a ? orig : 0);
+        }
+        activeDirty.clear();
       }
 
       // 1b. Atlas-texture aval reactivity: an `aval<ITexture>` that
@@ -3994,7 +4190,26 @@ export function buildHeapScene(
             const length = arenaU32[refU32 + 1]!;
 
             if (!KNOWN_TYPE_IDS.has(typeId)) {
-              push(`bucket#${bucketIdx} slot=${slot} field='${f.name}' alloc@0x${ref.toString(16)} typeId=${typeId} unknown`);
+              // Dump the first 8 u32s of the alloc to help diagnose
+              // what wrote garbage onto the header. Also peek the
+              // FOUR u32s BEFORE the alloc to see if a neighbour
+              // overran into us.
+              const before = refU32 >= 4
+                ? `prev=[${arenaU32[refU32 - 4]},${arenaU32[refU32 - 3]},${arenaU32[refU32 - 2]},${arenaU32[refU32 - 1]}] `
+                : "";
+              const here = `here=[${arenaU32[refU32]},${arenaU32[refU32 + 1]},${arenaU32[refU32 + 2]},${arenaU32[refU32 + 3]},${arenaU32[refU32 + 4]},${arenaU32[refU32 + 5]},${arenaU32[refU32 + 6]},${arenaU32[refU32 + 7]}]`;
+              // Compare CPU shadow vs GPU read-back. Differ → GPU
+              // write corrupted; match → bug is in CPU-side write path
+              // OR the alloc never went through pool.acquire.
+              const shadowChunk = arena.attrs.chunk(0);
+              const shadowU32 = shadowChunk.peekShadowU32(ref, 8);
+              const shadowStr = `shadow=[${shadowU32[0]},${shadowU32[1]},${shadowU32[2]},${shadowU32[3]},${shadowU32[4]},${shadowU32[5]},${shadowU32[6]},${shadowU32[7]}]`;
+              const cpuMatches = shadowU32[0] === arenaU32[refU32]
+                && shadowU32[1] === arenaU32[refU32 + 1]
+                && shadowU32[2] === arenaU32[refU32 + 2]
+                && shadowU32[3] === arenaU32[refU32 + 3];
+              const verdict = cpuMatches ? "GPU=CPU (likely CPU-write bug)" : "GPU≠CPU (likely GPU-write corruption)";
+              push(`bucket#${bucketIdx} slot=${slot} field='${f.name}' alloc@0x${ref.toString(16)} typeId=${typeId} unknown ${verdict} ${before}${here} ${shadowStr}`);
               attrAllocsBad++;
               continue;
             }
@@ -4102,11 +4317,18 @@ export function buildHeapScene(
                 tilesBad++;
               }
             }
+            // The scan kernel intentionally writes `numRecords - 1` as the
+            // sentinel (not `numRecords`) — the render VS's binary search
+            // uses `hi = firstDrawInTile[_tileIdx + 1u]` as an *inclusive*
+            // upper bound, so the sentinel must point at the last valid
+            // record slot. See scanKernel.ts `buildTileIndex` for the
+            // full rationale.
+            const expectedSentinel = recordCount === 0 ? 0 : recordCount - 1;
             const sentinel = fdt[dc.numTiles]!;
             tilesChecked++;
-            if (sentinel !== recordCount) {
+            if (sentinel !== expectedSentinel) {
               push(`bucket#${bucketIdx} firstDrawInTile[${dc.numTiles}] sentinel ` +
-                `got=${sentinel} expected=${recordCount}`);
+                `got=${sentinel} expected=${expectedSentinel}`);
               tilesBad++;
             }
             dc.firstDrawInTile.unmap();
@@ -5018,5 +5240,7 @@ export function buildHeapScene(
     },
   };
 
-  return { frame, update, encodeIntoPass, encodeComputePrep, addDraw, removeDraw, stats, dispose, _debug } as HeapScene;
+  const __addDrawCallsGetter = (): number => __addDrawCalls;
+  const __removeDrawCallsGetter = (): number => __removeDrawCalls;
+  return { frame, update, encodeIntoPass, encodeComputePrep, addDraw, removeDraw, stats, dispose, _debug, __addDrawCalls: __addDrawCallsGetter, __removeDrawCalls: __removeDrawCallsGetter } as HeapScene;
 }

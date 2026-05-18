@@ -112,9 +112,23 @@ export class UniformPool {
       return existing.ref;
     }
     const r = arena.alloc(dataBytes, chunkIdx);
-    // The alloc may have spilled into a different chunk if `chunkIdx`
-    // was full. Honour wherever it landed — addRO's chunk-routing
-    // commits the RO to the spill chunk too.
+    // `arena.alloc` may spill to a different chunk if `chunkIdx`'s
+    // GrowBuffer is at its maxCapacity. Callers (heapScene.addRO)
+    // bind a bucket's bind groups to a single chunk's buffer — a
+    // silent spill makes the bucket's drawHeader refs point into
+    // the wrong chunk's buffer (garbage reads / typeId corruption).
+    //
+    // Hard-fail with diagnostic info instead of returning quietly.
+    // The right long-term fix is for addRO to pre-probe the chunk,
+    // open a new bucket bound to the spill chunk, and re-route; but
+    // until that lands, a clear error beats unexplained artefacts.
+    if (r.chunkIdx !== chunkIdx) {
+      throw new Error(
+        `UniformPool.acquire: allocator spilled from chunk ${chunkIdx} to chunk ${r.chunkIdx} ` +
+        `(${dataBytes} bytes). Caller's bucket is bound to chunk ${chunkIdx}; this would silently ` +
+        `corrupt the drawHeader→arena reads. Open a new bucket bound to chunk ${r.chunkIdx} instead.`,
+      );
+    }
     const finalChunk = r.chunkIdx;
     const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
     const buf = new ArrayBuffer(allocBytes);
@@ -142,7 +156,17 @@ export class UniformPool {
     if (e === undefined) return;
     e.refcount--;
     if (e.refcount > 0) return;
-    arena.release(e.chunkIdx, e.ref, ALIGN16(ALLOC_HEADER_PAD_TO + e.dataBytes));
+    // BUG FIX: arena.release's third arg is `dataBytes` (raw), and the
+    // chunk's AttributeArena.release internally adds the header padding
+    // via `ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes)`. We MUST pass the
+    // raw data size here — passing pre-aligned `allocBytes` (the old
+    // code) double-pads, freeing 16 extra bytes per release. The freed
+    // surplus then gets coalesced with the neighbouring scalar-uniform
+    // allocs (any 32 B u32/f32) into a single combined block, and the
+    // next attribute alloc handed out from that pool ends up STARTING
+    // 16 B inside the previous alloc → overlapping allocations →
+    // garbage `typeId`/`length` in the attribute header.
+    arena.release(e.chunkIdx, e.ref, e.dataBytes);
     byChunk!.delete(chunkIdx);
     if (byChunk!.size === 0) this.byAval.delete(av);
   }
@@ -312,6 +336,8 @@ interface IndexPoolEntry {
 export class DrawHeap {
   private free: number[] = [];
   private nextSlot = 0;
+  /** DEBUG: tracks slot live/free state. true = live (in use). */
+  private readonly live = new Set<number>();
   constructor(private readonly buf: GrowBuffer, private readonly slotBytes: number) {}
   get buffer(): GPUBuffer { return this.buf.buffer; }
   /** Bytes per slot — caller multiplies by slot index for byte offsets. */
@@ -320,11 +346,21 @@ export class DrawHeap {
   get usedBytes(): number { return this.nextSlot * this.slotBytes; }
   alloc(): number {
     const slot = this.free.length > 0 ? this.free.pop()! : this.nextSlot++;
+    if (this.live.has(slot)) {
+      throw new Error(`DrawHeap.alloc: returned already-live slot ${slot}`);
+    }
+    this.live.add(slot);
     this.buf.ensureCapacity((slot + 1) * this.slotBytes);
     this.buf.setUsed(Math.max(this.buf.usedBytes, (slot + 1) * this.slotBytes));
     return slot;
   }
-  release(slot: number): void { this.free.push(slot); }
+  release(slot: number): void {
+    if (!this.live.has(slot)) {
+      throw new Error(`DrawHeap.release: slot ${slot} was not live — double-release or release-of-never-allocated.`);
+    }
+    this.live.delete(slot);
+    this.free.push(slot);
+  }
   onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
   destroy(): void { this.buf.destroy(); }
 }
@@ -340,6 +376,11 @@ export class DrawHeap {
 export class AttributeArena {
   private cursor = 0;
   private readonly freelist = new Freelist();
+  /** DEBUG: tracks every live allocation by start byte → size. Set
+   *  on alloc, cleared on release. Used by `assertNoOverlap()` to
+   *  detect allocator returning overlapping ranges. Enabled in
+   *  development; cheap (one Map insert/delete per alloc). */
+  private readonly liveAllocs = new Map<number, number>();
   /** CPU shadow of the entire GPU buffer; writes go here first then
    *  flush() emits one writeBuffer per dirty contiguous range. */
   private shadow: Uint8Array;
@@ -356,6 +397,15 @@ export class AttributeArena {
   get buffer(): GPUBuffer { return this.buf.buffer; }
   get capacity(): number { return this.buf.capacity; }
   get usedBytes(): number { return this.cursor; }
+  /** Read 4 u32s from the CPU shadow starting at byte `off`. Used by
+   *  the validator to compare against the GPU's read-back values:
+   *  if CPU shadow is correct but GPU shows garbage → the corruption
+   *  came from a GPU-side write (a compute kernel writing to a wrong
+   *  byte). If both differ from what pool.acquire wrote → CPU-side
+   *  write path is the culprit. */
+  peekShadowU32(off: number, count: number): Uint32Array {
+    return new Uint32Array(this.shadow.buffer, this.shadow.byteOffset + off, count);
+  }
   write(dst: number, data: Uint8Array): void {
     this.shadow.set(data, dst);
     if (dst < this.dirtyMin) this.dirtyMin = dst;
@@ -383,13 +433,18 @@ export class AttributeArena {
   tryAlloc(dataBytes: number): number | undefined {
     const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
     const reused = this.freelist.alloc(allocBytes);
-    if (reused !== undefined) return reused;
+    if (reused !== undefined) {
+      this.recordAlloc(reused, allocBytes, "freelist");
+      return reused;
+    }
     const next = this.cursor + allocBytes;
     if (next > this.buf.maxCapacity) return undefined;
     this.cursor = next;
     this.buf.ensureCapacity(next);
     this.buf.setUsed(next);
-    return next - allocBytes;
+    const ref = next - allocBytes;
+    this.recordAlloc(ref, allocBytes, "bump");
+    return ref;
   }
   alloc(dataBytes: number): number {
     const r = this.tryAlloc(dataBytes);
@@ -402,6 +457,22 @@ export class AttributeArena {
   }
   release(ref: number, dataBytes: number): void {
     const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
+    const tracked = this.liveAllocs.get(ref);
+    if (tracked === undefined) {
+      throw new Error(
+        `AttributeArena.release: ref=${ref} (size=${allocBytes}) was not in liveAllocs — ` +
+        `double-free or release for an alloc that never happened. ` +
+        `Live alloc count=${this.liveAllocs.size}.`,
+      );
+    }
+    if (tracked !== allocBytes) {
+      throw new Error(
+        `AttributeArena.release: size mismatch at ref=${ref} — recorded=${tracked} but ` +
+        `release args→ allocBytes=${allocBytes} (dataBytes=${dataBytes}). ` +
+        `Caller is releasing the wrong size; this WILL corrupt the freelist via over- or under-shrinking.`,
+      );
+    }
+    this.liveAllocs.delete(ref);
     this.freelist.release(ref, allocBytes);
     // §5: shrink the bump cursor back if release exposed a free
     // tail touching it (cascading — `freelist.release` may have
@@ -413,6 +484,23 @@ export class AttributeArena {
       this.cursor = top.off;
       this.buf.setUsed(this.cursor);
     }
+  }
+  /** Throws if the just-returned alloc overlaps any live allocation. */
+  private recordAlloc(off: number, size: number, source: string): void {
+    // Check against every existing live alloc — O(N). Cheap while N
+    // is small (per-tile demos run with ~hundreds of allocs). Wire
+    // off behind an env-flag if it ever becomes a hot path.
+    for (const [liveOff, liveSize] of this.liveAllocs) {
+      // [a, a+sa) vs [b, b+sb) overlap iff a < b+sb && b < a+sa
+      if (off < liveOff + liveSize && liveOff < off + size) {
+        throw new Error(
+          `AttributeArena.tryAlloc(${source}): returned [${off},${off + size}) ` +
+          `(size=${size}) overlaps live alloc at [${liveOff},${liveOff + liveSize}) ` +
+          `(size=${liveSize}). Allocator is handing out shared memory!`,
+        );
+      }
+    }
+    this.liveAllocs.set(off, size);
   }
   onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
   destroy(): void { this.buf.destroy(); }
@@ -428,6 +516,8 @@ export class AttributeArena {
 export class IndexAllocator {
   private cursor = 0;     // in u32s, not bytes
   private readonly freelist = new Freelist();
+  /** DEBUG: live index allocations tracked by start element. */
+  private readonly liveAllocs = new Map<number, number>();
   private shadow: Uint8Array;
   private dirtyMin = Infinity;
   private dirtyMax = 0;
@@ -462,13 +552,30 @@ export class IndexAllocator {
    *  Used by `ChunkedIndexAllocator` to probe before spilling. */
   tryAlloc(elements: number): number | undefined {
     const reused = this.freelist.alloc(elements);
-    if (reused !== undefined) return reused;
+    if (reused !== undefined) {
+      this.recordAlloc(reused, elements, "freelist");
+      return reused;
+    }
     const nextElts = this.cursor + elements;
     if (nextElts * 4 > this.buf.maxCapacity) return undefined;
     this.cursor = nextElts;
     this.buf.ensureCapacity(nextElts * 4);
     this.buf.setUsed(nextElts * 4);
-    return nextElts - elements;
+    const off = nextElts - elements;
+    this.recordAlloc(off, elements, "bump");
+    return off;
+  }
+  private recordAlloc(off: number, size: number, source: string): void {
+    for (const [liveOff, liveSize] of this.liveAllocs) {
+      if (off < liveOff + liveSize && liveOff < off + size) {
+        throw new Error(
+          `IndexAllocator.tryAlloc(${source}): returned [${off},${off + size}) ` +
+          `(size=${size}) overlaps live alloc at [${liveOff},${liveOff + liveSize}) ` +
+          `(size=${liveSize}). Index allocator is handing out shared memory!`,
+        );
+      }
+    }
+    this.liveAllocs.set(off, size);
   }
   alloc(elements: number): number {
     const r = this.tryAlloc(elements);
@@ -478,10 +585,22 @@ export class IndexAllocator {
     return r;
   }
   release(off: number, elements: number): void {
+    const tracked = this.liveAllocs.get(off);
+    if (tracked === undefined) {
+      throw new Error(
+        `IndexAllocator.release: off=${off} (elements=${elements}) was not in ` +
+        `liveAllocs — double-free or release for an alloc that never happened. ` +
+        `Live alloc count=${this.liveAllocs.size}.`,
+      );
+    }
+    if (tracked !== elements) {
+      throw new Error(
+        `IndexAllocator.release: size mismatch at off=${off} — recorded=${tracked} ` +
+        `but release elements=${elements}. Will corrupt the freelist.`,
+      );
+    }
+    this.liveAllocs.delete(off);
     this.freelist.release(off, elements);
-    // §5: cursor-shrink mirror of AttributeArena.release. Cursor
-    // is in u32 elements here, and setUsed on the GrowBuffer
-    // expects bytes — multiply by 4.
     while (true) {
       const top = this.freelist.takeBlockEndingAt(this.cursor);
       if (top === undefined) break;

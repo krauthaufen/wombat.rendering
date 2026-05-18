@@ -288,6 +288,19 @@ export function renderObjectToHeapSpec(
       // every release closure reads the cell and frees the LATEST
       // sub-rect — no leaks even when multiple ROs are bucket-shared.
       const cell = currentRefCellFor(texAvalTyped, acq.ref);
+      // The pool.acquire above bumped refcount to 1; release it
+      // immediately so the entry's refcount tracks ACTUAL drawHeader
+      // usage, not adapter-call count. heapScene.addDraw bumps refcount
+      // via incRef per cycle (paired with our release closure). Without
+      // this drop, every cached HeapDrawSpec (re-introduced across
+      // aset add/remove cycles) leaves the atlas entry pinned forever.
+      pool.release(acq.ref);
+      // Heap-side re-acquire hook (attached after the literal so the
+      // strict HeapTextureSet typing stays clean): if the entry was
+      // evicted between heap remove/add cycles, addDraw acquires a
+      // fresh sub-rect and uses this to redirect our per-aval cell to
+      // the new ref, so the release closure stops freeing the long-
+      // evicted one.
       textures = {
         kind: "atlas",
         format: atlasFormat,
@@ -312,6 +325,7 @@ export function renderObjectToHeapSpec(
           return next;
         },
       };
+      (textures as unknown as { __retarget: (r: number) => void }).__retarget = (r: number) => { cell.ref = r; };
     } else {
       // Tier-L fallback: keep the existing standalone path, which
       // requires a resolved GPUTexture/GPUSampler.
@@ -350,5 +364,8 @@ export function renderObjectToHeapSpec(
     indices,
     ...(textures !== undefined ? { textures } : {}),
     ...(ro.modeRules !== undefined ? { modeRules: ro.modeRules } : {}),
+    // Pass `active` through unforced so the heap path can subscribe
+    // and react to flips without re-running the spec adapter.
+    ...(ro.active !== undefined ? { active: ro.active } : {}),
   };
 }

@@ -122,6 +122,41 @@ export class Freelist {
     return out;
   }
 
+  /** Internal consistency check (paranoia mode). Walks the freelist
+   *  and asserts no two blocks overlap. O(N log N). Cheap enough to
+   *  run after every alloc/release while debugging an allocator
+   *  invariant violation. Throws with the offending pair on failure. */
+  assertInvariants(where: string): void {
+    const blocks = this.toArray();
+    for (let i = 1; i < blocks.length; i++) {
+      const a = blocks[i - 1]!;
+      const b = blocks[i]!;
+      if (a.off + a.size > b.off) {
+        throw new Error(
+          `Freelist@${where}: overlapping free blocks ` +
+          `(${a.off},${a.size}) and (${b.off},${b.size}) — ` +
+          `${a.off}+${a.size}=${a.off + a.size} > ${b.off}`,
+        );
+      }
+    }
+    for (const [off, size] of this.byStart) {
+      const endLookup = this.byEnd.get(off + size);
+      if (endLookup !== off) {
+        throw new Error(
+          `Freelist@${where}: byStart/byEnd desync — byStart[${off}]=${size} ` +
+          `but byEnd[${off + size}]=${endLookup} (expected ${off})`,
+        );
+      }
+      const sizeSet = this.bySize.get(size);
+      if (sizeSet === undefined || !sizeSet.has(off)) {
+        throw new Error(
+          `Freelist@${where}: byStart/bySize desync — byStart[${off}]=${size} ` +
+          `but bySize[${size}] does not contain ${off}`,
+        );
+      }
+    }
+  }
+
   private addBlock(off: number, size: number): void {
     let set = this.bySize.get(size);
     if (set === undefined) {

@@ -612,6 +612,25 @@ export class AtlasPool {
   }
 
   /**
+   * Bump refcount on an entry that's already live (used by the heap
+   * path when a cached HeapDrawSpec is re-introduced: the spec already
+   * carries `poolRef` from the original acquire, but every add/remove
+   * cycle fires the release closure once — without a matching incRef
+   * the refcount underflows and the entry gets actuallyFree'd while
+   * live drawHeaders still reference it).
+   *
+   * Returns `true` if the bump was applied; `false` if the entry has
+   * been evicted in the meantime (caller must fall back to re-acquire).
+   */
+  incRef(ref: number): boolean {
+    const e = this.entriesByRef.get(ref);
+    if (e === undefined) return false;
+    if (e.refcount === 0) this.lru.delete(e.ref);
+    e.refcount++;
+    return true;
+  }
+
+  /**
    * Drop an LRU entry for real: remove its packer slot, drop the entry
    * from every lookup map. Caller must guarantee `refcount === 0`.
    */
