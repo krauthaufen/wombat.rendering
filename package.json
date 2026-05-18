@@ -11,7 +11,7 @@
   ],
   "scripts": {
     "build": "tsc -b",
-    "clean": "tsc -b --clean && rm -rf packages/*/dist",
+    "clean": "tsc -b --clean && rimraf packages/*/dist",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:browser": "vitest run --config vitest.browser.config.ts",
@@ -27,6 +27,7 @@
     "@webgpu/types": "^0.1.69",
     "fast-check": "^4.7.0",
     "playwright": "^1.59.1",
+    "rimraf": "^5.0.5",
     "typescript": "^5.4.0",
     "vitest": "^1.4.0"
   },
