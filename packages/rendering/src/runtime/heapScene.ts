@@ -43,7 +43,7 @@
 // group's bind-group layout; the user's FS WGSL declares them.
 
 import { Trafo3d, V3d, V4f, M44d, type V2f } from "@aardworx/wombat.base";
-import type { ITexture } from "../core/texture.js";
+import type { HostTextureSource, ITexture } from "../core/texture.js";
 import type { ISampler } from "../core/sampler.js";
 import { AVal, AdaptiveObject, AdaptiveToken, HashTable } from "@aardworx/wombat.adaptive";
 import type { aval, aset, IAdaptiveObject, IDisposable, IHashSetReader } from "@aardworx/wombat.adaptive";
@@ -645,6 +645,14 @@ export type HeapTextureSet =
        * reference.
        */
       readonly repack?: (newTex: ITexture) => import("./textureAtlas/atlasPool.js").AtlasAcquisition;
+      /**
+       * Host source captured at adapter time, used by the heap-side
+       * re-acquire path when the pool entry was evicted while this spec
+       * sat idle (heap remove → re-add). Without it, `AtlasPool.acquire`
+       * allocates a fresh sub-rect with no `source` and skips `upload()`,
+       * leaving the drawHeader pointing at uninitialized atlas pixels.
+       */
+      readonly host?: HostTextureSource;
     };
 
 /**
@@ -3111,11 +3119,25 @@ export function buildHeapScene(
           // remove state. Acquire a fresh sub-rect, redirect the spec
           // (and the per-aval cell behind its release closure) to the
           // new ref, and re-emit the drawHeader fields.
+          // Pass the captured `host` as `source` so the pool's
+          // `finalize` re-runs `upload()` for the fresh sub-rect. Without
+          // this, AtlasPool.acquire allocates the rect and skips the
+          // upload (the `source.host !== undefined` branch in finalize),
+          // so the drawHeader points at uninitialized atlas pixels —
+          // exactly the "black rectangle holes" symptom on tiles that
+          // cycled out and back in across a long-enough gap to be
+          // evicted.
+          const reW = spec.textures.size.x;
+          const reH = spec.textures.size.y;
+          const host = spec.textures.host;
           const acq = atlasPool.acquire(
             spec.textures.page.format,
             spec.textures.sourceAval as aval<ITexture>,
-            spec.textures.size.x, spec.textures.size.y,
-            { wantsMips: spec.textures.numMips > 1 },
+            reW, reH,
+            {
+              wantsMips: spec.textures.numMips > 1,
+              ...(host !== undefined ? { source: { width: reW, height: reH, host } } : {}),
+            },
           );
           (spec.textures as { pageId: number }).pageId = acq.pageId;
           (spec.textures as { origin: V2f }).origin = acq.origin;

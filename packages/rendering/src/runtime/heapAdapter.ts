@@ -324,6 +324,13 @@ export function renderObjectToHeapSpec(
           cell.ref = next.ref;
           return next;
         },
+        // Captured for the heap-side re-acquire path (see addDraw atlas
+        // bucket: when the pool entry was evicted while this spec sat
+        // idle, the pool re-acquires a fresh sub-rect and MUST also
+        // re-upload the texture pixels — otherwise the drawHeader
+        // points at uninitialized atlas memory (or worse, leftover
+        // pixels from the just-evicted neighbor).
+        ...(dims.host !== undefined ? { host: dims.host } : {}),
       };
       (textures as unknown as { __retarget: (r: number) => void }).__retarget = (r: number) => { cell.ref = r; };
     } else {
