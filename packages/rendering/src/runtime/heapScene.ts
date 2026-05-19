@@ -2398,12 +2398,24 @@ export function buildHeapScene(
             `has no captured descriptor — bucket promotion cannot synthesise a migration combo.`,
           );
         }
+        // Read EFFECTIVE indexCount from the CPU slot's drawTable shadow
+        // — for an active=false draw this is 0, so the new GPU master
+        // record must carry the 0, not the original entry.indexCount.
+        // Otherwise the CPU→GPU bucket promotion silently resurrects
+        // every hidden draw.
+        const cpuRecIdx = slot !== undefined ? slot.slotToRecord[ls] : undefined;
+        const effIc = (cpuRecIdx !== undefined && cpuRecIdx >= 0 && slot !== undefined)
+          ? slot.drawTableShadow![cpuRecIdx * RECORD_U32 + 3]!
+          : e.indexCount;
+        const effInst = (cpuRecIdx !== undefined && cpuRecIdx >= 0 && slot !== undefined)
+          ? slot.drawTableShadow![cpuRecIdx * RECORD_U32 + 4]!
+          : e.instanceCount;
         cpuMigration.push({
           localSlot:     ls,
           drawId,
           firstIndex:    e.firstIndex,
-          indexCount:    e.indexCount,
-          instanceCount: e.instanceCount,
+          indexCount:    effIc,
+          instanceCount: effInst,
           perDrawRefs:   bucket.localPerDrawRefs[ls]!,
           descriptor,
           targetComboId: 0,
@@ -3682,10 +3694,17 @@ export function buildHeapScene(
           // Swap-pop from old slot's drawTable.
           const oldSlot = bucket.slots[oldSlotIdx]!;
           const entry = bucket.localEntries[localSlot];
-          const emit = entry !== undefined ? entry.indexCount * entry.instanceCount : 0;
           const oldRecIdx = oldSlot.slotToRecord[localSlot]!;
           const lastRecIdx = oldSlot.recordCount - 1;
           const oldShadow = oldSlot.drawTableShadow!;
+          // Read the EFFECTIVE indexCount from the old slot's drawTable
+          // shadow — for an active=false draw this is already 0, so the
+          // emit accounting on the OLD slot must NOT subtract the
+          // original (entry.indexCount) which would double-decrement and
+          // also pin the carried-over count below.
+          const effectiveIndexCount = oldShadow[oldRecIdx * RECORD_U32 + 3]!;
+          const effectiveInstanceCount = oldShadow[oldRecIdx * RECORD_U32 + 4]!;
+          const emit = effectiveIndexCount * effectiveInstanceCount;
           if (oldRecIdx !== lastRecIdx) {
             const dst = oldRecIdx * RECORD_U32;
             const src = lastRecIdx * RECORD_U32;
@@ -3720,8 +3739,13 @@ export function buildHeapScene(
           newShadow[newRecIdx * RECORD_U32 + 0] = 0;
           newShadow[newRecIdx * RECORD_U32 + 1] = localSlot;
           newShadow[newRecIdx * RECORD_U32 + 2] = entry !== undefined ? entry.firstIndex : 0;
-          newShadow[newRecIdx * RECORD_U32 + 3] = entry !== undefined ? entry.indexCount : 0;
-          newShadow[newRecIdx * RECORD_U32 + 4] = entry !== undefined ? entry.instanceCount : 0;
+          // Carry over the EFFECTIVE indexCount (read from oldShadow
+          // above) so an active=false draw remains hidden after the
+          // reslot. Using entry.indexCount here was the bug: it always
+          // wrote the ORIGINAL count, resurrecting hidden draws every
+          // time a mode-key flip moved them between slots.
+          newShadow[newRecIdx * RECORD_U32 + 3] = effectiveIndexCount;
+          newShadow[newRecIdx * RECORD_U32 + 4] = effectiveInstanceCount;
           newSlot.recordCount = newRecIdx + 1;
           newSlot.slotToRecord[localSlot] = newRecIdx;
           newSlot.recordToSlot[newRecIdx] = localSlot;
