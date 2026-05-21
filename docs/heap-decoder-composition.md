@@ -1,5 +1,10 @@
 # Heap-decoder VS — composition-based heap rewrite
 
+> **STATUS: IMPLEMENTED.** Shipped — see `runtime/heapDecoder.ts`
+> (`synthesizeHeapDecoderModule`, composed via `effect(decoder, …stages)` +
+> `composeStages`, driven from `heapEffectIR.ts`). This doc is retained as
+> design rationale.
+
 Replaces the current `Effect.substitute` + `applyFamilyMemberShape` heap path
 with a design that uses wombat.shader's own composition primitives. The
 heap rewrite becomes a *prepended* vertex stage instead of a mid-pipeline

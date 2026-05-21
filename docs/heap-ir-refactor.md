@@ -1,5 +1,9 @@
 # Heap rewriter — IR-based refactor plan
 
+> **STATUS: IMPLEMENTED.** This refactor shipped — see `runtime/heapEffectIR.ts`
+> (the live path, used by `heapScene` + `heapShaderFamily`). The old regex/
+> `substitute` path is now legacy. This doc is retained as design rationale.
+
 The current `heapEffect.ts` rewriter operates on raw WGSL strings via
 regex substitution. This works for the happy path but is brittle:
 
