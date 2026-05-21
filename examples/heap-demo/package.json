@@ -10,10 +10,10 @@
   },
   "dependencies": {
     "@aardworx/wombat.adaptive": "^0.2.3",
-    "@aardworx/wombat.base": "^0.4.2",
+    "@aardworx/wombat.base": "^0.4.4",
     "@aardworx/wombat.shader": "^0.5.3",
     "@aardworx/wombat.shader-vite": "^0.3.1",
-    "@aardworx/wombat.rendering": "file:../../packages/rendering",
+    "@aardworx/wombat.rendering": "^0.19.3",
     "boperators": "^0.3.2"
   },
   "devDependencies": {
