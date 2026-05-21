@@ -21,10 +21,9 @@ heap-textures-plan, multi-pipeline-buckets-integration, heap-debug-tools).
   plumbing but has no direct browser test reading back the swap-chain texture.
 - **alphaToCoverage real-GPU test** — wired in `prepareRenderObject`, no
   end-to-end pixel validation yet.
-- **`runFrame` dirty-skip** — skip rAF work when nothing is marked dirty (idle
-  canvases should do nothing per frame). In `loop.ts`.
-- **Per-instance FS varying regression test** — works, but not regression-tested
-  against complex derived-modes setups.
+- **Per-instance FS varying × derived-modes test** — per-instance attributes as
+  FS varyings are real-GPU tested (`tests-browser/instancing-real`), but NOT in
+  combination with `derivedMode`; add that combined case.
 - **Example ports** — examples that were waiting on the scene-graph layer can now
   use wombat.dom; revisit (hello-cube + UBO/camera, instanced grid, post chain).
 
@@ -33,8 +32,9 @@ heap-textures-plan, multi-pipeline-buckets-integration, heap-debug-tools).
 - **Lift the `totalSlots ≤ 16` kernel cap** — widen the partition's bind-group
   layout; the cartesian over active axes exceeds 16 fast (cull(3) × depthCompare(8)
   = 24). Pairs with the stencil-axis rules (central TODO #6).
-- **Build-time vite-plugin diagnostics** — warn on open output domains and on
-  per-frame `derivedMode(...)` construction.
+- **Build-time diagnostics** — warn on open derived-mode output domains and on
+  per-frame `derivedMode(...)` construction. (No build plugin ships from this
+  package today; would live in wombat.shader-vite or a new one.)
 - **GPU-side rule chaining** — a derived-mode rule reading a §7-derived uniform's
   output rather than a raw arena uniform.
 

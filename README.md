@@ -122,20 +122,32 @@ main();
   state-aware sort, bind-group cache keyed on resolved handle
   identity, `(effect, signature)` pipeline cache key, real-GPU
   validated.
+- **Heap renderer fast-path.** A megacall-encoded path
+  (`O(buckets)` rather than `O(draws)`; ~50K objects at ~44fps on
+  iPhone) backed by chunked GPU arenas with a best-fit freelist and
+  pooled allocation, value-keyed multi-pipeline buckets, GPU derived
+  uniforms (registry / rule IR) and derived modes
+  (pipeline-state-as-a-function-of-uniforms via a GPU partition
+  kernel), texture atlasing (tiers S/M/L with reactive residency),
+  and per-RenderObject instancing. See
+  [`docs/heap-renderer-design.md`](docs/heap-renderer-design.md),
+  [`docs/derived-uniforms.md`](docs/derived-uniforms.md), and
+  [`docs/derived-modes.md`](docs/derived-modes.md).
 
 ## Status
 
-v0.1, working end-to-end on real hardware.
+Production-ready (`0.19.3`). WebGPU render layer plus the heap
+renderer fast-path, validated end-to-end on real hardware.
 
-- 57 mock tests + 17 real-GPU tests = 74 passing.
-- Real-GPU tests run under `vitest --browser` + Playwright with the
-  system Chromium picking the actual GPU via Vulkan
-  (validated on NVIDIA RTX 5060 / Blackwell).
+- Mock-GPU tests plus real-GPU tests run under `vitest --browser` +
+  Playwright with the system Chromium picking the actual GPU via
+  Vulkan (validated on NVIDIA RTX 5060 / Blackwell).
 - `examples/hello-triangle` renders a coloured triangle in real
   Chromium via the `@aardworx/wombat.shader-vite` inline-marker
-  workflow.
+  workflow; `examples/heap-demo` exercises the heap renderer.
 
-See [`TODO.md`](TODO.md) for what's still deferred.
+See [`TODO.md`](TODO.md) for the current open items and roadmap;
+architectural threads are tracked in `~/claude/wombat-todo.md`.
 
 ## Build & test
 

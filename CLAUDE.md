@@ -9,6 +9,16 @@ The scenegraph layer (declarative scene → RenderObjects) lives
 **outside** this repo. This package stops at the RenderObject /
 ScenePass / Runtime boundary.
 
+Production-ready (`0.19.3`). On top of the base render layer it
+ships a heap renderer fast-path: megacall encode (`O(buckets)` not
+`O(draws)`), chunked GPU arenas with a best-fit freelist + pooled
+allocation, value-keyed multi-pipeline buckets, GPU derived
+uniforms (registry / rule IR) + derived modes (pipeline-state as a
+function of uniforms, via a GPU partition kernel), texture atlasing
+(tiers S/M/L, reactive residency), and per-RenderObject instancing.
+Open items live in `TODO.md`; the larger architectural threads are
+tracked in `~/claude/wombat-todo.md`.
+
 ## Repository layout
 
 ```
@@ -28,7 +38,9 @@ packages/
                  ├── commands/    per-encoder — clear, render, renderMany,
                  │                beginPassDescriptor
                  ├── runtime/     Runtime, compileRenderTask, ScenePass
-                 │                (delta-driven walker), renderTo, copy
+                 │                (delta-driven walker), renderTo, copy;
+                 │                heap renderer (heapScene/, derivedModes/,
+                 │                derivedUniforms/, textureAtlas/, heap*.ts)
                  ├── window/      attachCanvas + runFrame
                  └── index.ts     re-exports everything
 
