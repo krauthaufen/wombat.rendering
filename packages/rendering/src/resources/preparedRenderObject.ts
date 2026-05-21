@@ -357,6 +357,7 @@ export class PreparedRenderObject {
     private readonly drawCall: aval<import("../core/index.js").DrawCall>,
     pipelineCtx: PipelineBuildContext,
     pipelineState: import("../core/index.js").PipelineState,
+    private readonly active: aval<boolean> | undefined = undefined,
   ) {
     this.groups = groups;
     this._pipelineCtx = pipelineCtx;
@@ -398,6 +399,12 @@ export class PreparedRenderObject {
   }
 
   record(pass: GPURenderPassEncoder, token: AdaptiveToken): void {
+    // Active gate: a reactive `RenderObject.active` flipping to false
+    // skips the draw entirely (legacy/standalone path's equivalent of
+    // the heap path's indexCount→0). Subscribed via getValue so the
+    // task re-records when it flips back. Without this, `<Sg Active=…>`
+    // is a no-op on the non-heap path and gated subtrees keep drawing.
+    if (this.active !== undefined && !this.active.getValue(token)) return;
     // Resolve current pipeline. If `update` was already called by the
     // walker this is a no-op cache hit; otherwise we still pick the
     // right pipeline for the token-evaluated values.
@@ -741,6 +748,7 @@ export function prepareRenderObject(
     obj.drawCall,
     pipelineCtx,
     obj.pipelineState,
+    obj.active,
   );
 }
 
