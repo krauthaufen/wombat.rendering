@@ -11,10 +11,7 @@
     "verbatimModuleSyntax": false,
     "isolatedModules": true,
     "skipLibCheck": true,
-    "noEmit": true,
-    "plugins": [
-      { "transform": "@boperators/plugin-tsc", "transformProgram": true }
-    ]
+    "noEmit": true
   },
   "include": ["src/**/*.ts"]
 }

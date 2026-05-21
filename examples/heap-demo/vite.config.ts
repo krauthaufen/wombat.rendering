@@ -3,7 +3,6 @@ import { fileURLToPath } from "node:url";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { boperators } from "@boperators/plugin-vite";
 import { wombatShader } from "@aardworx/wombat.shader-vite";
 import { adaptiveMemoPlugin } from "@aardworx/wombat.adaptive/plugin";
 
@@ -21,7 +20,7 @@ const httpsConfig = existsSync(certPath) && existsSync(keyPath)
   : undefined;
 
 export default defineConfig({
-  plugins: [boperators(), wombatShader({ rootDir: here }), adaptiveMemoPlugin()],
+  plugins: [wombatShader({ rootDir: here }), adaptiveMemoPlugin()],
   server: {
     host: true,
     port: 5180,
