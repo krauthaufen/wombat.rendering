@@ -1,87 +1,51 @@
-# wombat.rendering — deferred work
+# wombat.rendering — TODO
 
-What's NOT yet implemented. DONE markers pruned periodically.
+Status: ✅ production-ready (0.19.3). WebGPU render layer + heap renderer
+fast-path. Shipped: megacall encode (O(buckets) not O(draws); 50K objects ~44fps
+on iPhone), chunked GPU arenas + best-fit freelist + pooled allocation, value-keyed
+multi-pipeline buckets, GPU derived uniforms (registry/rule IR) + derived modes
+(pipeline-state-as-fn-of-uniforms via GPU partition kernel), texture atlasing
+(tiers S/M/L, reactive residency), per-RO instancing.
 
-## Examples
+**The big architectural threads (IR heap rewriter, decoder composition, periodic
+compaction, stencil modes, cubemap atlasing, scene prewarm, device.lost,
+family-merge, WebGL2) live in `~/claude/wombat-todo.md`.** Design docs kept under
+`docs/` (heap-design-arc, heap-renderer-design, derived-modes, derived-uniforms,
+derived-uniforms-extensible, heap-decoder-composition, heap-ir-refactor,
+heap-textures-plan, multi-pipeline-buckets-integration, heap-debug-tools).
 
-- Only `examples/hello-triangle`. More examples (`hello-cube` with
-  a UBO + camera, instanced grid, post-processing chain) wait for
-  the scenegraph layer that produces RenderObjects from a
-  declarative tree — that layer lives outside this repo by design.
+## Open (repo-level)
 
-## Tests we'd take if free
+- **MSAA-on-canvas real-GPU test** — the offscreen MSAA path is validated via
+  `renderTo`; the canvas swap-chain MSAA path inherits the same resolveTarget
+  plumbing but has no direct browser test reading back the swap-chain texture.
+- **alphaToCoverage real-GPU test** — wired in `prepareRenderObject`, no
+  end-to-end pixel validation yet.
+- **`runFrame` dirty-skip** — skip rAF work when nothing is marked dirty (idle
+  canvases should do nothing per frame). In `loop.ts`.
+- **Per-instance FS varying regression test** — works, but not regression-tested
+  against complex derived-modes setups.
+- **Example ports** — examples that were waiting on the scene-graph layer can now
+  use wombat.dom; revisit (hello-cube + UBO/camera, instanced grid, post chain).
 
-- **MSAA-on-canvas real-GPU test.** `attachCanvas({ sampleCount })`
-  is wired and the offscreen MSAA path is validated through
-  `renderTo`; the canvas-swap-chain MSAA path inherits the same
-  `beginPassDescriptor` resolveTarget plumbing, so it's likely
-  fine. A direct browser test rendering MSAA into the canvas and
-  reading back the swap-chain texture would close the gap.
-- **alphaToCoverage real-GPU test.** Wired in `prepareRenderObject`
-  via `pipelineState.alphaToCoverage`, no end-to-end pixel
-  validation yet.
+## Derived-modes close-out (none urgent)
 
-## Heap scaling (post-0.17.0)
+- **Lift the `totalSlots ≤ 16` kernel cap** — widen the partition's bind-group
+  layout; the cartesian over active axes exceeds 16 fast (cull(3) × depthCompare(8)
+  = 24). Pairs with the stencil-axis rules (central TODO #6).
+- **Build-time vite-plugin diagnostics** — warn on open output domains and on
+  per-frame `derivedMode(...)` construction.
+- **GPU-side rule chaining** — a derived-mode rule reading a §7-derived uniform's
+  output rather than a raw arena uniform.
 
-See `docs/heap-future-work.md` §2-§5. Shipped this round: large-object
-eject, best-fit Freelist, hardware-aware chunk cap, cursor-shrink.
-Still open:
+## Conditional (only if profiling demands)
 
-- **§3 full multi-chunk + multi-draw-call.** Bucket gains per-chunk
-  `chunkParts`; allocator opens a new chunk when the current one
-  hits its hardware-cap; encode iterates `bucket × chunkPart × slot`.
-  Pool entries key by `(aval, chunkIdx)` so shared avals across
-  chunks duplicate (acceptable cost). Trigger: when a real
-  workload's arena steady-state crosses a single chunk's adapter
-  cap (post-§2 eject, this is photogrammetry / dense pointcloud
-  territory only).
-- **§5 periodic compaction.** Walks live allocs, relocates them to
-  fill the freelist, patches refs in drawHeaders + master records
-  + derived-uniform input slots. Real defrag, not just
-  cursor-shrink. Land when a high-churn workload shows visible
-  fragmentation that cursor-shrink alone doesn't address.
-- **§5 drop-empty-chunks.** Pairs with §3 — trivially "do nothing"
-  in the single-chunk world.
+- **Per-vertex (drawIdx, vid) lookup table** to replace the megacall binary
+  search (≈8 B/emit, ≈5.76 MB at 720K verts). Worth it only if mobile profiling
+  shows per-vertex reads are the bottleneck.
 
-## Derived-modes close-out (heap path)
+## Out of scope (recorded so they don't resurface)
 
-The derived-modes architecture is shipped (see `docs/derived-modes.md`
-status banner — wombat.rendering 0.16.1). Open items, none urgent:
-
-- **`totalSlots ≤ 16` kernel cap.** Lift mechanically: widen the
-  partition's bind-group layout (one BGL entry per slot count +
-  draw table). At present the cartesian over active axes can
-  exceed 16 quickly (cull(3) × depthCompare(8) = 24 already).
-- **Static `scene.ready()` pre-warm** of the cartesian pipeline
-  domain. Today pipelines are created sync on first `registerCombo`;
-  first use of a freshly-introduced pipeline still stalls the GPU
-  queue while the driver compiles. The design's enumeration story
-  would let `await scene.ready()` cover everything.
-- **Build-time vite-plugin diagnostics**: warn on open output
-  domains, per-frame `derivedMode(...)` construction.
-- **GPU-side rule chaining**: a derived-mode rule reading a
-  §7-derived uniform's output rather than a raw arena uniform.
-- **Stencil-axis rules** when stencil is enabled.
-
-## Out-of-scope (recorded so they don't surprise us)
-
-- **Multiple queues / async submission.** WebGPU's spec exposes one
-  queue per `GPUDevice`. No portable concurrent submission today;
-  revisit if/when WebGPU gains it.
-- **Mock vs real-GPU coverage policy.** Mock tests assert
-  implementation invariants (call-pattern, cache hits, ordering);
-  real-GPU tests assert pixel correctness. Both kept.
-- **`device.lost` rebuild-recovery.** On lost, the Runtime
-  auto-disposes; user-level avals (`cval` / `clist` / `cset`)
-  survive; caller constructs a fresh Runtime from a new device and
-  re-compiles the same `alist<Command>`. Per-device caches use
-  `WeakMap<GPUDevice, …>` so they re-key naturally.
-  `MockGPU.simulateLost(...)` exposes a manually-resolvable
-  `device.lost` for the auto-dispose test.
-- **Per-token source-map granularity beyond what's there.** WGSL
-  emitter ships per-segment maps for assignments / expression
-  statements / output writes — sufficient for "go to source"
-  navigation. Threading spans through every IR Expr node in the
-  walk would be possible but adds plumbing for diminishing
-  returns.
-- **Scenegraph.** Lives outside this repo.
+- **Multiple queues / async submission** — WebGPU exposes one queue per device.
+- **Per-token source-map granularity** beyond per-statement (diminishing returns).
+- **Scene graph** — lives in wombat.dom, not here.
