@@ -46,6 +46,9 @@ const ROCount = countParam !== null ? Math.max(1, parseInt(countParam, 10) | 0) 
 // Default off — fall back to CPU-computed M44f via spec.inputs.
 const enableDerivedUniforms = new URLSearchParams(location.search).get("derived") === "1";
 const gpuDebug = new URLSearchParams(location.search).get("gpudebug") === "1";
+// `?nonindexed=1` expands all geometry to non-indexed draws (no index buffer)
+// to exercise the heap's non-indexed megacall path. Forces non-instanced.
+const NONINDEXED = new URLSearchParams(location.search).get("nonindexed") === "1";
 const validateHeap = new URLSearchParams(location.search).get("validate") === "1";
 const simulateParam = new URLSearchParams(location.search).get("simulate");
 const simulateSamples = simulateParam !== null ? Math.max(1, parseInt(simulateParam, 10) | 0) : 0;
@@ -76,14 +79,41 @@ interface GeoBundle {
   readonly positions: BufferView;
   readonly normals:   BufferView;
   readonly uvs:       BufferView;
-  readonly indices:   BufferView;
+  readonly indices?:  BufferView;
   readonly drawCall:  aval<DrawCall>;
+}
+
+// Expand an indexed mesh to flat per-vertex arrays (one vertex per index) so it
+// can be drawn non-indexed — used by the ?nonindexed=1 heap path.
+function unindex(g: GeometryData): { positions: Float32Array; normals: Float32Array; uvs: Float32Array; count: number } {
+  const n = g.indices.length;
+  const positions = new Float32Array(n * 3);
+  const normals = new Float32Array(n * 3);
+  const uvs = new Float32Array(n * 2);
+  for (let i = 0; i < n; i++) {
+    const v = g.indices[i]!;
+    positions[i * 3] = g.positions[v * 3]!; positions[i * 3 + 1] = g.positions[v * 3 + 1]!; positions[i * 3 + 2] = g.positions[v * 3 + 2]!;
+    normals[i * 3] = g.normals[v * 3]!; normals[i * 3 + 1] = g.normals[v * 3 + 1]!; normals[i * 3 + 2] = g.normals[v * 3 + 2]!;
+    uvs[i * 2] = g.uvs[v * 2]!; uvs[i * 2 + 1] = g.uvs[v * 2 + 1]!;
+  }
+  return { positions, normals, uvs, count: n };
 }
 
 function bundleOf(g: GeometryData): GeoBundle {
   // Float32Array on its own is ambiguous — could be packed scalars,
   // V2f, V3f, V4f, or whatever. The default inference picks F32; we
   // override per-attribute to match what the shader expects.
+  if (NONINDEXED) {
+    const u = unindex(g);
+    return {
+      positions: BufferView.ofArray(u.positions, { elementType: ElementType.V3f }),
+      normals:   BufferView.ofArray(u.normals,   { elementType: ElementType.V3f }),
+      uvs:       BufferView.ofArray(u.uvs,        { elementType: ElementType.V2f }),
+      drawCall: AVal.constant<DrawCall>({
+        kind: "non-indexed", vertexCount: u.count, instanceCount: 1, firstVertex: 0, firstInstance: 0,
+      }),
+    };
+  }
   return {
     positions: BufferView.ofArray(g.positions, { elementType: ElementType.V3f }),
     normals:   BufferView.ofArray(g.normals,   { elementType: ElementType.V3f }),
@@ -257,7 +287,7 @@ function makeRO(spec: RoSpec, viewTrafo: aval<Trafo3d>, projTrafo: aval<Trafo3d>
     }),
     textures,
     samplers,
-    indices: spec.geo.indices,
+    ...(spec.geo.indices !== undefined ? { indices: spec.geo.indices } : {}),
     drawCall: spec.geo.drawCall,
   };
 }
@@ -593,10 +623,12 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
         time: timeAval,
         tint: tints[(k >> 3) % tints.length]!,
       };
-      if (fx.instanced) {
+      if (fx.instanced && !NONINDEXED) {
         ros.push(makeInstancedTowerRO(spec, viewTrafo, projTrafo, instCount, 0.7));
       } else {
-        ros.push(makeRO(spec, viewTrafo, projTrafo));
+        // NONINDEXED forces the non-instanced surface effect (instanced effects
+        // expect the InstanceOffset attribute the tower path supplies).
+        ros.push(makeRO(NONINDEXED ? { ...spec, effect: spec.texture !== undefined ? texturedSurface : surface } : spec, viewTrafo, projTrafo));
       }
     }
   }

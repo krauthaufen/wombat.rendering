@@ -229,29 +229,33 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
     for (const av of textures) if (!isHeapServableTexture(av.getValue(token))) return false;
     for (const av of samplers) if (!isHeapServableSampler(av.getValue(token))) return false;
     const dc = ro.drawCall.getValue(token);
-    if (dc.kind !== "indexed") return false;
     if (dc.instanceCount < 1) return false;
-    if (dc.baseVertex !== 0) return false;
-    if (dc.firstIndex !== 0) return false;
     if (dc.firstInstance !== 0) return false;
-    // Whole-buffer wedge: the heap ingests the ENTIRE index + vertex
-    // buffers for an RO (IndexPool/AttributeArena copy `arr.length`,
-    // not the drawCall slice). An RO that consumes only a PREFIX of a
-    // shared index buffer (firstIndex=0 but indexCount < bufferCount —
-    // e.g. one glyph in a multi-glyph text run whose glyphs share a
-    // single atlas index buffer) would therefore drag the rest of the
-    // buffer into its draw: the trailing indices reference vertices
-    // past this RO's range (including the next sub-mesh's / this
-    // glyph's band vertices), painting stray triangles. Until the heap
-    // honours the drawCall slice, only ROs that own their whole index
-    // buffer are eligible. Single-mesh ROs (indexCount === bufferCount)
-    // pass; shared-atlas slices fall to the legacy ScenePass.
-    if (ro.indices !== undefined) {
+    if (dc.kind === "indexed") {
+      if (ro.indices === undefined) return false;
+      if (dc.baseVertex !== 0) return false;
+      if (dc.firstIndex !== 0) return false;
+      // Whole-buffer wedge: the heap ingests the ENTIRE index + vertex
+      // buffers for an RO (IndexPool/AttributeArena copy `arr.length`,
+      // not the drawCall slice). An RO that consumes only a PREFIX of a
+      // shared index buffer (firstIndex=0 but indexCount < bufferCount —
+      // e.g. one glyph in a multi-glyph text run whose glyphs share a
+      // single atlas index buffer) would therefore drag the rest of the
+      // buffer into its draw: the trailing indices reference vertices
+      // past this RO's range, painting stray triangles. Until the heap
+      // honours the drawCall slice, only ROs that own their whole index
+      // buffer are eligible.
       const ib = ro.indices.buffer.getValue(token);
       if (ib.kind === "host") {
         const idxBufCount = ib.sizeBytes >>> 2; // u32 indices
         if (dc.indexCount !== idxBufCount) return false;
       }
+    } else {
+      // Non-indexed: the megacall uses the local vertex index directly, so a
+      // prefix read is safe (vid = 0..vertexCount-1) — no whole-buffer wedge.
+      // firstVertex must be 0 (the heap maps vid → attribute[vid] from base 0).
+      if (ro.indices !== undefined) return false;
+      if (dc.firstVertex !== 0) return false;
     }
     return true;
   });

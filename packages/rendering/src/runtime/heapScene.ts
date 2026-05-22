@@ -143,6 +143,11 @@ import {
  * Geometry triple. Tightly-packed Float32 positions / normals (3
  * floats per vertex) plus Uint32 indices.
  */
+/** drawTable `firstIndex` sentinel marking a non-indexed record: the megacall
+ *  prelude then uses the local vertex index directly (no indexStorage lookup).
+ *  Must match the literal in heapEffect.ts's `megacallSearchPrelude`. */
+export const HEAP_NONINDEXED = 0xffffffff;
+
 export interface HeapGeometry {
   readonly positions: Float32Array;
   readonly normals:   Float32Array;
@@ -453,8 +458,13 @@ export interface HeapDrawSpec {
   /**
    * Index buffer for this draw. Indices live in their own `INDEX`-
    * usage `GPUBuffer` (WebGPU forces this), separate from the arena.
+   * Omit for a NON-INDEXED draw — then `vertexCount` is required and the
+   * megacall uses the local vertex index directly (no index-buffer lookup,
+   * no index-pool allocation). See the megacall prelude's `vid` select.
    */
-  readonly indices: aval<Uint32Array> | Uint32Array;
+  readonly indices?: aval<Uint32Array> | Uint32Array;
+  /** Vertex count for a non-indexed draw (when `indices` is omitted). */
+  readonly vertexCount?: number;
   /**
    * Optional texture set. When present, adds a `texture_2d<f32>` at
    * binding 4 and a sampler at binding 5; the FS must declare them.
@@ -3005,10 +3015,18 @@ export function buildHeapScene(
 
     // Indices live in their own INDEX-usage buffer (WebGPU constraint).
     // Aval-keyed: 19K instanced clones of the same mesh share one
-    // index allocation + one upload.
-    const indicesAval = asAval(spec.indices) as aval<Uint32Array>;
-    const indicesArr = readPlain(spec.indices) as Uint32Array;
-    const idxAlloc = indexPool.acquire(device, arena.indices, indicesAval, bucket.chunkIdx, indicesArr);
+    // index allocation + one upload. NON-INDEXED draws (spec.indices
+    // omitted) skip the index pool entirely: the drawTable record stores
+    // firstIndex = HEAP_NONINDEXED (sentinel) and indexCount = vertexCount,
+    // and the megacall prelude uses the local vertex index directly.
+    const hasIndices = spec.indices !== undefined;
+    const indicesAval = hasIndices ? (asAval(spec.indices!) as aval<Uint32Array>) : undefined;
+    const idxAlloc = hasIndices
+      ? indexPool.acquire(device, arena.indices, indicesAval!, bucket.chunkIdx, readPlain(spec.indices!) as Uint32Array)
+      : undefined;
+    // Emit count per instance + the firstIndex field written to the record.
+    const emitCount = hasIndices ? idxAlloc!.count : (spec.vertexCount ?? 0);
+    const firstIndexField = hasIndices ? idxAlloc!.firstIndex : HEAP_NONINDEXED;
 
     const localSlot = bucket.drawHeap.alloc();
     // Per-RO instancing: read `spec.instanceCount` (defaults to 1).
@@ -3101,7 +3119,7 @@ export function buildHeapScene(
     bucket.localPosRefs[localSlot] = perDrawRefs.get("Positions");
     bucket.localNorRefs[localSlot] = perDrawRefs.get("Normals");
     bucket.localEntries[localSlot] = {
-      indexCount: idxAlloc.count, firstIndex: idxAlloc.firstIndex, instanceCount,
+      indexCount: emitCount, firstIndex: firstIndexField, instanceCount,
     };
     bucket.localToDrawId[localSlot] = drawId;
     bucket.drawSlots.add(localSlot);
@@ -3217,7 +3235,7 @@ export function buildHeapScene(
       const uniformRefs: number[] = (bucket.uniformOrder ?? []).map(
         name => perDrawRefs.get(name) ?? 0,
       );
-      partition.appendRecord(localSlot, idxAlloc.firstIndex, idxAlloc.count, instanceCount, roComboId, uniformRefs);
+      partition.appendRecord(localSlot, firstIndexField, emitCount, instanceCount, roComboId, uniformRefs);
       bucket.drawIdToRecord!.set(drawId, recIdx);
       bucket.recordToDrawId![recIdx] = drawId;
       bucket.drawIdToComboId!.set(drawId, roComboId);
@@ -3228,7 +3246,7 @@ export function buildHeapScene(
       const numRecords = recIdx + 1;
       const recBytes = numRecords * RECORD_BYTES;
       const needBlocks = Math.max(1, Math.ceil(numRecords / SCAN_TILE_SIZE));
-      const emitDelta = idxAlloc.count * instanceCount;
+      const emitDelta = emitCount * instanceCount;
       for (const s of bucket.slots) {
         s.drawTableBuf!.ensureCapacity(recBytes);
         s.drawTableBuf!.setUsed(Math.max(s.drawTableBuf!.usedBytes, recBytes));
@@ -3261,15 +3279,15 @@ export function buildHeapScene(
       // firstEmit is GPU-overwritten by the prefix-sum pass; 0 is fine.
       shadow[recIdx * RECORD_U32 + 0] = 0;
       shadow[recIdx * RECORD_U32 + 1] = localSlot;
-      shadow[recIdx * RECORD_U32 + 2] = idxAlloc.firstIndex;
-      shadow[recIdx * RECORD_U32 + 3] = idxAlloc.count;
+      shadow[recIdx * RECORD_U32 + 2] = firstIndexField;
+      shadow[recIdx * RECORD_U32 + 3] = emitCount;
       shadow[recIdx * RECORD_U32 + 4] = instanceCount;
       roSlot.recordCount = recIdx + 1;
       roSlot.slotToRecord[localSlot] = recIdx;
       roSlot.recordToSlot[recIdx] = localSlot;
       if (byteOff < roSlot.drawTableDirtyMin) roSlot.drawTableDirtyMin = byteOff;
       if (byteOff + RECORD_BYTES > roSlot.drawTableDirtyMax) roSlot.drawTableDirtyMax = byteOff + RECORD_BYTES;
-      roSlot.totalEmitEstimate += idxAlloc.count * instanceCount;
+      roSlot.totalEmitEstimate += emitCount * instanceCount;
       const newNumTiles = Math.max(1, Math.ceil(roSlot.totalEmitEstimate / TILE_K));
       roSlot.firstDrawInTileBuf!.ensureCapacity((newNumTiles + 1) * 4);
       roSlot.scanDirty = true;
@@ -3286,7 +3304,7 @@ export function buildHeapScene(
     // `subscribeActive` → `activeDirty` and drained in `update()`.
     if (spec.active !== undefined) {
       drawIdToActiveAval.set(drawId, spec.active);
-      drawIdToOrigIndexCount.set(drawId, idxAlloc.count);
+      drawIdToOrigIndexCount.set(drawId, emitCount);
       const initial = spec.active.getValue(outerTok);
       subscribeActive(spec.active, drawId);
       if (initial === false) {
@@ -5157,7 +5175,9 @@ export function buildHeapScene(
           let _instCount  = drawTable[_slot * 5u + 4u];
           let _local      = emitIdx - _firstEmit;
           let _instId     = _local / _indexCount;
-          let _vid        = indexStorage[_indexStart + (_local % _indexCount)];
+          let _li         = _local % _indexCount;
+          var _vid: u32   = _li;
+          if (_indexStart != 0xffffffffu) { _vid = indexStorage[_indexStart + _li]; }
           let base = i * 8u;
           outRows[base + 0u] = _slot;
           outRows[base + 1u] = _drawIdx;

@@ -354,11 +354,21 @@ export function buildMegacallPrelude(emitIdx: Expr): { stmts: Stmt[]; locals: Me
   stmts.push({ kind: "Declare", var: localOff, init: { kind: "Expr", value: sub(emitIdx, varExpr(firstEmit), Tu32) } });
   // let instId = _local / _indexCount;
   stmts.push({ kind: "Declare", var: instId, init: { kind: "Expr", value: div(varExpr(localOff), varExpr(indexCount), Tu32) } });
-  // let vid = indexStorage[_indexStart + (_local % _indexCount)];
+  // Non-indexed records carry _indexStart == 0xffffffff (HEAP_NONINDEXED): the
+  // vertex is the local index directly; otherwise decode through indexStorage.
+  //   let vid = (_indexStart == 0xffffffff)
+  //     ? (_local % _indexCount)
+  //     : indexStorage[_indexStart + (_local % _indexCount)];
+  const liExpr = (): Expr => mod(varExpr(localOff), varExpr(indexCount), Tu32);
   stmts.push({
     kind: "Declare",
     var: vid,
-    init: { kind: "Expr", value: item(indexStorage, add(varExpr(indexStart), mod(varExpr(localOff), varExpr(indexCount), Tu32), Tu32), Tu32) },
+    init: { kind: "Expr", value: select(
+      eqU32(varExpr(indexStart), constU32(0xffffffff)),
+      liExpr(),
+      item(indexStorage, add(varExpr(indexStart), liExpr(), Tu32), Tu32),
+      Tu32,
+    ) },
   });
 
   return { stmts, locals: { heapDrawIdx, instId, vid } };

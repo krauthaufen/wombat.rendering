@@ -229,10 +229,10 @@ export function renderObjectToHeapSpec(
 
   // 2. Indices: BufferView → aval<Uint32Array>. Map the underlying
   //    IBuffer aval; the heap path's IndexPool will key on this aval.
-  if (ro.indices === undefined) {
-    throw new Error("heapAdapter: RenderObject without indices not supported (heap is indexed-only)");
-  }
-  const indices: aval<Uint32Array> = indicesAvalFor(ro.indices.buffer);
+  //    Non-indexed ROs (no `ro.indices`) carry no index aval — the spec
+  //    then sets `vertexCount` and the megacall decodes the vertex directly.
+  const indices: aval<Uint32Array> | undefined =
+    ro.indices !== undefined ? indicesAvalFor(ro.indices.buffer) : undefined;
 
   // 3. Texture/sampler: single-pair v1. The Sg compile layer binds
   //    each texture aval under both `name` and `${name}_view` so the
@@ -358,9 +358,17 @@ export function renderObjectToHeapSpec(
   // 4. DrawCall: read once. Classifier validates fields are heap-
   //    compatible (indexed, instanceCount=1, zero offsets).
   const dc = ro.drawCall.getValue(token);
-  if (dc.kind !== "indexed") {
-    throw new Error("heapAdapter: non-indexed drawCall; classifier should have caught this");
+  if (dc.kind === "indexed" && indices === undefined) {
+    throw new Error("heapAdapter: indexed drawCall without indices");
   }
+  if (dc.kind === "non-indexed" && indices !== undefined) {
+    throw new Error("heapAdapter: non-indexed drawCall with an index buffer");
+  }
+  // Indexed → carry the index aval; non-indexed → carry the vertex count and
+  // the megacall uses the local vertex index directly (no index lookup).
+  const geom = dc.kind === "indexed"
+    ? { indices: indices! }
+    : { vertexCount: dc.vertexCount };
 
   return {
     effect: ro.effect,
@@ -368,7 +376,7 @@ export function renderObjectToHeapSpec(
     inputs,
     ...(instanceAttributes !== undefined ? { instanceAttributes } : {}),
     ...(dc.instanceCount > 1 ? { instanceCount: dc.instanceCount } : {}),
-    indices,
+    ...geom,
     ...(textures !== undefined ? { textures } : {}),
     ...(ro.modeRules !== undefined ? { modeRules: ro.modeRules } : {}),
     // Pass `active` through unforced so the heap path can subscribe
