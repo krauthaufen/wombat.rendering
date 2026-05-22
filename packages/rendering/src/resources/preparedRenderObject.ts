@@ -248,7 +248,12 @@ function buildGroups(device: GPUDevice, descs: readonly EntryDesc[][]): GroupDes
       switch (e.kind) {
         case "ubuf":   return { binding: e.binding, visibility, buffer: { type: "uniform" } };
         case "sbuf":   return {
-          binding: e.binding, visibility,
+          // WebGPU forbids read-write ("storage") buffers in the vertex stage;
+          // read-only-storage is allowed in any stage. So a read_write storage
+          // buffer (e.g. an A-buffer node pool written from the fragment shader)
+          // must be bound FRAGMENT-only.
+          binding: e.binding,
+          visibility: e.access === "read_write" ? ShaderStage.FRAGMENT : visibility,
           buffer: { type: e.access === "read_write" ? "storage" : "read-only-storage" },
         };
         case "tex":    return { binding: e.binding, visibility, texture: { sampleType: e.sampleType } };
