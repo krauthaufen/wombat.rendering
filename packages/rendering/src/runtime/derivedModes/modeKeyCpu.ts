@@ -125,9 +125,11 @@ function snapshotDepth(d: DepthState, signature: FramebufferSignature): DepthSli
   };
 }
 
+const NOOP_BLEND_COMPONENT: BlendComponent = { srcFactor: "one", dstFactor: "zero", operation: "add" };
 function snapshotAttachment(b: PsBlendState): AttachmentBlend {
-  const color = snapshotBlendComponent(b.color);
-  const alpha = snapshotBlendComponent(b.alpha);
+  // Write-mask-only entries (no color/alpha) are blend-disabled.
+  const color = b.color !== undefined ? snapshotBlendComponent(b.color) : NOOP_BLEND_COMPONENT;
+  const alpha = b.alpha !== undefined ? snapshotBlendComponent(b.alpha) : NOOP_BLEND_COMPONENT;
   const writeMask = b.writeMask.force(/* allow-force */) & 0xF;
   // "Blend enabled" derives from whether the components differ from
   // the no-op (src=one, dst=zero, op=add) shape. This mirrors WebGPU's
@@ -233,8 +235,8 @@ export class ModeKeyTracker implements IDisposable {
         visit(ps.blends);
         const map = ps.blends.force(/* allow-force */);
         for (const [, bs] of map) {
-          visit(bs.color.srcFactor); visit(bs.color.dstFactor); visit(bs.color.operation);
-          visit(bs.alpha.srcFactor); visit(bs.alpha.dstFactor); visit(bs.alpha.operation);
+          if (bs.color !== undefined) { visit(bs.color.srcFactor); visit(bs.color.dstFactor); visit(bs.color.operation); }
+          if (bs.alpha !== undefined) { visit(bs.alpha.srcFactor); visit(bs.alpha.dstFactor); visit(bs.alpha.operation); }
           visit(bs.writeMask);
         }
       }
@@ -320,8 +322,8 @@ export class ModeKeyTracker implements IDisposable {
   }
 
   private subBlendState(b: PsBlendState): void {
-    this.sub(b.color.srcFactor); this.sub(b.color.dstFactor); this.sub(b.color.operation);
-    this.sub(b.alpha.srcFactor); this.sub(b.alpha.dstFactor); this.sub(b.alpha.operation);
+    if (b.color !== undefined) { this.sub(b.color.srcFactor); this.sub(b.color.dstFactor); this.sub(b.color.operation); }
+    if (b.alpha !== undefined) { this.sub(b.alpha.srcFactor); this.sub(b.alpha.dstFactor); this.sub(b.alpha.operation); }
     this.sub(b.writeMask);
   }
 

@@ -64,8 +64,8 @@ interface BlendComponentSnap {
   readonly dstFactor: GPUBlendFactor;
 }
 interface BlendSnap {
-  readonly color: BlendComponentSnap;
-  readonly alpha: BlendComponentSnap;
+  readonly color?: BlendComponentSnap;
+  readonly alpha?: BlendComponentSnap;
   readonly writeMask: number;
 }
 interface StencilFaceSnap {
@@ -127,16 +127,8 @@ function snapshotPipeline(
     const arr: [string, BlendSnap][] = [];
     for (const [k, b] of m) {
       arr.push([k, {
-        color: {
-          operation: b.color.operation.getValue(token),
-          srcFactor: b.color.srcFactor.getValue(token),
-          dstFactor: b.color.dstFactor.getValue(token),
-        },
-        alpha: {
-          operation: b.alpha.operation.getValue(token),
-          srcFactor: b.alpha.srcFactor.getValue(token),
-          dstFactor: b.alpha.dstFactor.getValue(token),
-        },
+        ...(b.color !== undefined ? { color: { operation: b.color.operation.getValue(token), srcFactor: b.color.srcFactor.getValue(token), dstFactor: b.color.dstFactor.getValue(token) } } : {}),
+        ...(b.alpha !== undefined ? { alpha: { operation: b.alpha.operation.getValue(token), srcFactor: b.alpha.srcFactor.getValue(token), dstFactor: b.alpha.dstFactor.getValue(token) } } : {}),
         writeMask: b.writeMask.getValue(token),
       }]);
     }
@@ -176,10 +168,15 @@ function colorTargetsForSnap(
     const target: GPUColorTargetState = { format: fmt };
     const blend = blendMap?.get(o.name);
     if (blend !== undefined) {
-      target.blend = {
-        color: { operation: blend.color.operation, srcFactor: blend.color.srcFactor, dstFactor: blend.color.dstFactor },
-        alpha: { operation: blend.alpha.operation, srcFactor: blend.alpha.srcFactor, dstFactor: blend.alpha.dstFactor },
-      };
+      // A blend entry with `color`/`alpha` emits a GPU blend; one with only
+      // `writeMask` is a write-mask-only target (no blend) — needed for
+      // non-blendable formats like rgba32float.
+      if (blend.color !== undefined && blend.alpha !== undefined) {
+        target.blend = {
+          color: { operation: blend.color.operation, srcFactor: blend.color.srcFactor, dstFactor: blend.color.dstFactor },
+          alpha: { operation: blend.alpha.operation, srcFactor: blend.alpha.srcFactor, dstFactor: blend.alpha.dstFactor },
+        };
+      }
       target.writeMask = blend.writeMask;
     }
     out[o.location] = target;

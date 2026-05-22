@@ -58,8 +58,11 @@ export interface BlendComponentState {
 }
 
 export interface BlendState {
-  readonly color:     BlendComponentState;
-  readonly alpha:     BlendComponentState;
+  /** Omit `color`/`alpha` for a write-mask-only target (no blending) — required
+   *  for non-blendable formats such as `rgba32float` that still need a write
+   *  mask (e.g. masking a pick attachment during a composite pass). */
+  readonly color?:    BlendComponentState;
+  readonly alpha?:    BlendComponentState;
   /** RGBA channel write mask (bitmask: R=1, G=2, B=4, A=8). */
   readonly writeMask: aval<number>;
 }
@@ -122,8 +125,9 @@ export interface PlainBlendComponentState {
 }
 
 export interface PlainBlendState {
-  readonly color: PlainBlendComponentState;
-  readonly alpha: PlainBlendComponentState;
+  /** Omit `color`/`alpha` for a write-mask-only target (no blending). */
+  readonly color?: PlainBlendComponentState;
+  readonly alpha?: PlainBlendComponentState;
   readonly writeMask: number;
 }
 
@@ -142,16 +146,8 @@ export interface PlainPipelineState {
 
 function blendStateFromPlain(b: PlainBlendState): BlendState {
   return {
-    color: {
-      operation: AVal.constant(b.color.operation),
-      srcFactor: AVal.constant(b.color.srcFactor),
-      dstFactor: AVal.constant(b.color.dstFactor),
-    },
-    alpha: {
-      operation: AVal.constant(b.alpha.operation),
-      srcFactor: AVal.constant(b.alpha.srcFactor),
-      dstFactor: AVal.constant(b.alpha.dstFactor),
-    },
+    ...(b.color !== undefined ? { color: { operation: AVal.constant(b.color.operation), srcFactor: AVal.constant(b.color.srcFactor), dstFactor: AVal.constant(b.color.dstFactor) } } : {}),
+    ...(b.alpha !== undefined ? { alpha: { operation: AVal.constant(b.alpha.operation), srcFactor: AVal.constant(b.alpha.srcFactor), dstFactor: AVal.constant(b.alpha.dstFactor) } } : {}),
     writeMask: AVal.constant(b.writeMask),
   };
 }
