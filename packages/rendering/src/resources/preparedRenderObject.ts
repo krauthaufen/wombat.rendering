@@ -215,9 +215,14 @@ function sampleTypeFor(type: Type): GPUTextureSampleType {
     if (type.comparison === true) return "depth";
     const s = type.sampled;
     if (s.kind === "Int") return s.signed ? "sint" : "uint";
-    return "float";
+    // Multisampled float textures can't be filtered — bind as unfilterable.
+    return type.multisampled ? "unfilterable-float" : "float";
   }
   return "float";
+}
+
+function isMultisampled(type: Type): boolean {
+  return type.kind === "Texture" && type.multisampled;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +232,7 @@ function sampleTypeFor(type: Type): GPUTextureSampleType {
 type EntryDesc =
   | { kind: "ubuf";    binding: number; resource: AdaptiveResource<GPUBuffer> }
   | { kind: "sbuf";    binding: number; resource: AdaptiveResource<GPUBuffer>; access: "read" | "read_write" }
-  | { kind: "tex";     binding: number; resource: AdaptiveResource<GPUTexture>; sampleType: GPUTextureSampleType }
+  | { kind: "tex";     binding: number; resource: AdaptiveResource<GPUTexture>; sampleType: GPUTextureSampleType; multisampled: boolean }
   | { kind: "sampler"; binding: number; resource: AdaptiveResource<GPUSampler> };
 
 interface GroupDesc {
@@ -253,7 +258,7 @@ function buildGroups(device: GPUDevice, descs: readonly EntryDesc[][]): GroupDes
           visibility: e.access === "read_write" ? ShaderStage.FRAGMENT : visibility,
           buffer: { type: e.access === "read_write" ? "storage" : "read-only-storage" },
         };
-        case "tex":    return { binding: e.binding, visibility, texture: { sampleType: e.sampleType } };
+        case "tex":    return { binding: e.binding, visibility, texture: { sampleType: e.sampleType, ...(e.multisampled ? { multisampled: true } : {}) } };
         case "sampler": return { binding: e.binding, visibility, sampler: { type: "filtering" } };
       }
     });
@@ -693,7 +698,7 @@ export function prepareRenderObject(
     const res = prepareAdaptiveTexture(device, av, {
       ...(opts.label !== undefined ? { label: `${opts.label}.${t.name}` } : {}),
     });
-    perGroup[t.group]!.push({ kind: "tex", binding: slotOf(t), resource: res, sampleType: sampleTypeFor(t.type) });
+    perGroup[t.group]!.push({ kind: "tex", binding: slotOf(t), resource: res, sampleType: sampleTypeFor(t.type), multisampled: isMultisampled(t.type) });
   }
 
   for (const s of iface.samplers) {
