@@ -29,8 +29,12 @@ import {
   type aval,
   HashMap,
   cval,
+  AVal,
 } from "@aardworx/wombat.adaptive";
 import type { Type } from "@aardworx/wombat.shader/ir";
+import { isDerivedRule } from "../runtime/derivedUniforms/rule.js";
+import { STANDARD_DERIVED_RULES, STANDARD_TRAFO_LEAVES } from "../runtime/derivedUniforms/recipes.js";
+import { interpretExpr } from "../runtime/derivedUniforms/cpuEval.js";
 import { prepareAdaptiveBuffer } from "./adaptiveBuffer.js";
 import { prepareAdaptiveTexture } from "./adaptiveTexture.js";
 import { prepareAdaptiveSampler } from "./adaptiveSampler.js";
@@ -785,17 +789,60 @@ function mergeUniformInputs(
   let merged = HashMap.empty<string, aval<unknown>>();
   for (const f of block.fields) {
     const u = user.tryGet(f.name);
-    if (u !== undefined) { merged = merged.add(f.name, u); continue; }
+    if (u !== undefined) { merged = merged.add(f.name, resolveUniform(u, user, bindings)); continue; }
     const getter = bindings?.[f.name];
-    if (getter === undefined) continue;
-    const v = getter();
-    merged = merged.add(f.name, isAval(v) ? (v as aval<unknown>) : cval(v));
+    if (getter !== undefined) { merged = merged.add(f.name, resolveUniform(getter(), user, bindings)); continue; }
+    // Standard derived recipe by name (ModelViewTrafo, …) — derive it CPU-side
+    // here just as the heap path derives it on the GPU, so the legacy path
+    // serves the same declared uniforms.
+    const recipe = STANDARD_DERIVED_RULES.get(f.name);
+    if (recipe !== undefined) merged = merged.add(f.name, ruleToAval(recipe, user, bindings));
   }
   return merged;
 }
 
 function isAval(v: unknown): boolean {
   return typeof v === "object" && v !== null && typeof (v as { getValue?: unknown }).getValue === "function";
+}
+
+// A uniform binding value is either an aval/constant or a derivedUniform RULE.
+// Rules are evaluated on CPU (cpuEval) in double precision and exposed as a
+// derived aval — the legacy per-RO path's answer to the heap's §7 compute pass.
+type UProvider = import("../core/index.js").IUniformProvider;
+type Bindings = Readonly<Record<string, () => unknown>> | undefined;
+
+function resolveUniform(v: unknown, user: UProvider, bindings: Bindings): aval<unknown> {
+  if (isDerivedRule(v)) return ruleToAval(v, user, bindings);
+  return isAval(v) ? (v as aval<unknown>) : cval(v);
+}
+
+function ruleToAval(rule: import("../runtime/derivedUniforms/rule.js").DerivedRule, user: UProvider, bindings: Bindings): aval<unknown> {
+  return AVal.custom((token: AdaptiveToken) =>
+    interpretExpr(rule.ir, (leaf) => readLeaf(leaf, user, bindings, token)),
+  ) as aval<unknown>;
+}
+
+// Resolve a `u.<name>` leaf to its current value, recursing through nested
+// rules / standard recipes. Reading the leaf aval's value under `token`
+// registers the dependency, so the derived aval re-evaluates reactively.
+function readLeaf(name: string, user: UProvider, bindings: Bindings, token: AdaptiveToken): unknown {
+  const evalRule = (r: unknown): unknown =>
+    interpretExpr((r as import("../runtime/derivedUniforms/rule.js").DerivedRule).ir, (n) => readLeaf(n, user, bindings, token));
+  const lookup = (n: string): unknown => {
+    const u = user.tryGet(n);
+    if (u !== undefined) return isDerivedRule(u) ? evalRule(u) : isAval(u) ? (u as aval<unknown>).getValue(token) : u;
+    const getter = bindings?.[n];
+    if (getter !== undefined) { const v = getter(); return isDerivedRule(v) ? evalRule(v) : isAval(v) ? (v as aval<unknown>).getValue(token) : v; }
+    const recipe = STANDARD_DERIVED_RULES.get(n);
+    if (recipe !== undefined) return evalRule(recipe);
+    return undefined;
+  };
+  const direct = lookup(name);
+  if (direct !== undefined) return direct;
+  // Standard recipes read short trafo leaves (Model / View / Proj) that the RO
+  // binds under ModelTrafo / ViewTrafo / ProjTrafo — alias them like the heap.
+  const alias = STANDARD_TRAFO_LEAVES.get(name);
+  return alias !== undefined ? lookup(alias) : undefined;
 }
 
 function ubAsBlock(ub: import("../core/index.js").UniformBlockInfo): import("../core/index.js").UniformBlockInfo {

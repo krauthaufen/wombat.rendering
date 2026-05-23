@@ -115,7 +115,10 @@ describe("megacall IR WGSL emission", () => {
     // headers via it). `instId` lives iff the effect reads
     // instance_index; this effect doesn't, so DCE drops it.
     expect(ir.vs).toMatch(/let heap_drawIdx:\s*u32\s*=\s*drawTable\[/);
-    expect(ir.vs).toMatch(/let vid:\s*u32\s*=\s*indexStorage\[/);
+    // vid is a sentinel-aware select: indexStorage[indexStart + li] for an
+    // indexed draw, or the local vertex index when indexStart is the
+    // non-indexed sentinel (0xffffffff). See the megacall prelude.
+    expect(ir.vs).toMatch(/let vid:\s*u32\s*=\s*select\(indexStorage\[/);
     expect(ir.vs).not.toMatch(/let __heap_drawIdx\b/);
     // No leftover @builtin(instance_index) — the decoder owns the
     // megacall search and consumers receive `instId` as a local.

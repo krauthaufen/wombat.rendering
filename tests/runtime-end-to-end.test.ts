@@ -86,7 +86,7 @@ function obj() {
 describe("Runtime.compile(alist<Command>)", () => {
   it("Clear + Render on same FBO coalesces into one pass with loadOp clear", () => {
     const gpu = new MockGPU();
-    const runtime = new Runtime({ device: gpu.device });
+    const runtime = new Runtime({ device: gpu.device, heapEnabled: cval(false) });
     const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
     const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
     fbo.acquire();
@@ -114,7 +114,7 @@ describe("Runtime.compile(alist<Command>)", () => {
 
   it("Ordered tree of two leaves batches into one render pass", () => {
     const gpu = new MockGPU();
-    const runtime = new Runtime({ device: gpu.device });
+    const runtime = new Runtime({ device: gpu.device, heapEnabled: cval(false) });
     const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
     const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
     fbo.acquire();

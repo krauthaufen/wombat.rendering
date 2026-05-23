@@ -160,10 +160,12 @@ describe("isHeapEligible — per-RO instancing", () => {
     expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(true);
   });
 
-  it("RO with non-tight stride on instance attribute is ineligible", () => {
+  it("RO with non-tight stride on instance attribute is eligible (de-interleaved at ingest)", () => {
     const ibuf = cval<IBuffer>(IBuffer.fromHost(new ArrayBuffer(64)));
     const view: BufferView = {
       // V3f source (12B) but stride 16 — interleaved, not tight, not broadcast.
+      // heapAdapter.tightenBufferView gathers a tight copy at ingest, so this
+      // is now eligible (the stride wedge was lifted in v0.19.9).
       buffer: ibuf, offset: 0, stride: 16, elementType: ElementType.V3f,
     };
     const ro = baseRO({
@@ -173,7 +175,7 @@ describe("isHeapEligible — per-RO instancing", () => {
         firstIndex: 0, baseVertex: 0, firstInstance: 0,
       }),
     });
-    expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(false);
+    expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(true);
   });
 
   it("RO with firstInstance != 0 is ineligible (still rejected)", () => {

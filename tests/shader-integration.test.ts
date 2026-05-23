@@ -194,7 +194,7 @@ describe("shader integration: invariants", () => {
     const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
     const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
     fbo.acquire();
-    const runtime = new Runtime({ device: gpu.device });
+    const runtime = new Runtime({ device: gpu.device, heapEnabled: cval(false) });
     const cmds = AList.ofArray<Command>([
       { kind: "Render", tree: RenderTree.ordered(RenderTree.leaf(mk()), RenderTree.leaf(mk())) },
     ]);

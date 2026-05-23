@@ -51,7 +51,7 @@ function singleAttribEffect() {
 describe("RenderObject vertexAttributes — per-buffer reactivity", () => {
   it("flipping an inner BufferView aval to a new buffer does not rebuild the pipeline", () => {
     const gpu = new MockGPU();
-    const runtime = new Runtime({ device: gpu.device });
+    const runtime = new Runtime({ device: gpu.device, heapEnabled: cval(false) });
     const eff = singleAttribEffect();
 
     // Buffer reactivity now lives inside `BufferView.buffer: aval<IBuffer>`.
