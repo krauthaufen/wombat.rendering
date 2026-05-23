@@ -11,7 +11,7 @@
   "dependencies": {
     "@aardworx/wombat.adaptive": "^0.2.5",
     "@aardworx/wombat.base": "^0.5.0",
-    "@aardworx/wombat.rendering": "^0.19.11",
+    "@aardworx/wombat.rendering": "^0.19.12",
     "@aardworx/wombat.shader": "^0.6.0",
     "@aardworx/wombat.shader-vite": "^0.3.5"
   },
