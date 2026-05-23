@@ -42,6 +42,11 @@ export class DerivedUniformsScene {
    *  scene-wide; records partition by chunk so each dispatch binds
    *  the right chunk's main heap. */
   private readonly recordsByChunk = new Map<number, RecordsBuffer>();
+  /** Scene-wide CHAIN records (GPU transform propagation). Dispatched BEFORE
+   *  the §7 per-chunk passes — they write per-RO Model constituents that §7
+   *  then reads. Scene-wide (not per-chunk) because they target the shared
+   *  constituents buffer, not any chunk's main heap. */
+  readonly chainRecords = new RecordsBuffer();
   readonly dispatcher: DerivedUniformsDispatcher;
   /** Constituents storage GPU buffer (`array<vec2<f32>>` — df32 mat4 halves). */
   constituentsBuf: GPUBuffer;
@@ -58,7 +63,7 @@ export class DerivedUniformsScene {
     this.constituentsBuf = device.createBuffer({
       label: "derivedUniforms.constituents",
       size: initial * DF32_MAT4_BYTES,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
     this.dispatcher = new DerivedUniformsDispatcher(device, {
       constituentsBuf: () => this.constituentsBuf,
@@ -70,6 +75,13 @@ export class DerivedUniformsScene {
    *  a new chunk opens or an existing chunk's buffer reallocates. */
   setMainHeapForChunk(chunkIdx: number, getter: () => GPUBuffer): void {
     this.mainHeapByChunk.set(chunkIdx, getter);
+  }
+
+  /** Any registered main-heap getter (the chain pass needs a MainHeap binding
+   *  even though its arm never touches it). */
+  private firstHeapGetter(): (() => GPUBuffer) | undefined {
+    for (const g of this.mainHeapByChunk.values()) return g;
+    return undefined;
   }
 
   /** Get-or-create the records buffer for `chunkIdx`. */
@@ -98,7 +110,7 @@ export class DerivedUniformsScene {
     this.constituentsBuf = this.device.createBuffer({
       label: "derivedUniforms.constituents",
       size: cap,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
     this.bufferEpoch++;
     // Fresh buffer is zero-initialised; re-upload everything packed so far.
@@ -135,6 +147,17 @@ export class DerivedUniformsScene {
    *  main heap buffer. */
   encode(enc: GPUCommandEncoder): boolean {
     let any = false;
+    // Phase 1: chain pass — writes per-RO Model constituents (fwd+inv) into the
+    // shared constituents buffer. Must run BEFORE the §7 passes that read them.
+    // The MainHeap binding is unused by the chain arm; bind any registered heap.
+    if (this.chainRecords.recordCount > 0) {
+      const anyHeap = this.firstHeapGetter();
+      if (anyHeap === undefined) {
+        throw new Error("derivedUniforms.encode: chain records present but no chunk main-heap registered to bind.");
+      }
+      if (this.dispatcher.encodeChunk(enc, this.registry, this.chainRecords, anyHeap)) any = true;
+    }
+    // Phase 2: §7 per-chunk (reads constituents incl. the chain-written Model).
     for (const [chunkIdx, records] of this.recordsByChunk) {
       if (records.recordCount === 0) continue;
       const heapGetter = this.mainHeapByChunk.get(chunkIdx);
@@ -161,16 +184,17 @@ export interface RoDerivedRequest {
   /** Derived rules to install, keyed by the uniform name each produces. */
   readonly rules: ReadonlyMap<string, DerivedRule>;
   /**
-   * GPU transform-propagation chains, keyed by the uniform name each produces
-   * (e.g. "ModelTrafo" / "ModelViewTrafo"). Each value is the ordered link
-   * list whose df32 product `links[0]·links[1]·…` IS that uniform — the SG
-   * ancestor path (with constant runs folded), optionally prefixed with
-   * View/Proj. The links are `aval<Trafo3d>` constituents (shared by aval
-   * identity, so a root trafo shared by N ROs is one slot referenced N times).
-   * The output drawHeader slot is GPU-written; it must NOT also be a host
-   * upload. See docs/gpu-transform-propagation.md.
+   * GPU transform propagation: the SG ancestor trafo chain for THIS RO's
+   * `Model` (root→leaf order, constant runs folded), as `aval<Trafo3d>` links.
+   * Links are constituents shared by aval identity, so a root trafo shared by
+   * N ROs is ONE slot referenced N times (no CPU fan-out). When present, the
+   * chain pass computes a per-RO `Model` constituent (fwd from the links, inv
+   * from the reversed inverse links) and the §7 rules' `Model` leaf resolves to
+   * it — so ModelTrafo / ModelView / ModelViewInv / NormalMatrix / custom rules
+   * all derive from the GPU-composed Model, unchanged. See
+   * docs/gpu-transform-propagation.md.
    */
-  readonly chains?: ReadonlyMap<string, readonly aval<Trafo3d>[]>;
+  readonly modelChain?: readonly aval<Trafo3d>[];
   /** Trafo avals available on this RO, keyed by the uniform name a rule leaf may reference (e.g. "ModelTrafo"). */
   readonly trafoAvals: ReadonlyMap<string, aval<Trafo3d>>;
   /** drawHeader byte offset (relative to `drawHeaderBaseByte`) of a host-supplied uniform on this RO; undefined if not present. */
@@ -192,6 +216,9 @@ export interface RoRegistration {
   readonly ruleHashes: readonly string[];
   /** Chunk this registration was placed into — used by deregister. */
   readonly chunkIdx: number;
+  /** Per-RO Model output constituent pair (transform propagation); freed on
+   *  deregister. Present iff the request carried a `modelChain`. */
+  readonly modelPair?: PairedSlots;
 }
 
 export function registerRoDerivations(
@@ -199,8 +226,7 @@ export function registerRoDerivations(
   owner: object,
   req: RoDerivedRequest,
 ): RoRegistration {
-  const chainCount = req.chains?.size ?? 0;
-  if (req.rules.size === 0 && chainCount === 0) {
+  if (req.rules.size === 0 && req.modelChain === undefined) {
     return { owner, constituentAvals: [], ruleHashes: [], chunkIdx: req.chunkIdx };
   }
   const records = scene.recordsFor(req.chunkIdx);
@@ -222,8 +248,9 @@ export function registerRoDerivations(
   };
   const resolve = (inp: RuleInput): number => {
     // A matrix-typed leaf bound as an aval is a `Trafo3d` ⇒ a df32 constituent slot
-    // (its `Inverse` reads the stored backward half — free).
-    if (inp.type.kind === "Matrix" && req.trafoAvals.has(inp.name)) {
+    // (its `Inverse` reads the stored backward half — free). `Model` may instead
+    // be a GPU-composed chain output already in `pairByName` (modelChain case).
+    if (inp.type.kind === "Matrix" && (req.trafoAvals.has(inp.name) || pairByName.has(inp.name))) {
       const p = acquireTrafo(inp.name);
       return makeHandle(SlotTag.Constituent, inp.inverse ? p.inv : p.fwd);
     }
@@ -239,6 +266,27 @@ export function registerRoDerivations(
         `(not a Trafo3d binding, and non-trafo host-uniform leaves aren't supported yet)`,
     );
   };
+
+  // GPU transform propagation: compute this RO's `Model` as a per-RO constituent
+  // from its ancestor chain, and point §7's `Model` leaf at it. The chain pass
+  // (a separate, earlier dispatch) writes the fwd half from the links and the
+  // inv half from the reversed inverse links.
+  let modelPair: PairedSlots | undefined;
+  if (req.modelChain !== undefined) {
+    modelPair = scene.constituents.allocOutputPair();
+    pairByName.set("Model", modelPair);
+    const linkPairs = req.modelChain.map((av) => {
+      acquiredAvals.push(av);
+      return scene.constituents.acquire(av);
+    });
+    const n = linkPairs.length;
+    // Model.fwd = link0·link1·…·link(n-1)  (forward order, fwd slots).
+    scene.chainRecords.add(owner, CHAIN_RULE_ID, makeHandle(SlotTag.Constituent, modelPair.fwd),
+      [n, ...linkPairs.map((p) => makeHandle(SlotTag.Constituent, p.fwd))]);
+    // Model.inv = link(n-1)⁻¹·…·link0⁻¹  (reversed order, inv slots).
+    scene.chainRecords.add(owner, CHAIN_RULE_ID, makeHandle(SlotTag.Constituent, modelPair.inv),
+      [n, ...linkPairs.slice().reverse().map((p) => makeHandle(SlotTag.Constituent, p.inv))]);
+  }
 
   for (const [outName, rule] of req.rules) {
     // `flatten` returns the same Expr object when nothing was substituted (the common case —
@@ -257,30 +305,17 @@ export function registerRoDerivations(
     records.add(owner, id, makeHandle(SlotTag.HostHeap, req.drawHeaderBaseByte + outOff), inSlots);
   }
 
-  // GPU transform-propagation chains. Each link is acquired as a constituent
-  // (shared by aval identity ⇒ a root trafo is one slot, referenced N times);
-  // the record is [CHAIN_RULE_ID, outHandle, count, link0, link1, …].
-  if (req.chains !== undefined) {
-    for (const [outName, links] of req.chains) {
-      const outOff = req.outputOffset(outName);
-      if (outOff === undefined) {
-        throw new Error(`derivedUniforms: no drawHeader slot for chain output '${outName}' on this RO`);
-      }
-      const inSlots: number[] = [links.length];
-      for (const av of links) {
-        const p = scene.constituents.acquire(av);
-        acquiredAvals.push(av);
-        inSlots.push(makeHandle(SlotTag.Constituent, p.fwd));
-      }
-      records.add(owner, CHAIN_RULE_ID, makeHandle(SlotTag.HostHeap, req.drawHeaderBaseByte + outOff), inSlots);
-    }
-  }
   scene.ensureConstituentsCapacity(scene.constituents.slotCount * DF32_MAT4_BYTES);
-  return { owner, constituentAvals: acquiredAvals, ruleHashes, chunkIdx: req.chunkIdx };
+  return {
+    owner, constituentAvals: acquiredAvals, ruleHashes, chunkIdx: req.chunkIdx,
+    ...(modelPair !== undefined ? { modelPair } : {}),
+  };
 }
 
 export function deregisterRoDerivations(scene: DerivedUniformsScene, reg: RoRegistration): void {
   scene.recordsFor(reg.chunkIdx).removeAllForOwner(reg.owner);
+  scene.chainRecords.removeAllForOwner(reg.owner);
   for (const h of reg.ruleHashes) scene.registry.release(h);
   for (const av of reg.constituentAvals) scene.constituents.release(av);
+  if (reg.modelPair !== undefined) scene.constituents.freeOutputPair(reg.modelPair);
 }

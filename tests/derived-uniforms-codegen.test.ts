@@ -23,7 +23,7 @@ describe("derived-uniforms: codegen", () => {
     // The built-in transform-propagation CHAIN arm is always present and needs
     // df32, so the df32 lib + chain arm + chain case ship in every kernel now.
     expect(wgsl).toContain("fn df_mul(");
-    expect(wgsl).toContain("fn arm_chain(base: u32, out_byte: u32)");
+    expect(wgsl).toContain("fn arm_chain(base: u32, out_slot: u32)");
     expect(wgsl).toContain("case 2147483647u: { arm_chain(base, out_byte); }");
   });
 

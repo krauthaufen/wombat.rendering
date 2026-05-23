@@ -87,6 +87,21 @@ export class ConstituentSlots {
     this.mirror = new Float32Array(initialCapacity * 32);
   }
 
+  /** Allocate a fwd+inv slot pair for a GPU-WRITTEN output (not keyed by any
+   *  aval, never dirty-tracked or CPU-uploaded). Used for a per-RO `Model`
+   *  produced by the transform-propagation chain pass and then consumed by §7
+   *  as a constituent. Free with `freeOutputPair`. */
+  allocOutputPair(): PairedSlots {
+    const fwd = this.pool.alloc() as SlotIndex;
+    const inv = this.pool.alloc() as SlotIndex;
+    this.ensureCapacity(this.pool.highWaterMark);
+    return { fwd, inv };
+  }
+  freeOutputPair(p: PairedSlots): void {
+    this.pool.release(p.fwd);
+    this.pool.release(p.inv);
+  }
+
   acquire(av: aval<Trafo3d>): PairedSlots {
     let entry = this.byAval.get(av);
     if (entry === undefined) {

@@ -1,6 +1,7 @@
-// GPU transform propagation — CPU-side structural tests for the CHAIN record
-// path (registration, the shared-constituent fan-out property, add/remove).
-// The df32 math itself is verified on a real GPU in
+// GPU transform propagation — CPU-side structural tests for the modelChain
+// path: each RO's ancestor chain becomes a per-RO Model constituent computed by
+// the chain pass (two CHAIN records: fwd + reversed-inv), with the §7 `Model`
+// leaf pointed at that output pair. The df32 math is verified on a real GPU in
 // tests-browser/transform-chain-real.test.ts.
 
 import { describe, it, expect } from "vitest";
@@ -15,79 +16,78 @@ import { handleTag, handlePayload, SlotTag } from "../packages/rendering/src/run
 import { CHAIN_RULE_ID } from "../packages/rendering/src/runtime/derivedUniforms/codegen.js";
 
 const dev = (): GPUDevice => new MockGPU().device;
+const tr = (x: number, y = 0, z = 0): AVal<Trafo3d> => AVal.constant(Trafo3d.translation(new V3d(x, y, z)));
 
-function chainReq(chain: ReturnType<typeof cval<Trafo3d>>[] | AVal<Trafo3d>[], outOff = 0): RoDerivedRequest {
+function chainReq(modelChain: AVal<Trafo3d>[]): RoDerivedRequest {
   return {
     rules: new Map(),
-    chains: new Map([["ModelTrafo", chain as unknown as AVal<Trafo3d>[]]]),
+    modelChain,
     trafoAvals: new Map(),
     hostUniformOffset: () => undefined,
-    outputOffset: () => outOff,
+    outputOffset: () => undefined,
     drawHeaderBaseByte: 0,
     chunkIdx: 0,
   };
 }
 
-describe("transform-propagation CHAIN records", () => {
-  it("lays out a chain record as [CHAIN_RULE_ID, outHandle, count, links…]", () => {
+describe("transform-propagation modelChain → Model constituent", () => {
+  it("emits fwd + reversed-inv CHAIN records writing the Model constituent pair", () => {
     const scene = new DerivedUniformsScene(dev());
     const root = cval(Trafo3d.translation(new V3d(1, 0, 0)));
-    const a = AVal.constant(Trafo3d.translation(new V3d(0, 2, 0)));
-    const ro = {};
-    registerRoDerivations(scene, ro, chainReq([root, a], 64));
+    const a = tr(0, 2, 0);
+    const reg = registerRoDerivations(scene, {}, chainReq([root, a]));
 
-    const rec = scene.recordsFor(0);
-    expect(rec.recordCount).toBe(1);
-    const d = rec.data;
-    expect(d[0]).toBe(CHAIN_RULE_ID >>> 0);            // rule id
-    expect(handleTag(d[1]!)).toBe(SlotTag.HostHeap);   // output → drawHeader
-    expect(handlePayload(d[1]!)).toBe(64);             // at outOff
-    expect(d[2]).toBe(2);                               // count
-    expect(handleTag(d[3]!)).toBe(SlotTag.Constituent); // link 0 (root)
-    expect(handleTag(d[4]!)).toBe(SlotTag.Constituent); // link 1 (a)
+    const cr = scene.chainRecords;
+    expect(cr.recordCount).toBe(2);          // fwd + inv
+    expect(reg.modelPair).toBeDefined();
+    const d = cr.data, stride = cr.strideWords;
+
+    // Record 0 = fwd: writes Model.fwd, links forward (root, a).
+    expect(d[0]).toBe(CHAIN_RULE_ID >>> 0);
+    expect(handleTag(d[1]!)).toBe(SlotTag.Constituent);
+    expect(handlePayload(d[1]!)).toBe(reg.modelPair!.fwd);
+    expect(d[2]).toBe(2);                     // count
+    // Record 1 = inv: writes Model.inv, links reversed.
+    expect(d[stride + 0]).toBe(CHAIN_RULE_ID >>> 0);
+    expect(handlePayload(d[stride + 1]!)).toBe(reg.modelPair!.inv);
+    expect(d[stride + 2]).toBe(2);
+    // fwd record link0 == a-then... no: fwd is [root,a]; inv is reversed [a,root].
+    // So fwd.link0 (root.fwd) != inv.link0 (a.inv).
+    expect(d[3]).not.toBe(d[stride + 3]);
   });
 
-  it("shares one constituent slot for a root trafo across N ROs (no fan-out)", () => {
+  it("shares one root constituent across N ROs (no fan-out)", () => {
     const scene = new DerivedUniformsScene(dev());
-    const root = cval(Trafo3d.translation(new V3d(5, 0, 0)));   // the shared root
-    const a = AVal.constant(Trafo3d.scale?.(new V3d(2, 2, 2)) ?? Trafo3d.translation(new V3d(0, 1, 0)));
-    const b = AVal.constant(Trafo3d.translation(new V3d(0, 0, 3)));
-    registerRoDerivations(scene, {}, chainReq([root, a]));
-    registerRoDerivations(scene, {}, chainReq([root, b]));
+    const root = cval(Trafo3d.translation(new V3d(5, 0, 0)));
+    registerRoDerivations(scene, {}, chainReq([root, tr(0, 1, 0)]));
+    registerRoDerivations(scene, {}, chainReq([root, tr(0, 0, 3)]));
 
-    const d = scene.recordsFor(0).data;
-    const stride = scene.recordsFor(0).strideWords;
-    // link 0 of both records is `root` → identical constituent handle.
-    const root0 = d[3]!;
-    const root1 = d[stride + 3]!;
-    expect(root0).toBe(root1);
-    // link 1 differs (a vs b).
-    expect(d[4]).not.toBe(d[stride + 4]);
-    // 3 distinct avals × (fwd+inv) = 6 constituent slots — NOT 4 (no per-RO root copy).
-    expect(scene.constituents.slotCount).toBe(6);
+    const d = scene.chainRecords.data, stride = scene.chainRecords.strideWords;
+    expect(scene.chainRecords.recordCount).toBe(4); // 2 ROs × (fwd+inv)
+    // Both ROs' fwd records start with the SAME root constituent handle.
+    // Record order: ro1.fwd, ro1.inv, ro2.fwd, ro2.inv.
+    const ro1FwdRoot = d[3]!;            // ro1 fwd link0 = root.fwd
+    const ro2FwdRoot = d[2 * stride + 3]!; // ro2 fwd link0 = root.fwd
+    expect(ro1FwdRoot).toBe(ro2FwdRoot);
   });
 
-  it("add/remove ROs (structural): records appear and swap-remove cleanly", () => {
+  it("add/remove ROs (structural): chain records + Model pairs reclaimed", () => {
     const scene = new DerivedUniformsScene(dev());
     const root = cval(Trafo3d.translation(new V3d(1, 1, 1)));
-    const ro1 = {}, ro2 = {}, ro3 = {};
-    const r1 = registerRoDerivations(scene, ro1, chainReq([root, AVal.constant(Trafo3d.translation(new V3d(1, 0, 0)))]));
-    const r2 = registerRoDerivations(scene, ro2, chainReq([root, AVal.constant(Trafo3d.translation(new V3d(2, 0, 0)))]));
-    const r3 = registerRoDerivations(scene, ro3, chainReq([root, AVal.constant(Trafo3d.translation(new V3d(3, 0, 0)))]));
-    expect(scene.recordsFor(0).recordCount).toBe(3);
+    const r1 = registerRoDerivations(scene, {}, chainReq([root, tr(1)]));
+    const r2 = registerRoDerivations(scene, {}, chainReq([root, tr(2)]));
+    const r3 = registerRoDerivations(scene, {}, chainReq([root, tr(3)]));
+    expect(scene.chainRecords.recordCount).toBe(6);
 
-    // Remove the middle one — swap-remove must keep the other two intact.
-    deregisterRoDerivations(scene, r2);
-    expect(scene.recordsFor(0).recordCount).toBe(2);
-
+    deregisterRoDerivations(scene, r2); // swap-remove middle
+    expect(scene.chainRecords.recordCount).toBe(4);
     deregisterRoDerivations(scene, r1);
     deregisterRoDerivations(scene, r3);
-    expect(scene.recordsFor(0).recordCount).toBe(0);
-    // All constituents released back to the pool (root refcount hit 0).
-    // slotCount is a high-water mark; the pool frees indices for reuse, so a
-    // fresh acquire reuses them — assert reuse rather than shrink.
+    expect(scene.chainRecords.recordCount).toBe(0);
+
+    // Freed slots (link + Model-pair) are reused on the next register — no growth.
     const before = scene.constituents.slotCount;
-    registerRoDerivations(scene, {}, chainReq([root]));
-    expect(scene.constituents.slotCount).toBe(before); // reused freed slots, no growth
+    registerRoDerivations(scene, {}, chainReq([root, tr(9)]));
+    expect(scene.constituents.slotCount).toBe(before);
   });
 });

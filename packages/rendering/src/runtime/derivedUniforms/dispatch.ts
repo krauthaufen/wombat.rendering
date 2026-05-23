@@ -43,7 +43,9 @@ export interface DerivedUniformsResources {
 
 function bglEntries(): GPUBindGroupLayoutEntry[] {
   return [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+    // Constituents: read_write — the chain pass writes per-RO Model constituents
+    // here (a separate, earlier dispatch); §7 reads them. read_write permits both.
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
@@ -119,9 +121,12 @@ class RecordsGpu {
 class UberPipeline {
   private readonly device: GPUDevice;
   readonly bgl: GPUBindGroupLayout;
-  private pipe: GPUComputePipeline | undefined;
+  // Cache one pipeline per record stride (the kernel bakes RECORD_STRIDE). The
+  // chain pass and the §7 pass usually have different strides, and both are
+  // dispatched every frame, so a single-slot cache would thrash → recompile
+  // per frame. Cleared on a registry-version bump (new rule shape).
+  private readonly pipes = new Map<number, GPUComputePipeline>();
   private builtVersion = -1;
-  private builtStride = -1;
 
   constructor(device: GPUDevice) {
     this.device = device;
@@ -133,19 +138,21 @@ class UberPipeline {
     // empty registry, so a scene using only transform-propagation chains (no
     // §7 rules) still gets a pipeline. encodeChunk's recordCount===0 guard is
     // what skips the dispatch when there's genuinely nothing to do.
-    if (this.pipe !== undefined && this.builtVersion === registry.version && this.builtStride === strideU32) {
-      return this.pipe;
+    if (registry.version !== this.builtVersion) {
+      this.pipes.clear();
+      this.builtVersion = registry.version;
     }
+    const cached = this.pipes.get(strideU32);
+    if (cached !== undefined) return cached;
     const { wgsl } = buildUberKernel(registry, strideU32);
     const module = this.device.createShaderModule({ code: wgsl, label: "derivedUniforms.uber" });
-    this.pipe = this.device.createComputePipeline({
+    const pipe = this.device.createComputePipeline({
       label: "derivedUniforms.uber",
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.bgl] }),
       compute: { module, entryPoint: "main" },
     });
-    this.builtVersion = registry.version;
-    this.builtStride = strideU32;
-    return this.pipe;
+    this.pipes.set(strideU32, pipe);
+    return pipe;
   }
 }
 

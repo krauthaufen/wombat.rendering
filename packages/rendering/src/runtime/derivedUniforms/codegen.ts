@@ -148,6 +148,12 @@ fn load_entry_mat4(h: u32, r: u32, c: u32) -> vec2<f32> {
 fn write_mat4_entry(out_byte: u32, r: u32, c: u32, v: f32) {
   MainHeap[(out_byte >> 2u) + r * 4u + c] = v;
 }
+// Write one df32 mat4 entry (r,c) into a constituent slot — keeps both hi+lo
+// so a downstream §7 pass reads it at full df32 precision. Used by the chain
+// pass, whose output IS a per-RO Model constituent (not a collapsed uniform).
+fn write_constituent_entry(slot: u32, r: u32, c: u32, e: vec2<f32>) {
+  Constituents[slot * 16u + r * 4u + c] = e;
+}
 fn write_mat3_entry(out_byte: u32, r: u32, c: u32, v: f32) {
   // std140 mat3<f32>: 3 rows × 4-float stride; the 4th column per row is left untouched.
   MainHeap[(out_byte >> 2u) + r * 4u + c] = v;
@@ -156,7 +162,7 @@ fn write_mat3_entry(out_byte: u32, r: u32, c: u32, v: f32) {
 
 function bindings(strideU32: number): string {
   return /* wgsl */ `
-@group(0) @binding(0) var<storage, read>       Constituents: array<vec2<f32>>;
+@group(0) @binding(0) var<storage, read_write> Constituents: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read_write> MainHeap:     array<f32>;
 @group(0) @binding(2) var<storage, read>       RecordData:   array<u32>;
 struct CountUniform { count: u32 }
@@ -226,12 +232,16 @@ function emitMatMulChainArm(id: number, n: number): string {
   return `\nfn arm_${id}(${params}, out_byte: u32) {\n${body}}\n`;
 }
 
-/** Built-in `CHAIN` arm: variable-length df32 matmul chain read straight from
- *  the record. `RecordData[base+2]` = count; `RecordData[base+3+k]` = link k
- *  (Constituent handle). Folds P = L0·L1·…·L(count-1) in df32, writes collapsed.
- *  P starts at identity so count==0 yields identity (defensive). */
+/** Built-in `CHAIN` arm (GPU transform propagation): variable-length df32
+ *  matmul chain read straight from the record. `RecordData[base+2]` = count;
+ *  `RecordData[base+3+k]` = link k (Constituent handle). Folds
+ *  P = L0·L1·…·L(count-1) in df32 and writes it — keeping BOTH hi+lo — into the
+ *  output CONSTITUENT slot (`out_slot` = the out handle's payload), so a later
+ *  §7 pass reads it at full df32 precision. The inverse half is produced by a
+ *  second chain record over the links' inv slots in reverse order (same arm).
+ *  P starts at identity so count==0 yields identity. */
 const CHAIN_ARM = /* wgsl */ `
-fn arm_chain(base: u32, out_byte: u32) {
+fn arm_chain(base: u32, out_slot: u32) {
   let count = RecordData[base + 2u];
   var P: array<vec2<f32>, 16>;
   for (var i: u32 = 0u; i < 16u; i = i + 1u) { P[i] = vec2<f32>(0.0, 0.0); }
@@ -253,8 +263,7 @@ fn arm_chain(base: u32, out_byte: u32) {
   }
   for (var r: u32 = 0u; r < 4u; r = r + 1u) {
     for (var c: u32 = 0u; c < 4u; c = c + 1u) {
-      let e = P[r * 4u + c];
-      write_mat4_entry(out_byte, r, c, e.x + e.y);
+      write_constituent_entry(out_slot, r, c, P[r * 4u + c]);
     }
   }
 }

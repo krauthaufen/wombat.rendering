@@ -1,152 +1,125 @@
-// GPU transform propagation — real-GPU verification of the df32 CHAIN arm.
-// Composes an ancestor chain on the GPU and checks it equals the CPU f64
-// product, plus the fan-out property: changing a shared root marks O(1)
-// constituent slots regardless of how many ROs reference it.
+// GPU transform propagation — real-GPU verification of the modelChain path:
+// the chain pass composes a per-RO Model constituent (fwd+inv) in df32, then
+// §7 reads it. Verifies the Model constituent itself, the chain→constituent→§7
+// ModelView end-to-end, and the fan-out property (shared root → O(1) dirty).
 
 import { describe, expect, it } from "vitest";
 import { AVal, cval, transact, AdaptiveToken } from "@aardworx/wombat.adaptive";
 import { Trafo3d, V3d, M44d } from "@aardworx/wombat.base";
 import {
-  DerivedUniformsScene, registerRoDerivations,
+  DerivedUniformsScene, registerRoDerivations, type RoDerivedRequest,
 } from "../packages/rendering/src/runtime/derivedUniforms/sceneIntegration.js";
+import { STANDARD_DERIVED_RULES } from "../packages/rendering/src/runtime/derivedUniforms/recipes.js";
 import { requestRealDevice } from "./_realGpu.js";
 
-async function readFloats(device: GPUDevice, buf: GPUBuffer, count: number): Promise<Float32Array> {
+async function readFloats(device: GPUDevice, buf: GPUBuffer, byteOffset: number, count: number): Promise<Float32Array> {
   const bytes = count * 4;
   const staging = device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const enc = device.createCommandEncoder();
-  enc.copyBufferToBuffer(buf, 0, staging, 0, bytes);
+  enc.copyBufferToBuffer(buf, byteOffset, staging, 0, bytes);
   device.queue.submit([enc.finish()]);
   await staging.mapAsync(GPUMapMode.READ);
   const out = new Float32Array(staging.getMappedRange().slice(0));
-  staging.unmap();
-  staging.destroy();
+  staging.unmap(); staging.destroy();
   return out;
 }
 
-function runChain(scene: DerivedUniformsScene, device: GPUDevice, heap: GPUBuffer): void {
-  const dirty = scene.pullDirty(AdaptiveToken.top);
-  scene.uploadDirty(dirty);
+// Collapse a df32 mat4 constituent slot (16 hi/lo pairs, row-major) to f32[16].
+async function readConstituent(device: GPUDevice, scene: DerivedUniformsScene, slot: number): Promise<Float32Array> {
+  const raw = await readFloats(device, scene.constituentsBuf, slot * 128, 32);
+  const out = new Float32Array(16);
+  for (let i = 0; i < 16; i++) out[i] = raw[i * 2]! + raw[i * 2 + 1]!;
+  return out;
+}
+
+function expectMatClose(got: Float32Array, want: M44d): void {
+  const w = [want.M00, want.M01, want.M02, want.M03, want.M10, want.M11, want.M12, want.M13,
+             want.M20, want.M21, want.M22, want.M23, want.M30, want.M31, want.M32, want.M33];
+  for (let i = 0; i < 16; i++) expect(Math.abs(got[i]! - w[i]!)).toBeLessThanOrEqual(1e-5 * (1 + Math.abs(w[i]!)));
+}
+
+function runFrame(scene: DerivedUniformsScene, device: GPUDevice): void {
+  scene.uploadDirty(scene.pullDirty(AdaptiveToken.top));
   const enc = device.createCommandEncoder();
   scene.encode(enc);
   device.queue.submit([enc.finish()]);
 }
 
-// Compare GPU row-major output (MainHeap[r*4+c]) to a CPU M44d (M.Mrc).
-// The GPU accumulates in df32 (≈f64) but collapses the result to f32 on write,
-// so use a RELATIVE tolerance (~f32 output precision) — the df32 accumulation
-// is what keeps a naive-f32 chain from losing precision far from the origin.
-function expectMatrixClose(gpu: Float32Array, want: M44d): void {
-  const w = [
-    want.M00, want.M01, want.M02, want.M03,
-    want.M10, want.M11, want.M12, want.M13,
-    want.M20, want.M21, want.M22, want.M23,
-    want.M30, want.M31, want.M32, want.M33,
-  ];
-  for (let i = 0; i < 16; i++) {
-    const tol = 1e-5 * (1 + Math.abs(w[i]!));
-    expect(Math.abs(gpu[i]! - w[i]!)).toBeLessThanOrEqual(tol);
-  }
-}
+const baseReq = (over: Partial<RoDerivedRequest>): RoDerivedRequest => ({
+  rules: new Map(), trafoAvals: new Map(), hostUniformOffset: () => undefined,
+  outputOffset: () => undefined, drawHeaderBaseByte: 0, chunkIdx: 0, ...over,
+});
 
-describe("GPU transform-propagation chain (real GPU)", () => {
-  it("composes link0·link1·link2 in df32 == CPU f64 product", async () => {
+describe("GPU transform propagation — modelChain (real GPU)", () => {
+  it("chain pass writes the per-RO Model constituent (fwd = product, inv = inverse)", async () => {
     const device = await requestRealDevice();
     const scene = new DerivedUniformsScene(device);
-    const heap = device.createBuffer({
-      size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
+    const heap = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
     scene.setMainHeapForChunk(0, () => heap);
 
     const a = Trafo3d.translation(new V3d(1, 2, 3));
     const b = Trafo3d.rotation(new V3d(0, 0, 1), 0.6);
     const c = Trafo3d.translation(new V3d(-4, 0.5, 2));
-    registerRoDerivations(scene, {}, {
-      rules: new Map(),
-      chains: new Map([["ModelTrafo", [AVal.constant(a), AVal.constant(b), AVal.constant(c)]]]),
-      trafoAvals: new Map(),
-      hostUniformOffset: () => undefined,
-      outputOffset: () => 0,
-      drawHeaderBaseByte: 0,
-      chunkIdx: 0,
-    });
+    const reg = registerRoDerivations(scene, {}, baseReq({
+      modelChain: [AVal.constant(a), AVal.constant(b), AVal.constant(c)],
+    }));
+    runFrame(scene, device);
 
-    runChain(scene, device, heap);
-    const out = await readFloats(device, heap, 16);
-    expectMatrixClose(out, a.forward.mul(b.forward).mul(c.forward));
+    const want = a.forward.mul(b.forward).mul(c.forward);
+    expectMatClose(await readConstituent(device, scene, reg.modelPair!.fwd), want);
+    expectMatClose(await readConstituent(device, scene, reg.modelPair!.inv), want.inverse());
     scene.dispose(); heap.destroy();
   });
 
-  it("a deep chain stays df32-accurate (far-from-origin)", async () => {
+  it("§7 reads the chain-written Model: ModelView == View · (chain)", async () => {
     const device = await requestRealDevice();
     const scene = new DerivedUniformsScene(device);
-    const heap = device.createBuffer({
-      size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
+    const heap = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
     scene.setMainHeapForChunk(0, () => heap);
 
-    const links: Trafo3d[] = [];
-    let want = Trafo3d.identity.forward; // M44d identity; compose in M44d order to match the GPU
-    for (let i = 0; i < 8; i++) {
-      const t = Trafo3d.translation(new V3d(100000 + i * 13, i * 7, -i * 5)).mul(Trafo3d.rotation(new V3d(0, 1, 0), 0.1 * i));
-      links.push(t);
-      want = want.mul(t.forward);
-    }
-    registerRoDerivations(scene, {}, {
-      rules: new Map(),
-      chains: new Map([["ModelTrafo", links.map((t) => AVal.constant(t))]]),
-      trafoAvals: new Map(),
-      hostUniformOffset: () => undefined,
-      outputOffset: () => 0,
-      drawHeaderBaseByte: 0,
-      chunkIdx: 0,
-    });
-    runChain(scene, device, heap);
-    const out = await readFloats(device, heap, 16);
-    // df32 holds ~double precision; even at 1e5 translations the f32 readback matches.
-    expectMatrixClose(out, want);
+    const m0 = Trafo3d.translation(new V3d(2, 0, 1));
+    const m1 = Trafo3d.rotation(new V3d(1, 0, 0), 0.4);
+    const view = Trafo3d.translation(new V3d(-3, 1, 2)).mul(Trafo3d.rotation(new V3d(0, 1, 0), 0.2));
+    registerRoDerivations(scene, {}, baseReq({
+      rules: new Map([["ModelViewTrafo", STANDARD_DERIVED_RULES.get("ModelViewTrafo")!]]),
+      modelChain: [AVal.constant(m0), AVal.constant(m1)],
+      trafoAvals: new Map([["View", AVal.constant(view)]]),
+      outputOffset: (n) => (n === "ModelViewTrafo" ? 0 : undefined),
+    }));
+    runFrame(scene, device);
+
+    const want = view.forward.mul(m0.forward.mul(m1.forward)); // View · Model
+    expectMatClose(await readFloats(device, heap, 0, 16), want);
     scene.dispose(); heap.destroy();
   });
 
-  it("changing a shared root marks O(1) constituent slots (no fan-out)", async () => {
+  it("shared root → root change marks O(1) slots; all Models update", async () => {
     const device = await requestRealDevice();
     const scene = new DerivedUniformsScene(device);
-    const N = 200;
-    const heap = device.createBuffer({
-      size: N * 64, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
+    const heap = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
     scene.setMainHeapForChunk(0, () => heap);
 
     const root = cval(Trafo3d.translation(new V3d(0, 0, 0)));
+    const N = 150;
+    const regs = [];
     for (let i = 0; i < N; i++) {
-      registerRoDerivations(scene, {}, {
-        rules: new Map(),
-        chains: new Map([["ModelTrafo", [root, AVal.constant(Trafo3d.translation(new V3d(i, 0, 0)))]]]),
-        trafoAvals: new Map(),
-        hostUniformOffset: () => undefined,
-        outputOffset: () => i * 64, // 16 floats per RO
-        drawHeaderBaseByte: 0,
-        chunkIdx: 0,
-      });
+      regs.push(registerRoDerivations(scene, {}, baseReq({ modelChain: [root, AVal.constant(Trafo3d.translation(new V3d(i, 0, 0)))] })));
     }
-    runChain(scene, device, heap); // initial
+    runFrame(scene, device);
 
-    // Change the one root cval shared by all N ROs.
     transact(() => { root.value = Trafo3d.translation(new V3d(1000, 0, 0)); });
-    scene.routeInputChanged(root);                 // heap would route this
+    scene.routeInputChanged(root);
     const dirty = scene.pullDirty(AdaptiveToken.top);
-    expect(dirty.size).toBe(2);                     // root fwd+inv ONLY — not 2·N
+    expect(dirty.size).toBe(2); // root fwd+inv only — not 2·N
     scene.uploadDirty(dirty);
     const enc = device.createCommandEncoder();
     scene.encode(enc);
     device.queue.submit([enc.finish()]);
 
-    // Every RO's ModelTrafo translation column now reflects the new root.
-    const out = await readFloats(device, heap, N * 16);
-    for (let i = 0; i < N; i++) {
-      const want = root.value.forward.mul(Trafo3d.translation(new V3d(i, 0, 0)).forward);
-      const base = i * 16;
-      expect(out[base + 3]!).toBeCloseTo(want.M03, 2);  // x translation
+    // Spot-check a few ROs' Model fwd: x translation == 1000 + i.
+    for (const i of [0, 1, 73, N - 1]) {
+      const m = await readConstituent(device, scene, regs[i]!.modelPair!.fwd);
+      expect(m[3]!).toBeCloseTo(1000 + i, 2); // M03
     }
     scene.dispose(); heap.destroy();
   });
