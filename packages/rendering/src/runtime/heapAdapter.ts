@@ -464,6 +464,7 @@ export function renderObjectToHeapSpec(
     ...geom,
     ...(textures !== undefined ? { textures } : {}),
     ...(ro.modeRules !== undefined ? { modeRules: ro.modeRules } : {}),
+    ...(ro.modelChain !== undefined ? { modelChain: ro.modelChain } : {}),
     // Pass `active` through unforced so the heap path can subscribe
     // and react to flips without re-running the spec adapter.
     ...(ro.active !== undefined ? { active: ro.active } : {}),

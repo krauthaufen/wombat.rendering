@@ -530,6 +530,16 @@ export interface HeapDrawSpec {
     readonly depthWrite?:     import("./derivedModes/rule.js").DerivedModeRule<"depthWrite">;
     readonly alphaToCoverage?: import("./derivedModes/rule.js").DerivedModeRule<"alphaToCoverage">;
   };
+  /**
+   * GPU transform propagation: this RO's `Model` ancestor trafo chain (root→
+   * leaf, constant runs folded) as `aval<Trafo3d>` links. When present, the §7
+   * compute pass composes a per-RO Model constituent from these on the GPU
+   * (instead of the RO supplying a single composed `ModelTrafo` aval), and the
+   * standard recipes / custom rules derive ModelView / inverses / NormalMatrix
+   * from it. Eliminates the CPU fan-out of a shared root trafo over many ROs.
+   * See docs/gpu-transform-propagation.md.
+   */
+  readonly modelChain?: readonly aval<Trafo3d>[];
 }
 
 export interface HeapSceneStats {
@@ -1193,6 +1203,10 @@ export function buildHeapScene(
     // just means "this RO doesn't supply the base trafos", so the field falls back to its
     // packed `spec.inputs` value (or errors later if there is none — same as without §7).
     for (const inp of inputsOf(rule.ir)) {
+      // `Model` may be supplied by the GPU transform-propagation chain rather
+      // than a ModelTrafo aval — treat it as bound when a modelChain is present
+      // (registerRoDerivations points the §7 Model leaf at the chain output).
+      if (inp.name === "Model" && spec.modelChain !== undefined) continue;
       const specName = STANDARD_TRAFO_LEAVES.get(inp.name) ?? inp.name;
       const lv = spec.inputs[specName];
       if (lv === undefined || isDerivedRule(lv)) {
@@ -3415,6 +3429,7 @@ export function buildHeapScene(
         const reg = registerRoDerivations(derivedScene, {}, {
           rules: ruleSubset,
           trafoAvals,
+          ...(spec.modelChain !== undefined ? { modelChain: spec.modelChain } : {}),
           hostUniformOffset: (n) => {
             const r = perDrawRefs.get(n);
             return r === undefined ? undefined : r + ALLOC_HEADER_PAD_TO;
