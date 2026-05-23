@@ -129,7 +129,10 @@ class UberPipeline {
   }
 
   pipeline(registry: DerivedUniformRegistry, strideU32: number): GPUComputePipeline | undefined {
-    if (registry.size === 0) return undefined;
+    // Always buildable: the kernel carries the built-in CHAIN arm even with an
+    // empty registry, so a scene using only transform-propagation chains (no
+    // §7 rules) still gets a pipeline. encodeChunk's recordCount===0 guard is
+    // what skips the dispatch when there's genuinely nothing to do.
     if (this.pipe !== undefined && this.builtVersion === registry.version && this.builtStride === strideU32) {
       return this.pipe;
     }

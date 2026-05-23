@@ -25,6 +25,7 @@ import {
 } from "./slots.js";
 import { DerivedUniformRegistry } from "./registry.js";
 import { RecordsBuffer, SlotTag, makeHandle } from "./records.js";
+import { CHAIN_RULE_ID } from "./codegen.js";
 import { DerivedUniformsDispatcher, uploadConstituentsRange } from "./dispatch.js";
 import { flatten, type RuleInput } from "./flatten.js";
 import { ruleFromIR, type DerivedRule } from "./rule.js";
@@ -159,6 +160,17 @@ export class DerivedUniformsScene {
 export interface RoDerivedRequest {
   /** Derived rules to install, keyed by the uniform name each produces. */
   readonly rules: ReadonlyMap<string, DerivedRule>;
+  /**
+   * GPU transform-propagation chains, keyed by the uniform name each produces
+   * (e.g. "ModelTrafo" / "ModelViewTrafo"). Each value is the ordered link
+   * list whose df32 product `links[0]·links[1]·…` IS that uniform — the SG
+   * ancestor path (with constant runs folded), optionally prefixed with
+   * View/Proj. The links are `aval<Trafo3d>` constituents (shared by aval
+   * identity, so a root trafo shared by N ROs is one slot referenced N times).
+   * The output drawHeader slot is GPU-written; it must NOT also be a host
+   * upload. See docs/gpu-transform-propagation.md.
+   */
+  readonly chains?: ReadonlyMap<string, readonly aval<Trafo3d>[]>;
   /** Trafo avals available on this RO, keyed by the uniform name a rule leaf may reference (e.g. "ModelTrafo"). */
   readonly trafoAvals: ReadonlyMap<string, aval<Trafo3d>>;
   /** drawHeader byte offset (relative to `drawHeaderBaseByte`) of a host-supplied uniform on this RO; undefined if not present. */
@@ -187,7 +199,10 @@ export function registerRoDerivations(
   owner: object,
   req: RoDerivedRequest,
 ): RoRegistration {
-  if (req.rules.size === 0) return { owner, constituentAvals: [], ruleHashes: [], chunkIdx: req.chunkIdx };
+  const chainCount = req.chains?.size ?? 0;
+  if (req.rules.size === 0 && chainCount === 0) {
+    return { owner, constituentAvals: [], ruleHashes: [], chunkIdx: req.chunkIdx };
+  }
   const records = scene.recordsFor(req.chunkIdx);
 
   const acquiredAvals: aval<Trafo3d>[] = [];
@@ -240,6 +255,25 @@ export function registerRoDerivations(
       throw new Error(`derivedUniforms: no drawHeader slot for derived uniform '${outName}' on this RO`);
     }
     records.add(owner, id, makeHandle(SlotTag.HostHeap, req.drawHeaderBaseByte + outOff), inSlots);
+  }
+
+  // GPU transform-propagation chains. Each link is acquired as a constituent
+  // (shared by aval identity ⇒ a root trafo is one slot, referenced N times);
+  // the record is [CHAIN_RULE_ID, outHandle, count, link0, link1, …].
+  if (req.chains !== undefined) {
+    for (const [outName, links] of req.chains) {
+      const outOff = req.outputOffset(outName);
+      if (outOff === undefined) {
+        throw new Error(`derivedUniforms: no drawHeader slot for chain output '${outName}' on this RO`);
+      }
+      const inSlots: number[] = [links.length];
+      for (const av of links) {
+        const p = scene.constituents.acquire(av);
+        acquiredAvals.push(av);
+        inSlots.push(makeHandle(SlotTag.Constituent, p.fwd));
+      }
+      records.add(owner, CHAIN_RULE_ID, makeHandle(SlotTag.HostHeap, req.drawHeaderBaseByte + outOff), inSlots);
+    }
   }
   scene.ensureConstituentsCapacity(scene.constituents.slotCount * DF32_MAT4_BYTES);
   return { owner, constituentAvals: acquiredAvals, ruleHashes, chunkIdx: req.chunkIdx };

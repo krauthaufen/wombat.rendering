@@ -23,6 +23,18 @@ export interface UberKernel {
   readonly strideU32: number;
 }
 
+/**
+ * Reserved rule id for the built-in variable-length trafo-chain arm (GPU
+ * transform propagation). A chain record is laid out as
+ *   [ CHAIN_RULE_ID, out_slot, count, link0, link1, … ]
+ * where each `linkK` is a Constituent handle. The arm folds the df32 product
+ * `link0 · link1 · … · link(count-1)` and writes it (collapsed) to `out_slot`.
+ * One arm handles every chain length, so distinct SG ancestor paths don't each
+ * spawn a kernel arm / recompile. Kept far above the registry's monotonic ids
+ * (which start at 0) so it can never collide. See docs/gpu-transform-propagation.md.
+ */
+export const CHAIN_RULE_ID = 0x7fffffff;
+
 // ─── Rule-shape classification ────────────────────────────────────────
 
 type Shape =
@@ -213,6 +225,40 @@ function emitMatMulChainArm(id: number, n: number): string {
   body += `  }\n`;
   return `\nfn arm_${id}(${params}, out_byte: u32) {\n${body}}\n`;
 }
+
+/** Built-in `CHAIN` arm: variable-length df32 matmul chain read straight from
+ *  the record. `RecordData[base+2]` = count; `RecordData[base+3+k]` = link k
+ *  (Constituent handle). Folds P = L0·L1·…·L(count-1) in df32, writes collapsed.
+ *  P starts at identity so count==0 yields identity (defensive). */
+const CHAIN_ARM = /* wgsl */ `
+fn arm_chain(base: u32, out_byte: u32) {
+  let count = RecordData[base + 2u];
+  var P: array<vec2<f32>, 16>;
+  for (var i: u32 = 0u; i < 16u; i = i + 1u) { P[i] = vec2<f32>(0.0, 0.0); }
+  P[0] = vec2<f32>(1.0, 0.0); P[5] = vec2<f32>(1.0, 0.0);
+  P[10] = vec2<f32>(1.0, 0.0); P[15] = vec2<f32>(1.0, 0.0);
+  for (var k: u32 = 0u; k < count; k = k + 1u) {
+    let h = RecordData[base + 3u + k];
+    var Q: array<vec2<f32>, 16>;
+    for (var r: u32 = 0u; r < 4u; r = r + 1u) {
+      for (var c: u32 = 0u; c < 4u; c = c + 1u) {
+        var acc = vec2<f32>(0.0, 0.0);
+        for (var t: u32 = 0u; t < 4u; t = t + 1u) {
+          acc = df_add(acc, df_mul(P[r * 4u + t], load_entry_mat4(h, t, c)));
+        }
+        Q[r * 4u + c] = acc;
+      }
+    }
+    P = Q;
+  }
+  for (var r: u32 = 0u; r < 4u; r = r + 1u) {
+    for (var c: u32 = 0u; c < 4u; c = c + 1u) {
+      let e = P[r * 4u + c];
+      write_mat4_entry(out_byte, r, c, e.x + e.y);
+    }
+  }
+}
+`;
 
 // ─── Generic path: arbitrary IR lowered via the wgsl printer (f32) ────
 //
@@ -454,13 +500,16 @@ export function buildUberKernel(registry: DerivedUniformRegistry, strideU32: num
 
   const arms = entries.map((e, i) => emitArm(e, shapes[i]!)).join("");
   const cases = entries.map((e, i) => emitCase(e, shapes[i]!)).join("\n");
-  const needsDf32 = shapes.some((s) => s.kind === "matmulChain");
+  // The CHAIN arm is always present (GPU transform propagation) and always
+  // needs the df32 library.
+  const needsDf32 = true;
 
   const wgsl = `${bindings(strideU32)}
 ${needsDf32 ? DF32_LIB : ""}
 ${HANDLE_HELPERS}
 ${loadersStorers}
 ${arms}
+${CHAIN_ARM}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= Count.count) { return; }
@@ -468,6 +517,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let rule_id = RecordData[base];
   let out_byte = RecordData[base + 1u] & SLOT_PAYLOAD_MASK;
   switch rule_id {
+    case ${CHAIN_RULE_ID >>> 0}u: { arm_chain(base, out_byte); }
 ${cases}
     default: { return; }
   }
