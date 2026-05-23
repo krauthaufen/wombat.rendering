@@ -1,6 +1,15 @@
 # GPU Transform Propagation — Implementation Plan
 
-Status: **planned, not built.** Companion to the TODO entry of the same name.
+Status: **IMPLEMENTED** (rendering 0.19.12 + dom 0.14.2). The SG emits a per-RO
+Model ancestor chain; the heap GPU-composes a per-RO Model constituent (fwd+inv,
+df32) in a chain pass before §7; §7 derives ModelView / inverses / NormalMatrix /
+custom rules from it unchanged. A root `cval` shared by N descendants now marks
+exactly its 2 constituent slots (not N composites) — the fan-out is gone. Real-GPU
+tested (chain math, chain→constituent→§7 ModelView, fan-out) + structural (CPU)
+tests + end-to-end validated on heap-demo-sg (correct render incl. trafo-determinant
+cull). **Remaining optimizations (deferred, not blocking):** constant-run folding in
+the chain (fewer constituent slots), and the Phase-2 colored prefix-scan (shared
+ancestor-prefix sharing). Companion to the TODO entry of the same name.
 
 ## Problem
 
