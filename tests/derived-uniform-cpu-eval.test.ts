@@ -50,6 +50,6 @@ describe("derived-uniform CPU interpreter", () => {
 
   it("throws clearly on a missing leaf", () => {
     const rule = derivedUniform((u) => u.ViewTrafo.mul(u.ModelTrafo));
-    expect(() => interpretExpr(rule.ir, () => undefined)).toThrow(/missing uniform leaf/);
+    expect(() => interpretExpr(rule.ir, () => undefined)).toThrow(/missing leaf/);
   });
 });

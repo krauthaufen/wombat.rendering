@@ -35,6 +35,7 @@ import type { Type } from "@aardworx/wombat.shader/ir";
 import { isDerivedRule } from "../runtime/derivedUniforms/rule.js";
 import { STANDARD_DERIVED_RULES, STANDARD_TRAFO_LEAVES } from "../runtime/derivedUniforms/recipes.js";
 import { interpretExpr } from "../runtime/derivedUniforms/cpuEval.js";
+import { evaluateModeRule } from "../runtime/derivedModes/cpuEval.js";
 import { prepareAdaptiveBuffer } from "./adaptiveBuffer.js";
 import { prepareAdaptiveTexture } from "./adaptiveTexture.js";
 import { prepareAdaptiveSampler } from "./adaptiveSampler.js";
@@ -369,6 +370,8 @@ export class PreparedRenderObject {
     pipelineCtx: PipelineBuildContext,
     pipelineState: import("../core/index.js").PipelineState,
     private readonly active: aval<boolean> | undefined = undefined,
+    private readonly modeRules: import("../core/renderObject.js").RenderObject["modeRules"] = undefined,
+    private readonly modeUniformReader: ((name: string, token: AdaptiveToken) => unknown) | undefined = undefined,
   ) {
     this.groups = groups;
     this._pipelineCtx = pipelineCtx;
@@ -380,6 +383,28 @@ export class PreparedRenderObject {
 
   /** Internal — exposed for tests. The PipelineState the RO is reading. */
   get pipelineState(): import("../core/index.js").PipelineState { return this._pipelineState; }
+
+  /**
+   * Override pipeline-axis values with CPU-evaluated derived-mode rules.
+   * Each rule reads per-RO uniforms + the SG-declared default; evaluating
+   * under `token` registers the dependency so a uniform/declared change
+   * re-keys the pipeline (recompile via the snapshot cache). The heap path
+   * does this on a GPU partition kernel — this is the legacy per-RO answer.
+   */
+  private applyModeRules(snap: PipelineSnap, token: AdaptiveToken): PipelineSnap {
+    const mr = this.modeRules;
+    const ru = this.modeUniformReader;
+    if (mr === undefined || ru === undefined) return snap;
+    const read = (name: string): unknown => ru(name, token);
+    const ov: Record<string, unknown> = {};
+    if (mr.cull            !== undefined) ov.cullMode        = evaluateModeRule(mr.cull, read, token);
+    if (mr.frontFace       !== undefined) ov.frontFace       = evaluateModeRule(mr.frontFace, read, token);
+    if (mr.topology        !== undefined) ov.topology        = evaluateModeRule(mr.topology, read, token);
+    if (mr.depthWrite      !== undefined) ov.depthWrite      = evaluateModeRule(mr.depthWrite, read, token);
+    if (mr.depthCompare    !== undefined) ov.depthCompare    = evaluateModeRule(mr.depthCompare, read, token);
+    if (mr.alphaToCoverage !== undefined) ov.alphaToCoverage = evaluateModeRule(mr.alphaToCoverage, read, token);
+    return { ...snap, ...ov };
+  }
 
   acquire(): void {
     for (const r of this.vertexBuffers.values()) r.acquire();
@@ -399,7 +424,7 @@ export class PreparedRenderObject {
    * surrounding sort / record path can read it without forcing.
    */
   update(token: AdaptiveToken): void {
-    const snap = snapshotPipeline(this._pipelineState, token);
+    const snap = this.applyModeRules(snapshotPipeline(this._pipelineState, token), token);
     const key = pipelineKeyOf(snap);
     let pipeline = this._pipelineCache.get(key);
     if (pipeline === undefined) {
@@ -751,6 +776,20 @@ export function prepareRenderObject(
     ...(opts.effectId !== undefined ? { effectId: opts.effectId } : {}),
   };
 
+  // Derived-mode rules (cull/frontFace/… as a function of per-RO uniforms)
+  // are evaluated CPU-side in the legacy path. Build a uniform reader over
+  // the RO's provider (resolving nested derived-uniform rules too).
+  let modeUniformReader: ((name: string, token: AdaptiveToken) => unknown) | undefined;
+  if (obj.modeRules !== undefined) {
+    const uniProv = asUniformProvider(obj.uniforms);
+    modeUniformReader = (name: string, token: AdaptiveToken): unknown => {
+      const v = uniProv.tryGet(name);
+      if (v === undefined) return undefined;
+      if (isDerivedRule(v)) return interpretExpr(v.ir, (n) => readLeaf(n, uniProv, effect.avalBindings, token));
+      return (v as aval<unknown>).getValue(token);
+    };
+  }
+
   return new PreparedRenderObject(
     device,
     vertexBindings, vertexBuffers, vertexViews,
@@ -760,6 +799,8 @@ export function prepareRenderObject(
     pipelineCtx,
     obj.pipelineState,
     obj.active,
+    obj.modeRules,
+    modeUniformReader,
   );
 }
 

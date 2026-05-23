@@ -198,7 +198,19 @@ function intrinsic(name: string, a: EvalValue[]): EvalValue {
  * `readLeaf`. Returns a host double value (`M44d` / `V3d` / number / …) that
  * `writeField` narrows to f32 when packing the UBO.
  */
-export function interpretExpr(ir: Expr, readLeaf: LeafReader): EvalValue {
+/**
+ * Optional evaluation context. `locals` resolves `Var` nodes (function
+ * params / `let` bindings); `callFn` resolves a user-function `Call` to a
+ * value (its name + already-evaluated args). Derived UNIFORMS pass neither
+ * (their rules are leaf-and-op only); derived MODES pass both (rule bodies
+ * have locals and call helpers like `flipCull`). See derivedModes/cpuEval.
+ */
+export interface EvalOpts {
+  readonly locals?: ReadonlyMap<string, EvalValue>;
+  readonly callFn?: (name: string, args: EvalValue[]) => EvalValue;
+}
+
+export function interpretExpr(ir: Expr, readLeaf: LeafReader, opts: EvalOpts = {}): EvalValue {
   const ev = (e: Expr): EvalValue => {
     switch (e.kind) {
       case "Const": {
@@ -208,10 +220,20 @@ export function interpretExpr(ir: Expr, readLeaf: LeafReader): EvalValue {
         throw new Error("derived eval: null const");
       }
       case "ReadInput": {
-        if (e.scope !== "Uniform") throw new Error("derived eval: non-uniform leaf scope " + e.scope);
+        // Scope-agnostic: the readLeaf decides what a name resolves to
+        // (uniforms for derived uniforms; uniforms + `declared` for modes).
         const raw = readLeaf(e.name);
-        if (raw === undefined) throw new Error("derived eval: missing uniform leaf '" + e.name + "'");
+        if (raw === undefined) throw new Error("derived eval: missing leaf '" + e.name + "'");
         return coerce(raw, e.type);
+      }
+      case "Var": {
+        const v = opts.locals?.get(e.var.name);
+        if (v === undefined) throw new Error("derived eval: unbound local '" + e.var.name + "'");
+        return v;
+      }
+      case "Call": {
+        if (opts.callFn === undefined) throw new Error("derived eval: Call '" + e.fn.signature.name + "' but no callFn provided");
+        return opts.callFn(e.fn.signature.name, e.args.map(ev));
       }
       case "Neg": return negate(ev(e.value));
       case "Not": return !(ev(e.value) as boolean);
