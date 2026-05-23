@@ -27,13 +27,14 @@
 // `ro.samplers.count <= 1` are classifier invariants.
 
 import { type aval, type AdaptiveToken } from "@aardworx/wombat.adaptive";
-import type { IBuffer, HostBufferSource } from "../core/buffer.js";
-import type { BufferView } from "../core/bufferView.js";
+import { IBuffer, type HostBufferSource } from "../core/buffer.js";
+import { BufferView } from "../core/bufferView.js";
 import { ITexture, type HostTextureSource } from "../core/texture.js";
 import { ISampler } from "../core/sampler.js";
 import type { RenderObject } from "../core/renderObject.js";
 import { asAttributeProvider, asUniformProvider } from "../core/provider.js";
 import type { HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
+import { isBufferView } from "./heapScene/pools.js";
 import { compileHeapEffect } from "./heapEffect.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
 
@@ -50,13 +51,29 @@ function asUint32(data: HostBufferSource): Uint32Array {
   return new Uint32Array(data);
 }
 
+// Widen 16-bit indices to u32 (the heap's indexStorage is u32). Copy, not a
+// reinterpret view — each u16 index becomes a u32 element.
+function widenU16(data: HostBufferSource): Uint32Array {
+  const u16 = data instanceof Uint16Array
+    ? data
+    : ArrayBuffer.isView(data)
+      ? new Uint16Array(data.buffer, data.byteOffset, data.byteLength / 2)
+      : new Uint16Array(data);
+  return Uint32Array.from(u16);
+}
+
 // IndexPool keys on aval identity → ROs sharing the same
 // `ro.indices.buffer` must produce the SAME downstream
 // `aval<Uint32Array>`. A fresh `.map(…)` per RO would defeat the
 // pool's identity-based sharing and balloon GPU memory (e.g. 11K
 // spheres each allocating their own copy of the 6144-index buffer
 // → 270 MB).
-const indicesAvalCache = new WeakMap<aval<IBuffer>, aval<Uint32Array>>();
+// Keyed by (buffer aval, baseVertex). baseVertex is baked into the index
+// VALUES (index[i] + baseVertex), so a buffer drawn with two different
+// baseVertex offsets needs two distinct transcoded arrays — but the common
+// case (baseVertex 0, or per-primitive index buffers that aren't shared)
+// keeps one entry per buffer and preserves the pool's identity sharing.
+const indicesAvalCache = new WeakMap<aval<IBuffer>, Map<number, aval<Uint32Array>>>();
 
 // Per-aval shared "current pool ref" cell. ROs that share an
 // `aval<ITexture>` (and therefore one AtlasPool entry) all read
@@ -71,18 +88,77 @@ function currentRefCellFor(av: aval<ITexture>, initial: number): { ref: number }
   }
   return c;
 }
-function indicesAvalFor(ibAval: aval<IBuffer>): aval<Uint32Array> {
-  let av = indicesAvalCache.get(ibAval);
+function indicesAvalFor(ibAval: aval<IBuffer>, indexFormat: GPUIndexFormat, baseVertex: number): aval<Uint32Array> {
+  let byBase = indicesAvalCache.get(ibAval);
+  if (byBase === undefined) {
+    byBase = new Map();
+    indicesAvalCache.set(ibAval, byBase);
+  }
+  let av = byBase.get(baseVertex);
   if (av === undefined) {
     av = ibAval.map((ib: IBuffer) => {
       if (ib.kind !== "host") {
         throw new Error("heapAdapter: index buffer flipped to native GPUBuffer; classifier should have caught this");
       }
-      return asUint32(ib.data);
+      const u32 = indexFormat === "uint16" ? widenU16(ib.data) : asUint32(ib.data);
+      if (baseVertex === 0) return u32;
+      // Fold baseVertex into the index values so the megacall decode
+      // (vid = indexStorage[...]) lands on the right vertex with no
+      // extra record field. Copy (don't mutate the shared view).
+      const out = new Uint32Array(u32.length);
+      for (let i = 0; i < u32.length; i++) out[i] = u32[i]! + baseVertex;
+      return out;
     });
-    indicesAvalCache.set(ibAval, av);
+    byBase.set(baseVertex, av);
   }
   return av;
+}
+
+// Byte view over a host buffer source (for the de-interleave gather).
+function bytesOf(data: HostBufferSource): Uint8Array {
+  if (data instanceof Uint8Array) return data;
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  return new Uint8Array(data);
+}
+
+// De-interleaved (tight, offset-0) views, keyed by (source buffer aval,
+// offset, stride) so ROs sharing one interleaved buffer + the same attribute
+// share a single gathered allocation.
+const deinterleaveCache = new WeakMap<aval<IBuffer>, Map<string, aval<IBuffer>>>();
+
+/**
+ * Make a tight, offset-0 BufferView the arena can ingest. Tight/broadcast
+ * views pass through unchanged; interleaved or offset views are gathered
+ * into a fresh packed host buffer (every `stride` bytes from `offset`,
+ * `byteSize` each) wrapped as a new whole-buffer view.
+ */
+function tightenBufferView(bv: BufferView): BufferView {
+  if (bv.singleValue !== undefined) return bv; // broadcast → lowered to a uniform
+  const byteSize = bv.elementType.byteSize;
+  const offset = bv.offset ?? 0;
+  const stride = (bv.stride !== undefined && bv.stride > 0) ? bv.stride : byteSize;
+  if (offset === 0 && stride === byteSize) return bv; // already tight
+  let byKey = deinterleaveCache.get(bv.buffer);
+  if (byKey === undefined) { byKey = new Map(); deinterleaveCache.set(bv.buffer, byKey); }
+  const key = `${offset}:${stride}:${byteSize}`;
+  let tight = byKey.get(key);
+  if (tight === undefined) {
+    tight = bv.buffer.map((ib: IBuffer): IBuffer => {
+      if (ib.kind !== "host") {
+        throw new Error("heapAdapter: interleaved attribute buffer flipped to native GPUBuffer; classifier should have caught this");
+      }
+      const src = bytesOf(ib.data);
+      const count = Math.max(0, Math.floor((src.byteLength - offset - byteSize) / stride) + 1);
+      const out = new Uint8Array(count * byteSize);
+      for (let i = 0; i < count; i++) {
+        const s = offset + i * stride;
+        out.set(src.subarray(s, s + byteSize), i * byteSize);
+      }
+      return IBuffer.fromHost(out);
+    });
+    byKey.set(key, tight);
+  }
+  return BufferView.ofBuffer(tight, bv.elementType);
 }
 
 /**
@@ -197,7 +273,7 @@ export function renderObjectToHeapSpec(
   const inputs: { [name: string]: aval<unknown> | unknown } = {};
   for (const a of schema.attributes) {
     const bv = vAttr.tryGet(a.name);
-    if (bv !== undefined) inputs[a.name] = bv;
+    if (bv !== undefined) inputs[a.name] = isBufferView(bv) ? tightenBufferView(bv) : bv;
   }
   const pullUniform = (name: string): void => {
     if (Object.prototype.hasOwnProperty.call(inputs, name)) return;
@@ -222,17 +298,25 @@ export function renderObjectToHeapSpec(
       instanceAttributes = {};
       for (const n of names) {
         const bv = iAttr.tryGet(n);
-        if (bv !== undefined) instanceAttributes[n] = bv;
+        if (bv !== undefined) instanceAttributes[n] = isBufferView(bv) ? tightenBufferView(bv) : bv;
       }
     }
   }
 
+  // DrawCall: read once (snapshot — like instanceCount/vertexCount).
+  //    Slice offsets fold in here: firstIndex → record indexStart,
+  //    indexCount → record slice length, baseVertex → baked into the
+  //    transcoded index values (so it needs no record field).
+  const dc = ro.drawCall.getValue(token);
+  const baseVertex = dc.kind === "indexed" ? dc.baseVertex : 0;
+
   // 2. Indices: BufferView → aval<Uint32Array>. Map the underlying
-  //    IBuffer aval; the heap path's IndexPool will key on this aval.
+  //    IBuffer aval; the heap path's IndexPool will key on this aval
+  //    (and on baseVertex, since it's baked into the values).
   //    Non-indexed ROs (no `ro.indices`) carry no index aval — the spec
   //    then sets `vertexCount` and the megacall decodes the vertex directly.
   const indices: aval<Uint32Array> | undefined =
-    ro.indices !== undefined ? indicesAvalFor(ro.indices.buffer) : undefined;
+    ro.indices !== undefined ? indicesAvalFor(ro.indices.buffer, ro.indices.elementType.indexFormat ?? "uint32", baseVertex) : undefined;
 
   // 3. Texture/sampler: single-pair v1. The Sg compile layer binds
   //    each texture aval under both `name` and `${name}_view` so the
@@ -355,19 +439,20 @@ export function renderObjectToHeapSpec(
     );
   }
 
-  // 4. DrawCall: read once. Classifier validates fields are heap-
-  //    compatible (indexed, instanceCount=1, zero offsets).
-  const dc = ro.drawCall.getValue(token);
+  // 4. DrawCall geometry. Classifier validates fields are heap-
+  //    compatible (instanceCount≥1, firstInstance=0, non-indexed firstVertex=0).
   if (dc.kind === "indexed" && indices === undefined) {
     throw new Error("heapAdapter: indexed drawCall without indices");
   }
   if (dc.kind === "non-indexed" && indices !== undefined) {
     throw new Error("heapAdapter: non-indexed drawCall with an index buffer");
   }
-  // Indexed → carry the index aval; non-indexed → carry the vertex count and
-  // the megacall uses the local vertex index directly (no index lookup).
+  // Indexed → carry the index aval + the firstIndex/indexCount slice (folded
+  // into the record's indexStart/indexCount; baseVertex is already baked into
+  // the index values). Non-indexed → carry the vertex count; the megacall uses
+  // the local vertex index directly (no index lookup).
   const geom = dc.kind === "indexed"
-    ? { indices: indices! }
+    ? { indices: indices!, firstIndex: dc.firstIndex, indexCount: dc.indexCount }
     : { vertexCount: dc.vertexCount };
 
   return {

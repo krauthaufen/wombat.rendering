@@ -185,27 +185,17 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
     return AVal.constant(false);
   }
 
-  // 2. BufferView stride wedge — only tight per-vertex/per-instance
-  //    layouts (and broadcasts via `singleValue` / stride 0) are
-  //    ingested. The shader-side cyclic addressing (`vid % length`,
-  //    `iidx % length`) makes broadcasts a degenerate length-1 case,
-  //    so we don't reject them here — but interleaved strides remain
-  //    unsupported. Per-instance attributes follow the same rule.
-  let strideBlocked = false;
-  const checkStride = (v: BufferView): void => {
-    const stride = v.stride ?? v.elementType.byteSize;
-    const isBroadcast = v.singleValue !== undefined || stride === 0;
-    if (!isBroadcast && stride !== v.elementType.byteSize) strideBlocked = true;
-  };
-  for (const v of attrViews(asAttributeProvider(ro.vertexAttributes))) checkStride(v);
-  if (ro.instanceAttributes !== undefined) {
-    for (const v of attrViews(asAttributeProvider(ro.instanceAttributes))) checkStride(v);
-  }
-  if (strideBlocked) return AVal.constant(false);
+  // 2. Interleaved / offset attributes are handled by de-interleaving at
+  //    ingest (heapAdapter.tightenBufferView gathers a tight, offset-0
+  //    copy keyed by (buffer, offset, stride) so sharing is preserved), so
+  //    no stride/offset wedge remains. Broadcasts (singleValue / stride 0)
+  //    still pass through as a degenerate length-1 case.
 
-  // 3. Index-format wedge — heap stores indices as u32.
-  if (ro.indices !== undefined && ro.indices.elementType.indexFormat !== "uint32") {
-    return AVal.constant(false);
+  // 3. Index-format wedge — heap stores indices as u32; u16 is widened
+  //    to u32 at ingest (heapAdapter.widenU16). Anything else is rejected.
+  if (ro.indices !== undefined) {
+    const fmt = ro.indices.elementType.indexFormat;
+    if (fmt !== "uint32" && fmt !== "uint16") return AVal.constant(false);
   }
 
   const buffers  = bufferAvals(ro);
@@ -233,27 +223,19 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
     if (dc.firstInstance !== 0) return false;
     if (dc.kind === "indexed") {
       if (ro.indices === undefined) return false;
-      if (dc.baseVertex !== 0) return false;
-      if (dc.firstIndex !== 0) return false;
-      // Whole-buffer wedge: the heap ingests the ENTIRE index + vertex
-      // buffers for an RO (IndexPool/AttributeArena copy `arr.length`,
-      // not the drawCall slice). An RO that consumes only a PREFIX of a
-      // shared index buffer (firstIndex=0 but indexCount < bufferCount —
-      // e.g. one glyph in a multi-glyph text run whose glyphs share a
-      // single atlas index buffer) would therefore drag the rest of the
-      // buffer into its draw: the trailing indices reference vertices
-      // past this RO's range, painting stray triangles. Until the heap
-      // honours the drawCall slice, only ROs that own their whole index
-      // buffer are eligible.
-      const ib = ro.indices.buffer.getValue(token);
-      if (ib.kind === "host") {
-        const idxBufCount = ib.sizeBytes >>> 2; // u32 indices
-        if (dc.indexCount !== idxBufCount) return false;
-      }
+      // Offsets and shared sub-buffer slices are all eligible now: the heap
+      // still ingests the WHOLE index + vertex buffers (one shared arena
+      // allocation per buffer aval — sharing is the heap's whole point), but
+      // the record now honours the drawCall slice. firstIndex folds into the
+      // record's indexStart, indexCount becomes the slice length (so a single
+      // glyph of a multi-glyph run reads only its run of indices), and
+      // baseVertex is baked into the transcoded index values at ingest
+      // (heapAdapter.indicesAvalFor). No drawCall wedge remains here.
     } else {
       // Non-indexed: the megacall uses the local vertex index directly, so a
-      // prefix read is safe (vid = 0..vertexCount-1) — no whole-buffer wedge.
-      // firstVertex must be 0 (the heap maps vid → attribute[vid] from base 0).
+      // prefix read is safe (vid = 0..vertexCount-1). firstVertex must be 0 —
+      // a non-indexed vertex offset would need a per-record field (the index
+      // bake-in trick doesn't apply with no index buffer), so it's deferred.
       if (ro.indices !== undefined) return false;
       if (dc.firstVertex !== 0) return false;
     }

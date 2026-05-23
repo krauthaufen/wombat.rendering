@@ -466,6 +466,17 @@ export interface HeapDrawSpec {
   /** Vertex count for a non-indexed draw (when `indices` is omitted). */
   readonly vertexCount?: number;
   /**
+   * Optional index slice into a (possibly shared) index buffer. The heap
+   * still allocates/uploads the WHOLE `indices` buffer once per aval (so N
+   * draws sharing it cost one allocation), but this draw emits only
+   * `[firstIndex, firstIndex+indexCount)`. Folds into the record's
+   * indexStart (`alloc.firstIndex + firstIndex`) and indexCount. Omit for a
+   * whole-buffer draw (defaults: firstIndex 0, indexCount = buffer length).
+   * (baseVertex is handled upstream by baking it into the index values.)
+   */
+  readonly firstIndex?: number;
+  readonly indexCount?: number;
+  /**
    * Optional texture set. When present, adds a `texture_2d<f32>` at
    * binding 4 and a sampler at binding 5; the FS must declare them.
    * Buckets with different `textures` (by reference) cannot share a
@@ -3025,8 +3036,11 @@ export function buildHeapScene(
       ? indexPool.acquire(device, arena.indices, indicesAval!, bucket.chunkIdx, readPlain(spec.indices!) as Uint32Array)
       : undefined;
     // Emit count per instance + the firstIndex field written to the record.
-    const emitCount = hasIndices ? idxAlloc!.count : (spec.vertexCount ?? 0);
-    const firstIndexField = hasIndices ? idxAlloc!.firstIndex : HEAP_NONINDEXED;
+    // Slice: emit only [firstIndex, firstIndex+indexCount) of the (shared,
+    // whole-buffer) index allocation. firstIndex folds into indexStart;
+    // indexCount defaults to the whole buffer.
+    const emitCount = hasIndices ? (spec.indexCount ?? idxAlloc!.count) : (spec.vertexCount ?? 0);
+    const firstIndexField = hasIndices ? (idxAlloc!.firstIndex + (spec.firstIndex ?? 0)) : HEAP_NONINDEXED;
 
     const localSlot = bucket.drawHeap.alloc();
     // Per-RO instancing: read `spec.instanceCount` (defaults to 1).

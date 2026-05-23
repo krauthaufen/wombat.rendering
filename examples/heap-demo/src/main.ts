@@ -49,6 +49,17 @@ const gpuDebug = new URLSearchParams(location.search).get("gpudebug") === "1";
 // `?nonindexed=1` expands all geometry to non-indexed draws (no index buffer)
 // to exercise the heap's non-indexed megacall path. Forces non-instanced.
 const NONINDEXED = new URLSearchParams(location.search).get("nonindexed") === "1";
+// Heap eligibility-lift exercisers (all should render pixel-identically with
+// heap-on vs heap-on=0 / each other):
+//   ?idx16=1      → 16-bit indices (widened to u32 at ingest)
+//   ?interleave=1 → pos/nrm/uv packed into one buffer with offsets+stride 32
+//   ?basevertex=N → prepend N dummy vertices, drawCall baseVertex=N (baked into indices)
+//   ?firstindex=N → prepend N dummy indices, drawCall firstIndex=N + sliced indexCount
+const IDX16 = new URLSearchParams(location.search).get("idx16") === "1";
+const INTERLEAVE = new URLSearchParams(location.search).get("interleave") === "1";
+const BASEVERTEX = Math.max(0, parseInt(new URLSearchParams(location.search).get("basevertex") ?? "0", 10) || 0);
+const FIRSTINDEX = Math.max(0, parseInt(new URLSearchParams(location.search).get("firstindex") ?? "0", 10) || 0);
+const FROZEN_T = (() => { const v = new URLSearchParams(location.search).get("t"); return v === null ? null : (parseFloat(v) || 0); })();
 const validateHeap = new URLSearchParams(location.search).get("validate") === "1";
 const simulateParam = new URLSearchParams(location.search).get("simulate");
 const simulateSamples = simulateParam !== null ? Math.max(1, parseInt(simulateParam, 10) | 0) : 0;
@@ -111,6 +122,57 @@ function bundleOf(g: GeometryData): GeoBundle {
       uvs:       BufferView.ofArray(u.uvs,        { elementType: ElementType.V2f }),
       drawCall: AVal.constant<DrawCall>({
         kind: "non-indexed", vertexCount: u.count, instanceCount: 1, firstVertex: 0, firstInstance: 0,
+      }),
+    };
+  }
+  // Eligibility-lift variants — interleave / baseVertex / firstIndex / u16.
+  if (INTERLEAVE || BASEVERTEX > 0 || FIRSTINDEX > 0 || IDX16) {
+    const vtx = g.positions.length / 3;
+    const pre = BASEVERTEX;            // dummy vertices prepended; baseVertex=pre
+    const total = pre + vtx;
+    let positions: BufferView, normals: BufferView, uvs: BufferView;
+    if (INTERLEAVE) {
+      // [px py pz nx ny nz u v] per vertex → stride 8 floats = 32 bytes.
+      const inter = new Float32Array(total * 8);
+      for (let i = 0; i < vtx; i++) {
+        const o = (pre + i) * 8;
+        inter[o]   = g.positions[i*3]!;   inter[o+1] = g.positions[i*3+1]!; inter[o+2] = g.positions[i*3+2]!;
+        inter[o+3] = g.normals[i*3]!;     inter[o+4] = g.normals[i*3+1]!;   inter[o+5] = g.normals[i*3+2]!;
+        inter[o+6] = g.uvs[i*2]!;         inter[o+7] = g.uvs[i*2+1]!;
+      }
+      positions = BufferView.ofArray(inter, { elementType: ElementType.V3f, offset: 0,  stride: 32 });
+      normals   = BufferView.ofArray(inter, { elementType: ElementType.V3f, offset: 12, stride: 32 });
+      uvs       = BufferView.ofArray(inter, { elementType: ElementType.V2f, offset: 24, stride: 32 });
+    } else {
+      // Separate (tight) buffers, optionally with `pre` dummy vertices.
+      const p = new Float32Array(total * 3), n = new Float32Array(total * 3), uv = new Float32Array(total * 2);
+      p.set(g.positions, pre * 3); n.set(g.normals, pre * 3); uv.set(g.uvs, pre * 2);
+      positions = BufferView.ofArray(p,  { elementType: ElementType.V3f });
+      normals   = BufferView.ofArray(n,  { elementType: ElementType.V3f });
+      uvs       = BufferView.ofArray(uv, { elementType: ElementType.V2f });
+    }
+    // Index buffer: 0-based indices (baseVertex applies the +pre shift),
+    // optionally prefixed with FIRSTINDEX dummy entries (sliced away by indexCount).
+    const idxLen = FIRSTINDEX + g.indices.length;
+    let indices: BufferView;
+    if (IDX16) {
+      const u16 = new Uint16Array(idxLen);
+      for (let i = 0; i < g.indices.length; i++) u16[FIRSTINDEX + i] = g.indices[i]!;
+      indices = BufferView.ofArray(u16); // → ElementType.U16
+    } else {
+      const u32 = new Uint32Array(idxLen);
+      u32.set(g.indices, FIRSTINDEX);
+      indices = BufferView.ofArray(u32);
+    }
+    return {
+      positions, normals, uvs, indices,
+      drawCall: AVal.constant<DrawCall>({
+        kind: "indexed",
+        indexCount:    g.indices.length,
+        instanceCount: 1,
+        firstIndex:    FIRSTINDEX,
+        baseVertex:    pre,
+        firstInstance: 0,
       }),
     };
   }
@@ -843,7 +905,10 @@ const canvas = document.getElementById("cv") as HTMLCanvasElement;
       if (gpuSampleN < gpuSamples.length) gpuSampleN++;
     },
     onAfterFrame: () => {
-      time.value = performance.now() - startTime;
+      // ?t=N freezes the orbit camera at time N (ms) for deterministic
+      // pixel-compare runs (heap-on vs heap-on=0 / feature variants).
+      if (FROZEN_T !== null) time.value = FROZEN_T;
+      else time.value = performance.now() - startTime;
       if (sceneSet !== undefined && churn > 0) {
         for (const r of churnPool) sceneSet.add(r);
         const live = Array.from(sceneSet);
