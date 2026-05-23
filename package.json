@@ -19,7 +19,7 @@
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {
-    "@aardworx/wombat.shader-vite": "^0.3.1",
+    "@aardworx/wombat.shader-vite": "^0.3.5",
     "@boperators/plugin-tsc": "^0.3.2",
     "@boperators/plugin-vite": "^0.3.2",
     "@types/node": "^20.11.0",
@@ -33,8 +33,8 @@
   },
   "dependencies": {
     "@aardworx/wombat.adaptive": "^0.2.5",
-    "@aardworx/wombat.base": "^0.4.3",
-    "@aardworx/wombat.shader": "^0.5.2",
+    "@aardworx/wombat.base": "^0.5.0",
+    "@aardworx/wombat.shader": "^0.6.0",
     "boperators": "^0.3.2"
   }
 }

@@ -30,23 +30,23 @@ import {
 import { Runtime } from "@aardworx/wombat.rendering/runtime";
 import { attachCanvas, runFrame } from "@aardworx/wombat.rendering/window";
 
-// The Vite plugin uses the TS type-checker to recover types — any
-// of these compose:
-//   - lambda parameter / return annotations
-//   - marker generic args (`vertex<I, O>(...)`)
-//   - bare `V4f` return → `gl_Position` for vertex,
-//     `outColor` for fragment
-//
-// Below: only the input record is annotated; the return type is
-// inferred from the lambda body, and the fragment uses bare V4f.
+// The Vite plugin uses the TS type-checker to recover types from each
+// lambda's parameter annotation. Stage bodies are blocks with an explicit
+// `return` of a NAMED-output object (concise expression-body arrows and the
+// bare-`V4f` return shorthand aren't supported by the frontend): the vertex
+// returns `gl_Position` (+ varyings), the fragment returns `outColor`.
 const helloTriangleEffect = effect(
-  vertex<{ a_position: V2f; a_color: V3f }>(input => ({
-    gl_Position: new V4f(input.a_position.x, input.a_position.y, 0.0, 1.0),
-    v_color: input.a_color,
-  })),
-  fragment<{ v_color: V3f }>(input =>
-    new V4f(input.v_color.x, input.v_color.y, input.v_color.z, 1.0),
-  ),
+  vertex((input: { a_position: V2f; a_color: V3f }) => {
+    return {
+      gl_Position: new V4f(input.a_position.x, input.a_position.y, 0.0, 1.0),
+      v_color: input.a_color,
+    };
+  }),
+  fragment((input: { v_color: V3f }) => {
+    return {
+      outColor: new V4f(input.v_color.x, input.v_color.y, input.v_color.z, 1.0),
+    };
+  }),
 );
 
 const status = document.getElementById("status")!;
