@@ -1,17 +1,90 @@
-# GPU Transform Propagation — Implementation Plan
+# GPU Transform Propagation
 
-Status: **IMPLEMENTED** (rendering 0.19.12 + dom 0.14.2). The SG emits a per-RO
-Model ancestor chain; the heap GPU-composes a per-RO Model constituent (fwd+inv,
-df32) in a chain pass before §7; §7 derives ModelView / inverses / NormalMatrix /
-custom rules from it unchanged. A root `cval` shared by N descendants now marks
-exactly its 2 constituent slots (not N composites) — the fan-out is gone. Real-GPU
-tested (chain math, chain→constituent→§7 ModelView, fan-out) + structural (CPU)
-tests + end-to-end validated on heap-demo-sg (correct render incl. trafo-determinant
-cull). Constant-run folding shipped in dom 0.14.3. **Phase-2 prefix-sharing shipped in
-rendering 0.19.13**: a heap-side suffix trie shares ancestor sub-chains across
-siblings — each shared ancestor is composed once at its depth level (dispatched
-topologically), dropping a deep shared hierarchy from O(leaves·depth) to
-O(nodes). Fully complete. Companion to the TODO entry of the same name.
+**Status: shipped & complete** — rendering ≥ 0.19.13, dom ≥ 0.14.3.
+
+Scene-graph `Model` transforms are composed **on the GPU**, not eagerly on the
+CPU. A `cval<Trafo3d>` shared by N objects used to mark N composed CPU
+`ModelTrafo` avals (N dirty heap slots) for one logical change — the worst
+adaptive fan-out in the stack. Now the SG emits each RO's ancestor *chain* and
+the heap composes it; that same root change marks **exactly its 2 constituent
+slots** regardless of N, and the GPU does the (parallel, df32) composition.
+
+## The problem it solves
+
+```
+<Sg Trafo={rootCval}>          // one cval over 20k objects
+  …20 000 leaves…
+</Sg>
+```
+
+Old: changing `rootCval` → 20 000 composed `ModelTrafo` avals mark → 20 000 heap
+re-uploads + CPU re-composition. New: 1 constituent slot marks; the GPU
+re-composes. CPU work is O(changed trafos), never O(objects).
+
+## How it works
+
+1. **SG emits a chain, not a composite.** Each `<Sg Trafo>` scope appends its
+   trafo to `TraversalState.modelChain` (`[leaf, …, root]` order); the leaf RO
+   carries it as `RenderObject.modelChain`. Constant runs are pre-multiplied at
+   build time, so a stack of static trafos is one link. The eager `model`
+   composite is still built (for the legacy/CPU path) but is *unobserved* on the
+   heap path.
+2. **Links are df32 constituents shared by aval identity.** A root trafo
+   referenced by N ROs is **one** constituent slot (fwd+inv halves), referenced
+   N times — that's why the fan-out dies.
+3. **A chain pass composes per-RO `Model` on the GPU** (df32 mat-mul) and writes
+   it to a per-RO/per-node Model constituent (`write_constituent_entry`),
+   **before** the §7 derived-uniforms pass.
+4. **§7 consumes the GPU-written `Model` unchanged** — `ModelTrafo` / `ModelView`
+   / `ModelViewInv` / `NormalMatrix` / custom `derivedUniform` rules and derived
+   **modes** all derive from it, exactly as if `Model` were a normal constituent.
+5. **Prefix sharing (suffix trie).** Chains are interned root-end-first into a
+   `TrafoTree`, so siblings sharing an ancestor sub-chain share trie nodes — each
+   shared ancestor is composed **once** (`node.world = link · parent.world`) at
+   its depth *level*; levels dispatch in topological order. A deep shared
+   hierarchy drops from O(leaves·depth) to O(nodes) GPU multiplies. Nodes are
+   refcounted and freed when no RO references them.
+
+Precision: composition runs in **df32** (≈f64) so far-from-origin chains don't
+lose precision; results collapse to f32 only when a final uniform is written.
+
+## Heap path vs legacy path
+
+| | composes `Model` | shared-root fan-out |
+|---|---|---|
+| **Heap path** (eligible ROs — the vast majority) | GPU, from `modelChain` | gone (O(1) CPU per change) |
+| **Legacy path** (heap-ineligible: storage buffers, 2+ textures, oversized payload, …) | CPU, eager `ModelTrafo` — **the normal path, unchanged** | present (but only over the few fallback ROs) |
+
+`modelChain` does **not** affect heap eligibility, so routing is unchanged. The
+SG always also exposes `ModelTrafo` (the eager composite) via the uniform
+provider, so a heap-ineligible RO falls back to the normal CPU composition with
+no special handling. (A future option: have the legacy path lazily compose from
+the chain via a non-subscribing `composedTrafoOf` walk — not built; not needed
+for the common case.)
+
+## Using it
+
+Nothing to do — it's automatic. Author `<Sg Trafo={…}>` as usual; the SG emits
+the chain and the heap composes it. Picking / gizmos that need a CPU `Model`
+value read it via the (lazy) `ModelTrafo` uniform as before. Requires
+rendering ≥ 0.19.13 + dom ≥ 0.14.3 (older rendering ignores `modelChain` and
+falls back to the eager `ModelTrafo`).
+
+## Tests / validation
+
+- `tests/transform-chain.test.ts` (CPU): trie sharing (N+1 nodes not 2N), deeper
+  shared paths, refcount/free on add/remove, distinct roots don't share.
+- `tests-browser/transform-chain-real.test.ts` (real GPU): chain math == CPU f64,
+  far-from-origin precision, chain→§7 `ModelView == View·Model`, 150-RO shared
+  root → 2 dirty slots + all Models correct.
+- `wombat.dom tests/transform-chain-fold.test.ts`: constant-run folding.
+- End-to-end: heap-demo-sg renders correctly (incl. `?det=1` trafo-determinant
+  derived-mode cull, which reads the GPU-composed Model).
+
+---
+
+The rest of this document is the original design/implementation plan and the
+refinements made while building it.
 
 ## Problem
 
