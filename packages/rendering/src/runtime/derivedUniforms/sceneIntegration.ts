@@ -42,11 +42,15 @@ export class DerivedUniformsScene {
    *  scene-wide; records partition by chunk so each dispatch binds
    *  the right chunk's main heap. */
   private readonly recordsByChunk = new Map<number, RecordsBuffer>();
-  /** Scene-wide CHAIN records (GPU transform propagation). Dispatched BEFORE
-   *  the §7 per-chunk passes — they write per-RO Model constituents that §7
-   *  then reads. Scene-wide (not per-chunk) because they target the shared
-   *  constituents buffer, not any chunk's main heap. */
-  readonly chainRecords = new RecordsBuffer();
+  /** CHAIN records partitioned by trie LEVEL (GPU transform propagation). A
+   *  trie node at level L computes `link · parentNode.world` — reading its
+   *  parent (level L-1) output — so levels must dispatch in ascending order,
+   *  BEFORE the §7 per-chunk passes. Scene-wide: they target the shared
+   *  constituents buffer (per-node Model), not any chunk's main heap.
+   *  Prefix-sharing: sibling chains share trie nodes (see TrafoTree). */
+  private readonly chainByLevel = new Map<number, RecordsBuffer>();
+  /** The suffix trie that dedups shared ancestor sub-chains across ROs. */
+  readonly trafoTree: TrafoTree;
   readonly dispatcher: DerivedUniformsDispatcher;
   /** Constituents storage GPU buffer (`array<vec2<f32>>` — df32 mat4 halves). */
   constituentsBuf: GPUBuffer;
@@ -68,6 +72,17 @@ export class DerivedUniformsScene {
     this.dispatcher = new DerivedUniformsDispatcher(device, {
       constituentsBuf: () => this.constituentsBuf,
     });
+    this.trafoTree = new TrafoTree(this);
+  }
+
+  /** Get-or-create the CHAIN records buffer for trie `level`. */
+  chainRecordsFor(level: number): RecordsBuffer {
+    let r = this.chainByLevel.get(level);
+    if (r === undefined) {
+      r = new RecordsBuffer();
+      this.chainByLevel.set(level, r);
+    }
+    return r;
   }
 
   /** Register (or replace) the GPUBuffer getter for a chunk's main
@@ -147,15 +162,21 @@ export class DerivedUniformsScene {
    *  main heap buffer. */
   encode(enc: GPUCommandEncoder): boolean {
     let any = false;
-    // Phase 1: chain pass — writes per-RO Model constituents (fwd+inv) into the
-    // shared constituents buffer. Must run BEFORE the §7 passes that read them.
-    // The MainHeap binding is unused by the chain arm; bind any registered heap.
-    if (this.chainRecords.recordCount > 0) {
+    // Chain pass — writes per-RO/per-node Model constituents (fwd+inv) into the
+    // shared constituents buffer. Dispatch trie LEVELS in ascending order: a
+    // level-L node reads its parent's (level L-1) output. Must run BEFORE the
+    // §7 passes that read the Models. MainHeap binding is unused here; bind any.
+    const levels = [...this.chainByLevel.keys()].sort((a, b) => a - b);
+    if (levels.length > 0) {
       const anyHeap = this.firstHeapGetter();
       if (anyHeap === undefined) {
         throw new Error("derivedUniforms.encode: chain records present but no chunk main-heap registered to bind.");
       }
-      if (this.dispatcher.encodeChunk(enc, this.registry, this.chainRecords, anyHeap)) any = true;
+      for (const lvl of levels) {
+        const recs = this.chainByLevel.get(lvl)!;
+        if (recs.recordCount === 0) continue;
+        if (this.dispatcher.encodeChunk(enc, this.registry, recs, anyHeap)) any = true;
+      }
     }
     // Phase 2: §7 per-chunk (reads constituents incl. the chain-written Model).
     for (const [chunkIdx, records] of this.recordsByChunk) {
@@ -175,6 +196,84 @@ export class DerivedUniformsScene {
   dispose(): void {
     this.dispatcher.dispose();
     this.constituentsBuf.destroy();
+  }
+}
+
+// ─── Trafo suffix-trie (prefix sharing) ───────────────────────────────
+//
+// Dedups shared ancestor sub-chains across ROs. Each RO's chain is interned
+// from the ROOT end, so sibling chains share trie nodes for their common
+// ancestor suffix. A trie node owns a per-node Model constituent (fwd+inv) and
+// two CHAIN records computing `node.world = link · parent.world` (and the
+// reversed inverse) — at the node's depth LEVEL, so a shared ancestor is
+// composed ONCE and every descendant reads it. Levels dispatch in ascending
+// order (DerivedUniformsScene.encode). Refcounted: a node is freed when no RO
+// path references it. See docs/gpu-transform-propagation.md (Phase 2).
+
+export interface TrieNode {
+  readonly id: number;
+  readonly key: string;
+  readonly modelPair: PairedSlots;
+  readonly level: number;
+  readonly parent: TrieNode | undefined;
+  refcount: number;
+}
+
+export class TrafoTree {
+  private readonly byKey = new Map<string, TrieNode>();
+  private nextId = 0;
+  constructor(private readonly scene: DerivedUniformsScene) {}
+
+  /** Number of live trie nodes — diagnostics / tests (prefix-sharing check). */
+  get nodeCount(): number { return this.byKey.size; }
+
+  /** Intern a chain (array order `[leaf, …, root]`); returns the LEAF trie node
+   *  whose Model is the full product. increfs every node on the path so shared
+   *  ancestor nodes survive while any RO references them. */
+  intern(linkPairs: readonly PairedSlots[]): TrieNode {
+    let parent: TrieNode | undefined;
+    // Root end (last) → leaf (first), so shared ancestor suffixes share nodes.
+    for (let i = linkPairs.length - 1; i >= 0; i--) {
+      parent = this.internOne(parent, linkPairs[i]!);
+    }
+    if (parent === undefined) throw new Error("TrafoTree.intern: empty chain");
+    return parent;
+  }
+
+  /** Decref every node on the leaf→root path; free those that hit 0. */
+  release(leaf: TrieNode): void {
+    let n: TrieNode | undefined = leaf;
+    while (n !== undefined) {
+      const parent: TrieNode | undefined = n.parent;
+      if (--n.refcount === 0) {
+        this.byKey.delete(n.key);
+        this.scene.chainRecordsFor(n.level).removeAllForOwner(n);
+        this.scene.constituents.freeOutputPair(n.modelPair);
+      }
+      n = parent;
+    }
+  }
+
+  private internOne(parent: TrieNode | undefined, link: PairedSlots): TrieNode {
+    const key = `${parent?.id ?? -1}:${link.fwd}`;
+    const existing = this.byKey.get(key);
+    if (existing !== undefined) { existing.refcount++; return existing; }
+    const level = parent === undefined ? 0 : parent.level + 1;
+    const modelPair = this.scene.constituents.allocOutputPair();
+    const node: TrieNode = { id: this.nextId++, key, modelPair, level, parent, refcount: 1 };
+    this.byKey.set(key, node);
+    const h = (s: number): number => makeHandle(SlotTag.Constituent, s);
+    const recs = this.scene.chainRecordsFor(level);
+    // node.world.fwd = link.fwd · parent.world.fwd  (just link at the root end).
+    // node.world.inv = parent.world.inv · link.inv  (reversed; just link at root).
+    if (parent === undefined) {
+      recs.add(node, CHAIN_RULE_ID, h(modelPair.fwd), [1, h(link.fwd)]);
+      recs.add(node, CHAIN_RULE_ID, h(modelPair.inv), [1, h(link.inv)]);
+    } else {
+      recs.add(node, CHAIN_RULE_ID, h(modelPair.fwd), [2, h(link.fwd), h(parent.modelPair.fwd)]);
+      recs.add(node, CHAIN_RULE_ID, h(modelPair.inv), [2, h(parent.modelPair.inv), h(link.inv)]);
+    }
+    return node;
   }
 }
 
@@ -216,9 +315,9 @@ export interface RoRegistration {
   readonly ruleHashes: readonly string[];
   /** Chunk this registration was placed into — used by deregister. */
   readonly chunkIdx: number;
-  /** Per-RO Model output constituent pair (transform propagation); freed on
+  /** This RO's leaf trie node (transform propagation); its path is decref'd on
    *  deregister. Present iff the request carried a `modelChain`. */
-  readonly modelPair?: PairedSlots;
+  readonly modelLeaf?: TrieNode;
 }
 
 export function registerRoDerivations(
@@ -271,21 +370,17 @@ export function registerRoDerivations(
   // from its ancestor chain, and point §7's `Model` leaf at it. The chain pass
   // (a separate, earlier dispatch) writes the fwd half from the links and the
   // inv half from the reversed inverse links.
-  let modelPair: PairedSlots | undefined;
-  if (req.modelChain !== undefined) {
-    modelPair = scene.constituents.allocOutputPair();
-    pairByName.set("Model", modelPair);
+  let modelLeaf: TrieNode | undefined;
+  if (req.modelChain !== undefined && req.modelChain.length > 0) {
     const linkPairs = req.modelChain.map((av) => {
       acquiredAvals.push(av);
       return scene.constituents.acquire(av);
     });
-    const n = linkPairs.length;
-    // Model.fwd = link0·link1·…·link(n-1)  (forward order, fwd slots).
-    scene.chainRecords.add(owner, CHAIN_RULE_ID, makeHandle(SlotTag.Constituent, modelPair.fwd),
-      [n, ...linkPairs.map((p) => makeHandle(SlotTag.Constituent, p.fwd))]);
-    // Model.inv = link(n-1)⁻¹·…·link0⁻¹  (reversed order, inv slots).
-    scene.chainRecords.add(owner, CHAIN_RULE_ID, makeHandle(SlotTag.Constituent, modelPair.inv),
-      [n, ...linkPairs.slice().reverse().map((p) => makeHandle(SlotTag.Constituent, p.inv))]);
+    // Intern the chain into the suffix trie — siblings share ancestor nodes,
+    // each composed once (link · parent.world) at its level. The RO's Model is
+    // the leaf node's per-node Model constituent.
+    modelLeaf = scene.trafoTree.intern(linkPairs);
+    pairByName.set("Model", modelLeaf.modelPair);
   }
 
   for (const [outName, rule] of req.rules) {
@@ -308,14 +403,13 @@ export function registerRoDerivations(
   scene.ensureConstituentsCapacity(scene.constituents.slotCount * DF32_MAT4_BYTES);
   return {
     owner, constituentAvals: acquiredAvals, ruleHashes, chunkIdx: req.chunkIdx,
-    ...(modelPair !== undefined ? { modelPair } : {}),
+    ...(modelLeaf !== undefined ? { modelLeaf } : {}),
   };
 }
 
 export function deregisterRoDerivations(scene: DerivedUniformsScene, reg: RoRegistration): void {
   scene.recordsFor(reg.chunkIdx).removeAllForOwner(reg.owner);
-  scene.chainRecords.removeAllForOwner(reg.owner);
   for (const h of reg.ruleHashes) scene.registry.release(h);
   for (const av of reg.constituentAvals) scene.constituents.release(av);
-  if (reg.modelPair !== undefined) scene.constituents.freeOutputPair(reg.modelPair);
+  if (reg.modelLeaf !== undefined) scene.trafoTree.release(reg.modelLeaf);
 }

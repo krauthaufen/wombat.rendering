@@ -1,8 +1,7 @@
-// GPU transform propagation — CPU-side structural tests for the modelChain
-// path: each RO's ancestor chain becomes a per-RO Model constituent computed by
-// the chain pass (two CHAIN records: fwd + reversed-inv), with the §7 `Model`
-// leaf pointed at that output pair. The df32 math is verified on a real GPU in
-// tests-browser/transform-chain-real.test.ts.
+// GPU transform propagation — CPU-side structural tests for the suffix trie:
+// sibling chains share ancestor trie nodes (prefix sharing), and nodes are
+// refcounted/freed on add/remove. The df32 math + level dispatch are verified
+// on a real GPU in tests-browser/transform-chain-real.test.ts.
 
 import { describe, it, expect } from "vitest";
 import { AVal, cval } from "@aardworx/wombat.adaptive";
@@ -12,8 +11,6 @@ import {
   DerivedUniformsScene, registerRoDerivations, deregisterRoDerivations,
   type RoDerivedRequest,
 } from "../packages/rendering/src/runtime/derivedUniforms/sceneIntegration.js";
-import { handleTag, handlePayload, SlotTag } from "../packages/rendering/src/runtime/derivedUniforms/records.js";
-import { CHAIN_RULE_ID } from "../packages/rendering/src/runtime/derivedUniforms/codegen.js";
 
 const dev = (): GPUDevice => new MockGPU().device;
 const tr = (x: number, y = 0, z = 0): AVal<Trafo3d> => AVal.constant(Trafo3d.translation(new V3d(x, y, z)));
@@ -30,64 +27,56 @@ function chainReq(modelChain: AVal<Trafo3d>[]): RoDerivedRequest {
   };
 }
 
-describe("transform-propagation modelChain → Model constituent", () => {
-  it("emits fwd + reversed-inv CHAIN records writing the Model constituent pair", () => {
-    const scene = new DerivedUniformsScene(dev());
-    const root = cval(Trafo3d.translation(new V3d(1, 0, 0)));
-    const a = tr(0, 2, 0);
-    const reg = registerRoDerivations(scene, {}, chainReq([root, a]));
-
-    const cr = scene.chainRecords;
-    expect(cr.recordCount).toBe(2);          // fwd + inv
-    expect(reg.modelPair).toBeDefined();
-    const d = cr.data, stride = cr.strideWords;
-
-    // Record 0 = fwd: writes Model.fwd, links forward (root, a).
-    expect(d[0]).toBe(CHAIN_RULE_ID >>> 0);
-    expect(handleTag(d[1]!)).toBe(SlotTag.Constituent);
-    expect(handlePayload(d[1]!)).toBe(reg.modelPair!.fwd);
-    expect(d[2]).toBe(2);                     // count
-    // Record 1 = inv: writes Model.inv, links reversed.
-    expect(d[stride + 0]).toBe(CHAIN_RULE_ID >>> 0);
-    expect(handlePayload(d[stride + 1]!)).toBe(reg.modelPair!.inv);
-    expect(d[stride + 2]).toBe(2);
-    // fwd record link0 == a-then... no: fwd is [root,a]; inv is reversed [a,root].
-    // So fwd.link0 (root.fwd) != inv.link0 (a.inv).
-    expect(d[3]).not.toBe(d[stride + 3]);
-  });
-
-  it("shares one root constituent across N ROs (no fan-out)", () => {
+describe("transform-propagation suffix trie", () => {
+  it("siblings sharing a root share the ancestor trie node (prefix sharing)", () => {
     const scene = new DerivedUniformsScene(dev());
     const root = cval(Trafo3d.translation(new V3d(5, 0, 0)));
-    registerRoDerivations(scene, {}, chainReq([root, tr(0, 1, 0)]));
-    registerRoDerivations(scene, {}, chainReq([root, tr(0, 0, 3)]));
-
-    const d = scene.chainRecords.data, stride = scene.chainRecords.strideWords;
-    expect(scene.chainRecords.recordCount).toBe(4); // 2 ROs × (fwd+inv)
-    // Both ROs' fwd records start with the SAME root constituent handle.
-    // Record order: ro1.fwd, ro1.inv, ro2.fwd, ro2.inv.
-    const ro1FwdRoot = d[3]!;            // ro1 fwd link0 = root.fwd
-    const ro2FwdRoot = d[2 * stride + 3]!; // ro2 fwd link0 = root.fwd
-    expect(ro1FwdRoot).toBe(ro2FwdRoot);
+    // chains are [leaf, …, root]; siblings share the `root` suffix.
+    const r1 = registerRoDerivations(scene, {}, chainReq([tr(0, 1, 0), root]));
+    const r2 = registerRoDerivations(scene, {}, chainReq([tr(0, 0, 3), root]));
+    // root node shared + 2 distinct leaf nodes = 3 trie nodes (NOT 4).
+    expect(scene.trafoTree.nodeCount).toBe(3);
+    expect(r1.modelLeaf).toBeDefined();
+    expect(r1.modelLeaf!.parent).toBe(r2.modelLeaf!.parent); // same shared root node
+    expect(r1.modelLeaf!.parent!.level).toBe(0);             // root is level 0
+    expect(r1.modelLeaf!.level).toBe(1);                     // leaf is level 1
   });
 
-  it("add/remove ROs (structural): chain records + Model pairs reclaimed", () => {
+  it("a deeper shared ancestor path shares all its trie nodes", () => {
+    const scene = new DerivedUniformsScene(dev());
+    const root = cval(Trafo3d.translation(new V3d(1, 0, 0)));
+    const mid = cval(Trafo3d.translation(new V3d(0, 2, 0)));
+    registerRoDerivations(scene, {}, chainReq([tr(7), mid, root]));
+    registerRoDerivations(scene, {}, chainReq([tr(8), mid, root]));
+    // root + mid shared, 2 leaves = 4 nodes (not 6).
+    expect(scene.trafoTree.nodeCount).toBe(4);
+  });
+
+  it("add/remove: trie nodes are refcounted and freed", () => {
     const scene = new DerivedUniformsScene(dev());
     const root = cval(Trafo3d.translation(new V3d(1, 1, 1)));
-    const r1 = registerRoDerivations(scene, {}, chainReq([root, tr(1)]));
-    const r2 = registerRoDerivations(scene, {}, chainReq([root, tr(2)]));
-    const r3 = registerRoDerivations(scene, {}, chainReq([root, tr(3)]));
-    expect(scene.chainRecords.recordCount).toBe(6);
+    const r1 = registerRoDerivations(scene, {}, chainReq([tr(1), root]));
+    const r2 = registerRoDerivations(scene, {}, chainReq([tr(2), root]));
+    const r3 = registerRoDerivations(scene, {}, chainReq([tr(3), root]));
+    expect(scene.trafoTree.nodeCount).toBe(4); // root + 3 leaves
 
-    deregisterRoDerivations(scene, r2); // swap-remove middle
-    expect(scene.chainRecords.recordCount).toBe(4);
+    deregisterRoDerivations(scene, r2);          // leaf2 freed; root kept (r1,r3)
+    expect(scene.trafoTree.nodeCount).toBe(3);
     deregisterRoDerivations(scene, r1);
-    deregisterRoDerivations(scene, r3);
-    expect(scene.chainRecords.recordCount).toBe(0);
+    deregisterRoDerivations(scene, r3);          // last refs → root + leaves freed
+    expect(scene.trafoTree.nodeCount).toBe(0);
 
-    // Freed slots (link + Model-pair) are reused on the next register — no growth.
+    // Freed constituent slots are reused on the next register (no growth).
     const before = scene.constituents.slotCount;
-    registerRoDerivations(scene, {}, chainReq([root, tr(9)]));
+    registerRoDerivations(scene, {}, chainReq([tr(9), root]));
     expect(scene.constituents.slotCount).toBe(before);
+  });
+
+  it("distinct roots do not share", () => {
+    const scene = new DerivedUniformsScene(dev());
+    registerRoDerivations(scene, {}, chainReq([tr(1), cval(Trafo3d.translation(new V3d(1, 0, 0)))]));
+    registerRoDerivations(scene, {}, chainReq([tr(1), cval(Trafo3d.translation(new V3d(2, 0, 0)))]));
+    // Different root avals → different root nodes → 4 nodes, no sharing.
+    expect(scene.trafoTree.nodeCount).toBe(4);
   });
 });

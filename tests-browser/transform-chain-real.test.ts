@@ -66,8 +66,8 @@ describe("GPU transform propagation — modelChain (real GPU)", () => {
     runFrame(scene, device);
 
     const want = a.forward.mul(b.forward).mul(c.forward);
-    expectMatClose(await readConstituent(device, scene, reg.modelPair!.fwd), want);
-    expectMatClose(await readConstituent(device, scene, reg.modelPair!.inv), want.inverse());
+    expectMatClose(await readConstituent(device, scene, reg.modelLeaf!.modelPair.fwd), want);
+    expectMatClose(await readConstituent(device, scene, reg.modelLeaf!.modelPair.inv), want.inverse());
     scene.dispose(); heap.destroy();
   });
 
@@ -103,8 +103,11 @@ describe("GPU transform propagation — modelChain (real GPU)", () => {
     const N = 150;
     const regs = [];
     for (let i = 0; i < N; i++) {
-      regs.push(registerRoDerivations(scene, {}, baseReq({ modelChain: [root, AVal.constant(Trafo3d.translation(new V3d(i, 0, 0)))] })));
+      // chain [leaf, root] (SG order) → the root suffix is SHARED in the trie.
+      regs.push(registerRoDerivations(scene, {}, baseReq({ modelChain: [AVal.constant(Trafo3d.translation(new V3d(i, 0, 0))), root] })));
     }
+    // Prefix-sharing: one shared root node + N distinct leaf nodes (not 2·N).
+    expect(scene.trafoTree.nodeCount).toBe(N + 1);
     runFrame(scene, device);
 
     transact(() => { root.value = Trafo3d.translation(new V3d(1000, 0, 0)); });
@@ -118,7 +121,7 @@ describe("GPU transform propagation — modelChain (real GPU)", () => {
 
     // Spot-check a few ROs' Model fwd: x translation == 1000 + i.
     for (const i of [0, 1, 73, N - 1]) {
-      const m = await readConstituent(device, scene, regs[i]!.modelPair!.fwd);
+      const m = await readConstituent(device, scene, regs[i]!.modelLeaf!.modelPair.fwd);
       expect(m[3]!).toBeCloseTo(1000 + i, 2); // M03
     }
     scene.dispose(); heap.destroy();
