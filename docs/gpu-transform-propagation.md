@@ -7,10 +7,11 @@ custom rules from it unchanged. A root `cval` shared by N descendants now marks
 exactly its 2 constituent slots (not N composites) — the fan-out is gone. Real-GPU
 tested (chain math, chain→constituent→§7 ModelView, fan-out) + structural (CPU)
 tests + end-to-end validated on heap-demo-sg (correct render incl. trafo-determinant
-cull). Constant-run folding shipped in dom 0.14.3 (consecutive constant scopes
-pre-multiply into one chain link). **Remaining optimization (deferred, not blocking):**
-the Phase-2 colored prefix-scan (shared ancestor-prefix sharing across siblings).
-Companion to the TODO entry of the same name.
+cull). Constant-run folding shipped in dom 0.14.3. **Phase-2 prefix-sharing shipped in
+rendering 0.19.13**: a heap-side suffix trie shares ancestor sub-chains across
+siblings — each shared ancestor is composed once at its depth level (dispatched
+topologically), dropping a deep shared hierarchy from O(leaves·depth) to
+O(nodes). Fully complete. Companion to the TODO entry of the same name.
 
 ## Problem
 
