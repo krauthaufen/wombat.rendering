@@ -44,8 +44,9 @@ heap-textures-plan, multi-pipeline-buckets-integration, heap-debug-tools).
 per-RO Model ancestor chain → heap GPU-composes a per-RO Model constituent
 (fwd+inv df32, chain pass before §7) → §7 derives ModelView / inverses /
 NormalMatrix / custom rules unchanged. A root cval over N descendants marks 2
-slots, not N. Deferred optimizations: constant-run folding; the Phase-2 colored
-prefix-scan for ancestor-prefix sharing. Solves the worst adaptive fan-out: a `cval<Trafo3d>` above 20K objects marks 20K
+slots, not N. Constant-run folding shipped (dom 0.14.3). Deferred optimization:
+the Phase-2 colored prefix-scan for ancestor-prefix sharing. Solves the worst
+adaptive fan-out: a `cval<Trafo3d>` above 20K objects marks 20K
 composed `ModelTrafo` avals → 20K dirty heap slots, for ONE logical change. Same
 shape for `active` (AND-composition) and any other non-trivially-composed SG
 attribute. The heap already composes trafos in a compute shader (§7) — extend
