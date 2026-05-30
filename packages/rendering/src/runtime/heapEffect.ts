@@ -93,7 +93,7 @@ export interface FragmentOutputLayout {
 // and on quota; every failure simply degrades to "recompute".
 
 /** Cache-generation stamp for the persistent (localStorage) tier. */
-export const HEAP_PERSIST_VERSION = "h1";
+export const HEAP_PERSIST_VERSION = "h2";
 export const HEAP_PERSIST_PREFIX = "wbt.heapfx.";
 
 export function persistKey(version: string, kind: string, contentKey: string): string {
@@ -717,11 +717,22 @@ fn atlasSampleAtMip(
   k: u32,
   uv: vec2<f32>,
   addrU: u32, addrV: u32,
+  filterNearest: u32,
 ) -> vec4<f32> {
   let mip_o = atlasMipOriginPx(origin_px, size_px, k);
   let mip_s = atlasMipSizePx(size_px, k);
-  let px = atlasAxisAt(uv.x, mip_o.x, mip_s.x, addrU);
-  let py = atlasAxisAt(uv.y, mip_o.y, mip_s.y, addrV);
+  var px = atlasAxisAt(uv.x, mip_o.x, mip_s.x, addrU);
+  var py = atlasAxisAt(uv.y, mip_o.y, mip_s.y, addrV);
+  // Nearest (point) filtering: the atlas has no per-sub-rect GPUSampler —
+  // every sub-rect shares one hardware-linear atlasSampler — so point
+  // filtering is done here by snapping the atlas-pixel coord to the texel
+  // center. Bilinear evaluated exactly at a texel center returns that
+  // single texel, i.e. nearest. (Shader-defined sampler state: the
+  // mag/min filter bits ride in formatBits, see samplerStateBits.)
+  if (filterNearest == 1u) {
+    px = floor(px) + 0.5;
+    py = floor(py) + 0.5;
+  }
   let atlasUv = vec2<f32>(px, py) / ${atlasPageSizeConst()}.0;
 ${generateAtlasSwitch()}
   return vec4<f32>(0.0);
@@ -736,6 +747,10 @@ fn atlasSample(
   let numMips = (formatBits >> 1u) & 0x7u;
   let addrU   = (formatBits >> 4u) & 0x3u;
   let addrV   = (formatBits >> 6u) & 0x3u;
+  // mag/min filter bits (samplerStateBits): linear=1, nearest=0. The atlas
+  // filters in software, so the mag bit drives a single texel-snap flag for
+  // both axes — enough to distinguish MinMagMipPoint from MinMagMipLinear.
+  let filterNearest = u32(((formatBits >> 8u) & 0x3u) == 0u);
   // LOD on pre-wrap UV. dpdx/dpdy on the wrapped value spikes at the
   // fract/mirror seam (discontinuity → bogus huge derivative → tiny
   // mip selected → blurred band). Multiply by size_px to get
@@ -748,9 +763,9 @@ fn atlasSample(
   let lo = u32(floor(lod));
   let hi = min(lo + 1u, max(numMips, 1u) - 1u);
   let t  = lod - f32(lo);
-  let a = atlasSampleAtMip(pageRef, format, origin_px, size_px, lo, uv, addrU, addrV);
+  let a = atlasSampleAtMip(pageRef, format, origin_px, size_px, lo, uv, addrU, addrV, filterNearest);
   if (numMips <= 1u) { return a; }
-  let b = atlasSampleAtMip(pageRef, format, origin_px, size_px, hi, uv, addrU, addrV);
+  let b = atlasSampleAtMip(pageRef, format, origin_px, size_px, hi, uv, addrU, addrV, filterNearest);
   return mix(a, b, t);
 }
 `;
