@@ -26,11 +26,34 @@
 // No multi-binding texture API yet: `ro.textures.count <= 1` and
 // `ro.samplers.count <= 1` are classifier invariants.
 
-import { type aval, type AdaptiveToken } from "@aardworx/wombat.adaptive";
+import { type aval, type AdaptiveToken, AVal } from "@aardworx/wombat.adaptive";
 import { IBuffer, type HostBufferSource } from "../core/buffer.js";
 import { BufferView } from "../core/bufferView.js";
 import { ITexture, type HostTextureSource } from "../core/texture.js";
 import { ISampler } from "../core/sampler.js";
+
+/** Map shader-defined sampler state (FShade Filter/WrapMode names) to a
+ *  GPUSamplerDescriptor (heap path). */
+function samplerDescriptorFromState(
+  state: { readonly filter: string; readonly addressU: string; readonly addressV: string },
+): GPUSamplerDescriptor {
+  const addr = (a: string): GPUAddressMode =>
+    a === "Clamp" || a === "Border" ? "clamp-to-edge"
+    : a === "Mirror" ? "mirror-repeat"
+    : "repeat";
+  let mag: GPUFilterMode = "linear";
+  let min: GPUFilterMode = "linear";
+  let mip: GPUMipmapFilterMode = "linear";
+  switch (state.filter) {
+    case "MinMagMipPoint": mag = "nearest"; min = "nearest"; mip = "nearest"; break;
+    case "MinMagLinearMipPoint": mip = "nearest"; break;
+    default: break; // MinMagMipLinear / Anisotropic → all "linear"
+  }
+  return {
+    magFilter: mag, minFilter: min, mipmapFilter: mip,
+    addressModeU: addr(state.addressU), addressModeV: addr(state.addressV),
+  };
+}
 import type { RenderObject } from "../core/renderObject.js";
 import { asAttributeProvider, asUniformProvider } from "../core/provider.js";
 import type { HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
@@ -326,7 +349,16 @@ export function renderObjectToHeapSpec(
   const distinctTexAvals = new Set<aval<ITexture>>();
   ro.textures.iter((_n, av) => { distinctTexAvals.add(av as aval<ITexture>); });
   const distinctSamplerAvals = new Set<aval<ISampler>>();
-  ro.samplers.iter((_n, av) => { distinctSamplerAvals.add(av as aval<ISampler>); });
+  // Shader-defined sampler state (from a `sampler2d { filter …; addressU … }`
+  // builder, carried through the IR) overrides the scene's default sampler.
+  const stateBinding = schema.samplers.find(b => b.state !== undefined);
+  if (stateBinding?.state !== undefined) {
+    distinctSamplerAvals.add(
+      AVal.constant(ISampler.fromDescriptor(samplerDescriptorFromState(stateBinding.state))) as aval<ISampler>,
+    );
+  } else {
+    ro.samplers.iter((_n, av) => { distinctSamplerAvals.add(av as aval<ISampler>); });
+  }
   let textures: HeapTextureSet | undefined;
   if (distinctTexAvals.size === 1 && distinctSamplerAvals.size === 1) {
     const texAval = [...distinctTexAvals][0]!;

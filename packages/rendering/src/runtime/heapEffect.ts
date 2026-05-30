@@ -52,6 +52,9 @@ export interface HeapSamplerBinding {
   readonly name: string;
   /** WGSL type — "sampler" or "sampler_comparison". */
   readonly wgslType: string;
+  /** Shader-defined sampler state (filter/address) from the IR; the adapter
+   *  builds the GPUSamplerDescriptor from it, overriding the scene default. */
+  readonly state?: { readonly filter: string; readonly addressU: string; readonly addressV: string } | undefined;
 }
 
 export interface HeapEffectSchema {
@@ -242,6 +245,7 @@ function buildSchema(iface: ProgramInterface): HeapEffectSchema {
   }));
   const samplers: HeapSamplerBinding[] = iface.samplers.map(s => ({
     name: s.name, wgslType: "sampler",
+    ...(s.state !== undefined ? { state: s.state } : {}),
   }));
   return { attributes, uniforms, varyings, fragmentOutputs, textures, samplers };
 }

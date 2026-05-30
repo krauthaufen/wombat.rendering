@@ -39,9 +39,33 @@ import { evaluateModeRule } from "../runtime/derivedModes/cpuEval.js";
 import { prepareAdaptiveBuffer } from "./adaptiveBuffer.js";
 import { prepareAdaptiveTexture } from "./adaptiveTexture.js";
 import { prepareAdaptiveSampler } from "./adaptiveSampler.js";
+import { ISampler } from "../core/index.js";
 import { prepareUniformBuffer } from "./uniformBuffer.js";
 import { compileRenderPipeline, type CompileRenderPipelineDescription } from "./renderPipeline.js";
 import { BufferUsage, ShaderStage } from "./webgpuFlags.js";
+
+/** Map shader-defined sampler state (FShade Filter/WrapMode names, carried
+ *  through the IR) to a GPUSamplerDescriptor. */
+function samplerDescriptorFromState(
+  state: { readonly filter: string; readonly addressU: string; readonly addressV: string },
+): GPUSamplerDescriptor {
+  const addr = (a: string): GPUAddressMode =>
+    a === "Clamp" || a === "Border" ? "clamp-to-edge"
+    : a === "Mirror" ? "mirror-repeat"
+    : "repeat";
+  let mag: GPUFilterMode = "linear";
+  let min: GPUFilterMode = "linear";
+  let mip: GPUMipmapFilterMode = "linear";
+  switch (state.filter) {
+    case "MinMagMipPoint": mag = "nearest"; min = "nearest"; mip = "nearest"; break;
+    case "MinMagLinearMipPoint": mip = "nearest"; break;
+    default: break; // MinMagMipLinear / Anisotropic → all "linear"
+  }
+  return {
+    magFilter: mag, minFilter: min, mipmapFilter: mip,
+    addressModeU: addr(state.addressU), addressModeV: addr(state.addressV),
+  };
+}
 
 interface VertexBindingInfo {
   readonly name: string;
@@ -731,7 +755,13 @@ export function prepareRenderObject(
   }
 
   for (const s of iface.samplers) {
-    const av = obj.samplers.tryFind(s.name);
+    // Shader-defined sampler state (from an FShade-style `sampler2d { filter …;
+    // addressU … }` builder, carried through the IR) overrides the scene's
+    // default sampler — so filter/address declared in the shader reach the GPU.
+    let av =
+      s.state !== undefined
+        ? AVal.constant(ISampler.fromDescriptor(samplerDescriptorFromState(s.state)))
+        : obj.samplers.tryFind(s.name);
     if (av === undefined) throw new Error(`prepareRenderObject: missing sampler "${s.name}"`);
     const res = prepareAdaptiveSampler(device, av);
     perGroup[s.group]!.push({ kind: "sampler", binding: slotOf(s), resource: res });
