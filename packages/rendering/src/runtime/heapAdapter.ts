@@ -37,21 +37,39 @@ import { ISampler } from "../core/sampler.js";
 function samplerDescriptorFromState(
   state: { readonly filter: string; readonly addressU: string; readonly addressV: string },
 ): GPUSamplerDescriptor {
+  // FShade WrapMode names. WebGPU has no Border / MirrorOnce — map them to
+  // their closest modes (clamp-to-edge / mirror-repeat).
   const addr = (a: string): GPUAddressMode =>
     a === "Clamp" || a === "Border" ? "clamp-to-edge"
-    : a === "Mirror" ? "mirror-repeat"
+    : a === "Mirror" || a === "MirrorOnce" ? "mirror-repeat"
     : "repeat";
-  let mag: GPUFilterMode = "linear";
+  // Full FShade Filter vocabulary: the name spells Min/Mag/Mip in order;
+  // a missing Mip part means "use the trailing mode for mip too".
+  // Anisotropic → all-linear + maxAnisotropy.
   let min: GPUFilterMode = "linear";
+  let mag: GPUFilterMode = "linear";
   let mip: GPUMipmapFilterMode = "linear";
+  let aniso = 1;
   switch (state.filter) {
-    case "MinMagMipPoint": mag = "nearest"; min = "nearest"; mip = "nearest"; break;
+    case "Anisotropic": aniso = 16; break;
+    case "MinMagMipLinear": break;
+    case "MinMagMipPoint": min = "nearest"; mag = "nearest"; mip = "nearest"; break;
     case "MinMagLinearMipPoint": mip = "nearest"; break;
-    default: break; // MinMagMipLinear / Anisotropic → all "linear"
+    case "MinMagPointMipLinear": min = "nearest"; mag = "nearest"; break;
+    case "MinLinearMagMipPoint": mag = "nearest"; mip = "nearest"; break;
+    case "MinLinearMagPointMipLinear": mag = "nearest"; break;
+    case "MinPointMagLinearMipPoint": min = "nearest"; mip = "nearest"; break;
+    case "MinPointMagMipLinear": min = "nearest"; break;
+    case "MinMagPoint": min = "nearest"; mag = "nearest"; mip = "nearest"; break;
+    case "MinMagLinear": break;
+    case "MinPointMagLinear": min = "nearest"; break;
+    case "MinLinearMagPoint": mag = "nearest"; break;
+    default: break; // unknown → all-linear
   }
   return {
     magFilter: mag, minFilter: min, mipmapFilter: mip,
     addressModeU: addr(state.addressU), addressModeV: addr(state.addressV),
+    maxAnisotropy: aniso,
   };
 }
 import type { RenderObject } from "../core/renderObject.js";
