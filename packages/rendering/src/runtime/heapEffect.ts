@@ -247,15 +247,18 @@ function buildSchema(iface: ProgramInterface): HeapEffectSchema {
   const fragmentOutputs = iface.fragmentOutputs.map(o => ({
     name: o.name, location: o.location, wgslType: irTypeToWgsl(o.type),
   }));
-  // Texture/sampler bindings post-DCE. The IR Type for textures is a
-  // structured kind we don't fully model here yet — for v1 every
-  // texture maps to "texture_2d<f32>" and every sampler to plain
-  // "sampler". Specialise as multi-kind support lands in the DSL.
+  // Texture/sampler bindings post-DCE. Comparison (shadow) samplers pair
+  // with depth textures: the legalise pass marks both with
+  // `comparison: true` — map them to "texture_depth_2d" /
+  // "sampler_comparison". Everything else stays the v1 2D-float kind;
+  // specialise further as multi-kind support lands in the DSL.
+  const isComparison = (t: unknown): boolean =>
+    typeof t === "object" && t !== null && (t as { comparison?: boolean }).comparison === true;
   const textures: HeapTextureBinding[] = iface.textures.map(t => ({
-    name: t.name, wgslType: "texture_2d<f32>",
+    name: t.name, wgslType: isComparison(t.type) ? "texture_depth_2d" : "texture_2d<f32>",
   }));
   const samplers: HeapSamplerBinding[] = iface.samplers.map(s => ({
-    name: s.name, wgslType: "sampler",
+    name: s.name, wgslType: isComparison(s.type) ? "sampler_comparison" : "sampler",
     ...(s.state !== undefined ? { state: s.state } : {}),
   }));
   return { attributes, uniforms, varyings, fragmentOutputs, textures, samplers };

@@ -1273,7 +1273,10 @@ export function buildHeapScene(
   interface BglEntry { bgl: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout }
   const bglCache = new Map<string, BglEntry>();
   function getBgl(layout: BucketLayout, withAtlasArrays: boolean): BglEntry {
-    const key = `t${layout.textureBindings.length}|s${layout.samplerBindings.length}|a${withAtlasArrays ? 1 : 0}`;
+    const key =
+      `t${layout.textureBindings.map(t => t.wgslType).join(",")}` +
+      `|s${layout.samplerBindings.map(s => s.wgslType).join(",")}` +
+      `|a${withAtlasArrays ? 1 : 0}`;
     let e = bglCache.get(key);
     if (e !== undefined) return e;
     // Heap data buffers are read by both stages: FS uniform-via-varying
@@ -1294,13 +1297,13 @@ export function buildHeapScene(
     for (const t of layout.textureBindings) {
       entries.push({
         binding: t.binding, visibility: GPUShaderStage.FRAGMENT,
-        texture: { sampleType: "float" },
+        texture: { sampleType: t.wgslType === "texture_depth_2d" ? "depth" : "float" },
       });
     }
     for (const s of layout.samplerBindings) {
       entries.push({
         binding: s.binding, visibility: GPUShaderStage.FRAGMENT,
-        sampler: { type: "filtering" },
+        sampler: { type: s.wgslType === "sampler_comparison" ? "comparison" : "filtering" },
       });
     }
     if (withAtlasArrays) {

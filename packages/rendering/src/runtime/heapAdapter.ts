@@ -88,9 +88,24 @@ function samplerDescriptorFromState(
   if (state.addressW !== undefined) (desc as { addressModeW?: GPUAddressMode }).addressModeW = addr(state.addressW);
   if (state.minLod !== undefined) (desc as { lodMinClamp?: number }).lodMinClamp = state.minLod;
   if (state.maxLod !== undefined) (desc as { lodMaxClamp?: number }).lodMaxClamp = state.maxLod;
-  // NOT applied: `comparison` (a compare sampler needs a sampler_comparison
-  // binding — separate feature) and `mipLodBias` (no WebGPU counterpart).
+  // `comparison` is applied by the caller when the binding is a
+  // sampler_comparison (a compare function on a filtering sampler would
+  // fail WebGPU validation). `mipLodBias` has no WebGPU counterpart.
   return desc;
+}
+
+/** FShade ComparisonFunction case name → GPUCompareFunction. */
+function compareFunctionOf(name: string): GPUCompareFunction {
+  switch (name) {
+    case "Never": return "never";
+    case "Less": return "less";
+    case "Equal": return "equal";
+    case "LessOrEqual": return "less-equal";
+    case "Greater": return "greater";
+    case "GreaterOrEqual": return "greater-equal";
+    case "NotEqual": return "not-equal";
+    default: return "always";
+  }
 }
 import type { RenderObject } from "../core/renderObject.js";
 import { asAttributeProvider, asUniformProvider } from "../core/provider.js";
@@ -391,8 +406,16 @@ export function renderObjectToHeapSpec(
   // builder, carried through the IR) overrides the scene's default sampler.
   const stateBinding = schema.samplers.find(b => b.state !== undefined);
   if (stateBinding?.state !== undefined) {
+    const desc = samplerDescriptorFromState(stateBinding.state);
+    if (stateBinding.wgslType === "sampler_comparison") {
+      // Shadow sampler: the binding requires a compare function. WebGPU
+      // also forbids anisotropy unless all filters are linear; keep the
+      // state's choice (samplerDescriptorFromState already clamps).
+      (desc as { compare?: GPUCompareFunction }).compare =
+        compareFunctionOf(stateBinding.state.comparison ?? "LessOrEqual");
+    }
     distinctSamplerAvals.add(
-      AVal.constant(ISampler.fromDescriptor(samplerDescriptorFromState(stateBinding.state))) as aval<ISampler>,
+      AVal.constant(ISampler.fromDescriptor(desc)) as aval<ISampler>,
     );
   } else {
     ro.samplers.iter((_n, av) => { distinctSamplerAvals.add(av as aval<ISampler>); });
