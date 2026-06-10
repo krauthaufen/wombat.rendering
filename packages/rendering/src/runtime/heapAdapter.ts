@@ -35,7 +35,17 @@ import { ISampler } from "../core/sampler.js";
 /** Map shader-defined sampler state (FShade Filter/WrapMode names) to a
  *  GPUSamplerDescriptor (heap path). */
 function samplerDescriptorFromState(
-  state: { readonly filter: string; readonly addressU: string; readonly addressV: string },
+  state: {
+    readonly filter: string;
+    readonly addressU: string;
+    readonly addressV: string;
+    readonly addressW?: string;
+    readonly comparison?: string;
+    readonly maxAnisotropy?: number;
+    readonly minLod?: number;
+    readonly maxLod?: number;
+    readonly mipLodBias?: number;
+  },
 ): GPUSamplerDescriptor {
   // FShade WrapMode names. WebGPU has no Border / MirrorOnce — map them to
   // their closest modes (clamp-to-edge / mirror-repeat).
@@ -66,11 +76,21 @@ function samplerDescriptorFromState(
     case "MinLinearMagPoint": mag = "nearest"; break;
     default: break; // unknown → all-linear
   }
-  return {
+  // Explicit maxAnisotropy overrides the Anisotropic-filter default.
+  // WebGPU validation: maxAnisotropy > 1 requires all-linear filtering.
+  if (state.maxAnisotropy !== undefined) aniso = state.maxAnisotropy;
+  if (min !== "linear" || mag !== "linear" || mip !== "linear") aniso = 1;
+  const desc: GPUSamplerDescriptor = {
     magFilter: mag, minFilter: min, mipmapFilter: mip,
     addressModeU: addr(state.addressU), addressModeV: addr(state.addressV),
     maxAnisotropy: aniso,
   };
+  if (state.addressW !== undefined) (desc as { addressModeW?: GPUAddressMode }).addressModeW = addr(state.addressW);
+  if (state.minLod !== undefined) (desc as { lodMinClamp?: number }).lodMinClamp = state.minLod;
+  if (state.maxLod !== undefined) (desc as { lodMaxClamp?: number }).lodMaxClamp = state.maxLod;
+  // NOT applied: `comparison` (a compare sampler needs a sampler_comparison
+  // binding — separate feature) and `mipLodBias` (no WebGPU counterpart).
+  return desc;
 }
 import type { RenderObject } from "../core/renderObject.js";
 import { asAttributeProvider, asUniformProvider } from "../core/provider.js";

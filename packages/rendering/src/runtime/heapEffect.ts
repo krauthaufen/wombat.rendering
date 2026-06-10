@@ -52,9 +52,20 @@ export interface HeapSamplerBinding {
   readonly name: string;
   /** WGSL type — "sampler" or "sampler_comparison". */
   readonly wgslType: string;
-  /** Shader-defined sampler state (filter/address) from the IR; the adapter
-   *  builds the GPUSamplerDescriptor from it, overriding the scene default. */
-  readonly state?: { readonly filter: string; readonly addressU: string; readonly addressV: string } | undefined;
+  /** Shader-defined sampler state (filter/address/lod/anisotropy) from the
+   *  IR; the adapter builds the GPUSamplerDescriptor from it, overriding the
+   *  scene default. */
+  readonly state?: {
+    readonly filter: string;
+    readonly addressU: string;
+    readonly addressV: string;
+    readonly addressW?: string;
+    readonly comparison?: string;
+    readonly maxAnisotropy?: number;
+    readonly minLod?: number;
+    readonly maxLod?: number;
+    readonly mipLodBias?: number;
+  } | undefined;
 }
 
 export interface HeapEffectSchema {
