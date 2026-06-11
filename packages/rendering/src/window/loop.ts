@@ -37,9 +37,12 @@ import type { CanvasAttachment } from "./canvas.js";
 // AFTER each frame's pacer resolves (i.e. GPU work done), so a
 // harness can serialize edit → frame-complete → next edit and read
 // honest end-to-end frame costs.
-const UNCAPPED: boolean =
-  (globalThis as Record<string, unknown> & typeof globalThis)
+// Read at runFrame() start (NOT module load) — consumers set the flag
+// from app code that runs after this module is imported.
+function isUncapped(): boolean {
+  return (globalThis as Record<string, unknown> & typeof globalThis)
     .__wombatUncappedRenderLoop === true;
+}
 
 function bumpFrameCount(): void {
   const g = globalThis as Record<string, unknown> & typeof globalThis;
@@ -93,6 +96,7 @@ export function runFrame(
   let lastTime = performance.now();
   let rafId = 0;
   let pending = false;
+  const UNCAPPED = isUncapped();
 
   // Wrap the frame callback in an AVal so the adaptive system tracks
   // its dependency set. Each `force()` re-reads the inputs and runs
