@@ -49,6 +49,33 @@ function bumpFrameCount(): void {
   g.__wombatFrameCount = ((g.__wombatFrameCount as number | undefined) ?? 0) + 1;
 }
 
+// setTimeout(0) is useless for an uncapped loop: Chrome clamps nested
+// timers to a 4 ms minimum after depth 5. MessageChannel.postMessage
+// is the unthrottled macrotask primitive.
+const immediateCbs = new Map<number, () => void>();
+let immediateNext = 1;
+const immediateChannel: MessageChannel | null =
+  typeof MessageChannel !== "undefined" ? new MessageChannel() : null;
+if (immediateChannel !== null) {
+  immediateChannel.port1.onmessage = (e: MessageEvent): void => {
+    const id = e.data as number;
+    const cb = immediateCbs.get(id);
+    immediateCbs.delete(id);
+    cb?.();
+  };
+}
+function setImmediate2(cb: () => void): number {
+  if (immediateChannel === null) return setTimeout(cb, 0) as unknown as number;
+  const id = immediateNext++;
+  immediateCbs.set(id, cb);
+  immediateChannel.port2.postMessage(id);
+  return id;
+}
+function clearImmediate2(id: number): void {
+  if (immediateChannel === null) { clearTimeout(id); return; }
+  immediateCbs.delete(id);
+}
+
 export interface RunFrameOptions {
   /** Stop after N frames. Useful for tests + finite animations. */
   readonly maxFrames?: number;
@@ -131,11 +158,9 @@ export function runFrame(
   };
 
   const schedule = (cb: () => void): number =>
-    UNCAPPED
-      ? (setTimeout(cb, 0) as unknown as number)
-      : requestAnimationFrame(cb);
+    UNCAPPED ? setImmediate2(cb) : requestAnimationFrame(cb);
   const cancel = (h: number): void => {
-    if (UNCAPPED) clearTimeout(h);
+    if (UNCAPPED) clearImmediate2(h);
     else cancelAnimationFrame(h);
   };
 
