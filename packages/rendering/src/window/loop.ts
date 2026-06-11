@@ -26,6 +26,26 @@ import type { aval, AdaptiveToken, IDisposable } from "@aardworx/wombat.adaptive
 import { AVal, transact } from "@aardworx/wombat.adaptive";
 import type { CanvasAttachment } from "./canvas.js";
 
+// ─── Benchmark toggles ─────────────────────────────────────────────────
+//
+// `globalThis.__wombatUncappedRenderLoop = true` (set BEFORE the loop
+// starts) schedules frames via setTimeout(0) instead of
+// requestAnimationFrame — no vsync clamp; with the standard
+// `onSubmittedWorkDone` pacer the loop then runs at true GPU
+// completion rate. The canvas still presents whatever frame is
+// latest. When uncapped, `globalThis.__wombatFrameCount` increments
+// AFTER each frame's pacer resolves (i.e. GPU work done), so a
+// harness can serialize edit → frame-complete → next edit and read
+// honest end-to-end frame costs.
+const UNCAPPED: boolean =
+  (globalThis as Record<string, unknown> & typeof globalThis)
+    .__wombatUncappedRenderLoop === true;
+
+function bumpFrameCount(): void {
+  const g = globalThis as Record<string, unknown> & typeof globalThis;
+  g.__wombatFrameCount = ((g.__wombatFrameCount as number | undefined) ?? 0) + 1;
+}
+
 export interface RunFrameOptions {
   /** Stop after N frames. Useful for tests + finite animations. */
   readonly maxFrames?: number;
@@ -95,6 +115,8 @@ export function runFrame(
 
   const finalizeFrame = (): void => {
     if (stopped) return;
+    // pacer (GPU completion) has resolved by now — this frame is DONE
+    if (UNCAPPED) bumpFrameCount();
     if (opts.onAfterFrame !== undefined) {
       transact(opts.onAfterFrame);
     }
@@ -102,6 +124,15 @@ export function runFrame(
       stopped = true;
       sub.dispose();
     }
+  };
+
+  const schedule = (cb: () => void): number =>
+    UNCAPPED
+      ? (setTimeout(cb, 0) as unknown as number)
+      : requestAnimationFrame(cb);
+  const cancel = (h: number): void => {
+    if (UNCAPPED) clearTimeout(h);
+    else cancelAnimationFrame(h);
   };
 
   const tick = (): void => {
@@ -133,18 +164,18 @@ export function runFrame(
   }).addMarkingCallback(() => {
     if (pending || stopped) return;
     pending = true;
-    rafId = requestAnimationFrame(tick);
+    rafId = schedule(tick);
   });
 
   // Initial render. Schedules subsequent frames only when adaptive
   // marks reach `renderAval` (via the marking callback above).
   pending = true;
-  rafId = requestAnimationFrame(tick);
+  rafId = schedule(tick);
 
   return {
     stop() {
       stopped = true;
-      cancelAnimationFrame(rafId);
+      cancel(rafId);
       sub.dispose();
     },
   };
