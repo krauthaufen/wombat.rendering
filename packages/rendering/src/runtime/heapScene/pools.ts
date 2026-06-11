@@ -21,6 +21,7 @@ import type { BufferView } from "../../core/bufferView.js";
 import type { HostBufferSource } from "../../core/buffer.js";
 import { GrowBuffer, ALIGN16, DEFAULT_MAX_BUFFER_BYTES } from "./growBuffer.js";
 import { Freelist } from "./freelist.js";
+import { DirtyRanges } from "./dirtyRanges.js";
 import { ChunkedAttributeArena, ChunkedIndexAllocator } from "./chunkedArena.js";
 
 // ─── Debug toggles ─────────────────────────────────────────────────────
@@ -393,10 +394,11 @@ export class AttributeArena {
    *  development; cheap (one Map insert/delete per alloc). */
   private readonly liveAllocs = new Map<number, number>();
   /** CPU shadow of the entire GPU buffer; writes go here first then
-   *  flush() emits one writeBuffer per dirty contiguous range. */
+   *  flush() emits one writeBuffer per dirty contiguous range. A
+   *  single min..max span would re-upload nearly the whole arena on
+   *  scattered edits — see dirtyRanges.ts. */
   private shadow: Uint8Array;
-  private dirtyMin = Infinity;
-  private dirtyMax = 0;
+  private readonly dirty = new DirtyRanges();
   constructor(private readonly buf: GrowBuffer) {
     this.shadow = new Uint8Array(buf.capacity);
     buf.onResize(() => {
@@ -419,19 +421,17 @@ export class AttributeArena {
   }
   write(dst: number, data: Uint8Array): void {
     this.shadow.set(data, dst);
-    if (dst < this.dirtyMin) this.dirtyMin = dst;
-    const end = dst + data.byteLength;
-    if (end > this.dirtyMax) this.dirtyMax = end;
+    this.dirty.add(dst, dst + data.byteLength);
   }
   flush(device: GPUDevice): void {
-    if (this.dirtyMax <= this.dirtyMin) return;
-    device.queue.writeBuffer(
-      this.buf.buffer, this.dirtyMin,
-      this.shadow.buffer, this.shadow.byteOffset + this.dirtyMin,
-      this.dirtyMax - this.dirtyMin,
-    );
-    this.dirtyMin = Infinity;
-    this.dirtyMax = 0;
+    if (this.dirty.isEmpty) return;
+    this.dirty.drain((start, end) => {
+      device.queue.writeBuffer(
+        this.buf.buffer, start,
+        this.shadow.buffer, this.shadow.byteOffset + start,
+        end - start,
+      );
+    });
   }
   /**
    * Allocate space for one attribute. Returns the byte ref (offset
@@ -531,8 +531,7 @@ export class IndexAllocator {
   /** DEBUG: live index allocations tracked by start element. */
   private readonly liveAllocs = new Map<number, number>();
   private shadow: Uint8Array;
-  private dirtyMin = Infinity;
-  private dirtyMax = 0;
+  private readonly dirty = new DirtyRanges();
   constructor(private readonly buf: GrowBuffer) {
     this.shadow = new Uint8Array(buf.capacity);
     buf.onResize(() => {
@@ -545,19 +544,17 @@ export class IndexAllocator {
   get usedElements(): number { return this.cursor; }
   write(dstByteOffset: number, data: Uint8Array): void {
     this.shadow.set(data, dstByteOffset);
-    if (dstByteOffset < this.dirtyMin) this.dirtyMin = dstByteOffset;
-    const end = dstByteOffset + data.byteLength;
-    if (end > this.dirtyMax) this.dirtyMax = end;
+    this.dirty.add(dstByteOffset, dstByteOffset + data.byteLength);
   }
   flush(device: GPUDevice): void {
-    if (this.dirtyMax <= this.dirtyMin) return;
-    device.queue.writeBuffer(
-      this.buf.buffer, this.dirtyMin,
-      this.shadow.buffer, this.shadow.byteOffset + this.dirtyMin,
-      this.dirtyMax - this.dirtyMin,
-    );
-    this.dirtyMin = Infinity;
-    this.dirtyMax = 0;
+    if (this.dirty.isEmpty) return;
+    this.dirty.drain((start, end) => {
+      device.queue.writeBuffer(
+        this.buf.buffer, start,
+        this.shadow.buffer, this.shadow.byteOffset + start,
+        end - start,
+      );
+    });
   }
   /** Non-throwing alloc — returns `undefined` when the request
    *  would exceed the underlying GrowBuffer's `maxCapacity` cap.
