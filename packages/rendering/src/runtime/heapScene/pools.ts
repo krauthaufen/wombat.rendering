@@ -23,6 +23,17 @@ import { GrowBuffer, ALIGN16, DEFAULT_MAX_BUFFER_BYTES } from "./growBuffer.js";
 import { Freelist } from "./freelist.js";
 import { ChunkedAttributeArena, ChunkedIndexAllocator } from "./chunkedArena.js";
 
+// ─── Debug toggles ─────────────────────────────────────────────────────
+
+/** Opt-in O(live-allocs) overlap validation on every alloc. Set
+ *  `globalThis.__wombatDebugAllocOverlap = true` BEFORE scene creation
+ *  to enable. Default OFF: the scan made scene build O(n²) — 65 s for a
+ *  20 k-object scene, renderer-crash territory at 68 k. The O(1)
+ *  release-side checks (double-free, size mismatch) stay always-on. */
+const DEBUG_ALLOC_OVERLAP: boolean =
+  (globalThis as Record<string, unknown> & typeof globalThis)
+    .__wombatDebugAllocOverlap === true;
+
 // ─── Per-allocation header layout ──────────────────────────────────────
 
 /** Per-allocation header: (u32 typeId, u32 length). Data follows
@@ -485,19 +496,20 @@ export class AttributeArena {
       this.buf.setUsed(this.cursor);
     }
   }
-  /** Throws if the just-returned alloc overlaps any live allocation. */
+  /** Tracks the alloc; with `__wombatDebugAllocOverlap` set, also
+   *  throws if it overlaps any live allocation (O(live) per alloc —
+   *  made scene build O(n²) when always-on, hence opt-in). */
   private recordAlloc(off: number, size: number, source: string): void {
-    // Check against every existing live alloc — O(N). Cheap while N
-    // is small (per-tile demos run with ~hundreds of allocs). Wire
-    // off behind an env-flag if it ever becomes a hot path.
-    for (const [liveOff, liveSize] of this.liveAllocs) {
+    if (DEBUG_ALLOC_OVERLAP) {
       // [a, a+sa) vs [b, b+sb) overlap iff a < b+sb && b < a+sa
-      if (off < liveOff + liveSize && liveOff < off + size) {
-        throw new Error(
-          `AttributeArena.tryAlloc(${source}): returned [${off},${off + size}) ` +
-          `(size=${size}) overlaps live alloc at [${liveOff},${liveOff + liveSize}) ` +
-          `(size=${liveSize}). Allocator is handing out shared memory!`,
-        );
+      for (const [liveOff, liveSize] of this.liveAllocs) {
+        if (off < liveOff + liveSize && liveOff < off + size) {
+          throw new Error(
+            `AttributeArena.tryAlloc(${source}): returned [${off},${off + size}) ` +
+            `(size=${size}) overlaps live alloc at [${liveOff},${liveOff + liveSize}) ` +
+            `(size=${liveSize}). Allocator is handing out shared memory!`,
+          );
+        }
       }
     }
     this.liveAllocs.set(off, size);
@@ -566,13 +578,15 @@ export class IndexAllocator {
     return off;
   }
   private recordAlloc(off: number, size: number, source: string): void {
-    for (const [liveOff, liveSize] of this.liveAllocs) {
-      if (off < liveOff + liveSize && liveOff < off + size) {
-        throw new Error(
-          `IndexAllocator.tryAlloc(${source}): returned [${off},${off + size}) ` +
-          `(size=${size}) overlaps live alloc at [${liveOff},${liveOff + liveSize}) ` +
-          `(size=${liveSize}). Index allocator is handing out shared memory!`,
-        );
+    if (DEBUG_ALLOC_OVERLAP) {
+      for (const [liveOff, liveSize] of this.liveAllocs) {
+        if (off < liveOff + liveSize && liveOff < off + size) {
+          throw new Error(
+            `IndexAllocator.tryAlloc(${source}): returned [${off},${off + size}) ` +
+            `(size=${size}) overlaps live alloc at [${liveOff},${liveOff + liveSize}) ` +
+            `(size=${liveSize}). Index allocator is handing out shared memory!`,
+          );
+        }
       }
     }
     this.liveAllocs.set(off, size);
