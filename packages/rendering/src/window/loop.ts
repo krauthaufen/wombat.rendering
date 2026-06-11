@@ -47,6 +47,14 @@ function isUncapped(): boolean {
 function bumpFrameCount(): void {
   const g = globalThis as Record<string, unknown> & typeof globalThis;
   g.__wombatFrameCount = ((g.__wombatFrameCount as number | undefined) ?? 0) + 1;
+  // one-shot completion hook: lets a harness await frame completion
+  // without poll-spinning a timer/MessageChannel loop (which competes
+  // with the render loop's own scheduling).
+  const cb = g.__wombatOnFrame as (() => void) | undefined;
+  if (cb !== undefined) {
+    g.__wombatOnFrame = undefined;
+    cb();
+  }
 }
 
 // setTimeout(0) is useless for an uncapped loop: Chrome clamps nested
