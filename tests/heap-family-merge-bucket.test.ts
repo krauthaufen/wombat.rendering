@@ -134,7 +134,7 @@ describe.skip("§6 family-merge — bucket collapse (slice 3c)", () => {
     scene.update(AdaptiveToken.top);
   });
 
-  it("addDraw of an effect outside the frozen family throws", () => {
+  it("addDraw of a new effect after freeze registers it (reactive rebuild)", () => {
     const gpu = new MockGPU();
     const pool = new AtlasPool(gpu.device);
     const plain = plainSpec(makeHeapTestEffect());
@@ -142,6 +142,47 @@ describe.skip("§6 family-merge — bucket collapse (slice 3c)", () => {
       atlasPool: pool, enableFamilyMerge: true,
     });
     const stranger = makeHeapTestEffectTextured();
-    expect(() => scene.addDraw(texturedSpec(stranger, pool))).toThrow(/family is frozen/);
+    expect(() => scene.addDraw(texturedSpec(stranger, pool))).not.toThrow();
+  });
+});
+
+describe("reactive family rebuild — new effect after freeze", () => {
+  type DbgBucket = {
+    recordCount: number;
+    totalEmitEstimate: number;
+    drawTableBuf: GPUBuffer | undefined;
+    indirectBuf:  GPUBuffer | undefined;
+  };
+  const bucketsOf = (scene: unknown) =>
+    (scene as { _debug: { bucketsForTest(): readonly DbgBucket[] } })._debug.bucketsForTest();
+
+  it("a new effect added after freeze is fully encoded (records + indirect args)", () => {
+    const gpu = new MockGPU();
+    const pool = new AtlasPool(gpu.device);
+    // Build + draw ONE effect — the family freezes around it.
+    const scene = buildHeapScene(gpu.device, sig(), [plainSpec(makeHeapTestEffect())], {
+      atlasPool: pool,
+    });
+    scene.update(AdaptiveToken.top);
+    expect(scene.stats.groups).toBe(1);
+
+    // A genuinely new effect appears later (e.g. measurement markers on top of
+    // streamed tiles). Pre-fix this threw "family is frozen"; the bug after
+    // that was the late bucket never getting encoded (recordCount 0 → no draw).
+    const stranger = makeHeapTestEffectTextured();
+    let id = -1;
+    expect(() => { id = scene.addDraw(texturedSpec(stranger, pool)); }).not.toThrow();
+    expect(id).toBeGreaterThanOrEqual(0);
+    scene.update(AdaptiveToken.top);
+
+    // BOTH effects' buckets exist AND the late one carries a draw record +
+    // an indirect-args buffer — i.e. it will actually be drawn, not skipped.
+    expect(scene.stats.groups).toBe(2);
+    const bs = bucketsOf(scene);
+    expect(bs.length).toBe(2);
+    for (const b of bs) {
+      expect(b.recordCount).toBe(1);
+      expect(b.indirectBuf).toBeDefined();
+    }
   });
 });

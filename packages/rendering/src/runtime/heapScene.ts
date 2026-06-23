@@ -90,6 +90,7 @@ import {
   asAval, isBufferView, asFloat32,
   ALLOC_HEADER_BYTES, ALLOC_HEADER_PAD_TO,
   ENC_V3F_TIGHT, SEM_POSITIONS, SEM_NORMALS,
+  COMPACTION_WASTE_FLOOR_BYTES,
   type ArenaState,
 } from "./heapScene/pools.js";
 import { encodeModeKey, type PipelineStateDescriptor } from "./pipelineCache/index.js";
@@ -552,6 +553,10 @@ export interface HeapSceneStats {
   totalDraws: number;
   drawBytes: number;
   geometryBytes: number;
+  /** Cumulative count of waste-triggered arena compactions performed
+   *  (one per chunk per `update` that compacted). Stays 0 when the
+   *  arena never ratchets past the waste floor. */
+  compactions: number;
   /** §7 derived-uniforms per-frame breakdown (last frame). */
   derivedPullMs:   number;
   derivedUploadMs: number;
@@ -752,6 +757,21 @@ export interface BuildHeapSceneOptions {
    * chunks duplicate their pool entries (accepted trade-off).
    */
   readonly maxChunkBytes?: number;
+  /**
+   * Waste-triggered attribute-arena compaction. When enabled (default),
+   * `update()` relocates live arena allocations to the front of each chunk
+   * once fragmentation waste crosses `compactionWasteFloorBytes` and at least
+   * half the extent is wasted — preventing the high-water ratchet that
+   * exact-size freelist reuse can't fix under a drifting allocation-size
+   * distribution. Pass `false` to disable.
+   */
+  readonly enableCompaction?: boolean;
+  /**
+   * Override the fragmentation-waste floor (bytes) below which compaction is
+   * skipped. Default `COMPACTION_WASTE_FLOOR_BYTES` (4 MiB). Tests pass a
+   * small value to exercise the path without realistic memory pressure.
+   */
+  readonly compactionWasteFloorBytes?: number;
 }
 
 export function buildHeapScene(
@@ -1157,6 +1177,8 @@ export function buildHeapScene(
   // both. `derivedScene` is undefined when the option is off; nothing
   // else in this file should run when it is. On by default — pass
   // `enableDerivedUniforms: false` to opt out.
+  const enableCompaction = opts.enableCompaction !== false;
+  const compactionWasteFloor = opts.compactionWasteFloorBytes ?? COMPACTION_WASTE_FLOOR_BYTES;
   const enableDerivedUniforms = opts.enableDerivedUniforms !== false;
   const derivedScene: DerivedUniformsScene | undefined = enableDerivedUniforms
     ? new DerivedUniformsScene(device, {
@@ -1436,8 +1458,9 @@ export function buildHeapScene(
 
   // ─── Family state (§6 family-merge, slice 3c) ─────────────────────
   // Built lazily on the first addDraw batch from the union of all
-  // effects in that batch, then frozen. Subsequent addDraws with an
-  // unknown effect throw — reactive family rebuild is a v2 punt.
+  // effects in that batch. A NEW effect appearing later is registered
+  // on the fly (ensureFamilyForSpec) — families are independent per
+  // effect (merge disabled), so the scene can mix effects added over time.
   //
   // Bucket key collapses to (familyId, pipelineState): every effect
   // in the family shares one bucket per pipelineState. The family
@@ -1579,6 +1602,25 @@ export function buildHeapScene(
       throw new Error("heapScene: ensureFamilyKnowsEffect called before family build");
     }
     familyFor(effect); // throws if unknown
+  }
+
+  /**
+   * Reactive family rebuild: register a new effect's family when it first
+   * appears after the initial freeze. Family-merge is disabled, so every
+   * Effect already gets its OWN independent single-member family (its own
+   * shader modules + buckets); a late effect just needs its family compiled
+   * and added — no rebuild of existing families. Idempotent.
+   */
+  function ensureFamilyForSpec(spec: HeapDrawSpec): void {
+    if (!familyBuilt) { buildFamilyFromSpecs([spec]); return; }
+    if (familyByEffectId.has(spec.effect.id)) return;
+    const entry = { attributes: new Set<string>(), uniforms: new Set<string>() };
+    if (spec.instanceAttributes !== undefined) {
+      for (const name of Object.keys(spec.instanceAttributes)) entry.attributes.add(name);
+    }
+    const singleMap = new Map<Effect, { attributes: Set<string>; uniforms: Set<string> }>();
+    singleMap.set(spec.effect, entry);
+    familyByEffectId.set(spec.effect.id, compileFamilyFor([spec.effect], singleMap));
   }
 
   // ─── id-of helpers ────────────────────────────────────────────────
@@ -2916,6 +2958,7 @@ export function buildHeapScene(
     totalDraws: 0,
     drawBytes: 0,
     geometryBytes: 0,
+    compactions: 0,
     derivedPullMs:   0,
     derivedUploadMs: 0,
     derivedEncodeMs: 0,
@@ -2958,11 +3001,10 @@ export function buildHeapScene(
     // single spec when no batched lazy-build occurred earlier (e.g.
     // direct addDraw at runtime). The aset / array initial-population
     // paths build from the full effect set up front.
-    if (!familyBuilt) {
-      buildFamilyFromSpecs([spec]);
-    } else {
-      ensureFamilyKnowsEffect(spec.effect);
-    }
+    // Build the family lazily from this spec (first addDraw), or register a
+    // newly-seen effect's family on the fly (reactive rebuild) — supports a
+    // scene mixing multiple effects added over time (tiles + markers + …).
+    ensureFamilyForSpec(spec);
     const perInstanceUniforms = new Set<string>();
     const perInstanceAttributes = spec.instanceAttributes !== undefined
       ? new Set(Object.keys(spec.instanceAttributes))
@@ -3616,14 +3658,16 @@ export function buildHeapScene(
   function drainAsetWith(tok: AdaptiveToken): void {
     if (asetReader === undefined) return;
     const delta = asetReader.getChanges(tok);
+    // Process removals before adds. A remove+add in the same
+    // transaction must free its slot / arena region / atlas tile
+    // before the add allocates, so the freelist reuses the just-freed
+    // block instead of growing the high-water toward
+    // live + removed-this-tick. (Matches Aardvark's removals-first
+    // delta discipline.)
+    const adds: HeapDrawSpec[] = [];
     delta.iter((op: { value: HeapDrawSpec; count: number }) => {
       if (op.count > 0) {
-        // Re-use the outer evaluateAlways scope's token (caller is
-        // already sceneObj) — collapses N nested evaluateAlways into
-        // one for a bulk add. Saves a per-RO setUnsafeEvaluationDepth
-        // + outputs.add(sceneObj) round trip.
-        const id = addDrawImpl(op.value, tok);
-        specToDrawId.set(op.value, id);
+        adds.push(op.value);
       } else {
         const id = specToDrawId.get(op.value);
         if (id !== undefined) {
@@ -3632,6 +3676,13 @@ export function buildHeapScene(
         }
       }
     });
+    // Re-use the outer evaluateAlways scope's token (caller is already
+    // sceneObj) — collapses N nested evaluateAlways into one for a bulk
+    // add. Saves a per-RO setUnsafeEvaluationDepth + outputs.add round trip.
+    for (const value of adds) {
+      const id = addDrawImpl(value, tok);
+      specToDrawId.set(value, id);
+    }
   }
 
   // ─── Initial population ───────────────────────────────────────────
@@ -3648,9 +3699,9 @@ export function buildHeapScene(
     asetReader = (initialDraws as aset<HeapDrawSpec>).getReader();
     sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
       // First drain: snapshot all add-ops, build the family from their
-      // effects up front, then run addDraw. Subsequent drains either
-      // reuse the frozen family (matching effects) or throw on a new
-      // unseen effect (per the v1 frozen-family contract).
+      // effects up front, then run addDraw. Subsequent drains reuse the
+      // family, or register a newly-seen effect's family on the fly
+      // (ensureFamilyForSpec, via addDrawImpl).
       if (!familyBuilt) {
         const reader = asetReader!;
         const delta = reader.getChanges(tok);
@@ -3677,6 +3728,134 @@ export function buildHeapScene(
         drainAsetWith(tok);
       }
     });
+  }
+
+  // ─── Heap compaction (attribute arena + index buffer) ────────────
+  /**
+   * Compact every arena/index chunk whose fragmentation waste crosses the
+   * floor (or unconditionally when `force`), then re-seat EVERY cached ref so
+   * the relocated allocations stay addressable. Attribute arena:
+   *   • uniform-pool entries (`pool.remapRefs`)
+   *   • §7 derived-uniform record handles (`derivedScene.remapHostHeap`)
+   *   • modes partition master refs (`partitionScene.remapUniformRefs`)
+   *   • drawHeader cells + the Pos/Nor caches (re-`packBucketHeader`)
+   * Index buffer (ref = `allocBase + slice`, held in the drawTable / partition
+   * master + IndexPool entry):
+   *   • per-draw `indexStart` in the CPU drawTable or partition master
+   *   • `localEntries[slot].firstIndex` + IndexPool entry base
+   * Must run with the buffers current (we flush first) and before the
+   * per-bucket header / drawTable flush so the re-seated records upload.
+   */
+  function runCompaction(force: boolean): void {
+    arena.attrs.flush(device); // ensure the GPU buffer is current for the copy
+    const compactions = arena.attrs.compact(device, compactionWasteFloor, force);
+    for (const { chunkIdx, remap } of compactions) {
+      pool.remapRefs(chunkIdx, remap);
+      if (derivedScene !== undefined) {
+        // §7 handles store DATA offsets (ref + header pad), not header refs.
+        const dataRemap = new Map<number, number>();
+        for (const [o, n] of remap) {
+          dataRemap.set(o + ALLOC_HEADER_PAD_TO, n + ALLOC_HEADER_PAD_TO);
+        }
+        derivedScene.remapHostHeap(chunkIdx, dataRemap);
+      }
+      for (const bucket of buckets) {
+        if (bucket.chunkIdx !== chunkIdx) continue;
+        if (bucket.gpuRouted && bucket.partitionScene !== undefined) {
+          if (bucket.partitionScene.remapUniformRefs(remap) > 0) {
+            bucket.partitionDirty = true;
+          }
+        }
+        for (const localSlot of bucket.drawSlots) {
+          const refs = bucket.localPerDrawRefs[localSlot];
+          if (refs === undefined) continue;
+          let changed = false;
+          for (const [name, ref] of refs) {
+            const nn = remap.get(ref);
+            if (nn !== undefined) { refs.set(name, nn); changed = true; }
+          }
+          if (!changed) continue;
+          bucket.localPosRefs[localSlot] = refs.get("Positions");
+          bucket.localNorRefs[localSlot] = refs.get("Normals");
+          packBucketHeader(bucket, localSlot, refs, bucket.localLayoutIds[localSlot] ?? 0);
+          if (bucket.isAtlasBucket) {
+            const ts = bucket.localAtlasTextures[localSlot];
+            if (ts !== undefined) packAtlasTextureFields(bucket, localSlot, ts);
+          }
+          const byteOff = localSlot * bucket.layout.drawHeaderBytes;
+          if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
+          const end = byteOff + bucket.layout.drawHeaderBytes;
+          if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
+        }
+      }
+      stats.compactions++;
+    }
+
+    // ─── Index-buffer compaction ─────────────────────────────────────
+    // Element-unit twin of the above. A draw's stored index ref is
+    // `allocBase + sliceOffset`; we derive each draw's relocation delta from
+    // its IndexPool entry's OLD base, patch the drawTable / partition-master
+    // `indexStart`, then re-seat the pool. Non-indexed draws (no index aval)
+    // are skipped.
+    arena.indices.flush(device);
+    const idxFloorElements = Math.floor(compactionWasteFloor / 4);
+    const idxCompactions = arena.indices.compact(device, idxFloorElements, force);
+    for (const { chunkIdx, remap } of idxCompactions) {
+      for (const bucket of buckets) {
+        if (bucket.chunkIdx !== chunkIdx) continue;
+        for (const localSlot of bucket.drawSlots) {
+          const drawId = bucket.localToDrawId[localSlot];
+          if (drawId === undefined) continue;
+          const av = drawIdToIndexAval[drawId];
+          if (av === undefined) continue; // non-indexed draw
+          const oldBase = indexPool.baseFor(av, chunkIdx);
+          if (oldBase === undefined) continue;
+          const newBase = remap.get(oldBase);
+          if (newBase === undefined) continue;
+          const entry = bucket.localEntries[localSlot];
+          if (entry === undefined) continue;
+          const newStart = entry.firstIndex + (newBase - oldBase);
+          entry.firstIndex = newStart;
+          if (bucket.gpuRouted && bucket.partitionScene !== undefined) {
+            const recIdx = bucket.drawIdToRecord?.get(drawId);
+            if (recIdx !== undefined) {
+              bucket.partitionScene.setRecordIndexStart(recIdx, newStart);
+              bucket.partitionDirty = true;
+            }
+          } else {
+            const slotIdx = drawIdToSlotIdx[drawId];
+            const slot = slotIdx !== undefined ? bucket.slots[slotIdx] : bucket.slots[0];
+            const recIdx = slot?.slotToRecord[localSlot];
+            if (slot !== undefined && recIdx !== undefined && recIdx >= 0) {
+              slot.drawTableShadow![recIdx * RECORD_U32 + 2] = newStart >>> 0;
+              const off = recIdx * RECORD_BYTES;
+              if (off < slot.drawTableDirtyMin) slot.drawTableDirtyMin = off;
+              if (off + RECORD_BYTES > slot.drawTableDirtyMax) slot.drawTableDirtyMax = off + RECORD_BYTES;
+            }
+          }
+        }
+      }
+      indexPool.remapRefs(chunkIdx, remap);
+      stats.compactions++;
+    }
+
+    // The update() path flushes the re-seated drawHeaders via its own
+    // per-bucket loop right after this returns. The forced (test) path runs
+    // outside update(), so it must flush the headers it just dirtied itself.
+    if (force) {
+      for (const bucket of buckets) {
+        if (bucket.headerDirtyMax > bucket.headerDirtyMin) {
+          device.queue.writeBuffer(
+            bucket.drawHeap.buffer, bucket.headerDirtyMin,
+            bucket.drawHeaderStaging.buffer,
+            bucket.drawHeaderStaging.byteOffset + bucket.headerDirtyMin,
+            bucket.headerDirtyMax - bucket.headerDirtyMin,
+          );
+          bucket.headerDirtyMin = Infinity;
+          bucket.headerDirtyMax = 0;
+        }
+      }
+    }
   }
 
   // ─── update / encodeIntoPass / frame / dispose ───────────────────
@@ -3909,6 +4088,17 @@ export function buildHeapScene(
     // ~5 (arena, indices, plus one per bucket).
     arena.attrs.flush(device);
     arena.indices.flush(device);
+
+    // ─── Waste-triggered attribute-arena compaction ─────────────────
+    // Relocate live allocations to the front of each chunk once
+    // fragmentation waste crosses the floor — exact-size freelist reuse
+    // can't reclaim a drifting size distribution, so the arena would
+    // otherwise ratchet to its high-water forever. Runs AFTER the arena
+    // flush (GPU buffer current) and BEFORE the header flush (so the
+    // re-seated drawHeaders upload below). Indices live in a separate
+    // buffer and are not compacted here.
+    if (enableCompaction) runCompaction(false);
+
     for (const bucket of buckets) {
       if (bucket.headerDirtyMax > bucket.headerDirtyMin) {
         device.queue.writeBuffer(
@@ -4120,6 +4310,21 @@ export function buildHeapScene(
   // Test-only escape hatch for inspecting megacall bucket state. Not
   // part of the public API surface — keep cast at use-site.
   const _debug = {
+    /** Force a full heap compaction pass (attribute arena + index buffer)
+     *  regardless of the waste heuristics (bypasses the floor + 50%-live
+     *  gate), re-seat all refs, flush. Returns residual waste afterwards in
+     *  bytes (attr bytes + index elements×4; 0 when fully packed). Test-only —
+     *  drives relocation deterministically without engineering megabytes of
+     *  fragmentation. Callers should `update()` afterward to flush drawTables /
+     *  re-dispatch the partition (the render path does this). */
+    forceCompact(): number {
+      runCompaction(true);
+      return arena.attrs.totalWasteBytes() + arena.indices.totalWasteElements() * 4;
+    },
+    /** Current attribute-arena fragmentation waste (bytes). */
+    attrWasteBytes(): number { return arena.attrs.totalWasteBytes(); },
+    /** Current index-buffer fragmentation waste (bytes-equivalent). */
+    indexWasteBytes(): number { return arena.indices.totalWasteElements() * 4; },
     bucketsForTest(): readonly {
       indirectBuf: GPUBuffer | undefined;
       drawTableBuf: GPUBuffer | undefined;
