@@ -14,7 +14,8 @@
 // re-render portion is new.
 
 import { describe, expect, it } from "vitest";
-import { AdaptiveToken, cval, transact } from "@aardworx/wombat.adaptive";
+import { AVal, AdaptiveToken, cval, transact } from "@aardworx/wombat.adaptive";
+import { Trafo3d, V3d, V4f } from "@aardworx/wombat.base";
 import { ITexture } from "@aardworx/wombat.rendering/core";
 import { ISampler } from "@aardworx/wombat.rendering/core";
 import {
@@ -26,10 +27,11 @@ import { readTexturePixels, requestRealDevice } from "./_realGpu.js";
 
 import { makeHeapTestEffectTextured } from "../tests/_heapTestEffect.js";
 
-const IDENTITY44 = (() => { const a = new Float64Array(16); a[0]=1; a[5]=1; a[10]=1; a[15]=1; return a; })();
-const trafoIdentity = { forward: { toArray: () => IDENTITY44 } } as unknown;
-const v3 = (x: number, y: number, z: number) => ({ x, y, z }) as unknown;
-const v4 = (x: number, y: number, z: number, w: number) => ({ x, y, z, w }) as unknown;
+// Real wombat.base values — `ModelTrafo` is a §7 derived passthrough that
+// needs an actual `aval<Trafo3d>` (see heap-scene-megacall.test.ts).
+const trafoIdentity = AVal.constant(Trafo3d.identity) as unknown;
+const v3 = (x: number, y: number, z: number) => new V3d(x, y, z) as unknown;
+const v4 = (x: number, y: number, z: number, w: number) => new V4f(x, y, z, w) as unknown;
 
 describe("heap-atlas texture-aval reactivity (real GPU)", () => {
   it("swapping a cval<ITexture> rewrites the drawHeader and re-renders", async () => {

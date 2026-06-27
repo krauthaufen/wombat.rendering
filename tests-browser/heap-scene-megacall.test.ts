@@ -5,7 +5,8 @@
 // Then runs encodeIntoPass and asserts the framebuffer is non-empty.
 
 import { describe, expect, it } from "vitest";
-import { AdaptiveToken } from "@aardworx/wombat.adaptive";
+import { AdaptiveToken, AVal } from "@aardworx/wombat.adaptive";
+import { Trafo3d, V3d, V4f } from "@aardworx/wombat.base";
 import {
   buildHeapScene,
   type HeapDrawSpec,
@@ -14,15 +15,13 @@ import { createFramebufferSignature } from "@aardworx/wombat.rendering/resources
 import { readTexturePixels, requestRealDevice } from "./_realGpu.js";
 import { makeHeapTestEffect } from "../tests/_heapTestEffect.js";
 
-// Avoid `import { Trafo3d, V3d, V4f } from "@aardworx/wombat.base"` because
-// wombat.base pulls in poly2tri which references `global` and chokes
-// vite's dep optimiser. Stub the duck-typed shapes the heap-scene
-// packers consume: PACKER_MAT4 reads `forward.toArray()` (row-major
-// Float64), PACKER_VEC3 reads `.x/.y/.z`, PACKER_VEC4 reads `.x/.y/.z/.w`.
-const IDENTITY44 = (() => { const a = new Float64Array(16); a[0]=1; a[5]=1; a[10]=1; a[15]=1; return a; })();
-const trafoIdentity = { forward: { toArray: () => IDENTITY44 } } as unknown;
-const v3 = (x: number, y: number, z: number) => ({ x, y, z }) as unknown;
-const v4 = (x: number, y: number, z: number, w: number) => ({ x, y, z, w }) as unknown;
+// Real wombat.base values: `ModelTrafo` is a §7 derived passthrough
+// (recipes.ts `["ModelTrafo", Model]`) whose leaf resolves to this binding,
+// so the heap needs an actual `aval<Trafo3d>` (constituent df32 fwd/bwd),
+// not a duck-typed stub. Non-derived fields pack via M44d.copyTo / V4f.x…
+const trafoIdentity = AVal.constant(Trafo3d.identity) as unknown;
+const v3 = (x: number, y: number, z: number) => new V3d(x, y, z) as unknown;
+const v4 = (x: number, y: number, z: number, w: number) => new V4f(x, y, z, w) as unknown;
 
 async function readU32(device: GPUDevice, buf: GPUBuffer, byteCount: number): Promise<Uint32Array> {
   const staging = device.createBuffer({ size: byteCount, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
