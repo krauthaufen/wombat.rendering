@@ -111,6 +111,34 @@ export class RecordsBuffer {
     this.generation++;
   }
 
+  /**
+   * Re-seat `HostHeap` handles after a main-heap compaction relocated their
+   * backing allocations. `remap` maps an OLD handle payload (the data byte
+   * offset in the main heap) to its NEW one. `Constituent` handles point into
+   * the separate df32 slot buffer (never compacted) and are left untouched.
+   * Returns the number of handle words rewritten; bumps `generation` so the
+   * dispatcher re-uploads. O(records × stride).
+   */
+  remapHostHeap(remap: ReadonlyMap<number, number>): number {
+    if (remap.size === 0 || this.count === 0) return 0;
+    const s = this.strideU32;
+    let changed = 0;
+    for (let i = 0; i < this.count; i++) {
+      const base = i * s;
+      // out_slot at base+1, in_slots at base+2 .. base+s-1.
+      for (let w = base + 1; w < base + s; w++) {
+        const h = this.buf[w]!;
+        if (handleTag(h) !== SlotTag.HostHeap) continue;
+        const nn = remap.get(handlePayload(h));
+        if (nn === undefined) continue;
+        this.buf[w] = makeHandle(SlotTag.HostHeap, nn);
+        changed++;
+      }
+    }
+    if (changed > 0) this.generation++;
+    return changed;
+  }
+
   private removeAt(idx: number): void {
     const last = this.count - 1;
     // The record currently at `idx` is the one being removed.

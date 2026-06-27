@@ -3,11 +3,11 @@
 // classes here are tightly interleaved:
 //
 //   AttributeArena    — byte-bump over a STORAGE GrowBuffer
-//   IndexAllocator    — element-bump over an INDEX GrowBuffer
+//   (index arrays are AttributeArena regions too — VS storage-decodes them)
 //   DrawHeap          — slot-indexed allocator over a STORAGE GrowBuffer
 //                       (one slot per RO drawHeader)
 //   UniformPool       — aval-keyed refcounted alloc on top of AttributeArena
-//   IndexPool         — aval-keyed refcounted alloc on top of IndexAllocator,
+//   IndexPool         — aval-keyed refcounted alloc on top of AttributeArena,
 //                       with value-tuple dedup for constant avals (§5b).
 //
 // Plus the per-allocation header constants used by all of them and
@@ -22,7 +22,7 @@ import type { HostBufferSource } from "../../core/buffer.js";
 import { GrowBuffer, ALIGN16, DEFAULT_MAX_BUFFER_BYTES } from "./growBuffer.js";
 import { Freelist } from "./freelist.js";
 import { DirtyRanges } from "./dirtyRanges.js";
-import { ChunkedAttributeArena, ChunkedIndexAllocator } from "./chunkedArena.js";
+import { ChunkedAttributeArena } from "./chunkedArena.js";
 
 // ─── Debug toggles ─────────────────────────────────────────────────────
 
@@ -43,6 +43,11 @@ const DEBUG_ALLOC_OVERLAP: boolean =
 export const ALLOC_HEADER_BYTES   = 8;
 export const ALLOC_HEADER_PAD_TO  = 16;
 
+/** Default fragmentation-waste floor (bytes) below which `AttributeArena`
+ *  declines to compact — relocating a few KB isn't worth a GPU copy +
+ *  ref re-seat. Matches Aardvark's 4 MiB compaction floor. */
+export const COMPACTION_WASTE_FLOOR_BYTES = 4 * 1024 * 1024;
+
 /** Encoding-tag enum (low 16 bits of typeId). */
 export const ENC_V3F_TIGHT = 1; // tightly-packed array of vec3<f32> (12 B/elt)
 
@@ -61,7 +66,10 @@ export const SEM_NORMALS   = 2;
  */
 interface PoolEntry {
   readonly chunkIdx: number;
-  readonly ref: number;
+  /** Byte offset within the chunk's GPUBuffer. Mutated by
+   *  `UniformPool.remapRefs` when a waste-triggered arena compaction
+   *  relocates the allocation. */
+  ref: number;
   readonly dataBytes: number;
   readonly typeId: number;
   readonly pack: (val: unknown, dst: Float32Array, off: number) => void;
@@ -183,6 +191,19 @@ export class UniformPool {
     if (byChunk!.size === 0) this.byAval.delete(av);
   }
 
+  /** Re-seat every entry's `ref` in `chunkIdx` after a waste-triggered
+   *  arena compaction relocated allocations. `remap` maps OLD→NEW byte
+   *  offset. Entries whose ref didn't move are left as-is. O(entries). */
+  remapRefs(chunkIdx: number, remap: ReadonlyMap<number, number>): void {
+    if (remap.size === 0) return;
+    for (const byChunk of this.byAval.values()) {
+      const e = byChunk.get(chunkIdx);
+      if (e === undefined) continue;
+      const nn = remap.get(e.ref);
+      if (nn !== undefined) e.ref = nn;
+    }
+  }
+
   /** Re-pack one entry's data region into every chunk that holds
    *  this aval. When an aval is shared across N chunks (each chunk
    *  has its own duplicate alloc), every duplicate needs the
@@ -223,7 +244,7 @@ export class UniformPool {
 // ─── IndexPool ─────────────────────────────────────────────────────────
 
 /**
- * Aval-keyed pool over the `IndexAllocator`. Two draws referencing
+ * Aval-keyed pool over the (attribute) arena. Two draws referencing
  * the same `Uint32Array` (or aval thereof) share an index range —
  * 19K instanced clones of the same mesh share one allocation, one
  * upload.
@@ -262,7 +283,7 @@ export class IndexPool {
 
   acquire(
     device: GPUDevice,
-    indices: ChunkedIndexAllocator,
+    arena: ChunkedAttributeArena,
     av: aval<Uint32Array>,
     chunkIdx: number,
     arr: Uint32Array,
@@ -278,8 +299,8 @@ export class IndexPool {
     if (av.isConstant) {
       // Value-dedup is scoped per chunk — two constant avals in the
       // same chunk collapse to one allocation; two constant avals in
-      // DIFFERENT chunks each get their own (we can't share across
-      // chunks since the index range lives in the chunk's GPUBuffer).
+      // DIFFERENT chunks each get their own (the index range lives in
+      // the chunk's GPUBuffer).
       valueKey = `${chunkIdx}:${this.bufferIdOf(arr.buffer)}:${arr.byteOffset}:${arr.byteLength}`;
       const shared = this.byValueKey.get(valueKey);
       if (shared !== undefined) {
@@ -292,14 +313,23 @@ export class IndexPool {
         return { chunkIdx: shared.chunkIdx, firstIndex: shared.firstIndex, count: shared.count };
       }
     }
-    const r = indices.alloc(arr.length, chunkIdx);
-    indices.write(
-      r.chunkIdx, r.off * 4,
-      new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength),
-    );
+    // Index data lives in the SAME arena as attributes/uniforms (the heap VS
+    // storage-decodes indices — `indexStorage[_indexStart + i]` — so they need
+    // no separate index buffer). Allocate a normal header+data region; the
+    // raw u32 indices sit at `ref + 16`, so the element offset the drawTable
+    // stores is `(ref + 16) >> 2`. The header is unread by index gathers but
+    // kept for a uniform region layout (and so compaction treats it like any
+    // other region).
+    const byteLen = arr.byteLength;
+    const r = arena.alloc(byteLen, chunkIdx);
+    const dataOff = r.off + ALLOC_HEADER_PAD_TO;
+    const hdr = new Uint32Array([0, arr.length, 4, 0]); // (typeId, length, strideBytes, pad)
+    arena.write(r.chunkIdx, r.off, new Uint8Array(hdr.buffer));
+    arena.write(r.chunkIdx, dataOff, new Uint8Array(arr.buffer, arr.byteOffset, byteLen));
     void device;
+    const firstIndex = dataOff >>> 2;
     const entry: IndexPoolEntry = {
-      chunkIdx: r.chunkIdx, firstIndex: r.off, count: arr.length,
+      chunkIdx: r.chunkIdx, ref: r.off, firstIndex, count: arr.length,
       totalRefcount: 1, valueKey,
     };
     if (byChunk === undefined) {
@@ -308,10 +338,36 @@ export class IndexPool {
     }
     byChunk.set(r.chunkIdx, { entry, perAvalCount: 1 });
     if (valueKey !== undefined) this.byValueKey.set(valueKey, entry);
-    return { chunkIdx: r.chunkIdx, firstIndex: r.off, count: arr.length };
+    return { chunkIdx: r.chunkIdx, firstIndex, count: arr.length };
   }
 
-  release(indices: ChunkedIndexAllocator, av: aval<Uint32Array>, chunkIdx: number): void {
+  /** The allocation's byte header offset (`ref`) of `av`'s entry in `chunkIdx`,
+   *  or undefined if not allocated there. The heap compaction pass looks the
+   *  region up in the arena remap by this ref to compute the draw's new
+   *  `_indexStart`. */
+  baseFor(av: aval<Uint32Array>, chunkIdx: number): number | undefined {
+    return this.byAval.get(av)?.get(chunkIdx)?.entry.ref;
+  }
+
+  /** Re-seat every entry after a compaction relocated its region. `remap` maps
+   *  OLD→NEW byte header offset (`ref`); `firstIndex` is recomputed from the
+   *  new ref. Entries are shared by value-dedup, so each is visited once. */
+  remapRefs(chunkIdx: number, remap: ReadonlyMap<number, number>): void {
+    if (remap.size === 0) return;
+    const seen = new Set<IndexPoolEntry>();
+    for (const byChunk of this.byAval.values()) {
+      const bound = byChunk.get(chunkIdx);
+      if (bound === undefined || seen.has(bound.entry)) continue;
+      seen.add(bound.entry);
+      const nn = remap.get(bound.entry.ref);
+      if (nn !== undefined) {
+        bound.entry.ref = nn;
+        bound.entry.firstIndex = (nn + ALLOC_HEADER_PAD_TO) >>> 2;
+      }
+    }
+  }
+
+  release(arena: ChunkedAttributeArena, av: aval<Uint32Array>, chunkIdx: number): void {
     const byChunk = this.byAval.get(av);
     const bound = byChunk?.get(chunkIdx);
     if (bound === undefined) return;
@@ -322,7 +378,7 @@ export class IndexPool {
       if (byChunk!.size === 0) this.byAval.delete(av);
     }
     if (bound.entry.totalRefcount > 0) return;
-    indices.release(bound.entry.chunkIdx, bound.entry.firstIndex, bound.entry.count);
+    arena.release(bound.entry.chunkIdx, bound.entry.ref, bound.entry.count * 4);
     if (bound.entry.valueKey !== undefined) {
       this.byValueKey.delete(bound.entry.valueKey);
     }
@@ -331,6 +387,11 @@ export class IndexPool {
 
 interface IndexPoolEntry {
   chunkIdx: number;
+  /** Byte header offset of the region in the (attribute) arena — the unit the
+   *  compaction remap is keyed by. */
+  ref: number;
+  /** Element (u32) offset to the index DATA (`(ref + 16) >> 2`) — the value
+   *  the drawTable's `_indexStart` stores. */
   firstIndex: number;
   count: number;
   totalRefcount: number;
@@ -387,6 +448,10 @@ export class DrawHeap {
  */
 export class AttributeArena {
   private cursor = 0;
+  /** Sum of `allocBytes` over all live allocations. `cursor - liveBytes`
+   *  is the fragmentation waste below the high-water mark — what
+   *  `compact()` reclaims. */
+  private liveBytes = 0;
   private readonly freelist = new Freelist();
   /** DEBUG: tracks every live allocation by start byte → size. Set
    *  on alloc, cleared on release. Used by `assertNoOverlap()` to
@@ -446,6 +511,7 @@ export class AttributeArena {
     const reused = this.freelist.alloc(allocBytes);
     if (reused !== undefined) {
       this.recordAlloc(reused, allocBytes, "freelist");
+      this.liveBytes += allocBytes;
       return reused;
     }
     const next = this.cursor + allocBytes;
@@ -455,6 +521,7 @@ export class AttributeArena {
     this.buf.setUsed(next);
     const ref = next - allocBytes;
     this.recordAlloc(ref, allocBytes, "bump");
+    this.liveBytes += allocBytes;
     return ref;
   }
   alloc(dataBytes: number): number {
@@ -484,6 +551,7 @@ export class AttributeArena {
       );
     }
     this.liveAllocs.delete(ref);
+    this.liveBytes -= allocBytes;
     this.freelist.release(ref, allocBytes);
     // §5: shrink the bump cursor back if release exposed a free
     // tail touching it (cascading — `freelist.release` may have
@@ -514,111 +582,102 @@ export class AttributeArena {
     }
     this.liveAllocs.set(off, size);
   }
-  onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
-  destroy(): void { this.buf.destroy(); }
-}
+  /** Bytes the bump cursor can still grow into before hitting the chunk cap
+   *  (ignores freelist holes — a conservative lower bound on free space, used
+   *  by group placement to decide whether a draw's group fits here). */
+  get bumpHeadroom(): number { return this.buf.maxCapacity - this.cursor; }
+  /** Live bytes (sum of all live allocations, header+pad included). */
+  get liveByteCount(): number { return this.liveBytes; }
+  /** Fragmentation waste below the high-water mark: free bytes the tail-
+   *  reclaim couldn't recover because they sit between live allocations. */
+  get wasteBytes(): number { return this.cursor - this.liveBytes; }
 
-// ─── IndexAllocator (element-bump) ─────────────────────────────────────
-
-/**
- * Element-bump allocator over an index GrowBuffer (units = u32). Each
- * draw's index range is allocated as one block; on release the block
- * is returned to a Freelist and can be reused best-fit.
- */
-export class IndexAllocator {
-  private cursor = 0;     // in u32s, not bytes
-  private readonly freelist = new Freelist();
-  /** DEBUG: live index allocations tracked by start element. */
-  private readonly liveAllocs = new Map<number, number>();
-  private shadow: Uint8Array;
-  private readonly dirty = new DirtyRanges();
-  constructor(private readonly buf: GrowBuffer) {
-    this.shadow = new Uint8Array(buf.capacity);
-    buf.onResize(() => {
-      const grown = new Uint8Array(buf.capacity);
-      grown.set(this.shadow);
-      this.shadow = grown;
-    });
-  }
-  get buffer(): GPUBuffer { return this.buf.buffer; }
-  get usedElements(): number { return this.cursor; }
-  write(dstByteOffset: number, data: Uint8Array): void {
-    this.shadow.set(data, dstByteOffset);
-    this.dirty.add(dstByteOffset, dstByteOffset + data.byteLength);
-  }
-  flush(device: GPUDevice): void {
-    if (this.dirty.isEmpty) return;
-    this.dirty.drain((start, end) => {
-      device.queue.writeBuffer(
-        this.buf.buffer, start,
-        this.shadow.buffer, this.shadow.byteOffset + start,
-        end - start,
-      );
-    });
-  }
-  /** Non-throwing alloc — returns `undefined` when the request
-   *  would exceed the underlying GrowBuffer's `maxCapacity` cap.
-   *  Used by `ChunkedIndexAllocator` to probe before spilling. */
-  tryAlloc(elements: number): number | undefined {
-    const reused = this.freelist.alloc(elements);
-    if (reused !== undefined) {
-      this.recordAlloc(reused, elements, "freelist");
-      return reused;
+  /**
+   * Waste-triggered compaction. Relocates live allocations to the front of
+   * the buffer, eliminating the high-water ratchet that exact-size freelist
+   * reuse alone can't fix (a drifting allocation-size distribution never
+   * reuses its holes and grows toward the high-water forever).
+   *
+   * The byte move happens GPU-side via `copyBufferToBuffer` through a scratch
+   * buffer — no CPU→GPU re-upload — and is mirrored into the CPU shadow so it
+   * stays authoritative for future partial writes. Same-buffer copies can't
+   * overlap, hence the scratch round-trip.
+   *
+   * Returns a map of OLD→NEW byte offset for every allocation that moved; the
+   * caller must re-seat every cached ref (drawHeader cells, uniform-pool
+   * entries, derived-uniform handles, partition master refs). Returns an
+   * empty map when it declines to compact (waste below `wasteFloorBytes` or
+   * less than half the extent wasted).
+   *
+   * Precondition: the arena's pending shadow writes must already be flushed
+   * to the GPU buffer (the GPU copy reads the live buffer). O(live).
+   */
+  compact(device: GPUDevice, wasteFloorBytes: number, force = false): Map<number, number> {
+    const waste = this.cursor - this.liveBytes;
+    if (!force && (this.liveBytes * 2 >= this.cursor || waste < wasteFloorBytes)) {
+      return new Map();
     }
-    const nextElts = this.cursor + elements;
-    if (nextElts * 4 > this.buf.maxCapacity) return undefined;
-    this.cursor = nextElts;
-    this.buf.ensureCapacity(nextElts * 4);
-    this.buf.setUsed(nextElts * 4);
-    const off = nextElts - elements;
-    this.recordAlloc(off, elements, "bump");
-    return off;
-  }
-  private recordAlloc(off: number, size: number, source: string): void {
-    if (DEBUG_ALLOC_OVERLAP) {
-      for (const [liveOff, liveSize] of this.liveAllocs) {
-        if (off < liveOff + liveSize && liveOff < off + size) {
-          throw new Error(
-            `IndexAllocator.tryAlloc(${source}): returned [${off},${off + size}) ` +
-            `(size=${size}) overlaps live alloc at [${liveOff},${liveOff + liveSize}) ` +
-            `(size=${liveSize}). Index allocator is handing out shared memory!`,
-          );
-        }
+    // Live allocations sorted by current offset.
+    const live = [...this.liveAllocs.entries()].sort((a, b) => a[0] - b[0]);
+    // Assign packed offsets (bump from 0); build the OLD→NEW remap and the
+    // source-contiguous runs to copy. A run is a maximal set of live blocks
+    // adjacent in the source; under the bump it lands dest-contiguous too, so
+    // the compacted prefix [0, newExtent) is fully covered by the runs.
+    const remap = new Map<number, number>();
+    const runs: { srcStart: number; dstStart: number; len: number }[] = [];
+    let w = 0;
+    let cur: { srcStart: number; dstStart: number; len: number } | undefined;
+    for (const [off, size] of live) {
+      if (w !== off) remap.set(off, w);
+      if (cur !== undefined && off === cur.srcStart + cur.len) {
+        cur.len += size;
+      } else {
+        cur = { srcStart: off, dstStart: w, len: size };
+        runs.push(cur);
+      }
+      w += size;
+    }
+    const newExtent = w;
+    if (remap.size === 0) return remap; // already tight
+
+    // GPU move: arena → scratch (compacted), then scratch → arena[0,newExtent).
+    // Both copies are between distinct buffers, so no overlap constraint.
+    const scratch = device.createBuffer({
+      label: "AttributeArena/compact-scratch",
+      size: newExtent,
+      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    const enc = device.createCommandEncoder({ label: "AttributeArena/compact" });
+    for (const r of runs) {
+      enc.copyBufferToBuffer(this.buf.buffer, r.srcStart, scratch, r.dstStart, r.len);
+    }
+    enc.copyBufferToBuffer(scratch, 0, this.buf.buffer, 0, newExtent);
+    device.queue.submit([enc.finish()]);
+    scratch.destroy();
+
+    // Mirror the move in the CPU shadow. Runs are processed in ascending
+    // source order and every run moves down (dst ≤ src), so `copyWithin`
+    // never reads a region an earlier run already overwrote.
+    for (const r of runs) {
+      if (r.dstStart !== r.srcStart) {
+        this.shadow.copyWithin(r.dstStart, r.srcStart, r.srcStart + r.len);
       }
     }
-    this.liveAllocs.set(off, size);
+
+    // Rebuild allocator bookkeeping: live allocs at their new offsets, no free
+    // blocks (everything is now contiguous), cursor at the new high-water.
+    const moved: Array<[number, number]> = [];
+    for (const [off, size] of live) moved.push([remap.get(off) ?? off, size]);
+    this.liveAllocs.clear();
+    for (const [o, s] of moved) this.liveAllocs.set(o, s);
+    this.freelist.clear();
+    this.cursor = newExtent;
+    this.buf.setUsed(newExtent);
+    // No dirty range emitted: the GPU buffer was updated by the copy and the
+    // shadow was mirrored to match, so they already agree.
+    return remap;
   }
-  alloc(elements: number): number {
-    const r = this.tryAlloc(elements);
-    if (r === undefined) {
-      throw new Error(`IndexAllocator: allocation of ${elements} elements exceeds chunk cap`);
-    }
-    return r;
-  }
-  release(off: number, elements: number): void {
-    const tracked = this.liveAllocs.get(off);
-    if (tracked === undefined) {
-      throw new Error(
-        `IndexAllocator.release: off=${off} (elements=${elements}) was not in ` +
-        `liveAllocs — double-free or release for an alloc that never happened. ` +
-        `Live alloc count=${this.liveAllocs.size}.`,
-      );
-    }
-    if (tracked !== elements) {
-      throw new Error(
-        `IndexAllocator.release: size mismatch at off=${off} — recorded=${tracked} ` +
-        `but release elements=${elements}. Will corrupt the freelist.`,
-      );
-    }
-    this.liveAllocs.delete(off);
-    this.freelist.release(off, elements);
-    while (true) {
-      const top = this.freelist.takeBlockEndingAt(this.cursor);
-      if (top === undefined) break;
-      this.cursor = top.off;
-      this.buf.setUsed(this.cursor * 4);
-    }
-  }
+
   onResize(cb: () => void): IDisposable { return this.buf.onResize(cb); }
   destroy(): void { this.buf.destroy(); }
 }
@@ -626,17 +685,18 @@ export class IndexAllocator {
 // ─── ArenaState + helpers ──────────────────────────────────────────────
 
 /**
- * Global arena state: attribute / uniform data lives in `attrs`
- * (multi-typed-view storage); indices live in `indices` (separate
- * INDEX-usage buffer). Both are chunked: each chunk owns a separate
- * GPUBuffer + Freelist. Refs that downstream code stores are byte
- * offsets within a chunk; the chunk identity is carried alongside
- * (via bucket.chunkIdx in heapScene) and made implicit at draw
- * time by which chunk's bind group is active.
+ * Global arena state: ONE chunked arena holds all heap data (per-draw
+ * uniforms, attributes, and index arrays) as multi-typed views over the same
+ * buffers. Each chunk owns a separate GPUBuffer + Freelist. Refs that
+ * downstream code stores are byte offsets within a chunk; the chunk identity
+ * is carried alongside (via `bucket.chunkIdx`) and made implicit at draw time
+ * by which chunk's bind group is active.
  */
 export interface ArenaState {
-  readonly attrs:    ChunkedAttributeArena;
-  readonly indices:  ChunkedIndexAllocator;
+  /** The single arena holding ALL heap data — per-draw uniforms, vertex /
+   *  instance attributes, AND index arrays (the heap VS storage-decodes
+   *  indices, so they need no separate index buffer). */
+  readonly attrs: ChunkedAttributeArena;
 }
 
 export function buildArenaState(
@@ -655,19 +715,16 @@ export function buildArenaState(
   // exercise multi-chunk routing).
   const adapterCap = device.limits.maxStorageBufferBindingSize;
   const cap = maxChunkBytes ?? Math.min(adapterCap, DEFAULT_MAX_BUFFER_BYTES);
+  void idxBytesHint; void idxExtraUsage; // legacy params (separate index buffer removed)
   const attrs = new ChunkedAttributeArena(
-    device, `${label}/attrs`, GPUBufferUsage.STORAGE,
+    device, `${label}/arena`, GPUBufferUsage.STORAGE,
     attrBytesHint, cap,
   );
-  const indices = new ChunkedIndexAllocator(
-    device, `${label}/idx`, GPUBufferUsage.INDEX | idxExtraUsage,
-    idxBytesHint, cap,
-  );
-  return { attrs, indices };
+  return { attrs };
 }
 
 export function arenaBytes(arena: ArenaState): number {
-  return arena.attrs.totalUsedBytes() + arena.indices.totalUsedElements() * 4;
+  return arena.attrs.totalUsedBytes();
 }
 
 /** Upload a single attribute — header (typeId, length) + data — into the arena at byte offset `ref`. */

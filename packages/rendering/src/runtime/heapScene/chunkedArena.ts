@@ -14,7 +14,7 @@
 
 import type { IDisposable } from "@aardworx/wombat.adaptive";
 import { GrowBuffer, DEFAULT_MAX_BUFFER_BYTES } from "./growBuffer.js";
-import { AttributeArena, IndexAllocator } from "./pools.js";
+import { AttributeArena } from "./pools.js";
 
 /** Address inside a chunked arena. */
 export interface ChunkedRef {
@@ -45,6 +45,15 @@ export class ChunkedAttributeArena {
   get chunkCount(): number { return this._chunks.length; }
   get chunks(): ReadonlyArray<AttributeArena> { return this._chunks; }
   chunk(i: number): AttributeArena { return this._chunks[i]!; }
+
+  /** Bump headroom (bytes) of chunk `i` — free space before its cap, used by
+   *  group placement. Out-of-range → 0. */
+  bumpHeadroom(i: number): number {
+    return i >= 0 && i < this._chunks.length ? this._chunks[i]!.bumpHeadroom : 0;
+  }
+  /** Open a fresh empty chunk (page) and return its index. Used by group
+   *  placement when no existing chunk can hold a draw's whole group. */
+  openPage(): number { return this.openChunk(); }
 
   /**
    * Allocate `dataBytes` of attribute storage. Tries the `hint`
@@ -124,6 +133,27 @@ export class ChunkedAttributeArena {
     return s;
   }
 
+  /** Total fragmentation waste across all chunks (diagnostic / trigger). */
+  totalWasteBytes(): number {
+    let s = 0;
+    for (const c of this._chunks) s += c.wasteBytes;
+    return s;
+  }
+
+  /** Waste-triggered compaction across every chunk. Returns one entry per
+   *  chunk that actually relocated data — `remap` maps OLD→NEW byte offset
+   *  within that chunk. Empty array when nothing was worth compacting. The
+   *  caller must have flushed pending arena writes first (the GPU copy reads
+   *  the live buffers). */
+  compact(device: GPUDevice, wasteFloorBytes: number, force = false): Array<{ chunkIdx: number; remap: Map<number, number> }> {
+    const out: Array<{ chunkIdx: number; remap: Map<number, number> }> = [];
+    for (let i = 0; i < this._chunks.length; i++) {
+      const remap = this._chunks[i]!.compact(device, wasteFloorBytes, force);
+      if (remap.size > 0) out.push({ chunkIdx: i, remap });
+    }
+    return out;
+  }
+
   destroy(): void {
     for (const c of this._chunks) c.destroy();
     this._chunks.length = 0;
@@ -141,98 +171,3 @@ export class ChunkedAttributeArena {
   }
 }
 
-/** Multi-chunk wrapper around `IndexAllocator`. Element-bump units
- *  are u32. Same chunk-open / hint / fallback semantics as
- *  `ChunkedAttributeArena`. */
-export class ChunkedIndexAllocator {
-  private readonly _chunks: IndexAllocator[] = [];
-  private readonly onChunkAddedCbs = new Set<(chunkIdx: number) => void>();
-
-  constructor(
-    private readonly device: GPUDevice,
-    private readonly label: string,
-    private readonly usage: GPUBufferUsageFlags,
-    private readonly initialChunkBytes: number,
-    private readonly maxChunkBytes: number = DEFAULT_MAX_BUFFER_BYTES,
-  ) {
-    this.openChunk();
-  }
-
-  get chunkCount(): number { return this._chunks.length; }
-  get chunks(): ReadonlyArray<IndexAllocator> { return this._chunks; }
-  chunk(i: number): IndexAllocator { return this._chunks[i]!; }
-
-  alloc(elements: number, hint?: number): ChunkedRef {
-    if (hint !== undefined && hint >= 0 && hint < this._chunks.length) {
-      const off = this._chunks[hint]!.tryAlloc(elements);
-      if (off !== undefined) return { chunkIdx: hint, off };
-    }
-    for (let i = this._chunks.length - 1; i >= 0; i--) {
-      if (i === hint) continue;
-      const off = this._chunks[i]!.tryAlloc(elements);
-      if (off !== undefined) return { chunkIdx: i, off };
-    }
-    const newIdx = this.openChunk();
-    const off = this._chunks[newIdx]!.tryAlloc(elements);
-    if (off === undefined) {
-      throw new Error(
-        `ChunkedIndexAllocator '${this.label}': allocation of ${elements} elements exceeds maxChunkBytes/4 ${this.maxChunkBytes / 4}`,
-      );
-    }
-    return { chunkIdx: newIdx, off };
-  }
-
-  release(chunkIdx: number, off: number, elements: number): void {
-    const c = this._chunks[chunkIdx];
-    if (c === undefined) return;
-    c.release(off, elements);
-  }
-
-  flush(device: GPUDevice): void {
-    for (const c of this._chunks) c.flush(device);
-  }
-
-  write(chunkIdx: number, dst: number, data: Uint8Array): void {
-    this._chunks[chunkIdx]!.write(dst, data);
-  }
-
-  onChunkAdded(cb: (chunkIdx: number) => void): IDisposable {
-    this.onChunkAddedCbs.add(cb);
-    return { dispose: () => { this.onChunkAddedCbs.delete(cb); } };
-  }
-
-  onAnyResize(cb: (chunkIdx: number) => void): IDisposable {
-    const disposables: IDisposable[] = [];
-    for (let i = 0; i < this._chunks.length; i++) {
-      const idx = i;
-      disposables.push(this._chunks[i]!.onResize(() => cb(idx)));
-    }
-    disposables.push(this.onChunkAdded((idx) => {
-      disposables.push(this._chunks[idx]!.onResize(() => cb(idx)));
-      cb(idx);
-    }));
-    return { dispose: () => { for (const d of disposables) d.dispose(); } };
-  }
-
-  totalUsedElements(): number {
-    let s = 0;
-    for (const c of this._chunks) s += c.usedElements;
-    return s;
-  }
-
-  destroy(): void {
-    for (const c of this._chunks) c.destroy();
-    this._chunks.length = 0;
-  }
-
-  private openChunk(): number {
-    const idx = this._chunks.length;
-    const buf = new GrowBuffer(
-      this.device, `${this.label}/c${idx}`, this.usage,
-      this.initialChunkBytes, this.maxChunkBytes,
-    );
-    this._chunks.push(new IndexAllocator(buf));
-    for (const cb of this.onChunkAddedCbs) cb(idx);
-    return idx;
-  }
-}

@@ -25,7 +25,10 @@ export {
 
 export {
   buildHeapScene,
+  createHeapStorage,
   type HeapScene,
+  type HeapStorage,
+  type HeapStorageOptions,
   type HeapSceneStats,
   type HeapDrawSpec,
   type HeapGeometry,

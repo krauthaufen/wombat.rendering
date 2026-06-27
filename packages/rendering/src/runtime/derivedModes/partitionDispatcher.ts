@@ -248,11 +248,41 @@ export class GpuPartitionScene {
     this.masterShadow[recordIdx * this.recordU32 + 5] = comboId >>> 0;
   }
 
+  /** Update an existing record's `indexStart` (field 2 = allocBase + slice).
+   *  Used by index-buffer compaction; caller flags the bucket partitionDirty. */
+  setRecordIndexStart(recordIdx: number, indexStart: number): void {
+    if (recordIdx < 0 || recordIdx >= this.numRecords) return;
+    this.masterShadow[recordIdx * this.recordU32 + 2] = indexStart >>> 0;
+  }
+
   /** Update an existing record's uniform ref by uniform index. */
   setRecordUniformRef(recordIdx: number, uniformIdx: number, ref: number): void {
     if (recordIdx < 0 || recordIdx >= this.numRecords) return;
     if (uniformIdx < 0 || uniformIdx >= this._numUniforms) return;
     this.masterShadow[recordIdx * this.recordU32 + PARTITION_RECORD_PREFIX_U32 + uniformIdx] = ref >>> 0;
+  }
+
+  /**
+   * Re-seat every record's baked arena uniform refs after a main-heap
+   * compaction relocated their allocations. `remap` maps OLD→NEW arena byte
+   * offset (alloc header offset, same space the refs are stored in). Returns
+   * the number of ref words rewritten; the caller must flag the bucket
+   * `partitionDirty` so the master re-uploads. O(records × numUniforms).
+   */
+  remapUniformRefs(remap: ReadonlyMap<number, number>): number {
+    if (remap.size === 0 || this._numUniforms === 0) return 0;
+    const ru32 = this.recordU32;
+    let changed = 0;
+    for (let i = 0; i < this.numRecords; i++) {
+      const o = i * ru32 + PARTITION_RECORD_PREFIX_U32;
+      for (let k = 0; k < this._numUniforms; k++) {
+        const nn = remap.get(this.masterShadow[o + k]!);
+        if (nn === undefined) continue;
+        this.masterShadow[o + k] = nn >>> 0;
+        changed++;
+      }
+    }
+    return changed;
   }
 
   removeRecord(recordIdx: number): number {

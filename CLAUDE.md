@@ -11,11 +11,22 @@ ScenePass / Runtime boundary.
 
 Production-ready (`0.19.3`). On top of the base render layer it
 ships a heap renderer fast-path: megacall encode (`O(buckets)` not
-`O(draws)`), chunked GPU arenas with a best-fit freelist + pooled
-allocation, value-keyed multi-pipeline buckets, GPU derived
-uniforms (registry / rule IR) + derived modes (pipeline-state as a
-function of uniforms, via a GPU partition kernel), texture atlasing
-(tiers S/M/L, reactive residency), and per-RenderObject instancing.
+`O(draws)`), a single **paged `HeapStorage`** — one chunked GPU arena
+holding ALL heap data (per-draw uniforms, attributes, AND index
+arrays; the VS storage-decodes indices, so there is no separate index
+buffer) with a best-fit freelist + pooled allocation + waste-triggered
+compaction. A draw's whole group is placed on ONE page; scenes larger
+than a single storage-buffer cap spread across pages (one sub-draw per
+page, plain single-buffer gather — no shader-side chunk switch). A
+`HeapStorage` can be **shared across heaps** (`createHeapStorage` +
+`buildHeapScene({ storage })`) so e.g. a shadow pass and a color pass
+dedupe common geometry once; compaction is store-owned and re-seats
+every sharing scene. Plus: value-keyed multi-pipeline buckets, GPU
+derived uniforms (registry / rule IR; inverses are CPU-precomputed
+backward halves composed in reverse — the GPU never inverts) + derived
+modes (pipeline-state as a function of uniforms, via a GPU partition
+kernel), texture atlasing (tiers S/M/L, reactive residency), and
+per-RenderObject instancing.
 Open items live in `TODO.md`; the larger architectural threads are
 tracked in `~/claude/wombat-todo.md`.
 

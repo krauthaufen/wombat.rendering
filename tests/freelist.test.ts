@@ -1,5 +1,5 @@
-// Freelist — best-fit free-block manager backing AttributeArena +
-// IndexAllocator. These tests pin the unit-level behaviour: best-fit
+// Freelist — best-fit free-block manager backing AttributeArena.
+// These tests pin the unit-level behaviour: best-fit
 // alloc, split-remainder reinsert, left/right coalesce on release,
 // and a stress sweep against a reference linear implementation to
 // catch invariant drift.

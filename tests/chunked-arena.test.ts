@@ -1,4 +1,4 @@
-// ChunkedAttributeArena + ChunkedIndexAllocator unit tests. Exercises
+// ChunkedAttributeArena unit tests. Exercises
 // chunk opening, fallback ordering, hint routing, release into the
 // right chunk, and the cursor-shrink hygiene cascading per chunk.
 
@@ -6,7 +6,6 @@ import { describe, expect, it } from "vitest";
 import { MockGPU } from "./_mockGpu.js";
 import {
   ChunkedAttributeArena,
-  ChunkedIndexAllocator,
 } from "../packages/rendering/src/runtime/heapScene/chunkedArena.js";
 
 const KB = 1024;
@@ -79,22 +78,5 @@ describe("ChunkedAttributeArena", () => {
     for (let i = 0; i < 10_000 && ar.chunkCount === 1; i++) ar.alloc(1024);
     expect(opened.length).toBeGreaterThanOrEqual(1);
     expect(opened[0]).toBe(1);  // chunk 0 was already there pre-subscription
-  });
-});
-
-describe("ChunkedIndexAllocator", () => {
-  it("element-bump units cap at maxChunkBytes/4", () => {
-    const gpu = new MockGPU();
-    const CAP = 128 * KB;     // 32 K u32 elements per chunk.
-    const ix = new ChunkedIndexAllocator(gpu.device, "ix", GPUBufferUsage.INDEX, 1024, CAP);
-    let total = 0;
-    let chunks = new Set<number>();
-    for (let n = 0; n < 50_000 && chunks.size < 3; n++) {
-      const r = ix.alloc(1024);
-      chunks.add(r.chunkIdx);
-      total += 1024;
-    }
-    expect(chunks.size).toBeGreaterThan(1);
-    expect(ix.totalUsedElements()).toBeGreaterThanOrEqual(total - 1024);
   });
 });

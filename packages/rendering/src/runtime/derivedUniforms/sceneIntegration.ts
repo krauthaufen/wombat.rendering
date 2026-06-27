@@ -109,6 +109,16 @@ export class DerivedUniformsScene {
     return r;
   }
 
+  /**
+   * Re-seat the per-chunk derived-uniform records' `HostHeap` handles
+   * (derived outputs and host-uniform inputs) after the main heap compacted
+   * `chunkIdx`. `remap` maps OLD→NEW data byte offsets. Returns words changed.
+   */
+  remapHostHeap(chunkIdx: number, remap: ReadonlyMap<number, number>): number {
+    const r = this.recordsByChunk.get(chunkIdx);
+    return r === undefined ? 0 : r.remapHostHeap(remap);
+  }
+
   /** Total record count summed across every chunk's records buffer.
    *  Used by the scene's stats / diagnostics. */
   get totalRecordCount(): number {

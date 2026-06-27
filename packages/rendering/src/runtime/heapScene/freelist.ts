@@ -1,5 +1,5 @@
-// Freelist — best-fit free-block manager used by AttributeArena and
-// IndexAllocator. Replaces the earlier `{off,size}[]` sorted-by-off
+// Freelist — best-fit free-block manager used by AttributeArena.
+// Replaces the earlier `{off,size}[]` sorted-by-off
 // freelist (whose alloc was O(N) first-fit and release was O(log N)
 // binary-search-then-coalesce).
 //
@@ -94,7 +94,7 @@ export class Freelist {
   /**
    * Take and remove the free block whose end offset is exactly
    * `endOff`, if any exists. Used by `AttributeArena` /
-   * `IndexAllocator` to shrink the bump cursor back when releases
+   * `AttributeArena` to shrink the bump cursor back when releases
    * expose a free tail (§5 — cursor-shrink hygiene for long-lived
    * high-churn scenes).
    */

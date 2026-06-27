@@ -2,10 +2,19 @@
 
 Status: ✅ production-ready (0.19.3). WebGPU render layer + heap renderer
 fast-path. Shipped: megacall encode (O(buckets) not O(draws); 50K objects ~44fps
-on iPhone), chunked GPU arenas + best-fit freelist + pooled allocation, value-keyed
-multi-pipeline buckets, GPU derived uniforms (registry/rule IR) + derived modes
-(pipeline-state-as-fn-of-uniforms via GPU partition kernel), texture atlasing
-(tiers S/M/L, reactive residency), per-RO instancing.
+on iPhone); single paged `HeapStorage` — one chunked arena holding uniforms +
+attributes + index arrays (VS storage-decodes indices, no separate index buffer),
+best-fit freelist + pooled allocation + waste-triggered compaction; group-fit
+paging (a draw's group lands wholly on one page; >1-buffer-cap scenes spread over
+pages, one sub-draw per page, plain gather); shareable `HeapStorage` across heaps
+(shadow + color pass dedupe geometry; store-owned compaction re-seats all sharing
+scenes); value-keyed multi-pipeline buckets; GPU derived uniforms (registry/rule
+IR; inverses = CPU backward halves composed in reverse, never inverted on GPU) +
+derived modes (pipeline-state-as-fn-of-uniforms via GPU partition kernel); texture
+atlasing (tiers S/M/L, reactive residency); per-RO instancing.
+
+Heap follow-ups: drop fully-drained pages (free a whole `GPUBuffer` back); optional
+constituent sharing for cross-heap derived uniforms.
 
 **The big architectural threads (IR heap rewriter, decoder composition, periodic
 compaction, stencil modes, cubemap atlasing, scene prewarm, device.lost,
