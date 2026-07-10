@@ -174,14 +174,14 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
   // per-RO path, which at scale (thousands of textured ROs ⇒ thousands
   // of draw calls + bind-group switches) is far slower than the heap
   // megacall sampling one shared atlas page.
-  const distinctTextureAvals = new Set<aval<ITexture>>();
-  ro.textures.iter((_n, av) => { distinctTextureAvals.add(av); });
-  if (distinctTextureAvals.size > 1) {
+  // NOTE identity-dedup WITHOUT a Set: the long-lived AVal.custom
+  // closure below shares this function's V8 scope context, so any
+  // temporary Set here would be retained per-RO for the scene's
+  // lifetime (measured: 1 Set/RO of pure ballast at heap scale).
+  if (countDistinct(ro.textures) > 1) {
     return AVal.constant(false);
   }
-  const distinctSamplerAvals = new Set<aval<ISampler>>();
-  ro.samplers.iter((_n, av) => { distinctSamplerAvals.add(av); });
-  if (distinctSamplerAvals.size > 1) {
+  if (countDistinct(ro.samplers) > 1) {
     return AVal.constant(false);
   }
 
@@ -241,4 +241,20 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
     }
     return true;
   });
+}
+
+
+/** Count distinct avals in a name→aval map by identity, allocation-free
+ *  for the 0/1/2-distinct cases that matter (we only compare > 1). */
+function countDistinct(m: { iter(f: (n: string, av: aval<unknown>) => void): void }): number {
+  let first: aval<unknown> | undefined;
+  let second: aval<unknown> | undefined;
+  let n = 0;
+  m.iter((_n, av) => {
+    if (av === first || av === second) return;
+    if (first === undefined) { first = av; n = 1; }
+    else if (second === undefined) { second = av; n = 2; }
+    else n++;
+  });
+  return n;
 }

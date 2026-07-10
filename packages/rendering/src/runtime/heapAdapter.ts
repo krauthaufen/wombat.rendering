@@ -399,9 +399,11 @@ export function renderObjectToHeapSpec(
   //    WGSL schema's binding shape doesn't matter at scene time — that
   //    leaves us with two HashMap entries pointing at the same aval.
   //    Dedupe by identity before applying the single-pair rule.
-  const distinctTexAvals = new Set<aval<ITexture>>();
-  ro.textures.iter((_n, av) => { distinctTexAvals.add(av as aval<ITexture>); });
-  const distinctSamplerAvals = new Set<aval<ISampler>>();
+  // `let` + nulled after use: the spec's long-lived closures share
+  // this scope context — a leftover Set here is per-RO ballast.
+  let distinctTexAvals: Set<aval<ITexture>> | undefined = new Set<aval<ITexture>>();
+  ro.textures.iter((_n, av) => { distinctTexAvals!.add(av as aval<ITexture>); });
+  let distinctSamplerAvals: Set<aval<ISampler>> | undefined = new Set<aval<ISampler>>();
   // Shader-defined sampler state (from a `sampler2d { filter …; addressU … }`
   // builder, carried through the IR) overrides the scene's default sampler.
   const stateBinding = schema.samplers.find(b => b.state !== undefined);
@@ -418,7 +420,7 @@ export function renderObjectToHeapSpec(
       AVal.constant(ISampler.fromDescriptor(desc)) as aval<ISampler>,
     );
   } else {
-    ro.samplers.iter((_n, av) => { distinctSamplerAvals.add(av as aval<ISampler>); });
+    ro.samplers.iter((_n, av) => { distinctSamplerAvals!.add(av as aval<ISampler>); });
   }
   let textures: HeapTextureSet | undefined;
   if (distinctTexAvals.size === 1 && distinctSamplerAvals.size === 1) {
@@ -531,6 +533,9 @@ export function renderObjectToHeapSpec(
       `single-pair only in v1 (classifier should have caught this)`,
     );
   }
+  // Drop the dedup scratch — see the `let` note above.
+  distinctTexAvals = undefined;
+  distinctSamplerAvals = undefined;
 
   // 4. DrawCall geometry. Classifier validates fields are heap-
   //    compatible (instanceCount≥1, firstInstance=0, non-indexed firstVertex=0).
@@ -550,6 +555,7 @@ export function renderObjectToHeapSpec(
 
   return {
     effect: ro.effect,
+    ...(ro.pickId !== undefined ? { pickId: ro.pickId } : {}),
     pipelineState: ro.pipelineState,
     inputs,
     ...(instanceAttributes !== undefined ? { instanceAttributes } : {}),

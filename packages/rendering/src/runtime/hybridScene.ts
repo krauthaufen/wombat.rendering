@@ -291,6 +291,7 @@ export function compileHybridScene(
     __legacyCount(): number {
       return scenePass.collect().length;
     },
+
     heapDerivedTimings() {
       const s = heapScene.stats;
       return {

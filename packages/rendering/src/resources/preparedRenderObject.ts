@@ -12,7 +12,7 @@
 // PreparedRenderObject so flipping a non-pipeline-affecting field
 // (`stencilReference`, `blendConstant`) does NOT trigger a recompile.
 
-import {
+import { type IUniformProvider,
   AdaptiveResource,
   AttributeProvider,
   BufferView,
@@ -736,8 +736,16 @@ export function prepareRenderObject(
   const perGroup: EntryDesc[][] = [];
   for (let g = 0; g <= maxGroup; g++) perGroup.push([]);
 
+  // First-class `RenderObject.pickId` → synthesized `PickId` uniform on
+  // the classic path (the heap path writes it inline into the
+  // drawHeader instead — see INLINE_HEADER_UNIFORMS). Classic scenes
+  // are small, so a per-RO constant aval is fine here.
+  const uniformSource: IUniformProvider = obj.pickId !== undefined
+    ? withPickId(obj.pickId, asUniformProvider(obj.uniforms))
+    : asUniformProvider(obj.uniforms);
+
   for (const ub of iface.uniformBlocks) {
-    const merged = mergeUniformInputs(asUniformProvider(obj.uniforms), effect.avalBindings, ub);
+    const merged = mergeUniformInputs(uniformSource, effect.avalBindings, ub);
     const block = ubAsBlock(ub);
     const res = prepareUniformBuffer(device, block, merged, {
       ...(opts.label !== undefined ? { label: `${opts.label}.${ub.name}` } : {}),
@@ -811,7 +819,9 @@ export function prepareRenderObject(
   // the RO's provider (resolving nested derived-uniform rules too).
   let modeUniformReader: ((name: string, token: AdaptiveToken) => unknown) | undefined;
   if (obj.modeRules !== undefined) {
-    const uniProv = asUniformProvider(obj.uniforms);
+    const uniProv = obj.pickId !== undefined
+      ? withPickId(obj.pickId, asUniformProvider(obj.uniforms))
+      : asUniformProvider(obj.uniforms);
     modeUniformReader = (name: string, token: AdaptiveToken): unknown => {
       const v = uniProv.tryGet(name);
       if (v === undefined) return undefined;
@@ -844,6 +854,15 @@ export function prepareRenderObject(
 const SENTINEL_PIPELINE = { __sentinel: "PreparedRenderObject.pipeline" } as unknown as GPURenderPipeline;
 
 // ---------------------------------------------------------------------------
+/** Overlay provider: `PickId` first (constant), then `base`. */
+function withPickId(pickId: number, base: IUniformProvider): IUniformProvider {
+  const pick = AVal.constant<number>(pickId);
+  return {
+    tryGet(name: string) { return name === "PickId" ? (pick as aval<unknown>) : base.tryGet(name); },
+    *names() { yield "PickId"; yield* base.names(); },
+  };
+}
+
 // Uniform input merging — `obj.uniforms` wins; `avalBindings` is fallback.
 // ---------------------------------------------------------------------------
 

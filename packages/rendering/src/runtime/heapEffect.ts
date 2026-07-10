@@ -104,7 +104,21 @@ export interface FragmentOutputLayout {
 // and on quota; every failure simply degrades to "recompute".
 
 /** Cache-generation stamp for the persistent (localStorage) tier. */
-export const HEAP_PERSIST_VERSION = "h3"; // h3: packed-attribute decode arms (oct32/c4b)
+export const HEAP_PERSIST_VERSION = "h4"; // h4: inline PickId drawHeader read (was h3: packed decode arms)
+
+/**
+ * Uniforms whose drawHeader word IS the u32 value (no arena
+ * indirection, no pool entry, no per-RO aval) — the `__layoutId`
+ * mechanism generalised. Values come from first-class RenderObject
+ * fields (`ro.pickId`), not the uniform provider. Fields must be
+ * u32-typed.
+ */
+export const INLINE_HEADER_UNIFORMS: ReadonlySet<string> = new Set(["PickId"]);
+
+/** True for fields read inline from the drawHeader word. */
+export function isInlineHeaderField(f: { kind: string; name: string }): boolean {
+  return f.kind === "uniform-ref" && (f.name === "__layoutId" || INLINE_HEADER_UNIFORMS.has(f.name));
+}
 export const HEAP_PERSIST_PREFIX = "wbt.heapfx.";
 
 export function persistKey(version: string, kind: string, contentKey: string): string {

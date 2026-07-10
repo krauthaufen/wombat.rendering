@@ -169,14 +169,14 @@ export class ModeKeyTracker implements IDisposable {
   readonly ps: PipelineState | undefined;
   readonly signature: FramebufferSignature;
   private readonly onDirty: () => void;
-  private readonly subs: IDisposable[] = [];
+  private subs: IDisposable[] | undefined;
   private cachedDescriptor: PipelineStateDescriptor;
   private cachedModeKey: bigint;
   private readonly modeRules: RoModeRules | undefined;
   private readonly uniformAvals: ReadonlyMap<string, aval<unknown>> | undefined;
   /** Avals discovered while evaluating rules; merged into the leaf
    *  set returned by `forEachLeaf` so the heap scene subscribes once. */
-  private readonly ruleDeps = new Set<aval<unknown>>();
+  private ruleDeps: Set<aval<unknown>> | undefined;
 
   constructor(
     ps: PipelineState | undefined,
@@ -210,7 +210,7 @@ export class ModeKeyTracker implements IDisposable {
     return snapshotDescriptor(this.ps, this.signature, {
       ...(this.modeRules    !== undefined ? { modeRules:    this.modeRules    } : {}),
       ...(this.uniformAvals !== undefined ? { uniformAvals: this.uniformAvals } : {}),
-      recordDep: (av) => { this.ruleDeps.add(av); },
+      recordDep: (av) => { (this.ruleDeps ??= new Set()).add(av); },
     });
   }
 
@@ -257,7 +257,7 @@ export class ModeKeyTracker implements IDisposable {
         }
       }
     }
-    for (const av of this.ruleDeps) visit(av);
+    if (this.ruleDeps !== undefined) for (const av of this.ruleDeps) visit(av);
   }
 
   get descriptor(): PipelineStateDescriptor { return this.cachedDescriptor; }
@@ -274,7 +274,7 @@ export class ModeKeyTracker implements IDisposable {
    * subscription-dedupe layer picks them up.
    */
   recompute(): boolean {
-    this.ruleDeps.clear();
+    this.ruleDeps?.clear();
     const next = this.snapshot();
     const nextKey = encodeModeKey(next);
     if (nextKey === this.cachedModeKey) return false;
@@ -284,8 +284,8 @@ export class ModeKeyTracker implements IDisposable {
   }
 
   dispose(): void {
-    for (const s of this.subs) s.dispose();
-    this.subs.length = 0;
+    if (this.subs !== undefined) for (const s of this.subs) s.dispose();
+    this.subs = undefined;
   }
 
   private subscribeAll(): void {
@@ -318,7 +318,7 @@ export class ModeKeyTracker implements IDisposable {
   }
 
   private sub(a: aval<unknown>): void {
-    this.subs.push(addMarkingCallback(a, this.onDirty));
+    (this.subs ??= []).push(addMarkingCallback(a, this.onDirty));
   }
 
   private subBlendState(b: PsBlendState): void {

@@ -51,7 +51,7 @@ import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
 import type { PipelineState } from "../core/pipelineState.js";
 import type { BufferView } from "../core/bufferView.js";
 import type { IBuffer, HostBufferSource } from "../core/buffer.js";
-import {
+import { INLINE_HEADER_UNIFORMS,
   buildBucketLayout, compileHeapEffect,
   type BucketLayout, type FragmentOutputLayout,
   type HeapEffectSchema,
@@ -334,13 +334,24 @@ interface Bucket {
    * keyed by aval identity.
    */
   readonly localPerDrawAvals: (aval<unknown>[] | undefined)[];
+  /** Field indices (into `layout.drawHeaderFields`) whose drawHeader
+   *  cells hold RAW arena refs (§7 output slots, no pool entry). */
+  readonly localPerDrawRawFieldIdx: (number[] | undefined)[];
   /**
-   * Per-draw uniform refs (schema name → arena byte offset) for
-   * this slot. Stable during the slot's lifetime; used to re-pack
-   * the DrawHeader into a fresh staging mirror after the bucket's
-   * drawHeap GrowBuffer reallocates.
+   * Per-draw uniform refs for this slot, indexed by the bucket
+   * layout's drawHeaderFields ORDER (−1 = field not populated by
+   * this slot's effect). A flat Int32Array instead of a
+   * Map<string, number> — at heap scale (hundreds of thousands of
+   * draws) the per-draw Map was one of the largest JS-memory items.
+   * Stable during the slot's lifetime; used to re-pack the
+   * DrawHeader after the drawHeap GrowBuffer reallocates.
    */
-  readonly localPerDrawRefs: (Map<string, number> | undefined)[];
+  readonly localPerDrawRefs: (Int32Array | undefined)[];
+  /** drawHeaderFields name → array index (built once per bucket). */
+  readonly fieldIdx: Map<string, number>;
+  /** fieldIdx.get("Positions") / ("Normals"), −1 when absent. */
+  readonly posFieldIdx: number;
+  readonly norFieldIdx: number;
   /**
    * Per-local-slot layoutId for the §6 family-merge selector. Stable
    * during the slot's lifetime; written into the drawHeader's
@@ -447,6 +458,12 @@ export interface HeapDrawSpec {
    * share a pipeline + bucket.
    */
   readonly effect: Effect;
+  /**
+   * Optional picking id (u32 < 2^24), written INLINE into the
+   * drawHeader's `PickId` field (see `INLINE_HEADER_UNIFORMS`) — no
+   * pool entry, no per-draw aval.
+   */
+  readonly pickId?: number;
   /**
    * Per-name inputs covering both vertex attributes (e.g. `Positions`,
    * `Normals`) and uniforms (e.g. `ModelTrafo`, `Color`, `ViewProjTrafo`)
@@ -2656,7 +2673,7 @@ export function buildHeapScene(
       firstIndex: number;
       indexCount: number;
       instanceCount: number;
-      perDrawRefs: Map<string, number>;
+      perDrawRefs: Int32Array;
       descriptor: PipelineStateDescriptor;
       /** Filled in below after synthetic combos are registered. */
       targetComboId: number;
@@ -2836,7 +2853,11 @@ export function buildHeapScene(
       if (cpuMigration !== undefined) {
         let totalEmit = 0;
         for (const m of cpuMigration) {
-          const uRefs = bucket.uniformOrder!.map(n => m.perDrawRefs.get(n) ?? 0);
+          const uRefs = bucket.uniformOrder!.map(n => {
+            const i = bucket.fieldIdx.get(n);
+            const r = i === undefined ? -1 : m.perDrawRefs[i]!;
+            return r < 0 ? 0 : r;
+          });
           const recIdx = partition.appendRecord(
             m.localSlot, m.firstIndex, m.indexCount, m.instanceCount, m.targetComboId, uRefs,
           );
@@ -2957,6 +2978,8 @@ export function buildHeapScene(
     );
     const drawHeap = new DrawHeap(drawHeapBuf, layout.drawHeaderBytes);
 
+    const fieldIdx = new Map<string, number>();
+    layout.drawHeaderFields.forEach((f, i) => fieldIdx.set(f.name, i));
     const bucket: Bucket = {
       label: bk, textures: undefined, layout, chunkIdx,
       slots: [],  // populated lazily by ensureSlot per modeKey
@@ -2966,7 +2989,10 @@ export function buildHeapScene(
       headerDirtyMin: Infinity, headerDirtyMax: 0,
       localPosRefs: [], localNorRefs: [],
       localEntries: [], localToDrawId: [],
-      localPerDrawAvals: [], localPerDrawRefs: [], localLayoutIds: [],
+      localPerDrawAvals: [], localPerDrawRawFieldIdx: [], localPerDrawRefs: [], localLayoutIds: [],
+      fieldIdx,
+      posFieldIdx: fieldIdx.get("Positions") ?? -1,
+      norFieldIdx: fieldIdx.get("Normals") ?? -1,
       drawSlots: new Set<number>(), dirty: new Set<number>(),
       isAtlasBucket,
       localAtlasReleases: [],
@@ -3036,13 +3062,15 @@ export function buildHeapScene(
   // callers writeBuffer the result to the GPU.
   function packBucketHeader(
     bucket: Bucket, localSlot: number,
-    perDrawRefs: ReadonlyMap<string, number>,
+    perDrawRefs: Int32Array,
     layoutId: number,
   ): void {
     const dst = bucket.drawHeaderStaging;
     const u32 = new Uint32Array(dst.buffer, dst.byteOffset, dst.length);
     const baseFloat = (localSlot * bucket.layout.drawHeaderBytes) / 4;
-    for (const f of bucket.layout.drawHeaderFields) {
+    const fields = bucket.layout.drawHeaderFields;
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i]!;
       // texture-ref fields carry inline values (pageRef/formatBits as u32,
       // origin/size as vec2<f32>) and are filled by packAtlasTextureFields.
       if (f.kind === "texture-ref") continue;
@@ -3055,15 +3083,11 @@ export function buildHeapScene(
         u32[fOff] = layoutId >>> 0;
         continue;
       }
-      const ref = perDrawRefs.get(f.name);
-      if (ref === undefined) {
-        // Family-merge: a slot's effect doesn't populate every field of
-        // the union; leave the unused slots zero — the layoutId switch
-        // ensures they're never read by the wrong effect's helper.
-        u32[fOff] = 0;
-        continue;
-      }
-      u32[fOff] = ref;
+      const ref = perDrawRefs[i]!;
+      // Family-merge: a slot's effect doesn't populate every field of
+      // the union (−1); leave the unused slots zero — the layoutId
+      // switch ensures they're never read by the wrong effect's helper.
+      u32[fOff] = ref < 0 ? 0 : ref;
     }
   }
 
@@ -3244,7 +3268,7 @@ export function buildHeapScene(
 
     let estBytes = indexArr !== undefined ? ALIGN16(ALLOC_HEADER_PAD_TO + indexArr.byteLength) : 0;
     for (const f of layout.drawHeaderFields) {
-      if (f.kind === "texture-ref" || f.name === "__layoutId" || !effectFields.has(f.name)) continue;
+      if (f.kind === "texture-ref" || f.name === "__layoutId" || INLINE_HEADER_UNIFORMS.has(f.name) || !effectFields.has(f.name)) continue;
       if (ruleForUniform(spec, f.name) !== undefined) {
         estBytes += ALIGN16(ALLOC_HEADER_PAD_TO + PACKER_MAT4.dataBytes); // §7 derived dummy mat4
         continue;
@@ -3341,7 +3365,18 @@ export function buildHeapScene(
     // packs as a single value. Both go through the same pool — sharing
     // emerges from aval identity either way.
     const perDrawAvals: aval<unknown>[] = [];
-    const perDrawRefs = new Map<string, number>();
+    let perDrawRawFieldIdx: number[] | undefined;
+    const perDrawRefs = new Int32Array(bucket.layout.drawHeaderFields.length).fill(-1);
+    const setRef = (name: string, ref: number): void => {
+      const i = bucket.fieldIdx.get(name);
+      if (i !== undefined) perDrawRefs[i] = ref;
+    };
+    const getRef = (name: string): number | undefined => {
+      const i = bucket.fieldIdx.get(name);
+      if (i === undefined) return undefined;
+      const r = perDrawRefs[i]!;
+      return r < 0 ? undefined : r;
+    };
     {
       const tok = outerTok;
       for (const f of bucket.layout.drawHeaderFields) {
@@ -3353,18 +3388,45 @@ export function buildHeapScene(
         // layoutId branch never reads them, so the slot stays zero.
         if (f.name === "__layoutId") continue;
         if (!effectFields.has(f.name)) continue;
+        // Inline header uniforms (PickId): the header word IS the u32
+        // value — write it via perDrawRefs (packBucketHeader copies
+        // refs verbatim), skip the pool entirely. A provider-supplied
+        // PickId aval still works below as the (slow) fallback.
+        if (INLINE_HEADER_UNIFORMS.has(f.name)) {
+          const iv = f.name === "PickId" ? spec.pickId : undefined;
+          if (iv !== undefined) {
+            setRef(f.name, iv >>> 0);
+            continue;
+          }
+          const provInline = spec.inputs[f.name];
+          if (typeof provInline === "number") {
+            setRef(f.name, provInline >>> 0);
+            continue;
+          }
+          if (provInline === undefined) {
+            // No id at all (picking disabled but the effect still
+            // reads the uniform): 0 = "no pick", a reserved id.
+            setRef(f.name, 0);
+            continue;
+          }
+          // fall through: aval-provided → legacy pooled path
+        }
         // §7: derived-uniform fields are produced by the compute
         // pre-pass. We still allocate an arena slot here so the
         // drawHeader gets a valid ref written by packBucketHeader; §7
         // overwrites the arena data each frame the inputs are dirty.
         if (ruleForUniform(spec, f.name) !== undefined) {
-          const dummyAval = AVal.constant<M44d>(M44d.zero);
-          const ref = pool.acquire(
-            device, arena.attrs, dummyAval, bucket.chunkIdx, M44d.zero,
-            PACKER_MAT4.dataBytes, PACKER_MAT4.typeId, 1, PACKER_MAT4.pack,
+          // Raw (aval-less) slot: §7's compute pre-pass overwrites the
+          // data every dirty frame, so a keyed pool entry (placeholder
+          // ConstantVal + Map per draw) bought nothing. The ref lives
+          // in the drawHeader cell (compaction re-seats it there);
+          // removeDraw frees it via `perDrawRawFieldIdx`.
+          const ref = pool.allocRaw(
+            arena.attrs, bucket.chunkIdx,
+            PACKER_MAT4.dataBytes, PACKER_MAT4.typeId, 1,
           );
-          perDrawRefs.set(f.name, ref);
-          perDrawAvals.push(dummyAval);
+          setRef(f.name, ref);
+          (perDrawRawFieldIdx ??= []).push(bucket.fieldIdx.get(f.name)!);
           continue;
         }
         const isPerInstanceUniformField =
@@ -3439,19 +3501,20 @@ export function buildHeapScene(
           placement.dataBytes, placement.typeId, placement.length, placement.pack,
         );
         if (releasable !== undefined) releasable._v = null;   // staged — drop the CPU copy
-        perDrawRefs.set(f.name, ref);
+        setRef(f.name, ref);
         perDrawAvals.push(av);
       }
     }
 
-    bucket.localPosRefs[localSlot] = perDrawRefs.get("Positions");
-    bucket.localNorRefs[localSlot] = perDrawRefs.get("Normals");
+    bucket.localPosRefs[localSlot] = getRef("Positions");
+    bucket.localNorRefs[localSlot] = getRef("Normals");
     bucket.localEntries[localSlot] = {
       indexCount: emitCount, firstIndex: firstIndexField, instanceCount,
     };
     bucket.localToDrawId[localSlot] = drawId;
     bucket.drawSlots.add(localSlot);
     bucket.localPerDrawAvals[localSlot] = perDrawAvals;
+    bucket.localPerDrawRawFieldIdx[localSlot] = perDrawRawFieldIdx;
     bucket.localPerDrawRefs[localSlot]  = perDrawRefs;
     const layoutId = fam.schema.layoutIdOf.get(spec.effect)!;
     bucket.localLayoutIds[localSlot] = layoutId;
@@ -3561,7 +3624,7 @@ export function buildHeapScene(
       // it) get 0 — the kernel only reads refs through combo fns that
       // gate on `r.comboId`, so an unread 0 is harmless.
       const uniformRefs: number[] = (bucket.uniformOrder ?? []).map(
-        name => perDrawRefs.get(name) ?? 0,
+        name => getRef(name) ?? 0,
       );
       partition.appendRecord(localSlot, firstIndexField, emitCount, instanceCount, roComboId, uniformRefs);
       bucket.drawIdToRecord!.set(drawId, recIdx);
@@ -3701,11 +3764,11 @@ export function buildHeapScene(
       const ruleSubset = new Map<string, DerivedRule>();
       const outOffsetByName = new Map<string, number>();
       for (const f of bucket.layout.drawHeaderFields) {
-        if (f.name === "__layoutId") continue;
+        if (f.name === "__layoutId" || INLINE_HEADER_UNIFORMS.has(f.name)) continue;
         if (!effectFields.has(f.name)) continue;
         const rule = ruleForUniform(spec, f.name);
         if (rule === undefined) continue;
-        const ref = perDrawRefs.get(f.name);
+        const ref = getRef(f.name);
         if (ref === undefined) continue;
         ruleSubset.set(f.name, rule);
         outOffsetByName.set(f.name, ref + ALLOC_HEADER_PAD_TO);
@@ -3731,7 +3794,7 @@ export function buildHeapScene(
           trafoAvals,
           ...(spec.modelChain !== undefined ? { modelChain: spec.modelChain } : {}),
           hostUniformOffset: (n) => {
-            const r = perDrawRefs.get(n);
+            const r = getRef(n);
             return r === undefined ? undefined : r + ALLOC_HEADER_PAD_TO;
           },
           outputOffset: (n) => outOffsetByName.get(n),
@@ -3842,6 +3905,19 @@ export function buildHeapScene(
     // Release pool entries — refcount drops; if zero, allocation freed.
     const avals = bucket.localPerDrawAvals[localSlot];
     if (avals !== undefined) for (const av of avals) pool.release(arena.attrs, av, bucket.chunkIdx);
+    // Raw §7 slots: the live ref is the drawHeader cell (compaction
+    // keeps it current); free it directly.
+    const rawIdxs = bucket.localPerDrawRawFieldIdx[localSlot];
+    if (rawIdxs !== undefined) {
+      const rawRefs = bucket.localPerDrawRefs[localSlot];
+      if (rawRefs !== undefined) {
+        for (const fi of rawIdxs) {
+          const ref = rawRefs[fi]!;
+          if (ref >= 0) pool.releaseRaw(arena.attrs, bucket.chunkIdx, ref, PACKER_MAT4.dataBytes);
+        }
+      }
+      bucket.localPerDrawRawFieldIdx[localSlot] = undefined;
+    }
     const idxAval = drawIdToIndexAval[drawId];
     if (idxAval !== undefined) indexPool.release(arena.attrs, idxAval, bucket.chunkIdx);
     const atlasRel = bucket.localAtlasReleases[localSlot];
@@ -4063,13 +4139,22 @@ export function buildHeapScene(
           const refs = bucket.localPerDrawRefs[localSlot];
           if (refs === undefined) continue;
           let changed = false;
-          for (const [name, ref] of refs) {
+          for (let i = 0; i < refs.length; i++) {
+            const ref = refs[i]!;
+            if (ref < 0) continue;
+            const fld = bucket.layout.drawHeaderFields[i]!;
+            // Inline header values (PickId/__layoutId) are NOT arena
+            // refs — a numeric collision with an old offset must not
+            // remap them.
+            if (fld.name === "__layoutId" || INLINE_HEADER_UNIFORMS.has(fld.name)) continue;
             const nn = remap.get(ref);
-            if (nn !== undefined) { refs.set(name, nn); changed = true; }
+            if (nn !== undefined) { refs[i] = nn; changed = true; }
           }
           if (!changed) continue;
-          bucket.localPosRefs[localSlot] = refs.get("Positions");
-          bucket.localNorRefs[localSlot] = refs.get("Normals");
+          const pr = bucket.posFieldIdx >= 0 ? refs[bucket.posFieldIdx]! : -1;
+          const nr = bucket.norFieldIdx >= 0 ? refs[bucket.norFieldIdx]! : -1;
+          bucket.localPosRefs[localSlot] = pr < 0 ? undefined : pr;
+          bucket.localNorRefs[localSlot] = nr < 0 ? undefined : nr;
           packBucketHeader(bucket, localSlot, refs, bucket.localLayoutIds[localSlot] ?? 0);
           if (bucket.isAtlasBucket) {
             const ts = bucket.localAtlasTextures[localSlot];
@@ -4731,7 +4816,7 @@ export function buildHeapScene(
         for (let slot = 0; slot < recordCount; slot++) {
           const slotOff = slot * stride;
           for (const f of dc.bucket.layout.drawHeaderFields) {
-            if (f.name === "__layoutId") continue;
+            if (f.name === "__layoutId" || INLINE_HEADER_UNIFORMS.has(f.name)) continue;
             if (f.kind !== "uniform-ref" && f.kind !== "attribute-ref") continue;
             const ref = u32[(slotOff + f.byteOffset) >>> 2];
             if (ref === undefined || ref === 0) continue;
@@ -5054,7 +5139,7 @@ export function buildHeapScene(
       for (const dc of dcs) {
         const fs: Field[] = [];
         for (const f of dc.bucket.layout.drawHeaderFields) {
-          if (f.name === "__layoutId") continue;
+          if (f.name === "__layoutId" || INLINE_HEADER_UNIFORMS.has(f.name)) continue;
           if (f.kind !== "uniform-ref" && f.kind !== "attribute-ref") continue;
           const wt = f.kind === "uniform-ref" ? f.uniformWgslType : f.attributeWgslType;
           const eltF =

@@ -48,7 +48,42 @@ const MIN_STRIDE_U32 = 5; // rule_id, out_slot, in0, in1, in2 — covers the 13 
 export class RecordsBuffer {
   private buf: Uint32Array;
   private owners: (RecordOwner | undefined)[] = [];
-  private readonly byOwner = new Map<RecordOwner, Set<number>>();
+  /** Record indices per owner. A single number for the common one-
+   *  record-per-owner case, promoted to a small array on the second —
+   *  saves a whole `Set` per RO at heap scale. */
+  private readonly byOwner = new Map<RecordOwner, number | number[]>();
+
+  private ownerAdd(owner: RecordOwner, idx: number): void {
+    const v = this.byOwner.get(owner);
+    if (v === undefined) this.byOwner.set(owner, idx);
+    else if (typeof v === "number") this.byOwner.set(owner, [v, idx]);
+    else v.push(idx);
+  }
+  private ownerDelete(owner: RecordOwner, idx: number): void {
+    const v = this.byOwner.get(owner);
+    if (v === undefined) return;
+    if (typeof v === "number") {
+      if (v === idx) this.byOwner.delete(owner);
+      return;
+    }
+    const i = v.indexOf(idx);
+    if (i >= 0) {
+      v[i] = v[v.length - 1]!;
+      v.pop();
+      if (v.length === 1) this.byOwner.set(owner, v[0]!);
+      else if (v.length === 0) this.byOwner.delete(owner);
+    }
+  }
+  private ownerReplace(owner: RecordOwner, oldIdx: number, newIdx: number): void {
+    const v = this.byOwner.get(owner);
+    if (v === undefined) return;
+    if (typeof v === "number") {
+      if (v === oldIdx) this.byOwner.set(owner, newIdx);
+      return;
+    }
+    const i = v.indexOf(oldIdx);
+    if (i >= 0) v[i] = newIdx;
+  }
   private strideU32 = MIN_STRIDE_U32;
   private count = 0;
   /** Bumps whenever the byte layout changes shape (stride growth) so the dispatcher recompiles. */
@@ -86,26 +121,20 @@ export class RecordsBuffer {
     for (let i = 0; i < inSlots.length; i++) this.buf[base + 2 + i] = inSlots[i]! >>> 0;
     for (let i = base + 2 + inSlots.length; i < base + this.strideU32; i++) this.buf[i] = 0;
     this.owners[idx] = owner;
-    let set = this.byOwner.get(owner);
-    if (set === undefined) {
-      set = new Set();
-      this.byOwner.set(owner, set);
-    }
-    set.add(idx);
+    this.ownerAdd(owner, idx);
     this.generation++;
     return idx;
   }
 
   /** Remove every record owned by `owner` (swap-remove against the tail). */
   removeAllForOwner(owner: RecordOwner): void {
-    const set = this.byOwner.get(owner);
-    if (set === undefined || set.size === 0) {
-      this.byOwner.delete(owner);
+    const v = this.byOwner.get(owner);
+    if (v === undefined) {
       return;
     }
     // Process highest indices first so a swap can never move a not-yet-removed
     // record of this owner that we still hold a stale index for.
-    const indices = [...set].sort((a, b) => b - a);
+    const indices = typeof v === "number" ? [v] : [...v].sort((a, b) => b - a);
     for (const idx of indices) this.removeAt(idx);
     this.byOwner.delete(owner);
     this.generation++;
@@ -142,16 +171,14 @@ export class RecordsBuffer {
   private removeAt(idx: number): void {
     const last = this.count - 1;
     // The record currently at `idx` is the one being removed.
-    this.byOwner.get(this.owners[idx]!)?.delete(idx);
+    this.ownerDelete(this.owners[idx]!, idx);
     if (idx !== last) {
       // Move the tail record's words into the hole, and re-home it.
       const dst = idx * this.strideU32;
       const src = last * this.strideU32;
       this.buf.copyWithin(dst, src, src + this.strideU32);
       const lastOwner = this.owners[last]!;
-      const lset = this.byOwner.get(lastOwner)!;
-      lset.delete(last);
-      lset.add(idx);
+      this.ownerReplace(lastOwner, last, idx);
       this.owners[idx] = lastOwner;
     }
     this.owners[last] = undefined;

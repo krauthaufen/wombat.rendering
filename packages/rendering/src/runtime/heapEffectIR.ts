@@ -18,6 +18,7 @@
 // consumes is identical to the one heapScene.ts already builds.
 
 import { compileModule, stage as makeStage, effect as makeEffect } from "@aardworx/wombat.shader";
+import { isInlineHeaderField } from "./heapEffect.js";
 import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
 import { substituteInputsInStage, readInputs, mapExpr, mapStmt, liftReturns, uniformsToInputs } from "@aardworx/wombat.shader/passes";
 import { synthesizeHeapDecoderModule } from "./heapDecoder.js";
@@ -278,9 +279,12 @@ function buildVertexUniformMap(layout: BucketLayout): Map<string, Expr> {
   for (const f of layout.drawHeaderFields) {
     if (f.kind !== "uniform-ref") continue;
     const refExpr = loadHeaderRef(drawIdx, f.byteOffset, stride);
-    const value = layout.perInstanceUniforms.has(f.name)
-      ? loadInstanceByRef(refExpr, iidx, f.uniformWgslType ?? "")
-      : loadUniformByRef(refExpr, f.uniformWgslType ?? "");
+    // Inline fields: the header word IS the u32 value.
+    const value = isInlineHeaderField(f)
+      ? refExpr
+      : layout.perInstanceUniforms.has(f.name)
+        ? loadInstanceByRef(refExpr, iidx, f.uniformWgslType ?? "")
+        : loadUniformByRef(refExpr, f.uniformWgslType ?? "");
     out.set(f.name, value);
   }
   return out;
@@ -420,9 +424,11 @@ function rewriteFsUniformsDirect(m: Module, layout: BucketLayout): Module {
     const f = fieldByName.get(name);
     if (f === undefined || f.kind !== "uniform-ref") continue;
     const refExpr = loadHeaderRef(drawIdxExpr, f.byteOffset, layout.strideU32);
-    const value = layout.perInstanceUniforms.has(name)
-      ? loadInstanceByRef(refExpr, instIdExpr, f.uniformWgslType ?? "")
-      : loadUniformByRef(refExpr, f.uniformWgslType ?? "");
+    const value = isInlineHeaderField(f)
+      ? refExpr
+      : layout.perInstanceUniforms.has(name)
+        ? loadInstanceByRef(refExpr, instIdExpr, f.uniformWgslType ?? "")
+        : loadUniformByRef(refExpr, f.uniformWgslType ?? "");
     fsSubst.set(name, value);
   }
   return substituteInputsInStage(m, "fragment", "Uniform", n => fsSubst.get(n));
@@ -541,9 +547,12 @@ function rewriteFsUniforms(m: Module, layout: BucketLayout): Module {
       value: { kind: "Expr", value: refExprWriter },
     });
     const refReadFs = readScope("Input", refParamName, Tu32);
-    const value = layout.perInstanceUniforms.has(name)
-      ? loadInstanceByRef(refReadFs, readScope("Input", "_iidx", Tu32), f.uniformWgslType ?? "")
-      : loadUniformByRef(refReadFs, f.uniformWgslType ?? "");
+    // Inline fields: the threaded varying already carries the value.
+    const value = isInlineHeaderField(f)
+      ? refReadFs
+      : layout.perInstanceUniforms.has(name)
+        ? loadInstanceByRef(refReadFs, readScope("Input", "_iidx", Tu32), f.uniformWgslType ?? "")
+        : loadUniformByRef(refReadFs, f.uniformWgslType ?? "");
     fsSubst.set(name, value);
   }
 

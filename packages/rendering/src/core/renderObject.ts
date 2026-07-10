@@ -68,6 +68,15 @@ export interface RenderObject {
   readonly indices?: BufferView;
   readonly drawCall: aval<DrawCall>;
   /**
+   * Optional picking id (u32 < 2^24). First-class instead of a
+   * `PickId` uniform: one unique `AVal.constant` per RO would drag a
+   * pool entry + per-RO provider identity + adaptive bookkeeping in —
+   * measured ~6.5 KB of JS heap PER RO at scale. The heap path writes
+   * this INLINE into the drawHeader (like `__layoutId`); the classic
+   * path synthesizes the `PickId` uniform from it.
+   */
+  readonly pickId?: number;
+  /**
    * Optional gate: when `active` ticks to `false`, the runtime must
    * skip drawing this RO this frame **without** releasing pool
    * allocations or evicting it from the scene. When it ticks back

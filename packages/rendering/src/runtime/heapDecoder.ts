@@ -46,6 +46,7 @@ import {
   Tu32, Tf32,
 } from "@aardworx/wombat.shader/ir";
 import type { BucketLayout, DrawHeaderField } from "./heapEffect.js";
+import { isInlineHeaderField } from "./heapEffect.js";
 import {
   Tvec2, Tvec3, Tvec4, Tmat4, TarrU32,
   constU32, add, mul, div, item, newVec, readScope,
@@ -307,9 +308,13 @@ function addUniformOutput(
   }
   const irType = wgslTypeToIrType(wgslType);
   const refExpr = loadHeaderRef(drawIdxExpr, f.byteOffset, layout.strideU32);
-  const value = layout.perInstanceUniforms.has(f.name)
-    ? loadInstanceByRef(refExpr, instIdExpr, wgslType)
-    : loadUniformByRef(refExpr, wgslType);
+  // Inline fields (PickId, __layoutId family): the header word IS the
+  // u32 value — no arena indirection, no pool entry per draw.
+  const value = isInlineHeaderField(f)
+    ? refExpr
+    : layout.perInstanceUniforms.has(f.name)
+      ? loadInstanceByRef(refExpr, instIdExpr, wgslType)
+      : loadUniformByRef(refExpr, wgslType);
 
   outputs.push({
     name: f.name,

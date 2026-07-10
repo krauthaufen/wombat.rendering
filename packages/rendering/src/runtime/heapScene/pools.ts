@@ -88,27 +88,100 @@ interface PoolEntry {
  * an aval still share the underlying allocation.
  */
 export class UniformPool {
-  private readonly byAval = new Map<aval<unknown>, Map<number, PoolEntry>>();
+  /** Value is a single `PoolEntry` (the overwhelmingly common case —
+   *  one aval, one chunk) or a `Map<chunkIdx, PoolEntry>` once the
+   *  same aval is allocated in a second chunk. The flat form saves a
+   *  whole inner `Map` per aval, which at heap scale (several avals
+   *  per draw) is megabytes of JS heap. */
+  private readonly byAval = new Map<aval<unknown>, PoolEntry | Map<number, PoolEntry>>();
+
+  private getEntry(av: aval<unknown>, chunkIdx: number): PoolEntry | undefined {
+    const v = this.byAval.get(av);
+    if (v === undefined) return undefined;
+    if (v instanceof Map) return v.get(chunkIdx);
+    return v.chunkIdx === chunkIdx ? v : undefined;
+  }
+  private setEntry(av: aval<unknown>, e: PoolEntry): void {
+    const v = this.byAval.get(av);
+    if (v === undefined) { this.byAval.set(av, e); return; }
+    if (v instanceof Map) { v.set(e.chunkIdx, e); return; }
+    const m = new Map<number, PoolEntry>();
+    m.set(v.chunkIdx, v);
+    m.set(e.chunkIdx, e);
+    this.byAval.set(av, m);
+  }
+  private deleteEntry(av: aval<unknown>, chunkIdx: number): void {
+    const v = this.byAval.get(av);
+    if (v === undefined) return;
+    if (v instanceof Map) {
+      v.delete(chunkIdx);
+      if (v.size === 1) {
+        this.byAval.set(av, v.values().next().value as PoolEntry);
+      } else if (v.size === 0) this.byAval.delete(av);
+      return;
+    }
+    if (v.chunkIdx === chunkIdx) this.byAval.delete(av);
+  }
+  private *entriesOf(av: aval<unknown>): IterableIterator<PoolEntry> {
+    const v = this.byAval.get(av);
+    if (v === undefined) return;
+    if (v instanceof Map) yield* v.values();
+    else yield v;
+  }
 
   has(av: aval<unknown>, chunkIdx: number): boolean {
-    return this.byAval.get(av)?.has(chunkIdx) ?? false;
+    return this.getEntry(av, chunkIdx) !== undefined;
   }
   /** True when the pool holds at least one entry for `av` in any
    *  chunk. Used by the scene's `inputChanged` dispatch to decide
    *  whether a marking aval is one of our tracked allocations. */
   hasAny(av: aval<unknown>): boolean {
-    return (this.byAval.get(av)?.size ?? 0) > 0;
+    const v = this.byAval.get(av);
+    return v !== undefined && (!(v instanceof Map) || v.size > 0);
   }
   entry(av: aval<unknown>, chunkIdx: number): PoolEntry | undefined {
-    return this.byAval.get(av)?.get(chunkIdx);
+    return this.getEntry(av, chunkIdx);
   }
   /** First chunk this aval is allocated in, if any. Used by `addRO`
    *  to prefer co-locating a new RO with its already-allocated
    *  shared inputs (avoids unnecessary duplication). */
   firstChunkContaining(av: aval<unknown>): number | undefined {
-    const byChunk = this.byAval.get(av);
-    if (byChunk === undefined || byChunk.size === 0) return undefined;
-    return byChunk.keys().next().value as number;
+    for (const e of this.entriesOf(av)) return e.chunkIdx;
+    return undefined;
+  }
+
+  /**
+   * Unkeyed allocation for slots the GPU overwrites every dirty frame
+   * (§7 derived-uniform outputs). No aval, no `byAval` entry, no
+   * sharing — the caller keeps the ref in its drawHeader cell (which
+   * the compaction remap re-seats) and frees it with `releaseRaw`.
+   * Avoids a placeholder `AVal.constant` + pool entry per draw.
+   */
+  allocRaw(
+    arena: ChunkedAttributeArena,
+    chunkIdx: number,
+    dataBytes: number,
+    typeId: number,
+    length: number,
+  ): number {
+    const r = arena.alloc(dataBytes, chunkIdx);
+    if (r.chunkIdx !== chunkIdx) {
+      throw new Error(
+        `UniformPool.allocRaw: allocator spilled from chunk ${chunkIdx} to chunk ${r.chunkIdx} ` +
+        `(${dataBytes} bytes). Caller's bucket is bound to chunk ${chunkIdx}.`,
+      );
+    }
+    const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
+    const buf = new ArrayBuffer(allocBytes);
+    const u32 = new Uint32Array(buf);
+    u32[0] = typeId;
+    u32[1] = length;
+    u32[2] = length > 0 ? Math.floor(dataBytes / length) : 0;
+    arena.write(chunkIdx, r.off, new Uint8Array(buf));
+    return r.off;
+  }
+  releaseRaw(arena: ChunkedAttributeArena, chunkIdx: number, ref: number, dataBytes: number): void {
+    arena.release(chunkIdx, ref, dataBytes);
   }
 
   /**
@@ -128,8 +201,7 @@ export class UniformPool {
     length: number,
     pack: (val: unknown, dst: Float32Array, off: number) => void,
   ): number {
-    let byChunk = this.byAval.get(av);
-    const existing = byChunk?.get(chunkIdx);
+    const existing = this.getEntry(av, chunkIdx);
     if (existing !== undefined) {
       existing.refcount++;
       return existing.ref;
@@ -163,19 +235,14 @@ export class UniformPool {
     pack(value, f32, ALLOC_HEADER_PAD_TO / 4);
     arena.write(finalChunk, r.off, new Uint8Array(buf));
     void device;
-    if (byChunk === undefined) {
-      byChunk = new Map();
-      this.byAval.set(av, byChunk);
-    }
-    byChunk.set(finalChunk, {
+    this.setEntry(av, {
       chunkIdx: finalChunk, ref: r.off, dataBytes, typeId, pack, refcount: 1,
     });
     return r.off;
   }
 
   release(arena: ChunkedAttributeArena, av: aval<unknown>, chunkIdx: number): void {
-    const byChunk = this.byAval.get(av);
-    const e = byChunk?.get(chunkIdx);
+    const e = this.getEntry(av, chunkIdx);
     if (e === undefined) return;
     e.refcount--;
     if (e.refcount > 0) return;
@@ -190,8 +257,7 @@ export class UniformPool {
     // 16 B inside the previous alloc → overlapping allocations →
     // garbage `typeId`/`length` in the attribute header.
     arena.release(e.chunkIdx, e.ref, e.dataBytes);
-    byChunk!.delete(chunkIdx);
-    if (byChunk!.size === 0) this.byAval.delete(av);
+    this.deleteEntry(av, chunkIdx);
   }
 
   /** Re-seat every entry's `ref` in `chunkIdx` after a waste-triggered
@@ -199,8 +265,8 @@ export class UniformPool {
    *  offset. Entries whose ref didn't move are left as-is. O(entries). */
   remapRefs(chunkIdx: number, remap: ReadonlyMap<number, number>): void {
     if (remap.size === 0) return;
-    for (const byChunk of this.byAval.values()) {
-      const e = byChunk.get(chunkIdx);
+    for (const v of this.byAval.values()) {
+      const e = v instanceof Map ? v.get(chunkIdx) : (v.chunkIdx === chunkIdx ? v : undefined);
       if (e === undefined) continue;
       const nn = remap.get(e.ref);
       if (nn !== undefined) e.ref = nn;
@@ -217,10 +283,8 @@ export class UniformPool {
     av: aval<unknown>,
     val: unknown,
   ): void {
-    const byChunk = this.byAval.get(av);
-    if (byChunk === undefined) return;
     let dst: Float32Array | undefined;
-    for (const e of byChunk.values()) {
+    for (const e of this.entriesOf(av)) {
       if (dst === undefined || dst.length !== e.dataBytes / 4) {
         dst = new Float32Array(e.dataBytes / 4);
       }
@@ -236,10 +300,8 @@ export class UniformPool {
   /** Total bytes touched by `repack` for this aval — sum across
    *  chunks. Used by the dirty-bytes diagnostics. */
   totalDataBytes(av: aval<unknown>): number {
-    const byChunk = this.byAval.get(av);
-    if (byChunk === undefined) return 0;
     let s = 0;
-    for (const e of byChunk.values()) s += e.dataBytes;
+    for (const e of this.entriesOf(av)) s += e.dataBytes;
     return s;
   }
 }
@@ -260,11 +322,40 @@ export class UniformPool {
  */
 export class IndexPool {
   /** Per-aval, per-chunk bookkeeping. Same aval acquired in two
-   *  chunks gets two entries (accepted §3 duplication). */
+   *  chunks gets two entries (accepted §3 duplication). Value is a
+   *  single binding (common case) or a Map<chunkIdx, binding> once
+   *  the aval spans chunks — same flat-form saving as UniformPool. */
   private readonly byAval = new Map<
     aval<Uint32Array>,
-    Map<number, { entry: IndexPoolEntry; perAvalCount: number }>
+    IndexBinding | Map<number, IndexBinding>
   >();
+
+  private getBinding(av: aval<Uint32Array>, chunkIdx: number): IndexBinding | undefined {
+    const v = this.byAval.get(av);
+    if (v === undefined) return undefined;
+    if (v instanceof Map) return v.get(chunkIdx);
+    return v.entry.chunkIdx === chunkIdx ? v : undefined;
+  }
+  private setBinding(av: aval<Uint32Array>, b: IndexBinding): void {
+    const v = this.byAval.get(av);
+    if (v === undefined) { this.byAval.set(av, b); return; }
+    if (v instanceof Map) { v.set(b.entry.chunkIdx, b); return; }
+    const m = new Map<number, IndexBinding>();
+    m.set(v.entry.chunkIdx, v);
+    m.set(b.entry.chunkIdx, b);
+    this.byAval.set(av, m);
+  }
+  private deleteBinding(av: aval<Uint32Array>, chunkIdx: number): void {
+    const v = this.byAval.get(av);
+    if (v === undefined) return;
+    if (v instanceof Map) {
+      v.delete(chunkIdx);
+      if (v.size === 1) this.byAval.set(av, v.values().next().value as IndexBinding);
+      else if (v.size === 0) this.byAval.delete(av);
+      return;
+    }
+    if (v.entry.chunkIdx === chunkIdx) this.byAval.delete(av);
+  }
   /** Per-chunk constant-aval value-dedup (§5b in-chunk). */
   private readonly byValueKey = new Map<string, IndexPoolEntry>();
   private readonly bufferIds = new WeakMap<ArrayBufferLike, number>();
@@ -279,9 +370,10 @@ export class IndexPool {
   }
 
   firstChunkContaining(av: aval<Uint32Array>): number | undefined {
-    const byChunk = this.byAval.get(av);
-    if (byChunk === undefined || byChunk.size === 0) return undefined;
-    return byChunk.keys().next().value as number;
+    const v = this.byAval.get(av);
+    if (v === undefined) return undefined;
+    if (v instanceof Map) return v.size > 0 ? (v.keys().next().value as number) : undefined;
+    return v.entry.chunkIdx;
   }
 
   acquire(
@@ -291,8 +383,7 @@ export class IndexPool {
     chunkIdx: number,
     arr: Uint32Array,
   ): { chunkIdx: number; firstIndex: number; count: number } {
-    let byChunk = this.byAval.get(av);
-    const bound = byChunk?.get(chunkIdx);
+    const bound = this.getBinding(av, chunkIdx);
     if (bound !== undefined) {
       bound.perAvalCount++;
       bound.entry.totalRefcount++;
@@ -308,11 +399,7 @@ export class IndexPool {
       const shared = this.byValueKey.get(valueKey);
       if (shared !== undefined) {
         shared.totalRefcount++;
-        if (byChunk === undefined) {
-          byChunk = new Map();
-          this.byAval.set(av, byChunk);
-        }
-        byChunk.set(chunkIdx, { entry: shared, perAvalCount: 1 });
+        this.setBinding(av, { entry: shared, perAvalCount: 1 });
         return { chunkIdx: shared.chunkIdx, firstIndex: shared.firstIndex, count: shared.count };
       }
     }
@@ -335,11 +422,7 @@ export class IndexPool {
       chunkIdx: r.chunkIdx, ref: r.off, firstIndex, count: arr.length,
       totalRefcount: 1, valueKey,
     };
-    if (byChunk === undefined) {
-      byChunk = new Map();
-      this.byAval.set(av, byChunk);
-    }
-    byChunk.set(r.chunkIdx, { entry, perAvalCount: 1 });
+    this.setBinding(av, { entry, perAvalCount: 1 });
     if (valueKey !== undefined) this.byValueKey.set(valueKey, entry);
     return { chunkIdx: r.chunkIdx, firstIndex, count: arr.length };
   }
@@ -349,7 +432,7 @@ export class IndexPool {
    *  region up in the arena remap by this ref to compute the draw's new
    *  `_indexStart`. */
   baseFor(av: aval<Uint32Array>, chunkIdx: number): number | undefined {
-    return this.byAval.get(av)?.get(chunkIdx)?.entry.ref;
+    return this.getBinding(av, chunkIdx)?.entry.ref;
   }
 
   /** Re-seat every entry after a compaction relocated its region. `remap` maps
@@ -358,8 +441,8 @@ export class IndexPool {
   remapRefs(chunkIdx: number, remap: ReadonlyMap<number, number>): void {
     if (remap.size === 0) return;
     const seen = new Set<IndexPoolEntry>();
-    for (const byChunk of this.byAval.values()) {
-      const bound = byChunk.get(chunkIdx);
+    for (const v of this.byAval.values()) {
+      const bound = v instanceof Map ? v.get(chunkIdx) : (v.entry.chunkIdx === chunkIdx ? v : undefined);
       if (bound === undefined || seen.has(bound.entry)) continue;
       seen.add(bound.entry);
       const nn = remap.get(bound.entry.ref);
@@ -371,21 +454,22 @@ export class IndexPool {
   }
 
   release(arena: ChunkedAttributeArena, av: aval<Uint32Array>, chunkIdx: number): void {
-    const byChunk = this.byAval.get(av);
-    const bound = byChunk?.get(chunkIdx);
+    const bound = this.getBinding(av, chunkIdx);
     if (bound === undefined) return;
     bound.perAvalCount--;
     bound.entry.totalRefcount--;
-    if (bound.perAvalCount === 0) {
-      byChunk!.delete(chunkIdx);
-      if (byChunk!.size === 0) this.byAval.delete(av);
-    }
+    if (bound.perAvalCount === 0) this.deleteBinding(av, chunkIdx);
     if (bound.entry.totalRefcount > 0) return;
     arena.release(bound.entry.chunkIdx, bound.entry.ref, bound.entry.count * 4);
     if (bound.entry.valueKey !== undefined) {
       this.byValueKey.delete(bound.entry.valueKey);
     }
   }
+}
+
+interface IndexBinding {
+  entry: IndexPoolEntry;
+  perAvalCount: number;
 }
 
 interface IndexPoolEntry {
