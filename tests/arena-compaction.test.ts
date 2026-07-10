@@ -4,8 +4,8 @@
 // distribution: mid-arena holes never touch the bump cursor, so the
 // buffer ratchets toward its high-water forever. `compact()` relocates
 // the live allocations to the front, returns the OLD→NEW remap, and
-// mirrors the move into the CPU shadow. These tests cover the
-// bookkeeping, the shadow data move, and the decline thresholds.
+// the GPU bounce does the byte move (mirror-less). These tests cover
+// the bookkeeping and the decline thresholds.
 //
 // (The GPU-side copyBufferToBuffer is a no-op under MockGPU; full
 // data-integrity through the render pipeline — drawHeaders, §7 handles,
@@ -17,7 +17,7 @@ import { GrowBuffer } from "../packages/rendering/src/runtime/heapScene/growBuff
 import { AttributeArena } from "../packages/rendering/src/runtime/heapScene/pools.js";
 
 function makeArena(gpu: MockGPU): AttributeArena {
-  return new AttributeArena(new GrowBuffer(
+  return new AttributeArena(gpu.device, new GrowBuffer(
     gpu.device, "test/attrs", GPUBufferUsage.STORAGE, 4096,
   ));
 }
@@ -54,9 +54,9 @@ describe("AttributeArena.compact (waste-triggered)", () => {
     expect(arena.wasteBytes).toBe(0);
     expect(arena.liveByteCount).toBe(64);
 
-    // The relocated block's bytes followed it in the CPU shadow.
-    expect([...arena.peekShadowU32(0, 1)]).toEqual([0xa0]);   // block 0 unchanged
-    expect([...arena.peekShadowU32(32, 1)]).toEqual([0xa5]);  // ex-block-5 now at 32
+    // (Mirror-less arena: byte relocation happens GPU-side via the scratch
+    // bounce — data integrity is proven by the real-GPU compaction golden,
+    // which pixel-diffs a fragmented+compacted scene against a reference.)
   });
 
   it("a fresh alloc after compaction reuses the reclaimed tail (no ratchet)", () => {

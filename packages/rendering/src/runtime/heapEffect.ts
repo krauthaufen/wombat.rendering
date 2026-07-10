@@ -104,7 +104,7 @@ export interface FragmentOutputLayout {
 // and on quota; every failure simply degrades to "recompute".
 
 /** Cache-generation stamp for the persistent (localStorage) tier. */
-export const HEAP_PERSIST_VERSION = "h2";
+export const HEAP_PERSIST_VERSION = "h3"; // h3: packed-attribute decode arms (oct32/c4b)
 export const HEAP_PERSIST_PREFIX = "wbt.heapfx.";
 
 export function persistKey(version: string, kind: string, contentKey: string): string {

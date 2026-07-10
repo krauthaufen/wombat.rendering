@@ -90,12 +90,12 @@ export class ChunkedAttributeArena {
     c.release(off, dataBytes);
   }
 
-  /** Push the dirty CPU shadow of every chunk to its GPU buffer. */
+  /** No-op (mirror-less arena — writes upload immediately). Kept for API compat. */
   flush(device: GPUDevice): void {
     for (const c of this._chunks) c.flush(device);
   }
 
-  /** Write into a specific chunk's CPU shadow. */
+  /** Write into a specific chunk (immediate GPU upload). */
   write(chunkIdx: number, dst: number, data: Uint8Array): void {
     this._chunks[chunkIdx]!.write(dst, data);
   }
@@ -165,7 +165,7 @@ export class ChunkedAttributeArena {
       this.device, `${this.label}/c${idx}`, this.usage,
       this.initialChunkBytes, this.maxChunkBytes,
     );
-    this._chunks.push(new AttributeArena(buf));
+    this._chunks.push(new AttributeArena(this.device, buf));
     for (const cb of this.onChunkAddedCbs) cb(idx);
     return idx;
   }

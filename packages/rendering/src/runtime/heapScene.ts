@@ -88,7 +88,7 @@ import {
   buildArenaState, arenaBytes, writeAttribute,
   asAval, isBufferView, asFloat32,
   ALLOC_HEADER_BYTES, ALLOC_HEADER_PAD_TO,
-  ENC_V3F_TIGHT, SEM_POSITIONS, SEM_NORMALS,
+  ENC_V3F_TIGHT, ENC_OCT32, ENC_C4B, SEM_POSITIONS, SEM_NORMALS,
   COMPACTION_WASTE_FLOOR_BYTES,
   type ArenaState,
 } from "./heapScene/pools.js";
@@ -147,6 +147,41 @@ import {
  *  prelude then uses the local vertex index directly (no indexStorage lookup).
  *  Must match the literal in heapEffect.ts's `megacallSearchPrelude`. */
 export const HEAP_NONINDEXED = 0xffffffff;
+
+/**
+ * Packed attribute source — stored in the arena at 4 B/element (one u32)
+ * instead of the 12 B tight-f32 expansion, decoded by the VS's
+ * typeId-selected arm. Use for memory-bound scenes (phones): both the
+ * host-side aval payload AND the GPU arena shrink 3×.
+ *
+ * - `oct32(...)` — unit vectors (normals): 2×unorm16 octahedral, for
+ *   `vec3<f32>` fields. Matches build_vienna.py's `oct_pack`.
+ * - `c4b(...)` — RGBA8-unorm colors, for `vec4<f32>` fields
+ *   (`unpack4x8unorm` in the shader; alpha rides along).
+ */
+export interface HeapPackedAttribute {
+  readonly kind: "heap-packed";
+  readonly enc: "oct32" | "c4b";
+  readonly data: Uint32Array;
+}
+export function oct32(data: Int32Array | Uint32Array): HeapPackedAttribute {
+  const u = data instanceof Uint32Array ? data : new Uint32Array(data.buffer, data.byteOffset, data.length);
+  return { kind: "heap-packed", enc: "oct32", data: u };
+}
+export function c4b(data: Uint8Array | Uint32Array): HeapPackedAttribute {
+  if (data instanceof Uint8Array) {
+    if (data.byteLength % 4 !== 0 || data.byteOffset % 4 !== 0) {
+      throw new Error("heapScene.c4b: RGBA8 data must be 4-byte sized and aligned");
+    }
+    return { kind: "heap-packed", enc: "c4b", data: new Uint32Array(data.buffer, data.byteOffset, data.byteLength / 4) };
+  }
+  return { kind: "heap-packed", enc: "c4b", data };
+}
+export function isHeapPackedAttribute(v: unknown): v is HeapPackedAttribute {
+  return typeof v === "object" && v !== null
+    && (v as { kind?: unknown }).kind === "heap-packed"
+    && (v as { data?: unknown }).data instanceof Uint32Array;
+}
 
 export interface HeapGeometry {
   readonly positions: Float32Array;
@@ -772,6 +807,28 @@ export interface BuildHeapSceneOptions {
    */
   readonly compactionWasteFloorBytes?: number;
   /**
+   * Pre-size the arena chunks (bytes). When the caller can estimate the
+   * scene's total arena footprint up front (e.g. from an asset manifest),
+   * passing it here allocates each chunk at its final size immediately —
+   * eliminating the pow2-grow copies during ingest, whose old+new-buffer
+   * transient is what OOM-kills memory-tight targets (phones). Clamped to
+   * the per-chunk cap; harmless to overshoot.
+   */
+  readonly initialArenaBytes?: number;
+  /**
+   * Release constant attribute payloads after staging (aardvark's
+   * "StageOnce"). When a `HeapDrawSpec` attribute is supplied as a PLAIN
+   * value (raw typed array / packed marker — not a real aval), the heap
+   * wraps it in a constant holder; a constant is provably never re-read
+   * after its arena write (repack fires only on `inputChanged`, which
+   * constants never raise; compaction and growth move bytes GPU-side).
+   * With this flag the holder drops its payload right after staging, so
+   * the GPU arena becomes the ONLY copy of constant geometry — halving a
+   * static scene's memory. Real avals (cvals etc.) are never touched:
+   * changeable data stays alive by definition. Default false.
+   */
+  readonly releaseConstantAttributes?: boolean;
+  /**
    * Share a `HeapStorage` (arena + dedup pools) across multiple heap scenes.
    * When omitted, the scene creates a private store it owns and disposes.
    * When supplied (via `createHeapStorage`), two or more scenes — e.g. the
@@ -817,6 +874,8 @@ export interface HeapStorage {
 export interface HeapStorageOptions {
   /** Per-arena-chunk size cap in bytes. See `BuildHeapSceneOptions.maxChunkBytes`. */
   readonly maxChunkBytes?: number;
+  /** Pre-size chunks (bytes) — see `BuildHeapSceneOptions.initialArenaBytes`. */
+  readonly initialArenaBytes?: number;
 }
 
 /** Create a standalone `HeapStorage`. Pass it to `buildHeapScene` via
@@ -825,7 +884,7 @@ export function createHeapStorage(device: GPUDevice, opts: HeapStorageOptions = 
   void device;
   // Initial capacities are hints; the buffers pow2-grow on demand.
   const arena = buildArenaState(
-    device, 64 * 1024, 16 * 1024, "heapStorage",
+    device, Math.max(64 * 1024, opts.initialArenaBytes ?? 0), 16 * 1024, "heapStorage",
     GPUBufferUsage.STORAGE, opts.maxChunkBytes,
   );
   const pool = new UniformPool();
@@ -890,9 +949,10 @@ export function buildHeapScene(
   // pass — are deduped once). The local `arena`/`pool`/`indexPool`
   // bindings below keep every downstream reference unchanged.
   const ownsStorage = opts.storage === undefined;
-  const storage = opts.storage ?? createHeapStorage(
-    device, opts.maxChunkBytes !== undefined ? { maxChunkBytes: opts.maxChunkBytes } : {},
-  );
+  const storage = opts.storage ?? createHeapStorage(device, {
+    ...(opts.maxChunkBytes !== undefined ? { maxChunkBytes: opts.maxChunkBytes } : {}),
+    ...(opts.initialArenaBytes !== undefined ? { initialArenaBytes: opts.initialArenaBytes } : {}),
+  });
   const arena = storage.arena;
   const pool = storage.pool;
   const indexPool = storage.indexPool;
@@ -1063,6 +1123,28 @@ export function buildHeapScene(
     if (f.kind === "uniform-ref") {
       const p = packerForWgslType(f.uniformWgslType ?? "");
       return { dataBytes: p.dataBytes, typeId: p.typeId, length: 1, pack: p.pack };
+    }
+    // Packed attribute encodings (oct32 unit vectors / C4b colors): one
+    // u32 per element, decoded by the VS's typeId-selected arm. 3× smaller
+    // in the arena AND host-side (the caller keeps the packed source).
+    if (isHeapPackedAttribute(value)) {
+      const pa = value;
+      const wantType = pa.enc === "oct32" ? "vec3<f32>" : "vec4<f32>";
+      if (f.attributeWgslType !== wantType) {
+        throw new Error(
+          `heapScene: ${pa.enc} attribute supplied for '${f.attributeWgslType}' field — ` +
+          `oct32 requires vec3<f32>, c4b requires vec4<f32>`,
+        );
+      }
+      return {
+        dataBytes: pa.data.byteLength,
+        typeId: pa.enc === "oct32" ? ENC_OCT32 : ENC_C4B,
+        length: pa.data.length,
+        pack: (val, dst, off) => {
+          const src = (val as HeapPackedAttribute).data;
+          new Uint32Array(dst.buffer, dst.byteOffset + off * 4, src.length).set(src);
+        },
+      };
     }
     // attribute-ref: variable-size array; we copy verbatim into the
     // arena. The current encoding is V3F_TIGHT (3 f32s per element).
@@ -1261,6 +1343,7 @@ export function buildHeapScene(
   // else in this file should run when it is. On by default — pass
   // `enableDerivedUniforms: false` to opt out.
   const enableCompaction = opts.enableCompaction !== false;
+  const releaseConstantAttributes = opts.releaseConstantAttributes === true;
   const compactionWasteFloor = opts.compactionWasteFloorBytes ?? COMPACTION_WASTE_FLOOR_BYTES;
   const enableDerivedUniforms = opts.enableDerivedUniforms !== false;
   const derivedScene: DerivedUniformsScene | undefined = enableDerivedUniforms
@@ -3274,11 +3357,37 @@ export function buildHeapScene(
         let av: aval<unknown>;
         let value: unknown;
         let placement: ReturnType<typeof poolPlacementFor>;
+        let releasable: { _v: unknown } | undefined;
         if (f.kind === "attribute-ref" && !isPerInstanceUniformField && isBufferView(provided)) {
           const bv = provided;
           placement = bufferViewPlacement(f, bv);
           av = bv.buffer as aval<unknown>;
           value = bv.buffer.getValue(tok);
+        } else if (
+          releaseConstantAttributes
+          && f.kind === "attribute-ref"
+          && !isPerInstanceUniformField
+          && !(typeof provided === "object" && provided !== null
+               && typeof (provided as { getValue?: unknown }).getValue === "function")
+        ) {
+          // Plain value (raw array / packed marker) → CONSTANT by definition.
+          // Wrap in a droppable holder: after this field's arena write the GPU
+          // copy is the only copy the heap ever reads again, so the payload is
+          // released (real avals never take this branch — changeable data
+          // stays alive by contract).
+          const holder = {
+            _v: provided as unknown,
+            getValue(): unknown {
+              if (holder._v === null) {
+                throw new Error("heapScene: constant attribute payload was released after staging (releaseConstantAttributes)");
+              }
+              return holder._v;
+            },
+          };
+          releasable = holder;
+          av = holder as unknown as aval<unknown>;
+          value = provided;
+          placement = poolPlacementFor(f, value);
         } else {
           av = asAval(provided as aval<unknown> | unknown);
           value = av.getValue(tok);
@@ -3290,6 +3399,7 @@ export function buildHeapScene(
           device, arena.attrs, av, bucket.chunkIdx, value,
           placement.dataBytes, placement.typeId, placement.length, placement.pack,
         );
+        if (releasable !== undefined) releasable._v = null;   // staged — drop the CPU copy
         perDrawRefs.set(f.name, ref);
         perDrawAvals.push(av);
       }
@@ -4616,18 +4726,9 @@ export function buildHeapScene(
                 ? `prev=[${arenaU32[refU32 - 4]},${arenaU32[refU32 - 3]},${arenaU32[refU32 - 2]},${arenaU32[refU32 - 1]}] `
                 : "";
               const here = `here=[${arenaU32[refU32]},${arenaU32[refU32 + 1]},${arenaU32[refU32 + 2]},${arenaU32[refU32 + 3]},${arenaU32[refU32 + 4]},${arenaU32[refU32 + 5]},${arenaU32[refU32 + 6]},${arenaU32[refU32 + 7]}]`;
-              // Compare CPU shadow vs GPU read-back. Differ → GPU
-              // write corrupted; match → bug is in CPU-side write path
-              // OR the alloc never went through pool.acquire.
-              const shadowChunk = arena.attrs.chunk(0);
-              const shadowU32 = shadowChunk.peekShadowU32(ref, 8);
-              const shadowStr = `shadow=[${shadowU32[0]},${shadowU32[1]},${shadowU32[2]},${shadowU32[3]},${shadowU32[4]},${shadowU32[5]},${shadowU32[6]},${shadowU32[7]}]`;
-              const cpuMatches = shadowU32[0] === arenaU32[refU32]
-                && shadowU32[1] === arenaU32[refU32 + 1]
-                && shadowU32[2] === arenaU32[refU32 + 2]
-                && shadowU32[3] === arenaU32[refU32 + 3];
-              const verdict = cpuMatches ? "GPU=CPU (likely CPU-write bug)" : "GPU≠CPU (likely GPU-write corruption)";
-              push(`bucket#${bucketIdx} slot=${slot} field='${f.name}' alloc@0x${ref.toString(16)} typeId=${typeId} unknown ${verdict} ${before}${here} ${shadowStr}`);
+              // (Mirror-less arena: no CPU shadow to cross-check against —
+              // the GPU read-back is the only copy.)
+              push(`bucket#${bucketIdx} slot=${slot} field='${f.name}' alloc@0x${ref.toString(16)} typeId=${typeId} unknown ${before}${here}`);
               attrAllocsBad++;
               continue;
             }

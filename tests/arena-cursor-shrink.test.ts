@@ -12,7 +12,7 @@ import { GrowBuffer, DEFAULT_MAX_BUFFER_BYTES } from "../packages/rendering/src/
 import { AttributeArena } from "../packages/rendering/src/runtime/heapScene/pools.js";
 
 function makeArena(gpu: MockGPU): AttributeArena {
-  return new AttributeArena(new GrowBuffer(
+  return new AttributeArena(gpu.device, new GrowBuffer(
     gpu.device, "test/attrs", GPUBufferUsage.STORAGE, 1024,
   ));
 }

@@ -26,6 +26,8 @@ export {
 export {
   buildHeapScene,
   createHeapStorage,
+  oct32, c4b,
+  type HeapPackedAttribute,
   type HeapScene,
   type HeapStorage,
   type HeapStorageOptions,

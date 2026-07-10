@@ -21,7 +21,6 @@ import type { BufferView } from "../../core/bufferView.js";
 import type { HostBufferSource } from "../../core/buffer.js";
 import { GrowBuffer, ALIGN16, DEFAULT_MAX_BUFFER_BYTES } from "./growBuffer.js";
 import { Freelist } from "./freelist.js";
-import { DirtyRanges } from "./dirtyRanges.js";
 import { ChunkedAttributeArena } from "./chunkedArena.js";
 
 // ─── Debug toggles ─────────────────────────────────────────────────────
@@ -48,8 +47,12 @@ export const ALLOC_HEADER_PAD_TO  = 16;
  *  ref re-seat. Matches Aardvark's 4 MiB compaction floor. */
 export const COMPACTION_WASTE_FLOOR_BYTES = 4 * 1024 * 1024;
 
-/** Encoding-tag enum (low 16 bits of typeId). */
+/** Encoding-tag enum (low 16 bits of typeId). The generated VS decode
+ *  branches on this per field (2-arm select; header word 0 shares the
+ *  cache line with the broadcast length in word 1). */
 export const ENC_V3F_TIGHT = 1; // tightly-packed array of vec3<f32> (12 B/elt)
+export const ENC_OCT32     = 2; // oct-packed unit vectors, 2×unorm16 in one u32 (4 B/elt)
+export const ENC_C4B       = 3; // RGBA8-unorm colors, one u32/elt → unpack4x8unorm (4 B/elt)
 
 /** Semantic-tag enum (high 16 bits of typeId). Optional metadata —
  *  the shader doesn't branch on this. */
@@ -112,7 +115,7 @@ export class UniformPool {
    * Acquire (or share) an allocation for `aval` in `chunkIdx`.
    * Returns the byte offset within that chunk's GPUBuffer. If a
    * fresh allocation is made, the value is packed + uploaded
-   * immediately into the chunk's CPU shadow.
+   * immediately to the chunk's GPU buffer (mirror-less).
    */
   acquire(
     device: GPUDevice,
@@ -458,46 +461,30 @@ export class AttributeArena {
    *  detect allocator returning overlapping ranges. Enabled in
    *  development; cheap (one Map insert/delete per alloc). */
   private readonly liveAllocs = new Map<number, number>();
-  /** CPU shadow of the entire GPU buffer; writes go here first then
-   *  flush() emits one writeBuffer per dirty contiguous range. A
-   *  single min..max span would re-upload nearly the whole arena on
-   *  scattered edits — see dirtyRanges.ts. */
-  private shadow: Uint8Array;
-  private readonly dirty = new DirtyRanges();
-  constructor(private readonly buf: GrowBuffer) {
-    this.shadow = new Uint8Array(buf.capacity);
-    buf.onResize(() => {
-      const grown = new Uint8Array(buf.capacity);
-      grown.set(this.shadow);
-      this.shadow = grown;
-    });
-  }
+  // MIRROR-LESS: no CPU shadow of the arena. Writes go straight to
+  // `queue.writeBuffer` (queue-ordered with submits, so they serialize
+  // correctly against GrowBuffer's grow-copy and the compaction bounce —
+  // both of which preserve contents GPU-side). This halves the heap's
+  // host-memory footprint: the source-of-truth for values is the user's
+  // avals (they must stay alive — changeability is the point), and the
+  // GPU buffer is the render copy; a third full-size CPU mirror bought
+  // only dirty-range batching + debug readback comparisons.
+  constructor(
+    private readonly device: GPUDevice,
+    private readonly buf: GrowBuffer,
+  ) {}
   get buffer(): GPUBuffer { return this.buf.buffer; }
   get capacity(): number { return this.buf.capacity; }
   get usedBytes(): number { return this.cursor; }
-  /** Read 4 u32s from the CPU shadow starting at byte `off`. Used by
-   *  the validator to compare against the GPU's read-back values:
-   *  if CPU shadow is correct but GPU shows garbage → the corruption
-   *  came from a GPU-side write (a compute kernel writing to a wrong
-   *  byte). If both differ from what pool.acquire wrote → CPU-side
-   *  write path is the culprit. */
-  peekShadowU32(off: number, count: number): Uint32Array {
-    return new Uint32Array(this.shadow.buffer, this.shadow.byteOffset + off, count);
-  }
   write(dst: number, data: Uint8Array): void {
-    this.shadow.set(data, dst);
-    this.dirty.add(dst, dst + data.byteLength);
+    // Immediate upload; Chrome's queue staging does the batching. The
+    // write targets the CURRENT buffer handle — a later grow copies it
+    // forward (queue-ordered), so ordering stays correct.
+    this.device.queue.writeBuffer(this.buf.buffer, dst, data as BufferSource);
   }
-  flush(device: GPUDevice): void {
-    if (this.dirty.isEmpty) return;
-    this.dirty.drain((start, end) => {
-      device.queue.writeBuffer(
-        this.buf.buffer, start,
-        this.shadow.buffer, this.shadow.byteOffset + start,
-        end - start,
-      );
-    });
-  }
+  /** No-op — kept for call-site compatibility (mirror-less arena uploads
+   *  in `write`). */
+  flush(_device: GPUDevice): void {}
   /**
    * Allocate space for one attribute. Returns the byte ref (offset
    * to the header — data lives at ref + 16).
@@ -655,17 +642,9 @@ export class AttributeArena {
     device.queue.submit([enc.finish()]);
     scratch.destroy();
 
-    // Mirror the move in the CPU shadow. Runs are processed in ascending
-    // source order and every run moves down (dst ≤ src), so `copyWithin`
-    // never reads a region an earlier run already overwrote.
-    for (const r of runs) {
-      if (r.dstStart !== r.srcStart) {
-        this.shadow.copyWithin(r.dstStart, r.srcStart, r.srcStart + r.len);
-      }
-    }
-
     // Rebuild allocator bookkeeping: live allocs at their new offsets, no free
     // blocks (everything is now contiguous), cursor at the new high-water.
+    // (Mirror-less: the GPU bounce above IS the move — nothing else to sync.)
     const moved: Array<[number, number]> = [];
     for (const [off, size] of live) moved.push([remap.get(off) ?? off, size]);
     this.liveAllocs.clear();
@@ -673,8 +652,6 @@ export class AttributeArena {
     this.freelist.clear();
     this.cursor = newExtent;
     this.buf.setUsed(newExtent);
-    // No dirty range emitted: the GPU buffer was updated by the copy and the
-    // shadow was mirrored to match, so they already agree.
     return remap;
   }
 
@@ -716,9 +693,13 @@ export function buildArenaState(
   const adapterCap = device.limits.maxStorageBufferBindingSize;
   const cap = maxChunkBytes ?? Math.min(adapterCap, DEFAULT_MAX_BUFFER_BYTES);
   void idxBytesHint; void idxExtraUsage; // legacy params (separate index buffer removed)
+  // Clamp the pre-size hint to the per-chunk cap: GrowBuffer RAISES its max
+  // to fit a larger initial size, which would mint an oversized page (and
+  // §7 derived-record handles cap page offsets at 2^29 B = 512 MB). A
+  // multi-page scene simply pre-sizes each page at the cap as it opens.
   const attrs = new ChunkedAttributeArena(
     device, `${label}/arena`, GPUBufferUsage.STORAGE,
-    attrBytesHint, cap,
+    Math.min(attrBytesHint, cap), cap,
   );
   return { attrs };
 }

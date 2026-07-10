@@ -34,6 +34,9 @@ export default defineConfig({
       headless: true,
       providerOptions: {
         launch: {
+          // chromium 150 (Debian, 2026-07-07 update) SIGTRAPs on --no-sandbox;
+          // playwright passes it unless the sandbox is explicitly enabled.
+          chromiumSandbox: true,
           // Playwright's bundled chromium_headless_shell falls back
           // to SwiftShader for WebGPU. Use the system Chromium
           // (full build with the compositor) so adapter selection

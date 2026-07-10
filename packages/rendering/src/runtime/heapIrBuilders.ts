@@ -62,6 +62,23 @@ export const shr = (lhs: Expr, rhs: Expr, type: Type): Expr => ({
 export const select = (cond: Expr, ifTrue: Expr, ifFalse: Expr, type: Type): Expr => ({
   kind: "Conditional", cond, ifTrue, ifFalse, type,
 });
+export const bitAnd = (lhs: Expr, rhs: Expr, type: Type): Expr => ({
+  kind: "BitAnd", lhs, rhs, type,
+});
+export const ltF32 = (lhs: Expr, rhs: Expr): Expr => ({ kind: "Lt", lhs, rhs, type: Tbool });
+export const geF32 = (lhs: Expr, rhs: Expr): Expr => ({ kind: "Ge", lhs, rhs, type: Tbool });
+/** u32 → f32 numeric conversion. */
+export const toF32 = (value: Expr): Expr => ({ kind: "Convert", value, type: Tf32 } as Expr);
+/** Pure WGSL/GLSL intrinsic call (same emit name unless glsl differs). */
+const callIntrinsic = (wgsl: string, glsl: string, ret: Type, args: Expr[]): Expr => ({
+  kind: "CallIntrinsic",
+  op: { name: wgsl, returnTypeOf: () => ret, pure: true, emit: { wgsl, glsl } },
+  args, type: ret,
+} as Expr);
+export const absF32 = (e: Expr): Expr => callIntrinsic("abs", "abs", Tf32, [e]);
+export const normalize3 = (e: Expr): Expr => callIntrinsic("normalize", "normalize", Tvec3, [e]);
+export const unpack4x8unorm = (e: Expr): Expr =>
+  callIntrinsic("unpack4x8unorm", "unpackUnorm4x8", Tvec4, [e]);
 export const newVec = (components: Expr[], type: Type): Expr => ({
   kind: "NewVector", components, type,
 });
@@ -174,14 +191,40 @@ export function loadAttributeByRef(refIdent: Expr, idx: Expr, wgslType: string):
     const length = item(heapU32, add(div(refIdent, constU32(4), Tu32), constU32(1), Tu32), Tu32);
     return mul(mod(idx, length, Tu32), constU32(elemSize), Tu32);
   };
+  /** Header typeId (word 0 — same 16-byte cache line as the length the
+   *  broadcast modulo already loads, so the packed-encoding branch costs
+   *  no extra memory round-trip and is warp-coherent per field). */
+  const typeId = item(heapU32, div(refIdent, constU32(4), Tu32), Tu32);
+  /** One u32 element at the cyclic index (packed encodings: 4 B/elt). */
+  const packedWord = (): Expr => add(dataF32Base, cyclic(1), Tu32);
   switch (wgslType) {
     case "vec3<f32>": {
       const base = add(dataF32Base, cyclic(3), Tu32);
-      return newVec([
+      const tight = newVec([
         item(heapF32, base, Tf32),
         item(heapF32, add(base, constU32(1), Tu32), Tf32),
         item(heapF32, add(base, constU32(2), Tu32), Tf32),
       ], Tvec3);
+      // ENC_OCT32 (typeId 2): one u32/element — x = low unorm16, y = high
+      // unorm16, both → [-1,1]; octahedral fold when z<0 (matches
+      // build_vienna.py's oct_pack and the CPU decoder in renderbench).
+      const u = item(heapU32, packedWord(), Tu32);
+      const toSnorm = (word: Expr): Expr =>
+        add(mul(toF32(word), constF32(2 / 65535), Tf32), constF32(-1.0), Tf32);
+      const fx = toSnorm(bitAnd(u, constU32(0xffff), Tu32));
+      const fy = toSnorm(shr(u, constU32(16), Tu32));
+      const z = sub(sub(constF32(1.0), absF32(fx), Tf32), absF32(fy), Tf32);
+      const neg = ltF32(z, constF32(0.0));
+      const signOf = (v: Expr): Expr =>
+        select(geF32(v, constF32(0.0)), constF32(1.0), constF32(-1.0), Tf32);
+      const fold = (a: Expr, b: Expr): Expr =>   // (1-|b|) * sign(a)
+        mul(sub(constF32(1.0), absF32(b), Tf32), signOf(a), Tf32);
+      const oct = normalize3(newVec([
+        select(neg, fold(fx, fy), fx, Tf32),
+        select(neg, fold(fy, fx), fy, Tf32),
+        z,
+      ], Tvec3));
+      return select(eqU32(typeId, constU32(2 /* ENC_OCT32 */)), oct, tight, Tvec3);
     }
     case "vec4<f32>": {
       const strideBytes = item(heapU32, add(div(refIdent, constU32(4), Tu32), constU32(2), Tu32), Tu32);
@@ -190,12 +233,17 @@ export function loadAttributeByRef(refIdent: Expr, idx: Expr, wgslType: string):
       const off = mul(cycled, strideF, Tu32);
       const base = add(dataF32Base, off, Tu32);
       const w = select(eqU32(strideF, constU32(4)), item(heapF32, add(base, constU32(3), Tu32), Tf32), constF32(1.0), Tf32);
-      return newVec([
+      const tight = newVec([
         item(heapF32, base, Tf32),
         item(heapF32, add(base, constU32(1), Tu32), Tf32),
         item(heapF32, add(base, constU32(2), Tu32), Tf32),
         w,
       ], Tvec4);
+      // ENC_C4B (typeId 3): one u32/element, RGBA8 unorm — a single
+      // hardware unpack. (Vienna colours ship as C4b; storing them raw is
+      // 4 B/vertex instead of the 12 B tight-RGB expansion.)
+      const c4b = unpack4x8unorm(item(heapU32, packedWord(), Tu32));
+      return select(eqU32(typeId, constU32(3 /* ENC_C4B */)), c4b, tight, Tvec4);
     }
     case "vec2<f32>": {
       const base = add(dataF32Base, cyclic(2), Tu32);
