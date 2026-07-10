@@ -1,0 +1,23 @@
+{
+  "name": "wombat.rendering-renderbench",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "bench": "node bench.mjs",
+    "prepare": "ts-patch install -s"
+  },
+  "dependencies": {
+    "@aardworx/wombat.adaptive": "^0.2.5",
+    "@aardworx/wombat.base": "^0.5.0",
+    "@aardworx/wombat.shader": "^0.6.0",
+    "@aardworx/wombat.shader-vite": "^0.3.6",
+    "@aardworx/wombat.rendering": "^0.19.13"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.69",
+    "ts-patch": "^3.2.1",
+    "typescript": "^5.4.0",
+    "vite": "^5.0.0"
+  }
+}
