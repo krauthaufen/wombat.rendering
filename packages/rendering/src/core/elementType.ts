@@ -82,6 +82,14 @@ const _V3u  = new ElementKind<V3i>("v3u",  12, "uint32x3", undefined);
 const _V4u  = new ElementKind<V4i>("v4u",  16, "uint32x4", undefined);
 const _F32  = new ElementKind<number>("f32", 4, "float32", undefined);
 const _U32  = new ElementKind<number>("u32", 4, "uint32",  "uint32");
+// Packed vertex encodings — HEAP-ONLY (no native GPUVertexFormat
+// decodes them): `oct32` = unit vec3 as 2×unorm16 octahedral in one
+// u32 (shader type vec3<f32>); `c4b` = RGBA8-unorm in one u32 (shader
+// type vec4<f32>). The heap VS decodes them via its typeId arms
+// (ENC_OCT32 / ENC_C4B); the classic path rejects them at pipeline
+// creation. 4 bytes/element instead of 12/16.
+const _Oct32 = new ElementKind<import("@aardworx/wombat.base").V3f>("oct32", 4, undefined, undefined);
+const _C4b   = new ElementKind<import("@aardworx/wombat.base").V4f>("c4b", 4, undefined, undefined);
 const _I32  = new ElementKind<number>("i32", 4, "sint32",  undefined);
 const _U16  = new ElementKind<number>("u16", 2, undefined, "uint16");
 const _I16  = new ElementKind<number>("i16", 2, undefined, undefined);
@@ -167,6 +175,8 @@ export const ElementType = {
   V2u: _V2u, V3u: _V3u, V4u: _V4u,
   // Scalars
   F32: _F32, U32: _U32, I32: _I32,
+  // Packed vertex encodings (heap-only decode)
+  Oct32: _Oct32, C4b: _C4b,
   U16: _U16, I16: _I16, U8: _U8, I8: _I8,
 
   /** Infer from a wombat.base packed array or a native TypedArray. */

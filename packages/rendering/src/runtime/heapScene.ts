@@ -1184,6 +1184,45 @@ export function buildHeapScene(
       throw new Error(`heapScene: BufferView offset ${offset} > 0 not yet supported`);
     }
 
+    // Packed encodings by ELEMENT TYPE (the BufferView analogue of the
+    // oct32()/c4b() HeapDrawSpec markers): one u32 per element in the
+    // arena, decoded by the VS typeId arm. Dedup stays aval-keyed like
+    // any other BufferView attribute.
+    const etName = bv.elementType.name;
+    if (etName === "oct32" || etName === "c4b") {
+      const want = etName === "oct32" ? "vec3<f32>" : "vec4<f32>";
+      if (f.attributeWgslType !== want) {
+        throw new Error(
+          `heapScene: ${etName} BufferView requires a ${want} schema attribute (got ${f.attributeWgslType ?? "?"})`,
+        );
+      }
+      const strideP = bv.stride ?? 4;
+      const isBroadcastP = bv.singleValue !== undefined || strideP === 0;
+      if (!isBroadcastP && strideP !== 4) {
+        throw new Error(`heapScene: ${etName} BufferView stride ${strideP} not tight (4) and not a broadcast`);
+      }
+      const ibP = bv.buffer.force(/* allow-force */);
+      if (ibP.kind !== "host") {
+        throw new Error(`heapScene: ${etName} BufferView wraps a native GPUBuffer; not supported in heap path`);
+      }
+      const lengthP = isBroadcastP ? 1 : ibP.sizeBytes / 4;
+      const dataBytesP = 4 * lengthP;
+      return {
+        dataBytes: dataBytesP,
+        typeId: etName === "oct32" ? ENC_OCT32 : ENC_C4B,
+        length: lengthP,
+        pack: (val, dst, off) => {
+          const ibuf = val as IBuffer;
+          if (ibuf.kind !== "host") {
+            throw new Error("heapScene: packed BufferView aval flipped to native GPUBuffer");
+          }
+          const d = ibuf.data as ArrayBufferView;
+          // reinterpret the u32 payload as f32 bits for the arena write
+          dst.set(new Float32Array(d.buffer, d.byteOffset, dataBytesP / 4), off);
+        },
+      };
+    }
+
     // In-arena element bytes: the storage layout the shader will read
     // from. vec4 is always 16 (read via `heapV4f[idx]`), vec3 is 12
     // (read as 3 f32s), vec2 is 8, scalar is 4. V3f source for a vec4
