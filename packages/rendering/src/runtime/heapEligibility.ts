@@ -34,7 +34,7 @@
 // grows feature support each becomes a per-buffer eligibility
 // question instead of a blanket "no".
 
-import { AVal, type aval } from "@aardworx/wombat.adaptive";
+import { AVal, AdaptiveToken, type aval } from "@aardworx/wombat.adaptive";
 import type { IBuffer } from "../core/buffer.js";
 import type { BufferView } from "../core/bufferView.js";
 import type { ITexture } from "../core/texture.js";
@@ -202,11 +202,16 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
   const textures = textureAvals(ro);
   const samplers = samplerAvals(ro);
 
-  // Reactive AND-fold over all participating avals. We also subscribe
-  // to drawCall (instanceCount/baseVertex/firstIndex/firstInstance
-  // can flip; if they violate heap constraints the RO routes to the
-  // legacy path that frame).
-  return AVal.custom(token => {
+  // Constant collapse: when every participating aval is constant the
+  // answer can never change — evaluate once and return a plain
+  // constant. This keeps the hybrid partition from holding a custom
+  // aval + subscriptions per static RO (the overwhelmingly common
+  // case at heap scale).
+  let allConstant = ro.drawCall.isConstant;
+  if (allConstant) for (const av of buffers)  { if (!av.isConstant) { allConstant = false; break; } }
+  if (allConstant) for (const av of textures) { if (!av.isConstant) { allConstant = false; break; } }
+  if (allConstant) for (const av of samplers) { if (!av.isConstant) { allConstant = false; break; } }
+  const evaluate = (token: AdaptiveToken): boolean => {
     let payloadBytes = 0;
     for (const av of buffers) {
       const b = av.getValue(token);
@@ -240,7 +245,13 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
       if (dc.firstVertex !== 0) return false;
     }
     return true;
-  });
+  };
+  if (allConstant) return AVal.constant(evaluate(AdaptiveToken.top));
+  // Reactive AND-fold over all participating avals. We also subscribe
+  // to drawCall (instanceCount/baseVertex/firstIndex/firstInstance
+  // can flip; if they violate heap constraints the RO routes to the
+  // legacy path that frame).
+  return AVal.custom(evaluate);
 }
 
 

@@ -110,6 +110,49 @@ import {
   type Expr, type Stmt,
 } from "@aardworx/wombat.shader/ir";
 
+const NOOP = (): void => {};
+
+// ─── Shared pool packers ──────────────────────────────────────────────
+// Static functions where possible: a fresh closure per pool entry was
+// measurable ballast at heap scale (3 closures/leaf). Only the
+// broadcast prefix variant needs a capture (the copy limit differs
+// from the source buffer's size).
+type PoolPackFn = (val: unknown, dst: Float32Array, off: number) => void;
+const packPackedAttr: PoolPackFn = (val, dst, off) => {
+  const src = (val as HeapPackedAttribute).data;
+  new Uint32Array(dst.buffer, dst.byteOffset + off * 4, src.length).set(src);
+};
+const packF32Verbatim: PoolPackFn = (val, dst, off) => {
+  dst.set(val as Float32Array, off);
+};
+const packHostU32Bits: PoolPackFn = (val, dst, off) => {
+  const ibuf = val as IBuffer;
+  if (ibuf.kind !== "host") {
+    throw new Error("heapScene: packed BufferView aval flipped to native GPUBuffer");
+  }
+  const d = ibuf.data as ArrayBufferView;
+  // reinterpret the u32 payload as f32 bits for the arena write
+  dst.set(new Float32Array(d.buffer, d.byteOffset, d.byteLength >>> 2), off);
+};
+const packHostF32: PoolPackFn = (val, dst, off) => {
+  const ibuf = val as IBuffer;
+  if (ibuf.kind !== "host") {
+    throw new Error("heapScene: BufferView aval flipped to native GPUBuffer; not supported in heap path");
+  }
+  dst.set(asFloat32(ibuf.data), off);
+};
+/** Broadcast prefix copy — the only variant that genuinely captures. */
+function packHostPrefix(limitFloats: number): PoolPackFn {
+  return (val, dst, off) => {
+    const ibuf = val as IBuffer;
+    if (ibuf.kind !== "host") {
+      throw new Error("heapScene: BufferView aval flipped to native GPUBuffer; not supported in heap path");
+    }
+    const src = asFloat32(ibuf.data);
+    dst.set(src.subarray(0, limitFloats), off);
+  };
+}
+
 // GrowBuffer + ALIGN16 + MIN_BUFFER_BYTES + POW2 live in ./heapScene/growBuffer.
 // Packers (WGSL-type → JS-value → arena bytes) live in ./heapScene/packers.
 
@@ -1157,10 +1200,7 @@ export function buildHeapScene(
         dataBytes: pa.data.byteLength,
         typeId: pa.enc === "oct32" ? ENC_OCT32 : ENC_C4B,
         length: pa.data.length,
-        pack: (val, dst, off) => {
-          const src = (val as HeapPackedAttribute).data;
-          new Uint32Array(dst.buffer, dst.byteOffset + off * 4, src.length).set(src);
-        },
+        pack: packPackedAttr,
       };
     }
     // attribute-ref: variable-size array; we copy verbatim into the
@@ -1176,7 +1216,7 @@ export function buildHeapScene(
       dataBytes: arr.byteLength,
       typeId: ENC_V3F_TIGHT,
       length,
-      pack: (val, dst, off) => { dst.set(val as Float32Array, off); },
+      pack: packF32Verbatim,
     };
   }
 
@@ -1228,15 +1268,9 @@ export function buildHeapScene(
         dataBytes: dataBytesP,
         typeId: etName === "oct32" ? ENC_OCT32 : ENC_C4B,
         length: lengthP,
-        pack: (val, dst, off) => {
-          const ibuf = val as IBuffer;
-          if (ibuf.kind !== "host") {
-            throw new Error("heapScene: packed BufferView aval flipped to native GPUBuffer");
-          }
-          const d = ibuf.data as ArrayBufferView;
-          // reinterpret the u32 payload as f32 bits for the arena write
-          dst.set(new Float32Array(d.buffer, d.byteOffset, dataBytesP / 4), off);
-        },
+        // Tight case: the copy limit equals the source payload, so the
+        // static packer (which derives it from the buffer) is exact.
+        pack: isBroadcastP ? packHostPrefix(dataBytesP / 4) : packHostU32Bits,
       };
     }
 
@@ -1293,15 +1327,7 @@ export function buildHeapScene(
       dataBytes,
       typeId: ENC_V3F_TIGHT,
       length,
-      pack: (val, dst, off) => {
-        const ibuf = val as IBuffer;
-        if (ibuf.kind !== "host") {
-          throw new Error("heapScene: BufferView aval flipped to native GPUBuffer; not supported in heap path");
-        }
-        const src = asFloat32(ibuf.data);
-        const limitFloats = dataBytes / 4;
-        dst.set(src.subarray(0, limitFloats), off);
-      },
+      pack: isBroadcast ? packHostPrefix(dataBytes / 4) : packHostF32,
     };
   }
 
@@ -3729,7 +3755,10 @@ export function buildHeapScene(
     }
     const tracker = new ModeKeyTracker(
       spec.pipelineState, sig,
-      () => { dirtyModeKeyDrawIds.add(drawId); },
+      // skipSubscribe means the tracker never invokes onDirty itself
+      // (scene-level modeAvalToDrawIds dispatches instead) — a shared
+      // noop avoids one closure per draw.
+      NOOP,
       {
         skipSubscribe: true,
         ...(spec.modeRules  !== undefined ? { modeRules: spec.modeRules } : {}),
@@ -4805,7 +4834,7 @@ export function buildHeapScene(
       // Track unique attribute-alloc refs we've already inspected so we
       // don't re-validate the same shared alloc 20K times.
       const attrAllocsSeen = new Set<number>();
-      const KNOWN_TYPE_IDS = new Set<number>([0, 1, 2, 3]);
+const KNOWN_TYPE_IDS = new Set<number>([0, 1, 2, 3]);
 
       let bucketIdx = 0;
       for (const dc of dcs) {

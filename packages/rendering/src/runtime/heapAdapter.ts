@@ -113,6 +113,8 @@ import type { HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
 import { isBufferView } from "./heapScene/pools.js";
 import { compileHeapEffect } from "./heapEffect.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
+import { STANDARD_DERIVED_RULES, STANDARD_TRAFO_LEAVES } from "./derivedUniforms/recipes.js";
+import { inputsOf } from "./derivedUniforms/flatten.js";
 
 /**
  * View `HostBufferSource` as `Uint32Array`. Index buffers are u32 in
@@ -326,6 +328,7 @@ export function renderObjectToHeapSpec(
   ro: RenderObject,
   token: AdaptiveToken,
   pool?: AtlasPool,
+  opts?: { readonly enableDerivedUniforms?: boolean },
 ): HeapDrawSpec {
   // 1. Inputs map: vertex attributes (BufferView) + uniforms, pulled
   //    SHADER-DRIVEN from the providers. We compile `ro.effect` (cached
@@ -356,12 +359,38 @@ export function renderObjectToHeapSpec(
     const av = uProv.tryGet(name);
     if (av !== undefined) inputs[name] = av;
   };
-  for (const u of schema.uniforms) pullUniform(u.name);
+  // §7-covered derived trafos (ModelViewProjTrafo, NormalMatrix, …) are
+  // GPU-computed from the M/V/P constituents — addDraw never reads their
+  // `spec.inputs` entry when the rule applies. Deferring the pull keeps
+  // the provider from materialising a per-RO derived-aval chain (MapVal +
+  // nested closure contexts + a never-forced lazy constant) that would sit
+  // in `inputs` as pure ballast. Pulled after all as a fallback only when
+  // the recipe's base leaves turn out not to be bound (mirrors
+  // heapScene's `ruleForUniform` applicability test).
+  const deriveOnGpu = opts?.enableDerivedUniforms !== false;
+  const deferredDerived: string[] = [];
+  for (const u of schema.uniforms) {
+    if (deriveOnGpu && STANDARD_DERIVED_RULES.has(u.name)) {
+      deferredDerived.push(u.name);
+      continue;
+    }
+    pullUniform(u.name);
+  }
   // §7 derived-uniforms constituents — cheap (these are the raw
   // `state.model/view/proj` avals, no `compose`/`inverse`) and the
   // compute pre-pass needs them even when the effect itself doesn't
   // declare them. No-ops if the provider doesn't carry them.
   for (const n of ["ModelTrafo", "ViewTrafo", "ProjTrafo"]) pullUniform(n);
+  for (const name of deferredDerived) {
+    const rule = STANDARD_DERIVED_RULES.get(name)!;
+    let leavesBound = true;
+    for (const inp of inputsOf(rule.ir)) {
+      if (inp.name === "Model" && ro.modelChain !== undefined) continue;
+      const specName = STANDARD_TRAFO_LEAVES.get(inp.name) ?? inp.name;
+      if (inputs[specName] === undefined) { leavesBound = false; break; }
+    }
+    if (!leavesBound) pullUniform(name);
+  }
 
   // 1b. Instance attributes — provider is map-backed (user-supplied via
   //     `Sg.instanced({attributes})`), so enumerate its names. Threaded

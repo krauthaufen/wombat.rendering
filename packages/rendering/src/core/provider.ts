@@ -51,6 +51,57 @@ function hasOwn(o: object, k: string): boolean {
 
 const EMPTY_NAMES: readonly string[] = [];
 
+// Class-based providers: methods live on the prototype, so a provider
+// instance is ONE small object instead of an object + 2 closures + a
+// shared closure context. At heap scale (a provider per RenderObject)
+// that difference is measurable JS-heap ballast.
+
+class MapProvider<T> {
+  constructor(private readonly m: HashMap<string, T>) {}
+  tryGet(n: string): T | undefined { return this.m.tryFind(n); }
+  names(): Iterable<string> { return mapKeys(this.m); }
+}
+
+class ObjectProvider<T> {
+  constructor(private readonly o: Readonly<Record<string, T>>) {}
+  tryGet(n: string): T | undefined { return hasOwn(this.o, n) ? this.o[n] : undefined; }
+  names(): Iterable<string> { return Object.keys(this.o); }
+}
+
+class UnionProvider<T> {
+  constructor(private readonly ps: readonly { tryGet(name: string): T | undefined; names(): Iterable<string> }[]) {}
+  tryGet(n: string): T | undefined {
+    for (let i = 0; i < this.ps.length; i++) {
+      const v = this.ps[i]!.tryGet(n);
+      if (v !== undefined) return v;
+    }
+    return undefined;
+  }
+  names(): Iterable<string> {
+    const s = new Set<string>();
+    for (const p of this.ps) for (const n of p.names()) s.add(n);
+    return s;
+  }
+}
+
+class LazyProvider<T> {
+  private readonly cache = new Map<string, T | undefined>();
+  constructor(
+    private readonly known: readonly string[],
+    private readonly compute: (name: string) => T | undefined,
+  ) {}
+  tryGet(n: string): T | undefined {
+    const hit = this.cache.get(n);
+    if (hit !== undefined || this.cache.has(n)) return hit;
+    const v = this.compute(n);
+    this.cache.set(n, v);
+    return v;
+  }
+  names(): Iterable<string> { return this.known; }
+}
+
+const EMPTY_PROVIDER = { tryGet: (): undefined => undefined, names: (): Iterable<string> => EMPTY_NAMES };
+
 function makeProvider<T>(): {
   empty: { tryGet(name: string): T | undefined; names(): Iterable<string> };
   ofMap(m: HashMap<string, T>): { tryGet(name: string): T | undefined; names(): Iterable<string> };
@@ -59,15 +110,15 @@ function makeProvider<T>(): {
   lazy(known: readonly string[], compute: (name: string) => T | undefined): { tryGet(name: string): T | undefined; names(): Iterable<string> };
 } {
   type P = { tryGet(name: string): T | undefined; names(): Iterable<string> };
-  const empty: P = { tryGet: () => undefined, names: () => EMPTY_NAMES };
+  const empty = EMPTY_PROVIDER as P;
   return {
     empty,
     ofMap(m: HashMap<string, T>): P {
       if (m.containsKey === undefined) return empty; // defensive
-      return { tryGet: (n) => m.tryFind(n), names: () => mapKeys(m) };
+      return new MapProvider(m);
     },
     ofObject(o: Readonly<Record<string, T>>): P {
-      return { tryGet: (n) => (hasOwn(o, n) ? o[n] : undefined), names: () => Object.keys(o) };
+      return new ObjectProvider(o);
     },
     /** First non-`undefined` wins. Pass providers in priority order —
      *  e.g. `[leafAttrs, scopeAttrs]` so a leaf shadows the scope, or
@@ -75,36 +126,13 @@ function makeProvider<T>(): {
     union(...ps: P[]): P {
       if (ps.length === 0) return empty;
       if (ps.length === 1) return ps[0]!;
-      return {
-        tryGet: (n) => {
-          for (let i = 0; i < ps.length; i++) {
-            const v = ps[i]!.tryGet(n);
-            if (v !== undefined) return v;
-          }
-          return undefined;
-        },
-        names: () => {
-          const s = new Set<string>();
-          for (const p of ps) for (const n of p.names()) s.add(n);
-          return s;
-        },
-      };
+      return new UnionProvider(ps);
     },
     /** `compute(name)` runs the first time `name` is requested; the
      *  result (incl. `undefined`) is memoised. `known` is the cheap
      *  list of names `compute` can produce. */
     lazy(known: readonly string[], compute: (name: string) => T | undefined): P {
-      const cache = new Map<string, T | undefined>();
-      return {
-        tryGet: (n) => {
-          const hit = cache.get(n);
-          if (hit !== undefined || cache.has(n)) return hit;
-          const v = compute(n);
-          cache.set(n, v);
-          return v;
-        },
-        names: () => known,
-      };
+      return new LazyProvider(known, compute);
     },
   };
 }

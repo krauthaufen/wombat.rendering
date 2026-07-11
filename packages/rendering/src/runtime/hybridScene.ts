@@ -197,19 +197,33 @@ export function compileHybridScene(
   // toggle — flipping that off forces every RO to legacy.
   const heapEnabled = opts.heapEnabled ?? AVal.constant(true);
   const eligCache = new WeakMap<RenderObject, aval<boolean>>();
+  const notEligCache = new WeakMap<RenderObject, aval<boolean>>();
   const elig = (ro: RenderObject): aval<boolean> => {
     let av = eligCache.get(ro);
     if (av === undefined) {
       const perRO = isHeapEligible(ro);
-      av = AVal.custom(t => heapEnabled.getValue(t) && perRO.getValue(t));
+      // Constant collapse (static RO + constant heapEnabled): a plain
+      // constant instead of a custom aval + two subscriptions per RO.
+      av = heapEnabled.isConstant && perRO.isConstant
+        ? AVal.constant(heapEnabled.force(/* allow-force */) && perRO.force(/* allow-force */))
+        : AVal.custom(t => heapEnabled.getValue(t) && perRO.getValue(t));
       eligCache.set(ro, av);
+    }
+    return av;
+  };
+  const notElig = (ro: RenderObject): aval<boolean> => {
+    let av = notEligCache.get(ro);
+    if (av === undefined) {
+      const e = elig(ro);
+      av = e.isConstant ? AVal.constant(!e.force(/* allow-force */)) : e.map(b => !b);
+      notEligCache.set(ro, av);
     }
     return av;
   };
 
   const flat = flattenRenderTree(tree);
   const heapAset   = flat.filterA(ro => elig(ro));
-  const legacyAset = flat.filterA(ro => elig(ro).map(b => !b));
+  const legacyAset = flat.filterA(ro => notElig(ro));
 
   // ─── Atlas pool ──────────────────────────────────────────────────
   // Per-scene Tier-S atlas pool. Owned by this hybrid scene; disposed
@@ -231,7 +245,9 @@ export function compileHybridScene(
   const heapSpecAset = heapAset.map((ro: RenderObject) => {
     let spec = specCache.get(ro);
     if (spec === undefined) {
-      spec = renderObjectToHeapSpec(ro, AdaptiveToken.top, atlasPool);
+      spec = renderObjectToHeapSpec(ro, AdaptiveToken.top, atlasPool, {
+        enableDerivedUniforms: opts.enableDerivedUniforms !== false,
+      });
       specCache.set(ro, spec);
     }
     return spec;

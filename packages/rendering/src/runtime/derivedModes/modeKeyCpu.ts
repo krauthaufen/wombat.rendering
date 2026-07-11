@@ -165,6 +165,20 @@ function stripFormatFor(topology: GPUPrimitiveTopology): GPUIndexFormat | undefi
  * — `addMarkingCallback` is a no-op for an aval that never marks, so
  * no special-casing required.
  */
+/** Canonical descriptor per modeKey. The modeKey is a COMPLETE encoding
+ *  of the descriptor (that's what makes it the bucket key), so two
+ *  trackers with equal keys can share one frozen snapshot object —
+ *  at heap scale most draws share a handful of pipeline states, and a
+ *  per-draw descriptor (+ its attachments array) was measurable ballast.
+ *  The map is bounded by the number of DISTINCT pipeline states. */
+const descriptorInterning = new Map<bigint, PipelineStateDescriptor>();
+function internDescriptor(key: bigint, d: PipelineStateDescriptor): PipelineStateDescriptor {
+  const hit = descriptorInterning.get(key);
+  if (hit !== undefined) return hit;
+  descriptorInterning.set(key, d);
+  return d;
+}
+
 export class ModeKeyTracker implements IDisposable {
   readonly ps: PipelineState | undefined;
   readonly signature: FramebufferSignature;
@@ -201,8 +215,9 @@ export class ModeKeyTracker implements IDisposable {
     this.onDirty   = onDirty;
     if (options.modeRules    !== undefined) this.modeRules    = options.modeRules;
     if (options.uniformAvals !== undefined) this.uniformAvals = options.uniformAvals;
-    this.cachedDescriptor = this.snapshot();
-    this.cachedModeKey    = encodeModeKey(this.cachedDescriptor);
+    const d = this.snapshot();
+    this.cachedModeKey    = encodeModeKey(d);
+    this.cachedDescriptor = internDescriptor(this.cachedModeKey, d);
     if (options.skipSubscribe !== true) this.subscribeAll();
   }
 
@@ -278,7 +293,7 @@ export class ModeKeyTracker implements IDisposable {
     const next = this.snapshot();
     const nextKey = encodeModeKey(next);
     if (nextKey === this.cachedModeKey) return false;
-    this.cachedDescriptor = next;
+    this.cachedDescriptor = internDescriptor(nextKey, next);
     this.cachedModeKey    = nextKey;
     return true;
   }
