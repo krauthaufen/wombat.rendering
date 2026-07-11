@@ -59,6 +59,12 @@ export interface RuntimeContext {
    * compiled against this context. Default unset → adapter limit.
    */
   readonly maxChunkBytes?: number;
+  /** Pre-size heap arena chunks (bytes) — see `BuildHeapSceneOptions.initialArenaBytes`. */
+  readonly initialArenaBytes?: number;
+  /** Heap arena compaction toggle — see `BuildHeapSceneOptions.enableCompaction`. */
+  readonly enableCompaction?: boolean;
+  /** Compaction waste floor (bytes) — see `BuildHeapSceneOptions.compactionWasteFloorBytes`. */
+  readonly compactionWasteFloorBytes?: number;
 }
 
 class RenderTask implements IRenderTask {
@@ -262,6 +268,9 @@ class RenderTask implements IRenderTask {
         ...(this.ctx.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
         ...(this.ctx.enableDerivedUniforms === false ? { enableDerivedUniforms: false } : {}),
         ...(this.ctx.maxChunkBytes !== undefined ? { maxChunkBytes: this.ctx.maxChunkBytes } : {}),
+        ...(this.ctx.initialArenaBytes !== undefined ? { initialArenaBytes: this.ctx.initialArenaBytes } : {}),
+        ...(this.ctx.enableCompaction !== undefined ? { enableCompaction: this.ctx.enableCompaction } : {}),
+        ...(this.ctx.compactionWasteFloorBytes !== undefined ? { compactionWasteFloorBytes: this.ctx.compactionWasteFloorBytes } : {}),
       });
       this._scenes.set(cmd, s);
     }

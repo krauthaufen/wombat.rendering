@@ -47,6 +47,21 @@ export interface RuntimeOptions {
    * from a demo / test to exercise multi-chunk routing.
    */
   readonly maxChunkBytes?: number;
+  /**
+   * Pre-size heap arena chunks (bytes) — threaded into
+   * `BuildHeapSceneOptions.initialArenaBytes`. Streaming apps should pass
+   * their expected working-set size to avoid pow2 grow-copies (full-arena
+   * GPU copy + bind-group rebuilds) mid-navigation.
+   */
+  readonly initialArenaBytes?: number;
+  /**
+   * Heap arena compaction toggle — threaded into
+   * `BuildHeapSceneOptions.enableCompaction`. Streaming apps with steady
+   * churn may prefer `false` to guarantee no mid-frame compaction bounce.
+   */
+  readonly enableCompaction?: boolean;
+  /** Waste floor (bytes) before compaction triggers — see `BuildHeapSceneOptions`. */
+  readonly compactionWasteFloorBytes?: number;
 }
 
 /**
@@ -84,6 +99,9 @@ export class Runtime {
       ...(opts.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
       ...(opts.enableDerivedUniforms === false ? { enableDerivedUniforms: false } : {}),
       ...(opts.maxChunkBytes !== undefined ? { maxChunkBytes: opts.maxChunkBytes } : {}),
+      ...(opts.initialArenaBytes !== undefined ? { initialArenaBytes: opts.initialArenaBytes } : {}),
+      ...(opts.enableCompaction !== undefined ? { enableCompaction: opts.enableCompaction } : {}),
+      ...(opts.compactionWasteFloorBytes !== undefined ? { compactionWasteFloorBytes: opts.compactionWasteFloorBytes } : {}),
     };
     // `device.lost` is a real-WebGPU promise; mock devices may not
     // expose it. Treat as "never lost" in that case.

@@ -92,6 +92,12 @@ export interface CompileHybridSceneOptions {
    * massive workloads.
    */
   readonly maxChunkBytes?: number;
+  /** Pre-size heap arena chunks (bytes) — pass-through to `BuildHeapSceneOptions.initialArenaBytes`. */
+  readonly initialArenaBytes?: number;
+  /** Heap arena compaction toggle — pass-through to `BuildHeapSceneOptions.enableCompaction`. */
+  readonly enableCompaction?: boolean;
+  /** Compaction waste floor (bytes) — pass-through to `BuildHeapSceneOptions.compactionWasteFloorBytes`. */
+  readonly compactionWasteFloorBytes?: number;
 }
 
 export interface HybridScene {
@@ -259,6 +265,9 @@ export function compileHybridScene(
     ...(opts.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
     ...(opts.enableDerivedUniforms === false ? { enableDerivedUniforms: false } : {}),
     ...(opts.maxChunkBytes !== undefined ? { maxChunkBytes: opts.maxChunkBytes } : {}),
+    ...(opts.initialArenaBytes !== undefined ? { initialArenaBytes: opts.initialArenaBytes } : {}),
+    ...(opts.enableCompaction !== undefined ? { enableCompaction: opts.enableCompaction } : {}),
+    ...(opts.compactionWasteFloorBytes !== undefined ? { compactionWasteFloorBytes: opts.compactionWasteFloorBytes } : {}),
   });
 
   // ─── Legacy subset → RenderTree → ScenePass ──────────────────────
