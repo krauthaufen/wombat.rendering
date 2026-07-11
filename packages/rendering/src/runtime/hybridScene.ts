@@ -281,7 +281,12 @@ export function compileHybridScene(
 
   return {
     update(token: AdaptiveToken): void {
+      // Batch all of this frame's atlas uploads (tile ingest during
+      // heapScene.update → pool.acquire) into ONE queue submission —
+      // per-tile submits stall multi-frame when several tiles land at once.
+      atlasPool.beginUploadBatch();
       heapScene.update(token);
+      atlasPool.flushUploadBatch();
       scenePass.update(token);
     },
     encodeComputePrep(enc: GPUCommandEncoder, token: AdaptiveToken): void {

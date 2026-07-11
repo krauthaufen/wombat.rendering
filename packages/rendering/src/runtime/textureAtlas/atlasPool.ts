@@ -33,7 +33,10 @@ import { V2f, V2i } from "@aardworx/wombat.base";
 import { type aval, HashTable } from "@aardworx/wombat.adaptive";
 import type { ITexture, HostTextureSource } from "../../core/texture.js";
 import { TexturePacking } from "./packer.js";
-import { buildMipsAndGutterOnGpu, buildMipsAndGutterFromTexture, type MipSlot } from "./atlasMipGutterKernel.js";
+import {
+  buildMipsAndGutterOnGpu, buildMipsAndGutterFromTexture, type MipSlot,
+  beginMipGutterBatch, submitMipGutterBatch, type MipGutterBatch,
+} from "./atlasMipGutterKernel.js";
 
 export const ATLAS_PAGE_SIZE = 4096;
 /** Tier S/M source-side dimension cap. */
@@ -675,6 +678,27 @@ export class AtlasPool {
     this.lru.clear();
   }
 
+  // ── shared-encoder upload batching ─────────────────────────────────
+  // While a batch is open, per-tile kernel work encodes into ONE encoder
+  // and `flushUploadBatch` submits once — per-tile submits were measured
+  // as multi-frame stalls when several tiles land per frame (mobile GPUs,
+  // large photogrammetry textures). Callers that never open a batch keep
+  // the old immediate-submit behavior.
+  private uploadBatch: MipGutterBatch | null = null;
+
+  /** Open (or keep) a shared upload batch. Pair with `flushUploadBatch`. */
+  beginUploadBatch(): void {
+    if (this.uploadBatch === null) this.uploadBatch = beginMipGutterBatch(this.device);
+  }
+
+  /** Submit all batched uploads in one queue submission. */
+  flushUploadBatch(): void {
+    if (this.uploadBatch !== null) {
+      submitMipGutterBatch(this.device, this.uploadBatch);
+      this.uploadBatch = null;
+    }
+  }
+
   private finalize(
     aval: aval<ITexture>,
     format: AtlasPageFormat,
@@ -804,8 +828,10 @@ export class AtlasPool {
             this.device, page.texture,
             boundsX, boundsY, reservedW, reservedH,
             staging, w, h, slots,
+            this.uploadBatch ?? undefined,
           );
-          void this.device.queue.onSubmittedWorkDone().then(() => staging.destroy());
+          if (this.uploadBatch !== null) this.uploadBatch.trashTextures.push(staging);
+          else void this.device.queue.onSubmittedWorkDone().then(() => staging.destroy());
           return;
         } catch {
           // Source not in a copyable state (e.g. a not-ready video) —

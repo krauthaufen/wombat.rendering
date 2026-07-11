@@ -185,6 +185,44 @@ export interface MipSlot {
   readonly size:   { w: number; h: number };
 }
 
+/**
+ * Shared-encoder batch for atlas uploads: many tiles' mip/gutter kernels
+ * encode into ONE command encoder and submit ONCE — per-tile submits (2 per
+ * tile: the implicit copyExternalImageToTexture + a dedicated kernel submit)
+ * were measured as multi-frame stalls when several tiles land per frame on
+ * mobile GPUs. Resources pushed to `trash`/`trashTextures` are destroyed
+ * once the single submission completes.
+ */
+export interface MipGutterBatch {
+  readonly enc: GPUCommandEncoder;
+  readonly trash: GPUBuffer[];
+  readonly trashTextures: GPUTexture[];
+  /** encoded job count (empty batches skip the submit entirely) */
+  jobs: number;
+}
+
+export function beginMipGutterBatch(device: GPUDevice): MipGutterBatch {
+  return {
+    enc: device.createCommandEncoder({ label: "atlas/mipGutterBatch" }),
+    trash: [], trashTextures: [], jobs: 0,
+  };
+}
+
+export function submitMipGutterBatch(device: GPUDevice, batch: MipGutterBatch): void {
+  if (batch.jobs === 0) {
+    // nothing encoded — still finish the encoder to release it
+    batch.enc.finish();
+    for (const t of batch.trashTextures) t.destroy();
+    for (const b of batch.trash) b.destroy();
+    return;
+  }
+  device.queue.submit([batch.enc.finish()]);
+  void device.queue.onSubmittedWorkDone().then(() => {
+    for (const t of batch.trashTextures) t.destroy();
+    for (const b of batch.trash) b.destroy();
+  });
+}
+
 /** How mip-0's interior pixels get into the scratch buffer. */
 type Mip0Source =
   // The caller already filled the buffer's mip-0 region at creation
@@ -216,12 +254,15 @@ function runMipGutter(
   srcW: number, srcH: number,
   mips: readonly MipSlot[],
   mip0Src: Mip0Source,
+  batch?: MipGutterBatch,
 ): void {
   const k = getKernel(device);
   const bufStrideU32 = rowBytes / 4;
   const mip0 = mips[0]!;
 
-  const enc = device.createCommandEncoder({ label: "atlas/mipGutterKernel" });
+  const enc = batch !== undefined
+    ? batch.enc
+    : device.createCommandEncoder({ label: "atlas/mipGutterKernel" });
 
   const ubos: GPUBuffer[] = [];
   const makeUbo = (
@@ -312,6 +353,12 @@ function runMipGutter(
     { width: boundsW, height: boundsH, depthOrArrayLayers: 1 },
   );
 
+  if (batch !== undefined) {
+    batch.jobs++;
+    batch.trash.push(scratch, ...ubos);
+    return; // caller submits the shared encoder once per frame
+  }
+
   device.queue.submit([enc.finish()]);
 
   // Lifetime: destroy scratch + per-pass UBOs once submitted work is
@@ -348,6 +395,7 @@ export function buildMipsAndGutterOnGpu(
   srcPixels: Uint8Array,
   srcW: number, srcH: number,
   mips: readonly MipSlot[],
+  batch?: MipGutterBatch,
 ): void {
   if (mips.length === 0) return;
   const { rowBytes, bufSize } = scratchGeom(boundsW, boundsH);
@@ -382,7 +430,7 @@ export function buildMipsAndGutterOnGpu(
 
   runMipGutter(
     device, page, subRectX, subRectY, boundsW, boundsH,
-    rowBytes, scratch, srcW, srcH, mips, { kind: "prefilled" },
+    rowBytes, scratch, srcW, srcH, mips, { kind: "prefilled" }, batch,
   );
 }
 
@@ -408,6 +456,7 @@ export function buildMipsAndGutterFromTexture(
   srcTex: GPUTexture,
   srcW: number, srcH: number,
   mips: readonly MipSlot[],
+  batch?: MipGutterBatch,
 ): void {
   if (mips.length === 0) return;
   const { rowBytes, bufSize } = scratchGeom(boundsW, boundsH);
@@ -418,6 +467,6 @@ export function buildMipsAndGutterFromTexture(
   });
   runMipGutter(
     device, page, subRectX, subRectY, boundsW, boundsH,
-    rowBytes, scratch, srcW, srcH, mips, { kind: "texture", tex: srcTex },
+    rowBytes, scratch, srcW, srcH, mips, { kind: "texture", tex: srcTex }, batch,
   );
 }
