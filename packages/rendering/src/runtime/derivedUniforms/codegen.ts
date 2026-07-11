@@ -113,12 +113,26 @@ fn quick_two_sum(a: f32, b: f32) -> vec2<f32> {
   let t = fma(Count.one, s, -a);
   return vec2<f32>(s, fma(Count.one, b, -t));
 }
+// Veltkamp split with LAUNDERED halves. The laundering is load-bearing on
+// two fronts: Apple's fast-math distributes Dekker's partial products into
+// exact symbolic cancellation (err ≡ a*b - p ≡ 0) unless the halves are
+// opaque; and an fma-based two_prod (err = fma(a,b,-p)) is NOT an option —
+// Qualcomm Adreno and Intel Xe lower fma() to an unfused multiply-add,
+// which makes that error term exactly zero. Laundered Dekker needs no fma
+// at all, so it is exact on every backend probed (NVIDIA/Vulkan, Apple
+// M-series/Metal, Adreno/Android, Intel Xe/D3D).
+fn lsplit12(a: f32) -> vec2<f32> {
+  // 12/12 mantissa split (11 explicit + implicit high bits): every partial
+  // product below is <= 24 bits, i.e. exactly representable in f32.
+  let hi = bitcast<f32>(bitcast<u32>(a) & 0xFFFFF000u);
+  return vec2<f32>(ln_(hi), ln_(a - hi));
+}
 fn two_prod(a: f32, b: f32) -> vec2<f32> {
-  // fma IS the exact product error; laundering p hides the a*b - a*b
-  // cancellation from fast-math. Replaces the Veltkamp/Dekker split
-  // (whose partial products Apple's compiler distributes away).
-  let p = ln_(a * b);
-  return vec2<f32>(p, fma(a, b, Count.negOne * p));
+  let p = a * b;
+  let A = lsplit12(a);
+  let B = lsplit12(b);
+  let err = ((A.x * B.x - p) + A.x * B.y + A.y * B.x) + A.y * B.y;
+  return vec2<f32>(p, err);
 }
 fn df_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
   let s = two_sum(a.x, b.x);
