@@ -93,6 +93,39 @@ describe("GPU transform propagation — modelChain (real GPU)", () => {
     scene.dispose(); heap.destroy();
   });
 
+  it("df32 survives planet-scale magnitudes (ECEF): ModelView abs error < 1mm", async () => {
+    const device = await requestRealDevice();
+    const scene = new DerivedUniformsScene(device);
+    const heap = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    scene.setMainHeapForChunk(0, () => heap);
+
+    // Innsbruck-scale ECEF: model carries a 4.7e6 m translation; the camera
+    // sits ~110 m away, so the composed ModelView is eye-relative (entries
+    // ≤ a few hundred). A correct df32 chain keeps absolute error ≪ 1 mm;
+    // a chain that degrades to f32 shows ~0.3–0.5 m (the observed wobble).
+    const tileT = new V3d(4250557, 857436, 4662583);
+    // mul is "a then b": rotate locally FIRST, then translate to the tile.
+    const model = Trafo3d.rotation(new V3d(0, 0, 1), 0.3).mul(Trafo3d.translation(tileT));
+    const eyeT = Trafo3d.translation(new V3d(-(tileT.x + 80), -(tileT.y - 50), -(tileT.z + 60)));
+    const view = eyeT.mul(Trafo3d.rotation(new V3d(0, 1, 0), 0.7));
+    registerRoDerivations(scene, {}, baseReq({
+      rules: new Map([["ModelViewTrafo", STANDARD_DERIVED_RULES.get("ModelViewTrafo")!]]),
+      modelChain: [AVal.constant(model)],
+      trafoAvals: new Map([["View", AVal.constant(view)]]),
+      outputOffset: (n) => (n === "ModelViewTrafo" ? 0 : undefined),
+    }));
+    runFrame(scene, device);
+
+    const got = await readFloats(device, heap, 0, 16);
+    const want = view.forward.mul(model.forward);
+    const w = [want.M00, want.M01, want.M02, want.M03, want.M10, want.M11, want.M12, want.M13,
+               want.M20, want.M21, want.M22, want.M23, want.M30, want.M31, want.M32, want.M33];
+    for (let i = 0; i < 16; i++) {
+      expect(Math.abs(got[i]! - w[i]!)).toBeLessThanOrEqual(1e-3);
+    }
+    scene.dispose(); heap.destroy();
+  });
+
   it("shared root → root change marks O(1) slots; all Models update", async () => {
     const device = await requestRealDevice();
     const scene = new DerivedUniformsScene(device);

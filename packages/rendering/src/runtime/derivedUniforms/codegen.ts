@@ -90,7 +90,13 @@ function classify(entry: RuleEntry): Shape {
 
 const DF32_LIB = /* wgsl */ `
 fn split12(a: f32) -> vec2<f32> {
-  let hi = bitcast<f32>(bitcast<u32>(a) & 0xFFFFE000u);
+  // Veltkamp split for f32 (p=24): clear the LOW 12 mantissa bits so hi has
+  // 12 significant bits (11 explicit + implicit) and lo = a - hi has <= 12.
+  // Every partial product in two_prod is then <= 24 bits, i.e. EXACT.
+  // (Clearing 13 bits gave an 11/13 split: lo*lo needs 26 bits, rounding the
+  // error term and capping the whole df32 chain at ~2^-26 relative — the
+  // planet-scale mm-wobble.)
+  let hi = bitcast<f32>(bitcast<u32>(a) & 0xFFFFF000u);
   return vec2<f32>(hi, a - hi);
 }
 fn two_sum(a: f32, b: f32) -> vec2<f32> {
