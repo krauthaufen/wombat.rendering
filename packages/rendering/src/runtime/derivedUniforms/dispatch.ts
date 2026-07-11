@@ -85,6 +85,12 @@ class RecordsGpu {
       size: 16, // uniform min binding size
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+    // Fields 1..3 are DF32_LIB's fast-math guards (see codegen.ts): zeroBits,
+    // one, negOne — runtime values the shader compiler cannot constant-fold.
+    const init = new ArrayBuffer(16);
+    new Uint32Array(init, 0, 2).set([0, 0]); // count, zeroBits
+    new Float32Array(init, 8, 2).set([1.0, -1.0]); // one, negOne
+    device.queue.writeBuffer(this.countBuf, 0, init);
   }
 
   /** Re-upload the packed record data if it changed since last sync, and refresh `Count`. */

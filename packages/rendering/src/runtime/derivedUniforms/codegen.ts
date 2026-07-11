@@ -88,36 +88,37 @@ function classify(entry: RuleEntry): Shape {
 
 // ─── WGSL fragments ───────────────────────────────────────────────────
 
+// Error-free transforms survive ONLY if the compiler cannot see their
+// algebra: WebKit's WGSL→MSL path compiles with fast-math, which folds
+// (a+b)-a → b (two_sum dies) and distributes Dekker's split products into
+// exact cancellation (two_prod dies) — df32 silently degrades to f32, the
+// planet-scale 0.25m wobble on iOS. Desktop drivers fold the naked forms
+// too. Defense: the EFT-critical constants 1/-1/0 come from the `Count`
+// uniform, whose contents no shader compiler can constant-fold; validated
+// per-primitive on Apple M-series + NVIDIA/Vulkan (df32-probe, variant J).
 const DF32_LIB = /* wgsl */ `
-fn split12(a: f32) -> vec2<f32> {
-  // Veltkamp split for f32 (p=24): clear the LOW 12 mantissa bits so hi has
-  // 12 significant bits (11 explicit + implicit) and lo = a - hi has <= 12.
-  // Every partial product in two_prod is then <= 24 bits, i.e. EXACT.
-  // (Clearing 13 bits gave an 11/13 split: lo*lo needs 26 bits, rounding the
-  // error term and capping the whole df32 chain at ~2^-26 relative — the
-  // planet-scale mm-wobble.)
-  let hi = bitcast<f32>(bitcast<u32>(a) & 0xFFFFF000u);
-  return vec2<f32>(hi, a - hi);
-}
+// launder: value-preserving, but an opaque integer op the optimizer
+// cannot trace through (Count.zeroBits == 0 at runtime).
+fn ln_(x: f32) -> f32 { return bitcast<f32>(bitcast<u32>(x) ^ Count.zeroBits); }
 fn two_sum(a: f32, b: f32) -> vec2<f32> {
   let s  = a + b;
-  let bb = fma(1.0, s, -a);
-  let t1 = fma(1.0, s, -bb);
-  let t2 = fma(1.0, a, -t1);
-  let t3 = fma(1.0, b, -bb);
+  let bb = fma(Count.one, s, -a);
+  let t1 = fma(Count.one, s, -bb);
+  let t2 = fma(Count.one, a, -t1);
+  let t3 = fma(Count.one, b, -bb);
   return vec2<f32>(s, t2 + t3);
 }
 fn quick_two_sum(a: f32, b: f32) -> vec2<f32> {
   let s = a + b;
-  let t = fma(1.0, s, -a);
-  return vec2<f32>(s, fma(1.0, b, -t));
+  let t = fma(Count.one, s, -a);
+  return vec2<f32>(s, fma(Count.one, b, -t));
 }
 fn two_prod(a: f32, b: f32) -> vec2<f32> {
-  let p = a * b;
-  let A = split12(a);
-  let B = split12(b);
-  let err = ((A.x * B.x - p) + A.x * B.y + A.y * B.x) + A.y * B.y;
-  return vec2<f32>(p, err);
+  // fma IS the exact product error; laundering p hides the a*b - a*b
+  // cancellation from fast-math. Replaces the Veltkamp/Dekker split
+  // (whose partial products Apple's compiler distributes away).
+  let p = ln_(a * b);
+  return vec2<f32>(p, fma(a, b, Count.negOne * p));
 }
 fn df_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
   let s = two_sum(a.x, b.x);
@@ -171,7 +172,7 @@ function bindings(strideU32: number): string {
 @group(0) @binding(0) var<storage, read_write> Constituents: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read_write> MainHeap:     array<f32>;
 @group(0) @binding(2) var<storage, read>       RecordData:   array<u32>;
-struct CountUniform { count: u32 }
+struct CountUniform { count: u32, zeroBits: u32, one: f32, negOne: f32 }
 @group(0) @binding(3) var<uniform>             Count: CountUniform;
 
 const RECORD_STRIDE: u32 = ${strideU32 >>> 0}u;
