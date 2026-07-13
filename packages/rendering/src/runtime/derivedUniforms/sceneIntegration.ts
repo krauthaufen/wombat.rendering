@@ -274,14 +274,19 @@ export class TrafoTree {
     this.byKey.set(key, node);
     const h = (s: number): number => makeHandle(SlotTag.Constituent, s);
     const recs = this.scene.chainRecordsFor(level);
-    // node.world.fwd = link.fwd · parent.world.fwd  (just link at the root end).
-    // node.world.inv = parent.world.inv · link.inv  (reversed; just link at root).
+    // node.world.fwd = parent.world.fwd · link.fwd  (just link at the root end):
+    // deeper links sit on the RIGHT so they hit the column vector FIRST —
+    // p' = root · … · leaf · p, the scene-graph inner-first contract. (The
+    // previous `link · parent` order applied ancestors first, which put nested
+    // child trafos in WORLD space — invisible for the ubiquitous single-link
+    // chains, wrong for e.g. a translate under an adaptive billboard trafo.)
+    // node.world.inv = link.inv · parent.world.inv  (reversed accordingly).
     if (parent === undefined) {
       recs.add(node, CHAIN_RULE_ID, h(modelPair.fwd), [1, h(link.fwd)]);
       recs.add(node, CHAIN_RULE_ID, h(modelPair.inv), [1, h(link.inv)]);
     } else {
-      recs.add(node, CHAIN_RULE_ID, h(modelPair.fwd), [2, h(link.fwd), h(parent.modelPair.fwd)]);
-      recs.add(node, CHAIN_RULE_ID, h(modelPair.inv), [2, h(parent.modelPair.inv), h(link.inv)]);
+      recs.add(node, CHAIN_RULE_ID, h(modelPair.fwd), [2, h(parent.modelPair.fwd), h(link.fwd)]);
+      recs.add(node, CHAIN_RULE_ID, h(modelPair.inv), [2, h(link.inv), h(parent.modelPair.inv)]);
     }
     return node;
   }
