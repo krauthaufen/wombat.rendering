@@ -350,6 +350,14 @@ interface Bucket {
   readonly slots: BucketSlot[];
   /** Repointed by `rebuildBindGroups` whenever any backing GrowBuffer reallocates. */
   bindGroup: GPUBindGroup;
+  /** Scene-shared user storage buffers (layout.storageBindings), set on the
+   *  first addDraw that supplies them. */
+  storageBuffers: ReadonlyMap<string, aval<IBuffer>> | undefined;
+  /** Set when a storage aval marks (e.g. the OIT head buffer reallocating on
+   *  resize) — update() rebuilds this bucket's slot bind groups. */
+  storageDirty: boolean;
+  /** Disposers for the storage avals' marking subscriptions. */
+  storageSubs: (() => void)[];
 
   // Per-bucket buffers
   readonly drawHeap: DrawHeap;
@@ -579,6 +587,14 @@ export interface HeapDrawSpec {
    * alongside the effect id.
    */
   readonly textures?: HeapTextureSet;
+  /**
+   * Scene-shared storage buffers for effects that declare
+   * `var<storage>` bindings (e.g. the OIT node pool injected by the
+   * transparency task). Bound ONCE at bucket level — every RO in a
+   * bucket must supply the SAME avals (they are scene-level by
+   * construction). Buffers must be GPU-backed IBuffers.
+   */
+  readonly storageBuffers?: ReadonlyMap<string, aval<IBuffer>>;
   /**
    * Optional pipeline state (rasterizer / depth / blend). Two specs
    * sharing the SAME `PipelineState` object share a bucket; distinct
@@ -1516,6 +1532,19 @@ export function buildHeapScene(
   // that don't yet point at an allocated AtlasPage. WebGPU rejects
   // bind-group entries with `undefined` resources, so every slot in
   // the N-wide ladder must hold a valid view at all times.
+  // 4-byte placeholder storage buffer — binds user-storage slots on the
+  // seed bind group built before the first addDraw delivers the real
+  // buffers (rebuilt immediately after).
+  let storagePlaceholder: GPUBuffer | undefined;
+  function getStoragePlaceholder(): GPUBuffer {
+    if (storagePlaceholder === undefined) {
+      storagePlaceholder = device.createBuffer({
+        label: "heapScene/storagePlaceholder", size: 4, usage: GPUBufferUsage.STORAGE,
+      });
+    }
+    return storagePlaceholder;
+  }
+
   let atlasPlaceholders: Map<AtlasPageFormat, GPUTextureView> | undefined;
   function getAtlasPlaceholder(format: AtlasPageFormat): GPUTextureView {
     if (atlasPlaceholders === undefined) {
@@ -1546,6 +1575,7 @@ export function buildHeapScene(
     const key =
       `t${layout.textureBindings.map(t => t.wgslType).join(",")}` +
       `|s${layout.samplerBindings.map(s => s.wgslType).join(",")}` +
+      `|sb${layout.storageBindings.map(b => `${b.binding}${b.access === "read_write" ? "w" : "r"}`).join(",")}` +
       `|a${withAtlasArrays ? 1 : 0}`;
     let e = bglCache.get(key);
     if (e !== undefined) return e;
@@ -1574,6 +1604,14 @@ export function buildHeapScene(
       entries.push({
         binding: s.binding, visibility: GPUShaderStage.FRAGMENT,
         sampler: { type: s.wgslType === "sampler_comparison" ? "comparison" : "filtering" },
+      });
+    }
+    for (const sb of layout.storageBindings) {
+      // FRAGMENT only: WebGPU forbids writable storage in vertex stages,
+      // and the OIT writers are fragment-side anyway.
+      entries.push({
+        binding: sb.binding, visibility: GPUShaderStage.FRAGMENT,
+        buffer: { type: sb.access === "read_write" ? "storage" : "read-only-storage" },
       });
     }
     if (withAtlasArrays) {
@@ -2085,6 +2123,23 @@ export function buildHeapScene(
       // are served via the binding_array path instead). Nothing to push
       // here — the atlas slots come from the per-format page tracking
       // below.
+    }
+    for (const sb of bucket.layout.storageBindings) {
+      const av = bucket.storageBuffers?.get(sb.name);
+      if (av === undefined) {
+        // Buffers arrive with the first addDraw; the seed slot built at
+        // bucket creation is rebuilt right after they land. Bind a
+        // 4-byte placeholder so the seed bind group validates.
+        entries.push({ binding: sb.binding, resource: { buffer: getStoragePlaceholder() } });
+        continue;
+      }
+      const ib = av.force(/* allow-force */);
+      if (ib.kind !== "gpu") {
+        throw new Error(
+          `heapScene: user storage buffer '${sb.name}' must be a GPU-backed IBuffer`,
+        );
+      }
+      entries.push({ binding: sb.binding, resource: { buffer: ib.buffer } });
     }
     if (bucket.isAtlasBucket) {
       if (atlasPool === undefined) {
@@ -3028,6 +3083,7 @@ export function buildHeapScene(
     layout.drawHeaderFields.forEach((f, i) => fieldIdx.set(f.name, i));
     const bucket: Bucket = {
       label: bk, textures: undefined, layout, chunkIdx,
+      storageBuffers: undefined, storageDirty: false, storageSubs: [],
       slots: [],  // populated lazily by ensureSlot per modeKey
       bindGroup: null as unknown as GPUBindGroup,  // legacy field; slot.bindGroup is the real one
       drawHeap,
@@ -3354,6 +3410,28 @@ export function buildHeapScene(
             : arena.attrs.openPage();
     }
     const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, chunkIdx, precomputedDescriptor);
+    // User storage buffers (layout.storageBindings): bucket-level, set once.
+    if (bucket.layout.storageBindings.length > 0 && bucket.storageBuffers === undefined) {
+      if (spec.storageBuffers === undefined) {
+        throw new Error(
+          `heapScene: bucket '${bucket.label}' needs storage buffers ` +
+          `(${bucket.layout.storageBindings.map(b => b.name).join(", ")}) but spec.storageBuffers is undefined`,
+        );
+      }
+      bucket.storageBuffers = spec.storageBuffers;
+      // A storage aval marking (e.g. the OIT head buffer reallocating on a
+      // canvas resize) invalidates every slot bind group of this bucket.
+      for (const av of spec.storageBuffers.values()) {
+        const disposer = (av as unknown as { addMarkingCallback?: (cb: () => void) => () => void })
+          .addMarkingCallback?.(() => { bucket.storageDirty = true; });
+        if (disposer !== undefined) bucket.storageSubs.push(disposer);
+      }
+      // Slots seeded before the buffers were known carry incomplete bind
+      // groups — rebuild them now.
+      for (let i = 0; i < bucket.slots.length; i++) {
+        bucket.slots[i]!.bindGroup = buildBucketBindGroup(bucket, i);
+      }
+    }
     // Phase 5c.3 — every RO carrying a derived-mode rule is registered
     // on the bucket (lazy-promoting it to GPU-routed on the first
     // call). ROs may carry DIFFERENT rules even when they share the
@@ -4258,6 +4336,16 @@ export function buildHeapScene(
     let totalDirtyBytes = 0;
     sceneObj.evaluateAlways(token, (tok) => {
       drainAsetWith(tok);
+
+      // User storage buffers that marked (e.g. the OIT head buffer
+      // reallocating on a resize) invalidate the bucket's bind groups.
+      for (const b of buckets) {
+        if (!b.storageDirty) continue;
+        b.storageDirty = false;
+        for (let i = 0; i < b.slots.length; i++) {
+          b.slots[i]!.bindGroup = buildBucketBindGroup(b, i);
+        }
+      }
 
       // 0. Reactive rebucket: any RO whose PipelineState modeKey
       //    changed since last frame moves to its new bucket.

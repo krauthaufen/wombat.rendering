@@ -75,6 +75,10 @@ export interface HeapEffectSchema {
   readonly fragmentOutputs: readonly { readonly name: string; readonly location: number; readonly wgslType: string }[];
   readonly textures: readonly HeapTextureBinding[];
   readonly samplers: readonly HeapSamplerBinding[];
+  /** User-declared storage buffers (the OIT node pool & co) — bound at
+   *  bucket level from scene-shared avals (`HeapDrawSpec.storageBuffers`).
+   *  Absent/empty for ordinary effects. */
+  readonly storageBuffers?: readonly { readonly name: string; readonly access: "read" | "read_write" }[];
 }
 
 export interface CompiledHeapEffect {
@@ -104,7 +108,7 @@ export interface FragmentOutputLayout {
 // and on quota; every failure simply degrades to "recompute".
 
 /** Cache-generation stamp for the persistent (localStorage) tier. */
-export const HEAP_PERSIST_VERSION = "h4"; // h4: inline PickId drawHeader read (was h3: packed decode arms)
+export const HEAP_PERSIST_VERSION = "h6"; // h6: user storage bindings pinned (keep) + closure-hole resolution in mergeStages
 
 /**
  * Uniforms whose drawHeader word IS the u32 value (no arena
@@ -275,7 +279,11 @@ function buildSchema(iface: ProgramInterface): HeapEffectSchema {
     name: s.name, wgslType: isComparison(s.type) ? "sampler_comparison" : "sampler",
     ...(s.state !== undefined ? { state: s.state } : {}),
   }));
-  return { attributes, uniforms, varyings, fragmentOutputs, textures, samplers };
+  const storageBuffers = iface.storageBuffers.map(sb => ({ name: sb.name, access: sb.access }));
+  return {
+    attributes, uniforms, varyings, fragmentOutputs, textures, samplers,
+    ...(storageBuffers.length > 0 ? { storageBuffers } : {}),
+  };
 }
 
 function irTypeToWgsl(t: IrType): string {
@@ -389,6 +397,15 @@ export interface BucketLayout {
    * `atlasSample(...)` helper for these names only.
    */
   readonly atlasTextureBindings: ReadonlySet<string>;
+  /**
+   * User storage-buffer bindings (allocated from
+   * HEAP_USER_STORAGE_BINDING_BASE, above the atlas range). Bound at
+   * bucket level from `HeapDrawSpec.storageBuffers` — every RO in the
+   * bucket shares the same buffers (they are scene-level injections
+   * like the OIT node pool). FRAGMENT visibility only (WebGPU forbids
+   * writable storage in vertex stages).
+   */
+  readonly storageBindings: readonly { readonly name: string; readonly access: "read" | "read_write"; readonly binding: number }[];
 }
 
 /**
@@ -412,6 +429,8 @@ export const ATLAS_LINEAR_BINDING_BASE = 11;
 export const ATLAS_SRGB_BINDING_BASE = ATLAS_LINEAR_BINDING_BASE + ATLAS_ARRAY_SIZE;
 /** Atlas sampler binding (= linear base + 2N). */
 export const ATLAS_SAMPLER_BINDING = ATLAS_LINEAR_BINDING_BASE + 2 * ATLAS_ARRAY_SIZE;
+/** First user storage-buffer binding (above the whole atlas range). */
+export const HEAP_USER_STORAGE_BINDING_BASE = ATLAS_SAMPLER_BINDING + 1;
 
 export function buildBucketLayout(
   schema: HeapEffectSchema,
@@ -536,10 +555,18 @@ export function buildBucketLayout(
     isAtlasBucket,
   );
 
+  // User storage buffers: deterministic order (by name) starting above
+  // the atlas binding range.
+  let nextStorageBinding = HEAP_USER_STORAGE_BINDING_BASE;
+  const storageBindings = [...(schema.storageBuffers ?? [])]
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    .map(sb => ({ name: sb.name, access: sb.access, binding: nextStorageBinding++ }));
+
   const base = {
     drawHeaderFields, drawHeaderBytes, preludeWgsl, strideU32,
     perInstanceUniforms, perInstanceAttributes,
     textureBindings, samplerBindings, atlasTextureBindings,
+    storageBindings,
   };
   return { id: bucketLayoutId(base), ...base };
 }
@@ -567,6 +594,7 @@ export function bucketLayoutId(l: Omit<BucketLayout, "id">): string {
   parts.push("PIA:" + [...l.perInstanceAttributes].sort().join(","));
   for (const t of l.textureBindings) parts.push(`T:${t.name}|${t.wgslType}|${t.binding}`);
   for (const s of l.samplerBindings) parts.push(`S:${s.name}|${s.wgslType}|${s.binding}`);
+  for (const sb of l.storageBindings) parts.push(`SB:${sb.name}|${sb.access}|${sb.binding}`);
   parts.push("ATB:" + [...l.atlasTextureBindings].sort().join(","));
   // The prelude is derived from the above, but fold its hash in too —
   // cheap insurance against any generator path the field list misses.

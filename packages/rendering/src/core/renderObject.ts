@@ -63,6 +63,15 @@ export interface RenderObject {
   readonly samplers: HashMap<string, aval<ISampler>>;
   /** name → storage buffer source. */
   readonly storageBuffers?: HashMap<string, aval<IBuffer>>;
+  /**
+   * Scene-level INJECTED storage buffers (e.g. the OIT node pool the
+   * transparency task threads into every transparent leaf). Unlike
+   * `storageBuffers`, these do NOT disqualify the RO from the heap
+   * path — the heap binds them once per bucket (they are shared by
+   * construction). The classic path treats them exactly like
+   * `storageBuffers` (leaf-own entries win on name conflict).
+   */
+  readonly injectedStorage?: HashMap<string, aval<IBuffer>>;
 
   /** Index buffer for indexed draws. */
   readonly indices?: BufferView;

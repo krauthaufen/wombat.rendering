@@ -481,6 +481,26 @@ function unionDrawHeaders(
   // descriptor-only purpose of this slice, the per-effect-allocated
   // numbers are retained as-is on each entry.
 
+  // Union user storage-buffer bindings by name (type/access agreement),
+  // keeping the per-effect-allocated binding numbers (all effects allocate
+  // from the same fixed base in the same sorted-by-name order, so shared
+  // names agree; family-merge is disabled in practice anyway).
+  const storageByName = new Map<string, { name: string; access: "read" | "read_write"; binding: number }>();
+  for (const e of sortedEffects) {
+    const layout = perEffectLayout.get(e)!;
+    for (const sb of layout.storageBindings) {
+      const existing = storageByName.get(sb.name);
+      if (existing === undefined) storageByName.set(sb.name, { ...sb });
+      else if (existing.access !== sb.access) {
+        throw new Error(
+          `buildShaderFamily: storage buffer '${sb.name}' has conflicting access ` +
+          `across effects: '${existing.access}' vs '${sb.access}'.`,
+        );
+      }
+    }
+  }
+  const storageBindings = [...storageByName.values()].sort((a, b) => a.binding - b.binding);
+
   const base = {
     drawHeaderFields: fields,
     drawHeaderBytes,
@@ -491,6 +511,7 @@ function unionDrawHeaders(
     textureBindings: orderedTextures,
     samplerBindings: orderedSamplers,
     atlasTextureBindings: atlasUnion,
+    storageBindings,
   };
   return { id: bucketLayoutId(base), ...base };
 }

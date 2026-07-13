@@ -20,7 +20,8 @@
 import { compileModule, stage as makeStage, effect as makeEffect } from "@aardworx/wombat.shader";
 import { isInlineHeaderField } from "./heapEffect.js";
 import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
-import { substituteInputsInStage, readInputs, mapExpr, mapStmt, liftReturns, uniformsToInputs } from "@aardworx/wombat.shader/passes";
+import { substituteInputsInStage, readInputs, mapExpr, mapStmt, liftReturns, uniformsToInputs, resolveHoles } from "@aardworx/wombat.shader/passes";
+import type { HoleValue } from "@aardworx/wombat.shader/passes";
 import { synthesizeHeapDecoderModule } from "./heapDecoder.js";
 import {
   type Module, type Expr, type Stmt, type Type, type ValueDef,
@@ -1020,6 +1021,22 @@ function compileHeapEffectIRViaDecoder(
   // from the carrier varyings the decoder wrote).
   combined = rewriteFsAtlasTexturesViaCarrier(combined, layout);
 
+  // 6b. USER storage buffers (the OIT node pool & co): pin each to the
+  // slot the bucket's BGL committed to. `keep: true` makes the emitter
+  // use it verbatim (and stops `reduceUniforms` dropping an unreferenced
+  // one). Without this the emitter auto-assigns sequentially and collides
+  // with the heap's own reserved bindings.
+  if (layout.storageBindings.length > 0) {
+    const userStorageSlot = new Map(layout.storageBindings.map(b => [b.name, b.binding]));
+    combined = {
+      ...combined,
+      values: combined.values.map(v =>
+        v.kind === "StorageBuffer" && userStorageSlot.has(v.name)
+          ? { ...v, binding: { group: 0, slot: userStorageSlot.get(v.name)! }, keep: true }
+          : v),
+    };
+  }
+
   // 7. Compile.
   const compiled = compileModule(combined, compileOptions);
   if ((globalThis as { __HEAP_DEBUG_FULL__?: boolean }).__HEAP_DEBUG_FULL__) {
@@ -1566,7 +1583,24 @@ function mergeStages(eff: Effect): Module {
   // Combine all stages' templates into one module by concatenating
   // their values + types arrays. The compile pipeline's composeStages
   // pass will fuse same-stage entries afterwards.
+  //
+  // Closure holes are resolved here (per stage, with that stage's
+  // getters) — Effect.compile does this on the classic path, but the
+  // heap pipeline compiles the raw templates directly, and an
+  // unresolved `ReadInput("Closure", …)` emits as a bare identifier
+  // ("unresolved value" at pipeline compile). Constant captures like
+  // an OIT writer's node-pool capacity are the norm in composed
+  // effects.
   const types = eff.stages.flatMap(s => [...s.template.types]);
-  const values = eff.stages.flatMap(s => [...s.template.values]);
+  const values = eff.stages.flatMap(s => {
+    let hasHoles = false;
+    const sampled: Record<string, HoleValue> = {};
+    for (const [name, getter] of Object.entries(s.holes ?? {})) {
+      sampled[name] = getter();
+      hasHoles = true;
+    }
+    const filled = hasHoles ? resolveHoles(s.template, sampled) : s.template;
+    return [...filled.values];
+  });
   return { types, values };
 }

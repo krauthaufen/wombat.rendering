@@ -777,7 +777,7 @@ export function prepareRenderObject(
   }
 
   for (const sb of iface.storageBuffers) {
-    const av = obj.storageBuffers?.tryFind(sb.name);
+    const av = obj.storageBuffers?.tryFind(sb.name) ?? obj.injectedStorage?.tryFind(sb.name);
     if (av === undefined) throw new Error(`prepareRenderObject: missing storage buffer "${sb.name}"`);
     const usage = BufferUsage.STORAGE
       | (sb.access === "read_write" ? BufferUsage.COPY_DST : 0);
