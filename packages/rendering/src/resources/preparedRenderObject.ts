@@ -340,7 +340,8 @@ function buildPipelineForSnap(
         }
       : undefined;
   const desc: CompileRenderPipelineDescription = {
-    ...(ctx.label !== undefined ? { label: ctx.label } : {}),
+    // default label = the effect identity — attributable GPU debugging
+    label: ctx.label ?? `classic/${ctx.effectId ?? "anon"}`,
     ...(ctx.effectId !== undefined ? { effectId: ctx.effectId } : {}),
     vertexShaderSource: ctx.vsSource,
     fragmentShaderSource: ctx.fsSource,
@@ -886,7 +887,10 @@ function mergeUniformInputs(
     // here just as the heap path derives it on the GPU, so the legacy path
     // serves the same declared uniforms.
     const recipe = STANDARD_DERIVED_RULES.get(f.name);
-    if (recipe !== undefined) merged = merged.add(f.name, ruleToAval(recipe, user, bindings));
+    if (recipe !== undefined) { merged = merged.add(f.name, ruleToAval(recipe, user, bindings)); continue; }
+    // An unresolved field stays ZERO in the uniform buffer — silent garbage
+    // transforms/values downstream. Say so once per (block, field).
+    console.warn(`prepareRenderObject: uniform block field "${f.name}" resolves to undefined (buffer stays zero)`);
   }
   return merged;
 }

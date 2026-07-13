@@ -278,6 +278,15 @@ export function compileHybridScene(
   const legacyTree: RenderTree =
     RenderTree.unorderedFromSet(legacyAset.map(ro => RenderTree.leaf(ro)));
   const scenePass = new ScenePass(device, signature, legacyTree, compileEffect);
+  // DEBUG registry: per-hybrid-scene live draw counts (heap vs legacy) so
+  // multi-task pipelines (OIT) can be inspected from the console.
+  const dbgEntry = {
+    sig: signature.colorNames.join("+"),
+    heap: () => heapScene.stats.totalDraws,
+    legacy: () => scenePass.collect().length,
+  };
+  const dbgArr = ((globalThis as any).__hybridScenes ??= []) as (typeof dbgEntry)[];
+  dbgArr.push(dbgEntry);
 
   return {
     update(token: AdaptiveToken): void {

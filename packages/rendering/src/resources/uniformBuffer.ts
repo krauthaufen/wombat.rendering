@@ -99,7 +99,9 @@ class UniformBufferResource extends AdaptiveResource<GPUBuffer> {
       const desc: GPUBufferDescriptor = {
         size: this._scratch.bytes.byteLength,
         usage: BufferUsage.UNIFORM | BufferUsage.COPY_DST,
-        ...(this.label !== undefined ? { label: this.label } : {}),
+        // default label: the block's field names — makes GPU debugging
+        // (writeBuffer interception, buffer inspectors) attributable.
+        label: this.label ?? `ubo{${this.layout.fields.map((f) => f.name).join(",")}}`,
       };
       this._gpu = this.device.createBuffer(desc);
     }

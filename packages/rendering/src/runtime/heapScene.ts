@@ -1688,11 +1688,31 @@ export function buildHeapScene(
     const cached = pipelineByModeKey.get(cacheKey);
     if (cached !== undefined) return cached;
     const { pipelineLayout } = getBgl(layout, isAtlasBucket);
+    // Per-descriptor color targets: blend + write mask come from the RO's
+    // PipelineState (`desc.attachments`, ordered by signature colorNames —
+    // the same values the modeKey encodes). Using the bare scene-level
+    // `colorTargets` here silently dropped blends/write-masks from every
+    // heap pipeline: transparent heap leaves painted opaque, and the OIT
+    // pick passes' write-mask-0 "Colors" leaked color onto the composite.
+    const targets: GPUColorTargetState[] = colorTargets.map((t, i) => {
+      const a = desc.attachments[i];
+      if (a === undefined) return { format: t.format };
+      return {
+        format: t.format,
+        writeMask: a.writeMask,
+        ...(a.enabled
+          ? { blend: {
+                color: { operation: a.color.operation, srcFactor: a.color.srcFactor, dstFactor: a.color.dstFactor },
+                alpha: { operation: a.alpha.operation, srcFactor: a.alpha.srcFactor, dstFactor: a.alpha.dstFactor },
+              } }
+          : {}),
+      };
+    });
     const pipeline = device.createRenderPipeline({
       label: `heapScene/cached/${cacheKey}`,
       layout: pipelineLayout,
       vertex:   { module: fam.vsModule, entryPoint: fam.vsEntryName, buffers: [] },
-      fragment: { module: fam.fsModule, entryPoint: fam.fsEntryName, targets: colorTargets },
+      fragment: { module: fam.fsModule, entryPoint: fam.fsEntryName, targets },
       primitive: { topology: desc.topology, cullMode: desc.cullMode, frontFace: desc.frontFace },
       ...(depthFormat !== undefined && desc.depth !== undefined
         ? { depthStencil: { format: depthFormat, depthWriteEnabled: desc.depth.write, depthCompare: desc.depth.compare } }
