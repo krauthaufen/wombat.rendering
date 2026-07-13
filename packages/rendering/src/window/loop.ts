@@ -131,6 +131,8 @@ export function runFrame(
   let lastTime = performance.now();
   let rafId = 0;
   let pending = false;
+  let consecutiveErrors = 0;
+  const MAX_CONSECUTIVE_ERRORS = 30;
   const UNCAPPED = isUncapped();
 
   // Wrap the frame callback in an AVal so the adaptive system tracks
@@ -143,10 +145,34 @@ export function runFrame(
     attachment.markFrame();
     try {
       frame(token, { frame: frameNo, timestampMs: now, deltaMs: delta });
+      consecutiveErrors = 0;
     } catch (e) {
-      stopped = true;
-      console.error("runFrame: error in frame callback", e);
-      throw e;
+      // A throwing frame used to kill the loop for good. That is far too harsh
+      // for a transient fault (a resource disposed mid-frame, a one-off device
+      // hiccup): the page then looks alive — DOM, input and workers all keep
+      // running — while nothing renders again and any animation driven from the
+      // frame callback freezes. Retry instead, and only give up if the fault
+      // repeats every frame (a genuinely broken scene, which would otherwise
+      // spin the error path forever).
+      consecutiveErrors++;
+      console.error(
+        `runFrame: error in frame callback (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS})`, e,
+      );
+      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        stopped = true;
+        console.error("runFrame: giving up after repeated frame errors — render loop stopped");
+        throw e;
+      }
+      // Keep the loop breathing: schedule the next frame ourselves, since a
+      // frame that died early may not have read the inputs it would be marked
+      // by. Swallow the error rather than rethrowing — an exception escaping
+      // the aval eval leaves the wrapper's dirty state ambiguous, and we have
+      // already reported it.
+      queueMicrotask(() => {
+        if (stopped || pending) return;
+        pending = true;
+        rafId = schedule(tick);
+      });
     }
     frameNo++;
     return frameNo;
@@ -188,8 +214,10 @@ export function runFrame(
     // frame.
     if (opts.pacer !== undefined) {
       opts.pacer().then(finalizeFrame, (e) => {
-        stopped = true;
+        // A rejected pacer (GPU hiccup) must not brick the loop either — the
+        // frame is done as far as we're concerned; carry on.
         console.error("runFrame: pacer rejected", e);
+        finalizeFrame();
       });
     } else {
       finalizeFrame();
