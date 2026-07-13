@@ -108,7 +108,7 @@ export interface FragmentOutputLayout {
 // and on quota; every failure simply degrades to "recompute".
 
 /** Cache-generation stamp for the persistent (localStorage) tier. */
-export const HEAP_PERSIST_VERSION = "h6"; // h6: user storage bindings pinned (keep) + closure-hole resolution in mergeStages
+export const HEAP_PERSIST_VERSION = "h7"; // h7: OIT resolve early-exit
 
 /**
  * Uniforms whose drawHeader word IS the u32 value (no arena
