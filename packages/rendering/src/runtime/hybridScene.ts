@@ -248,12 +248,20 @@ export function compileHybridScene(
   // WeakMap keyed by RO ensures the same RO always maps to the same
   // spec instance, even if the RO migrates out and back in.
   const specCache = new WeakMap<RenderObject, HeapDrawSpec>();
-  const heapSpecAset = heapAset.map((ro: RenderObject) => {
+  // A null spec means "cannot be placed right now" — today: the texture atlas is
+  // full. Such an RO is dropped from this cycle's heap set instead of rendering,
+  // and NOT cached, so the next cycle retries it (by then a released tile will
+  // usually have freed atlas space). It costs a missing tile for a frame or two;
+  // the alternative was an exception in the frame callback, which killed the
+  // render loop outright.
+  const heapSpecAset = heapAset.choose((ro: RenderObject) => {
     let spec = specCache.get(ro);
     if (spec === undefined) {
-      spec = renderObjectToHeapSpec(ro, AdaptiveToken.top, atlasPool, {
+      const built = renderObjectToHeapSpec(ro, AdaptiveToken.top, atlasPool, {
         enableDerivedUniforms: opts.enableDerivedUniforms !== false,
       });
+      if (built === null) return undefined;
+      spec = built;
       specCache.set(ro, spec);
     }
     return spec;

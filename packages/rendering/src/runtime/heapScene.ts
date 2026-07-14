@@ -790,7 +790,7 @@ export type HeapTextureSet =
        * placement for `sourceAval` without holding a direct pool
        * reference.
        */
-      readonly repack?: (newTex: ITexture) => import("./textureAtlas/atlasPool.js").AtlasAcquisition;
+      readonly repack?: (newTex: ITexture) => import("./textureAtlas/atlasPool.js").AtlasAcquisition | null;
       /**
        * Host source captured at adapter time, used by the heap-side
        * re-acquire path when the pool entry was evicted while this spec
@@ -1397,7 +1397,7 @@ export function buildHeapScene(
   interface AtlasAvalRef {
     readonly bucket: Bucket;
     readonly localSlot: number;
-    readonly repack: (newTex: ITexture) => import("./textureAtlas/atlasPool.js").AtlasAcquisition;
+    readonly repack: (newTex: ITexture) => import("./textureAtlas/atlasPool.js").AtlasAcquisition | null;
     readonly sampler: ISampler;
   }
   // Content-keyed (`HashTable`, not a JS `Map`) so distinct
@@ -3684,6 +3684,15 @@ export function buildHeapScene(
               ...(host !== undefined ? { source: { width: reW, height: reH, host } } : {}),
             },
           );
+          // ATLAS FULL (acq === null). Every page is packed with textures still
+          // in use, so this one cannot be re-placed right now. Keep the spec's
+          // existing sub-rect and retry on a later cycle, once a released tile
+          // has freed space: the draw shows a stale texture for a frame or two
+          // instead of the correct one. Previously `acquire` THREW here, the
+          // exception escaped into the render loop's frame callback, and the
+          // whole viewer stopped rendering permanently — taking the tile cut
+          // with it, since the worker's camera is driven from `OnRendered`.
+          if (acq !== null) {
           (spec.textures as { pageId: number }).pageId = acq.pageId;
           (spec.textures as { origin: V2f }).origin = acq.origin;
           (spec.textures as { size: V2f }).size = acq.size;
@@ -3703,6 +3712,7 @@ export function buildHeapScene(
           const retarget = (spec.textures as unknown as { __retarget?: (ref: number) => void }).__retarget;
           if (retarget !== undefined) retarget(acq.ref);
           packAtlasTextureFields(bucket, localSlot, spec.textures);
+          }
         }
       }
       bucket.localAtlasReleases[localSlot] = spec.textures.release;
@@ -4506,6 +4516,9 @@ export function buildHeapScene(
           if (refs === undefined || refs.length === 0) continue;
           const newTex = av.getValue(tok);
           const acq = refs[0]!.repack(newTex);
+          // Atlas full → the texture keeps its current sub-rect this cycle; the
+          // draw shows the previous pixels rather than the pass dying.
+          if (acq === null) continue;
           for (const r of refs) {
             const newTextures: HeapTextureSet & { kind: "atlas" } = {
               kind: "atlas",

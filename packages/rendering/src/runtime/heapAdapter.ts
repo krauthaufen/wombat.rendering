@@ -329,7 +329,13 @@ export function renderObjectToHeapSpec(
   token: AdaptiveToken,
   pool?: AtlasPool,
   opts?: { readonly enableDerivedUniforms?: boolean },
-): HeapDrawSpec {
+  // Returns null when the RO cannot be placed on the heap RIGHT NOW — today
+  // that means the texture atlas is full (every page packed with textures still
+  // in use). The caller drops the draw for this cycle rather than rendering it;
+  // it comes back as soon as atlas space frees. Previously this condition threw,
+  // and the exception escaped into the render loop's frame callback: one full
+  // atlas killed the whole viewer, permanently.
+): HeapDrawSpec | null {
   // 1. Inputs map: vertex attributes (BufferView) + uniforms, pulled
   //    SHADER-DRIVEN from the providers. We compile `ro.effect` (cached
   //    per Effect by the module-level compile cache) to discover the
@@ -490,6 +496,15 @@ export function renderObjectToHeapSpec(
           ...(dims.host !== undefined ? { source: { width: dims.width, height: dims.height, host: dims.host } } : {}),
         },
       );
+      // ATLAS FULL — every page is packed with textures still in use. This is
+      // resource pressure, not a program error: fall out of the atlas branch and
+      // let this leaf take the ordinary (non-atlased) texture binding, which
+      // costs it heap eligibility but keeps it on screen. `acquire` used to
+      // throw here, and the exception escaped into the render loop's frame
+      // callback — one full atlas and the entire viewer stopped rendering,
+      // permanently, taking the tile-cut with it (the worker's camera is fed
+      // from `OnRendered`).
+      if (acq === null) return null;
       const texAvalTyped = texAval as aval<ITexture>;
       // Per-aval shared current-ref cell so all ROs sharing a single
       // `aval<ITexture>` see the same "live" pool ref. After a repack
@@ -529,6 +544,8 @@ export function renderObjectToHeapSpec(
           const next = pool.repack(texAvalTyped, newTex, {
             wantsMips: dims.mipLevelCount > 1,
           });
+          // Atlas full → keep the current sub-rect (stale pixels for now).
+          if (next === null) return null;
           cell.ref = next.ref;
           return next;
         },

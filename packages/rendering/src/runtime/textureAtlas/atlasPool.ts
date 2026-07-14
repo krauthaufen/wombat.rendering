@@ -275,6 +275,15 @@ export class AtlasPool {
    * toggle. With the LRU it fires only on first acquire.
    */
   private readonly lru = new Map<number, AtlasEntry>();
+  /** Formats we've already reported as full (once per format, not per frame). */
+  private readonly fullWarned = new Set<AtlasPageFormat>();
+  /** True while every page of `format` is packed with live (referenced) entries. */
+  isFull(format: AtlasPageFormat): boolean {
+    const pages = this.pagesByFormat.get(format);
+    if (pages === undefined || pages.length < ATLAS_MAX_PAGES_PER_FORMAT) return false;
+    for (const e of this.lru.values()) if (e.format === format) return false; // something is evictable
+    return true;
+  }
   private nextRef = 1;
 
   private innerKeyOf(t: ITexture): GPUTexture | HostTextureSource {
@@ -378,7 +387,9 @@ export class AtlasPool {
     width: number,
     height: number,
     opts: AtlasAcquireOptions = {},
-  ): AtlasAcquisition {
+    // Returns null when the atlas is FULL (every page packed with live
+    // entries). Callers must handle it — see the note at the throw site.
+  ): AtlasAcquisition | null {
     const existing = this.entriesByAval.get(sourceAval);
     if (existing !== undefined) {
       const wasIdle = existing.refcount === 0;
@@ -485,9 +496,27 @@ export class AtlasPool {
 
     // Allocate a fresh page if we haven't hit the max.
     if (pages.length >= ATLAS_MAX_PAGES_PER_FORMAT) {
-      throw new Error(
-        `atlas: ATLAS_MAX_PAGES_PER_FORMAT (${ATLAS_MAX_PAGES_PER_FORMAT}) exceeded for format ${format}`,
-      );
+      // The atlas is genuinely full: every page is packed with entries that are
+      // still referenced, so there is nothing to evict. That is resource
+      // pressure, NOT a program error — and throwing turned it into a fatal
+      // one: the exception escapes into the render loop's frame callback, which
+      // then dies (permanently, before `runFrame` learned to retry; and even
+      // with retries the condition repeats every frame until the loop gives up).
+      // A viewer that streams an unbounded world will hit this, and the right
+      // answer is to skip the texture for now, not to stop rendering.
+      //
+      // The caller decides what "skip" means (see heapScene: the draw is held
+      // back until space frees). We report it once per format so the condition
+      // is visible without spamming a frame-rate-long log.
+      if (!this.fullWarned.has(format)) {
+        this.fullWarned.add(format);
+        console.warn(
+          `atlas: FULL for ${format} — ${pages.length} pages × ${ATLAS_PAGE_SIZE}² all in use ` +
+          `(${this.entriesByRef.size} live entries, ${this.lru.size} evictable). ` +
+          `New textures are deferred until space frees.`,
+        );
+      }
+      return null;
     }
     const pageId = pages.length;
     const page = this.allocatePage(format, pageId);
@@ -531,7 +560,8 @@ export class AtlasPool {
     sourceAval: aval<ITexture>,
     newTexture: ITexture,
     opts: AtlasAcquireOptions = {},
-  ): AtlasAcquisition {
+    // null when the atlas is full — caller keeps its existing sub-rect.
+  ): AtlasAcquisition | null {
     const old = this.entriesByAval.get(sourceAval);
     if (old === undefined) {
       throw new Error("AtlasPool.repack: source aval has no live entry");
@@ -587,6 +617,10 @@ export class AtlasPool {
         : {}),
     };
     const acq = this.acquire(fmt, sourceAval, desc.width, desc.height, acqOpts);
+    // Atlas full: the caller keeps the OLD sub-rect (already freed above is not
+    // possible here — repack only frees after a successful acquire), so the
+    // texture simply doesn't update this cycle.
+    if (acq === null) return null;
 
     // 3. Restore the original refcount (acquire set it to 1).
     const newEntry = this.entriesByRef.get(acq.ref);
