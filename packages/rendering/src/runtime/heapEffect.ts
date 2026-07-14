@@ -109,7 +109,7 @@ export interface FragmentOutputLayout {
 // and on quota; every failure simply degrades to "recompute".
 
 /** Cache-generation stamp for the persistent (localStorage) tier. */
-export const HEAP_PERSIST_VERSION = "h8"; // h8: hole values are part of the cache key
+export const HEAP_PERSIST_VERSION = "h9"; // h9: standalone FS reads the heap directly (one _h_drawIdx varying)
 
 /**
  * Uniforms whose drawHeader word IS the u32 value (no arena

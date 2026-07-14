@@ -22,7 +22,7 @@ import { isInlineHeaderField } from "./heapEffect.js";
 import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
 import { substituteInputsInStage, readInputs, mapExpr, mapStmt, liftReturns, uniformsToInputs, resolveHoles } from "@aardworx/wombat.shader/passes";
 import type { HoleValue } from "@aardworx/wombat.shader/passes";
-import { synthesizeHeapDecoderModule } from "./heapDecoder.js";
+import { synthesizeHeapDecoderModule, HEAP_FS_DRAWIDX, HEAP_FS_INSTID } from "./heapDecoder.js";
 import {
   type Module, type Expr, type Stmt, type Type, type ValueDef,
   type EntryDef, type EntryParameter, type ParamDecoration,
@@ -33,6 +33,7 @@ import {
   generateAtlasBindings, generateAtlasSwitch, generateAtlasPrelude,
   HEAP_PERSIST_VERSION, persistKey, lsLoad, lsStore,
   type BucketLayout,
+  type DrawHeaderField,
 } from "./heapEffect.js";
 import type { IntrinsicRef } from "@aardworx/wombat.shader/ir";
 
@@ -349,6 +350,23 @@ function addInterstageParams(
 }
 
 /**
+ * Declare extra FRAGMENT inputs, leaving the vertex side alone. The decoder
+ * path already writes its carrier on the VS; the FS just needs the matching
+ * declaration to read it.
+ */
+function addFsInputs(m: Module, extras: readonly EntryParameter[]): Module {
+  if (extras.length === 0) return m;
+  const values = m.values.map((v): typeof v => {
+    if (v.kind !== "Entry" || v.entry.stage !== "fragment") return v;
+    const have = new Set(v.entry.inputs.map(p => p.name));
+    const add = extras.filter(p => !have.has(p.name));
+    if (add.length === 0) return v;
+    return { ...v, entry: { ...v.entry, inputs: [...v.entry.inputs, ...add] } };
+  });
+  return { ...m, values };
+}
+
+/**
  * Prepend `stmts` to every VS entry's body. Flatten when the body is
  * already a `Sequential` — CSE numbers `_cse0..N` per Sequential, so
  * nested Sequentials produce colliding declarations in the emitted
@@ -407,7 +425,15 @@ function wgslTypeFromHeapField(wgslType: string): Type {
  * emit `applyFamilyMemberFsShape` rewires the FS entry signature to
  * surface them as plain u32 fn parameters.
  */
-function rewriteFsUniformsDirect(m: Module, layout: BucketLayout): Module {
+function rewriteFsUniformsDirect(
+  m: Module,
+  layout: BucketLayout,
+  // Where the FS gets the per-draw header index from. `family-member` receives
+  // it as a plain u32 fn parameter (a Var); `standalone` reads it from the one
+  // flat varying it threads. Everything else about the direct load is identical.
+  drawIdxExpr: Expr = { kind: "Var", var: { name: "heap_drawIdx", type: Tu32, mutable: false } } as Expr,
+  instIdExpr: Expr = { kind: "Var", var: { name: "instId", type: Tu32, mutable: false } } as Expr,
+): Module {
   const used = new Set<string>();
   for (const v of m.values) {
     if (v.kind !== "Entry" || v.entry.stage !== "fragment") continue;
@@ -418,8 +444,6 @@ function rewriteFsUniformsDirect(m: Module, layout: BucketLayout): Module {
   if (used.size === 0) return m;
 
   const fieldByName = new Map(layout.drawHeaderFields.map(f => [f.name, f]));
-  const drawIdxExpr: Expr = { kind: "Var", var: { name: "heap_drawIdx", type: Tu32, mutable: false } } as Expr;
-  const instIdExpr:  Expr = { kind: "Var", var: { name: "instId",       type: Tu32, mutable: false } } as Expr;
   const fsSubst = new Map<string, Expr>();
   for (const name of used) {
     const f = fieldByName.get(name);
@@ -445,7 +469,11 @@ function rewriteFsUniformsDirect(m: Module, layout: BucketLayout): Module {
  * `heap_drawIdx`. The wrapper-supplied `heap_drawIdx` u32 fn parameter
  * carries the per-draw header index.
  */
-function rewriteFsAtlasTexturesDirect(m: Module, layout: BucketLayout): Module {
+function rewriteFsAtlasTexturesDirect(
+  m: Module,
+  layout: BucketLayout,
+  drawIdxExprIn: Expr = { kind: "Var", var: { name: "heap_drawIdx", type: Tu32, mutable: false } } as Expr,
+): Module {
   if (layout.atlasTextureBindings.size === 0) return m;
   const used = new Set<string>();
   for (const v of m.values) {
@@ -466,7 +494,7 @@ function rewriteFsAtlasTexturesDirect(m: Module, layout: BucketLayout): Module {
     inner.set(sub, byteOffsetOf(f.byteOffset));
   }
 
-  const drawIdxExpr: Expr = { kind: "Var", var: { name: "heap_drawIdx", type: Tu32, mutable: false } } as Expr;
+  const drawIdxExpr: Expr = drawIdxExprIn;
   const stride = layout.strideU32;
   const headerU32At = (offU32: number): Expr =>
     item(headersU32, add(mul(drawIdxExpr, constU32(stride), Tu32), constU32(offU32), Tu32), Tu32);
@@ -497,6 +525,78 @@ function rewriteFsAtlasTexturesDirect(m: Module, layout: BucketLayout): Module {
       return { kind: "CallIntrinsic", op: ATLAS_SAMPLE_INTRINSIC, args, type: Tvec4 };
     }),
   }));
+}
+
+/**
+ * STANDALONE FS heap access — one varying, not N.
+ *
+ * The old standalone path threaded a VS→FS varying per FS-used uniform AND
+ * FOUR per atlas texture (`_h_<t>{PageRef,FormatBits,Origin,Size}`). WebGPU
+ * caps inter-stage variables at 16 locations, so a shader with a handful of
+ * per-draw uniforms and a texture ran into the ceiling — and blowing it does
+ * not fail loudly: the pipeline is created INVALID, which poisons the whole
+ * command buffer, so the entire pass silently disappears. It made the varying
+ * budget a design constraint on every shader written against the heap.
+ *
+ * `family-member` never had this problem: it loads uniforms and atlas headers
+ * straight out of the heap arena in the FS, keyed by the draw index. Standalone
+ * now does the same — it just has to carry the draw index itself, so it threads
+ * exactly ONE flat u32 varying (`_h_drawIdx`), plus `_iidx` when a per-instance
+ * uniform is actually read from the FS. Varying count is now O(1) in the number
+ * of uniforms and textures.
+ *
+ * The trade is per-fragment storage reads instead of per-vertex ones. They are
+ * scalar, flat, and uniform across a draw (so they hit cache), and this is the
+ * path `family-member` has been running in production all along.
+ */
+function rewriteFsHeapDirectStandalone(m: Module, layout: BucketLayout): Module {
+  // What does the FS actually touch?
+  const usedUniforms = new Set<string>();
+  const usedAtlas = new Set<string>();
+  for (const v of m.values) {
+    if (v.kind !== "Entry" || v.entry.stage !== "fragment") continue;
+    for (const sn of readInputs(v.entry.body).values()) {
+      if (sn.scope === "Uniform") usedUniforms.add(sn.name);
+    }
+    visitStmtExprs(v.entry.body, e => {
+      const hit = isAtlasSampleCall(e, layout.atlasTextureBindings);
+      if (hit !== null) usedAtlas.add(hit.name);
+    });
+  }
+  if (usedUniforms.size === 0 && usedAtlas.size === 0) return m;
+
+  // Thread the carrier(s). `_iidx` only when a per-instance uniform is read —
+  // otherwise it is a varying nobody needs.
+  const needsIidx = [...usedUniforms].some(n => layout.perInstanceUniforms.has(n));
+  const threadParams: EntryParameter[] = [{
+    name: "_h_drawIdx", type: Tu32, semantic: "_h_drawIdx",
+    decorations: [{ kind: "Interpolation", mode: "flat" } as ParamDecoration],
+  }];
+  const vsWrites: Stmt[] = [{
+    kind: "WriteOutput", name: "_h_drawIdx",
+    value: { kind: "Expr", value: drawIdxExprFor(layout) },
+  }];
+  if (needsIidx) {
+    threadParams.push({
+      name: "_iidx", type: Tu32, semantic: "_iidx",
+      decorations: [{ kind: "Interpolation", mode: "flat" } as ParamDecoration],
+    });
+    vsWrites.push({
+      kind: "WriteOutput", name: "_iidx",
+      value: { kind: "Expr", value: readScope("Builtin", "instance_index", Tu32) },
+    });
+  }
+
+  const fsDrawIdx = readScope("Input", "_h_drawIdx", Tu32);
+  const fsInstId = readScope("Input", "_iidx", Tu32);
+
+  let out = m;
+  out = addInterstageParams(out, threadParams);
+  out = prependVsBodyStmts(out, vsWrites);
+  // Same loaders the family path uses — only the source of the draw index differs.
+  out = rewriteFsAtlasTexturesDirect(out, layout, fsDrawIdx);
+  out = rewriteFsUniformsDirect(out, layout, fsDrawIdx, fsInstId);
+  return out;
 }
 
 /**
@@ -900,8 +1000,11 @@ export function compileHeapEffectIR(
     combined = rewriteFsAtlasTexturesDirect(combined, layout);
     combined = rewriteFsUniformsDirect(combined, layout);
   } else {
-    combined = rewriteFsAtlasTextures(combined, layout);
-    combined = rewriteFsUniforms(combined, layout);
+    // Standalone reads the heap directly too — it just carries the draw index
+    // in ONE flat varying instead of receiving it as a parameter. (The old
+    // per-uniform / 4-per-texture varying threading is gone: it hit WebGPU's
+    // 16-location inter-stage cap and silently invalidated whole pipelines.)
+    combined = rewriteFsHeapDirectStandalone(combined, layout);
   }
   // Add heap storage buffers as bindings.
   combined = { ...combined, values: [...heapStorageBufferDecls(), ...combined.values] };
@@ -974,6 +1077,67 @@ export function compileHeapEffectIR(
  * No post-emit string mangling — `applyMegacallToEmittedVs` /
  * `applyFamilyMemberShape` are gone for this path.
  */
+/**
+ * FS heap access for the DECODER path: read per-draw uniforms and atlas-texture
+ * headers directly out of the arena, keyed by the draw index the decoder put on
+ * the carrier (`_h_drawIdx`), instead of reading values the decoder pushed
+ * across as one varying each.
+ *
+ * Only `uniform-ref` fields are substituted. `attribute-ref` fields are
+ * per-VERTEX data — they must keep flowing through the carrier, and they were
+ * renamed into `Input` scope by `uniformsToInputs` just like the uniforms, so
+ * the substitution has to be name-driven, not scope-driven.
+ */
+function rewriteFsHeapDirectViaCarrier(m: Module, layout: BucketLayout): Module {
+  const fsDrawIdx = readScope("Input", HEAP_FS_DRAWIDX, Tu32);
+  const fsInstId = readScope("Input", HEAP_FS_INSTID, Tu32);
+
+  // Declare the carrier(s) as FRAGMENT INPUTS. The decoder already writes them
+  // on the vertex side; without the matching input declaration the emitter has
+  // no struct member to resolve the read against (it reaches for the output
+  // struct and the module fails to parse).
+  const fsInputs: EntryParameter[] = [{
+    name: HEAP_FS_DRAWIDX, type: Tu32, semantic: HEAP_FS_DRAWIDX,
+    decorations: [{ kind: "Interpolation", mode: "flat" } as ParamDecoration],
+  }];
+  if (layout.perInstanceUniforms.size > 0) {
+    fsInputs.push({
+      name: HEAP_FS_INSTID, type: Tu32, semantic: HEAP_FS_INSTID,
+      decorations: [{ kind: "Interpolation", mode: "flat" } as ParamDecoration],
+    });
+  }
+  let out = addFsInputs(m, fsInputs);
+
+  // Atlas samples first (they read header sub-fields, not uniform values).
+  out = rewriteFsAtlasTexturesDirect(out, layout, fsDrawIdx);
+
+  // Which per-draw uniforms does the FS still read?
+  const uniformFields = new Map<string, DrawHeaderField>();
+  for (const f of layout.drawHeaderFields) {
+    if (f.kind === "uniform-ref") uniformFields.set(f.name, f);
+  }
+  const used = new Set<string>();
+  for (const v of out.values) {
+    if (v.kind !== "Entry" || v.entry.stage !== "fragment") continue;
+    for (const sn of readInputs(v.entry.body).values()) {
+      if (sn.scope === "Input" && uniformFields.has(sn.name)) used.add(sn.name);
+    }
+  }
+  if (used.size === 0) return out;
+
+  const subst = new Map<string, Expr>();
+  for (const name of used) {
+    const f = uniformFields.get(name)!;
+    const refExpr = loadHeaderRef(fsDrawIdx, f.byteOffset, layout.strideU32);
+    subst.set(name, isInlineHeaderField(f)
+      ? refExpr
+      : layout.perInstanceUniforms.has(name)
+        ? loadInstanceByRef(refExpr, fsInstId, f.uniformWgslType ?? "")
+        : loadUniformByRef(refExpr, f.uniformWgslType ?? ""));
+  }
+  return substituteInputsInStage(out, "fragment", "Input", n => subst.get(n));
+}
+
 function compileHeapEffectIRViaDecoder(
   userEffect: Effect,
   layout: BucketLayout,
@@ -1020,9 +1184,14 @@ function compileHeapEffectIRViaDecoder(
   combined = liftReturns(combined);
   combined = injectVsBuiltins(combined);
 
-  // 6. FS-side atlas rewrite (texture-sample → atlas-sample, reading
-  // from the carrier varyings the decoder wrote).
-  combined = rewriteFsAtlasTexturesViaCarrier(combined, layout);
+  // 6. FS-side heap access. The decoder no longer ships per-draw VALUES across
+  // the stage boundary (that cost one varying per uniform and four per texture,
+  // against WebGPU's 16-location cap — see heapDecoder). It ships the draw
+  // INDEX, and the FS loads what it needs straight from the arena. Whatever the
+  // fragment stage stops reading, `pruneCrossStage` then drops from the carrier
+  // by itself, so the varying count collapses to what genuinely varies per
+  // vertex.
+  combined = rewriteFsHeapDirectViaCarrier(combined, layout);
 
   // 6b. USER storage buffers (the OIT node pool & co): pin each to the
   // slot the bucket's BGL committed to. `keep: true` makes the emitter

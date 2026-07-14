@@ -56,6 +56,11 @@ import {
   headersU32,
 } from "./heapIrBuilders.js";
 
+/** Carrier name for the per-draw header index handed to the FS (flat u32). */
+export const HEAP_FS_DRAWIDX = "_h_drawIdx";
+/** Carrier name for the instance index (only when per-instance uniforms exist). */
+export const HEAP_FS_INSTID = "_h_instId";
+
 // Build an Expr that returns the u32 value of a specific inline u32
 // slot in the drawHeader: `headersU32[drawIdx * stride + offset_u32]`.
 function readHeaderU32(drawIdx: Expr, byteOffset: number, strideU32: number): Expr {
@@ -247,10 +252,47 @@ export function synthesizeHeapDecoderModule(layout: BucketLayout, mode: HeapDeco
     vidExpr     = { kind: "ReadInput", scope: "Input", name: "vid",         type: Tu32 };
   }
 
-  // Walk the bucket layout's drawHeader fields. The order doesn't
-  // matter for correctness — every surfaced name becomes a unique
-  // output and the carrier carries them all.
+  // THE CARRIER CARRIES THE DRAW INDEX, NOT THE DRAW'S VALUES.
+  //
+  // Per-draw uniforms and atlas-texture sub-fields are CONSTANT across a draw:
+  // pushing each of them across the stage boundary as its own flat varying
+  // costs one inter-stage location per uniform and FOUR per texture, and WebGPU
+  // allows only 16 in total. Shaders with a handful of per-draw uniforms plus a
+  // texture ran into that ceiling — and exceeding it does not fail loudly: the
+  // pipeline is created INVALID, which poisons the whole command buffer, so an
+  // entire pass silently vanishes. It made the varying budget a hidden design
+  // constraint on every heap shader.
+  //
+  // So the decoder surfaces the DRAW INDEX (one flat u32) and the FS loads what
+  // it needs straight from the heap arena, exactly as the family-member path
+  // already does. Cost: scalar, flat, draw-uniform storage reads per fragment
+  // instead of per vertex. Varying count is now O(1) in uniforms and textures.
+  //
+  // Per-VERTEX attribute refs are a different animal — they genuinely vary
+  // across the primitive — so they keep their carrier slots below.
   let nextLocation = 0;
+  outputs.push({
+    name: HEAP_FS_DRAWIDX,
+    type: Tu32,
+    semantic: HEAP_FS_DRAWIDX,
+    decorations: [
+      { kind: "Location", value: nextLocation++ },
+      { kind: "Interpolation", mode: "flat" },
+    ],
+  });
+  stmts.push({ kind: "WriteOutput", name: HEAP_FS_DRAWIDX, value: { kind: "Expr", value: drawIdxExpr } });
+  if (layout.perInstanceUniforms.size > 0) {
+    outputs.push({
+      name: HEAP_FS_INSTID,
+      type: Tu32,
+      semantic: HEAP_FS_INSTID,
+      decorations: [
+        { kind: "Location", value: nextLocation++ },
+        { kind: "Interpolation", mode: "flat" },
+      ],
+    });
+    stmts.push({ kind: "WriteOutput", name: HEAP_FS_INSTID, value: { kind: "Expr", value: instIdExpr } });
+  }
   // Texture-ref drawHeader fields are grouped by `textureBindingName` —
   // each atlas-routed texture binding produces four contiguous entries
   // (pageRef / formatBits / origin / size). We emit them as four
