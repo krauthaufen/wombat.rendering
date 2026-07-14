@@ -115,13 +115,20 @@ export function compileRenderPipeline(
 }
 
 function pipelineKey(d: CompileRenderPipelineDescription): string {
-  // Strong identity component: prefer `effectId` (wombat.shader's
-  // build-time stable hash); fall back to FNV-hashing the shader
-  // source for hand-built effects. The rest of the descriptor is
-  // small enough to JSON-stringify.
+  // Identity = effect id AND a fingerprint of the actual source.
+  //
+  // `effectId` is wombat.shader's hash of the effect TEMPLATE — its shape and
+  // types. It is NOT a hash of the emitted code: closure-hole values are
+  // specialised into the source as literals, so one effect id can legitimately
+  // emit different shaders (`const NULLU = 4294967295u` vs another cap, a
+  // baked tint, a compile-time branch). Keying on the id alone handed such an
+  // effect a pipeline built from a PREVIOUS hole value — a stale shader that
+  // silently keeps running. The source hash is what actually distinguishes two
+  // programs, so it always participates; the id stays in the key as a cheap
+  // discriminator (and keeps hash collisions from crossing effects).
   const ident = d.effectId !== undefined
-    ? d.effectId
-    : `${hashString(d.vertexShaderSource)}/${hashString(d.fragmentShaderSource)}`;
+    ? `${d.effectId}/${sourceHash(d.vertexShaderSource)}/${sourceHash(d.fragmentShaderSource)}`
+    : `${sourceHash(d.vertexShaderSource)}/${sourceHash(d.fragmentShaderSource)}`;
   const slim = {
     id: ident,
     vEntry: d.vertexEntryPoint,
@@ -134,6 +141,23 @@ function pipelineKey(d: CompileRenderPipelineDescription): string {
     ms: d.multisample,
   };
   return JSON.stringify(slim);
+}
+
+// Source hashes are memoised: `compileRenderPipeline` runs per prepared render
+// object, and a scene with thousands of them re-presents the SAME source string
+// (out of the effect's compile cache) every time. Hashing a multi-KB shader on
+// each of those would be pure waste; the map lookup is one hash of an already-
+// hashed string instance.
+const sourceHashes = new Map<string, number>();
+function sourceHash(s: string): number {
+  let h = sourceHashes.get(s);
+  if (h === undefined) {
+    h = hashString(s);
+    // Bounded: a pathological generator could otherwise grow this without end.
+    if (sourceHashes.size > 4096) sourceHashes.clear();
+    sourceHashes.set(s, h);
+  }
+  return h;
 }
 
 function hashString(s: string): number {

@@ -16,6 +16,7 @@
 //      attribute reads with heap loads at the IR level.
 
 import type { Effect } from "@aardworx/wombat.shader";
+import { effectHoleKey } from "@aardworx/wombat.shader";
 
 // ─── Schema (extracted from CompiledEffect.interface) ───────────────
 
@@ -108,7 +109,7 @@ export interface FragmentOutputLayout {
 // and on quota; every failure simply degrades to "recompute".
 
 /** Cache-generation stamp for the persistent (localStorage) tier. */
-export const HEAP_PERSIST_VERSION = "h7"; // h7: OIT resolve early-exit
+export const HEAP_PERSIST_VERSION = "h8"; // h8: hole values are part of the cache key
 
 /**
  * Uniforms whose drawHeader word IS the u32 value (no arena
@@ -180,7 +181,13 @@ function isCompiledHeapEffect(v: unknown): v is CompiledHeapEffect {
 }
 
 export function compileHeapEffect(effect: Effect, fragmentOutputLayout?: FragmentOutputLayout): CompiledHeapEffect {
-  const contentKey = effect.id + fboLayoutKey(fragmentOutputLayout);
+  // `effect.id` hashes the TEMPLATE, not the emitted code: closure-hole values
+  // are specialised into the source as literals and do NOT move the id when a
+  // getter's value changes at runtime. Keying only on the id therefore serves
+  // WGSL built from a previous hole value — and because this cache is also
+  // persisted, the stale shader outlives the page. Pair the id with a
+  // fingerprint of the current holes (empty for the hole-free hot path).
+  const contentKey = effect.id + effectHoleKey(effect) + fboLayoutKey(fragmentOutputLayout);
   const mem = _compiledHeapEffectMemCache.get(contentKey);
   if (mem !== undefined) return mem;
   const lsKey = persistKey(HEAP_PERSIST_VERSION, "che", contentKey);

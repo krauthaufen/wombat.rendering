@@ -17,7 +17,7 @@
 // This module knows nothing about the runtime; the BucketLayout it
 // consumes is identical to the one heapScene.ts already builds.
 
-import { compileModule, stage as makeStage, effect as makeEffect } from "@aardworx/wombat.shader";
+import { compileModule, stage as makeStage, effect as makeEffect, effectHoleKey } from "@aardworx/wombat.shader";
 import { isInlineHeaderField } from "./heapEffect.js";
 import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
 import { substituteInputsInStage, readInputs, mapExpr, mapStmt, liftReturns, uniformsToInputs, resolveHoles } from "@aardworx/wombat.shader/passes";
@@ -846,7 +846,10 @@ export function compileHeapEffectIR(
   compileOptions: CompileOptions,
   mode: HeapEffectEmitMode = "standalone",
 ): HeapEffectIR {
-  const contentKey = `${userEffect.id}|${layout.id}|${mode}|${compileOptionsKey(compileOptions)}`;
+  // Hole values are baked into the emitted code but do NOT move `effect.id`
+  // (see compileHeapEffect) — they must be part of the key, memory AND
+  // persisted, or a changed capture silently reuses the old shader.
+  const contentKey = `${userEffect.id}${effectHoleKey(userEffect)}|${layout.id}|${mode}|${compileOptionsKey(compileOptions)}`;
   const mem = _heapIrMemCache.get(contentKey);
   if (mem !== undefined) return mem;
   const lsKey = persistKey(HEAP_PERSIST_VERSION, "ir", contentKey);
