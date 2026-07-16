@@ -48,13 +48,14 @@ const trafoIdentity = { forward: {
 const v3 = (x: number, y: number, z: number) => ({ x, y, z }) as unknown;
 const v4 = (x: number, y: number, z: number, w: number) => ({ x, y, z, w }) as unknown;
 
-import { makeHeapTestEffectTextured } from "./_heapTestEffect.js";
+import { makeHeapTestEffectTextured, makeHeapTestEffectTexturedSize } from "./_heapTestEffect.js";
+import type { Effect } from "@aardworx/wombat.shader";
 
 // One DSL effect shared by every spec — bucket-keying tests that two
 // atlas-variant ROs sharing this effect collapse into one bucket.
 const sharedEffect = makeHeapTestEffectTextured();
 
-function geomSpec(pool: AtlasPool, format: "rgba8unorm" | "rgba8unorm-srgb"): {
+function geomSpec(pool: AtlasPool, format: "rgba8unorm" | "rgba8unorm-srgb", eff: Effect = sharedEffect): {
   spec: HeapDrawSpec; textures: HeapTextureSet & { kind: "atlas" };
 } {
   const tex = ITexture.fromRaw({
@@ -78,7 +79,7 @@ function geomSpec(pool: AtlasPool, format: "rgba8unorm" | "rgba8unorm-srgb"): {
     release: () => pool.release(acq.ref),
   };
   const spec: HeapDrawSpec = {
-    effect: sharedEffect,
+    effect: eff,
     inputs: {
       Positions: AVal.constant(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0])),
       Normals:   AVal.constant(new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1])),
@@ -198,5 +199,27 @@ describe("heap-atlas bucket plumbing", () => {
     const bindingsAfter = (bgAfter.entries as readonly GPUBindGroupEntry[]).map(e => e.binding);
     expect(bindingsAfter).toContain(11);
     expect(bindingsAfter).toContain(19);
+  });
+
+  it("FS textureSize on an atlas-routed texture rewrites to the draw header's size field", () => {
+    // A textureSize call must be rewritten alongside textureSample: the
+    // atlas rewrite removes the texture binding it references, so an
+    // unrewritten call leaves an unresolved `<name>_view` symbol and the
+    // pipeline is created invalid (silently killing the whole pass).
+    const gpu = new MockGPU();
+    const pool = new AtlasPool(gpu.device);
+    const { spec } = geomSpec(pool, "rgba8unorm", makeHeapTestEffectTexturedSize());
+    buildHeapScene(gpu.device, sig(), [spec], { atlasPool: pool });
+    const fsModules = gpu.shaderModules
+      .map(d => d.code as string)
+      .filter(c => /@fragment/.test(c));
+    expect(fsModules.length).toBeGreaterThan(0);
+    for (const code of fsModules) {
+      expect(code).not.toContain("textureSize(");
+      expect(code).not.toMatch(/checker_view|_view\b/);
+      // size comes from the draw header: two bitcast f32 reads → vec2<i32>
+      expect(code).toContain("vec2<i32>(");
+      expect(code).toContain("bitcast<f32>(");
+    }
   });
 });

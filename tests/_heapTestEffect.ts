@@ -8,7 +8,7 @@
 // the module.
 
 import { effect, vertex, fragment, type Effect } from "@aardworx/wombat.shader";
-import { type Sampler2D, texture } from "@aardworx/wombat.shader/types";
+import { type Sampler2D, texture, textureSize } from "@aardworx/wombat.shader/types";
 import { uniform } from "@aardworx/wombat.shader/uniforms";
 import { V3f, V4f } from "@aardworx/wombat.base";
 
@@ -50,10 +50,22 @@ const texturedFS = fragment((v: { color: V4f }) => {
   return { outColor: v.color.mul(tex) };
 });
 
+// Samples AND reads the texture's size — exercises the heap-atlas
+// `textureSize` rewrite (per-draw size from the draw header).
+const texturedSizeFS = fragment((v: { color: V4f }) => {
+  const tex = texture(checker, v.color.xy);
+  const ts = textureSize(checker, 0);
+  return { outColor: tex.mul(new V4f(v.color.x * ts.x, v.color.y * ts.y, 1.0, 1.0)) };
+});
+
 export function makeHeapTestEffect(): Effect {
   return effect(baseVS, plainFS);
 }
 
 export function makeHeapTestEffectTextured(): Effect {
   return effect(baseVS, texturedFS);
+}
+
+export function makeHeapTestEffectTexturedSize(): Effect {
+  return effect(baseVS, texturedSizeFS);
 }

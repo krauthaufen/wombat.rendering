@@ -73,6 +73,8 @@ const arrU32: Type    = { kind: "Array", element: Tu32, length: "runtime" } as T
 const arrF32: Type    = { kind: "Array", element: Tf32, length: "runtime" } as Type;
 const arrVec4: Type   = { kind: "Array", element: Vec(Tf32, 4), length: "runtime" } as Type;
 const Tvec2 = Vec(Tf32, 2);
+const Ti32: Type = { kind: "Int", signed: true, width: 32 } as Type;
+const Tvec2i = Vec(Ti32, 2);
 const Tvec3 = Vec(Tf32, 3);
 const Tvec4 = Vec(Tf32, 4);
 
@@ -481,6 +483,8 @@ function rewriteFsAtlasTexturesDirect(
     visitStmtExprs(v.entry.body, e => {
       const hit = isAtlasSampleCall(e, layout.atlasTextureBindings);
       if (hit !== null) used.add(hit.name);
+      const sz = isAtlasSizeCall(e, layout.atlasTextureBindings);
+      if (sz !== null) used.add(sz.name);
     });
   }
   if (used.size === 0) return m;
@@ -506,8 +510,17 @@ function rewriteFsAtlasTexturesDirect(
     type: Tf32,
   });
 
+  // textureSize → the draw header's `size` field (the texture's pixel size),
+  // converted to the ivec2 the intrinsic's IR type promises.
+  const sizeI32 = (v: Expr): Expr => ({ kind: "Convert", value: v, type: Ti32 } as Expr);
+
   return mapStageEntryBodies(m, "fragment", body => mapStmt(body, {
     expr: e => mapExpr(e, sub => {
+      const sz = isAtlasSizeCall(sub, layout.atlasTextureBindings);
+      if (sz !== null) {
+        const sizeOff = fieldByAtlas.get(sz.name)!.get("size")!.u32;
+        return newVec([sizeI32(headerF32At(sizeOff)), sizeI32(headerF32At(sizeOff + 1))], Tvec2i);
+      }
       const hit = isAtlasSampleCall(sub, layout.atlasTextureBindings);
       if (hit === null) return sub;
       const fields = fieldByAtlas.get(hit.name)!;
@@ -561,6 +574,8 @@ function rewriteFsHeapDirectStandalone(m: Module, layout: BucketLayout): Module 
     visitStmtExprs(v.entry.body, e => {
       const hit = isAtlasSampleCall(e, layout.atlasTextureBindings);
       if (hit !== null) usedAtlas.add(hit.name);
+      const sz = isAtlasSizeCall(e, layout.atlasTextureBindings);
+      if (sz !== null) usedAtlas.add(sz.name);
     });
   }
   if (usedUniforms.size === 0 && usedAtlas.size === 0) return m;
@@ -774,6 +789,26 @@ function isAtlasSampleCall(e: Expr, atlasNames: ReadonlySet<string>): { name: st
   // texture pair until splitWgslSamplers runs). The uv is args[1].
   const uv = e.args[1]!;
   return { name: matched, uv };
+}
+
+/** `textureSize(<atlas-routed sampler>)` — the sibling of `isAtlasSampleCall`.
+ *  Must be rewritten alongside sampling: the atlas rewrite removes the
+ *  texture binding it references, and the per-draw texture size already
+ *  lives in the draw header (the `size` field `atlasSample` reads). */
+function isAtlasSizeCall(e: Expr, atlasNames: ReadonlySet<string>): { name: string } | null {
+  if (e.kind !== "CallIntrinsic") return null;
+  if (e.op.emit.wgsl !== "textureSize") return null;
+  if (e.args.length < 1) return null;
+  const tex = e.args[0]!;
+  let name: string | undefined;
+  if (tex.kind === "ReadInput" && tex.scope === "Uniform") name = tex.name;
+  else if (tex.kind === "Var") name = (tex as { var: { name: string } }).var.name;
+  if (name === undefined) return null;
+  const matched =
+    atlasNames.has(name) ? name :
+    atlasNames.has(`${name}_view`) ? `${name}_view` :
+    undefined;
+  return matched === undefined ? null : { name: matched };
 }
 
 function rewriteFsAtlasTextures(m: Module, layout: BucketLayout): Module {

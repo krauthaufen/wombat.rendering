@@ -109,7 +109,7 @@ export interface FragmentOutputLayout {
 // and on quota; every failure simply degrades to "recompute".
 
 /** Cache-generation stamp for the persistent (localStorage) tier. */
-export const HEAP_PERSIST_VERSION = "h9"; // h9: standalone FS reads the heap directly (one _h_drawIdx varying)
+export const HEAP_PERSIST_VERSION = "h11"; // h11: FS textureSize on atlas-routed textures reads the draw-header size — emitted WGSL changed
 
 /**
  * Uniforms whose drawHeader word IS the u32 value (no arena
