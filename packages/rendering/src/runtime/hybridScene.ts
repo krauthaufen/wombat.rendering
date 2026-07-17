@@ -1,19 +1,19 @@
 // hybridScene — composes the heap-bucket fast path with the legacy
 // per-RO path into a single render-pass renderer.
 //
-// Pipeline:
+// Pipeline (fused — one aset stage per backend):
 //   1. `flattenRenderTree(tree)` → `aset<RenderObject>` (drops intra-
 //      pass ordering by contract).
-//   2. `partitionA(aset, isHeapEligible)` → (heapAset, legacyAset).
+//   2. `flat.chooseA(ro => elig(ro).map(e => e ? spec : undefined))`
+//      → `aset<HeapDrawSpec>` fed to `buildHeapScene`; the adapter is
+//      memoized per-RO so the same RO always maps to the same spec
+//      object (delta-driven removal identifies the right entry).
 //      Reactive: an RO migrates when its eligibility predicate marks
 //      (e.g. an `aval<IBuffer>` flips host↔gpu).
-//   3. `heapAset.map(renderObjectToHeapSpec)` → `aset<HeapDrawSpec>`,
-//      fed to `buildHeapScene`. The adapter is memoized per-RO so
-//      the same RO always maps to the same spec object — needed for
-//      delta-driven removal to identify the right entry.
-//   4. `legacyAset` wrapped as `RenderTree.unorderedFromSet(map(leaf))`
-//      and fed to `ScenePass`. Same NodeWalker machinery that the
-//      legacy `RenderTask` uses.
+//   3. `flat.chooseA(ro => elig(ro).map(e => e ? undefined : leaf))`
+//      wrapped as `RenderTree.unorderedFromSet` and fed to
+//      `ScenePass`. Same NodeWalker machinery as the legacy
+//      `RenderTask`.
 //
 // Per-frame:
 //   - `update(token)` runs both backends' update phases (CPU work
@@ -196,21 +196,25 @@ export function compileHybridScene(
       e.compile({ target: "wgsl", fragmentOutputLayout }));
 
   // ─── Partition ───────────────────────────────────────────────────
-  // Memoize the eligibility predicate per-RO so the two filterA calls
-  // share one underlying observation. Without this, both calls would
-  // build independent custom-avals with overlapping subscriptions.
-  // The per-RO eligibility is ANDed with the global `heapEnabled`
-  // toggle — flipping that off forces every RO to legacy.
+  // Memoize the eligibility predicate per-RO so both partition sides
+  // share one underlying observation. The per-RO eligibility is ANDed
+  // with the global `heapEnabled` toggle — flipping that off forces
+  // every RO to legacy.
+  //
+  // FUSION: each side is ONE `chooseA` straight off `flat` — the old
+  // `filterA(elig)` + `choose(spec)` (heap) and `filterA(notElig)` +
+  // `map(leaf)` (legacy) pipelines carried an intermediate aset each,
+  // i.e. a full History + per-element state of pure plumbing, plus a
+  // negation aval per RO. `chooseA`'s per-element wrapper rides
+  // `elig(ro).map(...)`, which for a CONSTANT eligibility (asserted
+  // rows under a constant `heapEnabled`, or fully-static ROs)
+  // collapses to a lazy constant — no adaptive node, no edges.
   const heapEnabled = opts.heapEnabled ?? AVal.constant(true);
-  // Producer-asserted ROs (`heapAsserted: true`) skip the per-RO
-  // predicate entirely — they all share these TWO scene-level avals
-  // instead of two live avals each (see RenderObject.heapAsserted).
-  const notHeapEnabled = heapEnabled.isConstant
-    ? AVal.constant(!heapEnabled.force(/* allow-force */))
-    : heapEnabled.map(b => !b);
   const eligCache = new WeakMap<RenderObject, aval<boolean>>();
-  const notEligCache = new WeakMap<RenderObject, aval<boolean>>();
   const elig = (ro: RenderObject): aval<boolean> => {
+    // Producer-asserted ROs (`heapAsserted: true`) skip the per-RO
+    // predicate entirely — they all share the scene-level toggle aval
+    // (see RenderObject.heapAsserted).
     if (ro.heapAsserted === true) return heapEnabled;
     let av = eligCache.get(ro);
     if (av === undefined) {
@@ -224,20 +228,8 @@ export function compileHybridScene(
     }
     return av;
   };
-  const notElig = (ro: RenderObject): aval<boolean> => {
-    if (ro.heapAsserted === true) return notHeapEnabled;
-    let av = notEligCache.get(ro);
-    if (av === undefined) {
-      const e = elig(ro);
-      av = e.isConstant ? AVal.constant(!e.force(/* allow-force */)) : e.map(b => !b);
-      notEligCache.set(ro, av);
-    }
-    return av;
-  };
 
   const flat = flattenRenderTree(tree);
-  const heapAset   = flat.filterA(ro => elig(ro));
-  const legacyAset = flat.filterA(ro => notElig(ro));
 
   // ─── Atlas pool ──────────────────────────────────────────────────
   // Per-scene Tier-S atlas pool. Owned by this hybrid scene; disposed
@@ -262,7 +254,7 @@ export function compileHybridScene(
   // usually have freed atlas space). It costs a missing tile for a frame or two;
   // the alternative was an exception in the frame callback, which killed the
   // render loop outright.
-  const heapSpecAset = heapAset.choose((ro: RenderObject) => {
+  const specOf = (ro: RenderObject): HeapDrawSpec | undefined => {
     let spec = specCache.get(ro);
     if (spec === undefined) {
       const built = renderObjectToHeapSpec(ro, AdaptiveToken.top, atlasPool, {
@@ -273,7 +265,10 @@ export function compileHybridScene(
       specCache.set(ro, spec);
     }
     return spec;
-  });
+  };
+  // ONE fused stage: eligibility routes straight into the spec.
+  const heapSpecAset = flat.chooseA((ro: RenderObject) =>
+    elig(ro).map((e) => (e ? specOf(ro) : undefined)));
 
   const heapScene: HeapScene = buildHeapScene(device, signature, heapSpecAset, {
     fragmentOutputLayout,
@@ -291,8 +286,17 @@ export function compileHybridScene(
   // path inherits the same "no order inside a pass" contract. Re-using
   // the existing NodeWalker machinery means RO preparation, caching,
   // and resource ref-counting all behave exactly as the master path.
-  const legacyTree: RenderTree =
-    RenderTree.unorderedFromSet(legacyAset.map(ro => RenderTree.leaf(ro)));
+  // ONE fused stage (ineligible → leaf); the leaf wrapper is memoized
+  // so eligibility flips re-emit the identical tree object.
+  const leafCache = new WeakMap<RenderObject, RenderTree>();
+  const leafOf = (ro: RenderObject): RenderTree => {
+    let l = leafCache.get(ro);
+    if (l === undefined) { l = RenderTree.leaf(ro); leafCache.set(ro, l); }
+    return l;
+  };
+  const legacyTree: RenderTree = RenderTree.unorderedFromSet(
+    flat.chooseA((ro: RenderObject) =>
+      elig(ro).map((e) => (e ? undefined : leafOf(ro)))));
   const scenePass = new ScenePass(device, signature, legacyTree, compileEffect);
   // DEBUG registry: per-hybrid-scene live draw counts (heap vs legacy) so
   // multi-task pipelines (OIT) can be inspected from the console.
