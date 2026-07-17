@@ -267,8 +267,22 @@ export function compileHybridScene(
     return spec;
   };
   // ONE fused stage: eligibility routes straight into the spec.
-  const heapSpecAset = flat.chooseA((ro: RenderObject) =>
-    elig(ro).map((e) => (e ? specOf(ro) : undefined)));
+  // Constant eligibility (asserted rows, fully-static ROs) takes the
+  // closure-free branch: an eager constant wrapper per RO — and the
+  // OTHER side of the partition collapses onto ONE shared
+  // `constant(undefined)`, so ChooseAReader's aval-keyed refcount map
+  // holds a single entry for the whole eligible population.
+  const CONST_UNDEF = AVal.constant(undefined);
+  const heapSpecAset = flat.chooseA((ro: RenderObject) => {
+    const e = elig(ro);
+    if (e.isConstant) {
+      // Why force here: constant — immutable by definition.
+      return e.force(/* allow-force */)
+        ? AVal.constant(specOf(ro))
+        : (CONST_UNDEF as aval<HeapDrawSpec | undefined>);
+    }
+    return e.map((b) => (b ? specOf(ro) : undefined));
+  });
 
   const heapScene: HeapScene = buildHeapScene(device, signature, heapSpecAset, {
     fragmentOutputLayout,
@@ -295,8 +309,16 @@ export function compileHybridScene(
     return l;
   };
   const legacyTree: RenderTree = RenderTree.unorderedFromSet(
-    flat.chooseA((ro: RenderObject) =>
-      elig(ro).map((e) => (e ? undefined : leafOf(ro)))));
+    flat.chooseA((ro: RenderObject) => {
+      const e = elig(ro);
+      if (e.isConstant) {
+        // Why force here: constant — immutable by definition.
+        return e.force(/* allow-force */)
+          ? (CONST_UNDEF as aval<RenderTree | undefined>)
+          : AVal.constant(leafOf(ro));
+      }
+      return e.map((b) => (b ? undefined : leafOf(ro)));
+    }));
   const scenePass = new ScenePass(device, signature, legacyTree, compileEffect);
   // DEBUG registry: per-hybrid-scene live draw counts (heap vs legacy) so
   // multi-task pipelines (OIT) can be inspected from the console.
