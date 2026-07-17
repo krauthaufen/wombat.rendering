@@ -202,9 +202,16 @@ export function compileHybridScene(
   // The per-RO eligibility is ANDed with the global `heapEnabled`
   // toggle — flipping that off forces every RO to legacy.
   const heapEnabled = opts.heapEnabled ?? AVal.constant(true);
+  // Producer-asserted ROs (`heapAsserted: true`) skip the per-RO
+  // predicate entirely — they all share these TWO scene-level avals
+  // instead of two live avals each (see RenderObject.heapAsserted).
+  const notHeapEnabled = heapEnabled.isConstant
+    ? AVal.constant(!heapEnabled.force(/* allow-force */))
+    : heapEnabled.map(b => !b);
   const eligCache = new WeakMap<RenderObject, aval<boolean>>();
   const notEligCache = new WeakMap<RenderObject, aval<boolean>>();
   const elig = (ro: RenderObject): aval<boolean> => {
+    if (ro.heapAsserted === true) return heapEnabled;
     let av = eligCache.get(ro);
     if (av === undefined) {
       const perRO = isHeapEligible(ro);
@@ -218,6 +225,7 @@ export function compileHybridScene(
     return av;
   };
   const notElig = (ro: RenderObject): aval<boolean> => {
+    if (ro.heapAsserted === true) return notHeapEnabled;
     let av = notEligCache.get(ro);
     if (av === undefined) {
       const e = elig(ro);

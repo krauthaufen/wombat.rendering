@@ -605,7 +605,11 @@ export function renderObjectToHeapSpec(
     pipelineState: ro.pipelineState,
     inputs,
     ...(instanceAttributes !== undefined ? { instanceAttributes } : {}),
-    ...(dc.instanceCount > 1 ? { instanceCount: dc.instanceCount } : {}),
+    // ≠ 1 (not > 1): instanceCount 0 must flow through — the scan
+    // kernel emits indexCount × 0 = nothing, matching what the legacy
+    // path draws for zero instances. Omitting it would default to 1
+    // and pack a garbage instance from empty per-instance arrays.
+    ...(dc.instanceCount !== 1 ? { instanceCount: dc.instanceCount } : {}),
     ...geom,
     ...(textures !== undefined ? { textures } : {}),
     ...(ro.injectedStorage !== undefined && ro.injectedStorage.count > 0

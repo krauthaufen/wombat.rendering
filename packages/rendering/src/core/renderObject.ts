@@ -129,4 +129,29 @@ export interface RenderObject {
    * See docs/gpu-transform-propagation.md.
    */
   readonly modelChain?: readonly aval<import("@aardworx/wombat.base").Trafo3d>[];
+  /**
+   * Producer-asserted heap eligibility. When `true`, the hybrid
+   * partition routes this RO to the heap path WITHOUT building the
+   * per-RO reactive `isHeapEligible` predicate — for an RO with an
+   * adaptive `drawCall` that predicate is a live custom aval + a
+   * negation aval + their subscriptions, retained per RO for the
+   * scene's lifetime; at collection scale (thousands of row-shaped
+   * ROs) that is pure ballast because the producer already knows the
+   * answer statically.
+   *
+   * The producer GUARANTEES, for the RO's whole lifetime:
+   *   - every attribute/index buffer aval resolves to `kind: "host"`,
+   *   - ≤ 1 distinct texture aval and ≤ 1 distinct sampler aval,
+   *     each heap-servable; no `storageBuffers`,
+   *   - index format (if indexed) is uint16/uint32,
+   *   - `drawCall.firstInstance === 0`; non-indexed ⇒
+   *     `firstVertex === 0`; `instanceCount ≥ 0` (0 draws nothing),
+   *   - payload stays within the heap ingest budget.
+   *
+   * Only the global `heapEnabled` toggle still applies (one shared
+   * aval per scene). A wrong assertion produces wrong routing —
+   * intended for scene-graph layers that verify these conditions
+   * once per template, never for hand-built ROs.
+   */
+  readonly heapAsserted?: boolean;
 }
