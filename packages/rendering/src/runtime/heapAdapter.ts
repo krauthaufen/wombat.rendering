@@ -115,6 +115,7 @@ import { compileHeapEffect } from "./heapEffect.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
 import { STANDARD_DERIVED_RULES, STANDARD_TRAFO_LEAVES } from "./derivedUniforms/recipes.js";
 import { inputsOf } from "./derivedUniforms/flatten.js";
+import { isDerivedRule, type DerivedRule } from "./derivedUniforms/rule.js";
 
 /**
  * View `HostBufferSource` as `Uint32Array`. Index buffers are u32 in
@@ -396,6 +397,21 @@ export function renderObjectToHeapSpec(
       if (inputs[specName] === undefined) { leavesBound = false; break; }
     }
     if (!leavesBound) pullUniform(name);
+  }
+  // Explicit `derivedUniform(...)` values: the §7 pass reads their
+  // leaves from THIS RO's inputs, but those leaf names are rule-
+  // private — the shader schema only declares the rule's OUTPUT name.
+  // Pull them here so `ruleForUniform`'s bound-leaf check succeeds
+  // (e.g. LineColor = select(AnnotationId == SelectedId, …) needs
+  // AnnotationId/SelectedId/… in `spec.inputs`).
+  for (const name of Object.keys(inputs)) {
+    const v = inputs[name];
+    if (isDerivedRule(v)) {
+      for (const inp of inputsOf((v as DerivedRule).ir)) {
+        if (inp.name === "Model" && ro.modelChain !== undefined) continue;
+        pullUniform(STANDARD_TRAFO_LEAVES.get(inp.name) ?? inp.name);
+      }
+    }
   }
 
   // 1b. Instance attributes — provider is map-backed (user-supplied via
