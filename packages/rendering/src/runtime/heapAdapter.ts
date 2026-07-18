@@ -377,6 +377,93 @@ export function renderObjectToHeapSpec(
   // and the exception escaped into the render loop's frame callback: one full
   // atlas killed the whole viewer, permanently.
 ): HeapDrawSpec | null {
+  const flat = buildFlatSpec(ro, token, pool, opts);
+  if (flat === null) return flat;
+  // Row specs (prototype-derived ROs — see materializeRow): chain the
+  // spec AND its inputs bag onto template-shared prototypes so each
+  // row retains only what actually differs. Protocol: the first row's
+  // spec stays flat and is remembered; the second row diffs against
+  // it (by identity) to mint the shared prototypes; rows 3+ get
+  // Object.create + own-only fields. Any shape surprise (different
+  // input name sets) falls back to the flat spec — correctness never
+  // depends on the chaining.
+  const tpl = Object.getPrototypeOf(ro) as RenderObject | null;
+  if (tpl === null || tpl === Object.prototype || (tpl as { effect?: unknown }).effect === undefined) {
+    return flat;
+  }
+  let cache = specShareCache.get(tpl);
+  if (cache === undefined) {
+    cache = { first: flat };
+    specShareCache.set(tpl, cache);
+    return flat;
+  }
+  if (cache.specProto === undefined) {
+    const first = cache.first;
+    if (first === undefined) return flat;
+    // Mint prototypes from the identity-agreeing subset.
+    const firstInputNames = Object.keys(first.inputs);
+    const thisInputNames = Object.keys(flat.inputs);
+    if (firstInputNames.length !== thisInputNames.length) return flat;
+    const inputsProto: Record<string, unknown> = {};
+    for (const n of firstInputNames) {
+      if (first.inputs[n] === (flat.inputs as Record<string, unknown>)[n]) inputsProto[n] = first.inputs[n];
+    }
+    const specProto: Record<string, unknown> = {};
+    const f = first as unknown as Record<string, unknown>;
+    const g = flat as unknown as Record<string, unknown>;
+    for (const k of Object.keys(f)) {
+      if (k === "inputs" || k === "instanceAttributes") continue;
+      if (f[k] === g[k]) specProto[k] = f[k];
+    }
+    cache.inputsProto = inputsProto;
+    cache.specProto = specProto;
+    cache.first = undefined; // release the flat reference
+  }
+  const inputsProto = cache.inputsProto!;
+  const specProto = cache.specProto!;
+  const names = Object.keys(flat.inputs);
+  // Shape guard: a key present in a prototype but ABSENT from this
+  // row would leak the shared value through the chain — bail to flat.
+  for (const k of Object.keys(specProto)) {
+    if (!(k in (flat as unknown as Record<string, unknown>))) return flat;
+  }
+  const slimInputs = Object.create(inputsProto) as Record<string, unknown>;
+  let protoNamesSeen = 0;
+  for (const n of names) {
+    const v = (flat.inputs as Record<string, unknown>)[n];
+    if (n in inputsProto) {
+      protoNamesSeen++;
+      if (inputsProto[n] !== v) slimInputs[n] = v;
+    } else {
+      slimInputs[n] = v;
+    }
+  }
+  // A name in the proto but ABSENT from this row would leak the shared
+  // value — bail to flat in that case.
+  if (protoNamesSeen !== Object.keys(inputsProto).length) return flat;
+  const slim = Object.create(specProto) as Record<string, unknown>;
+  const g2 = flat as unknown as Record<string, unknown>;
+  for (const k of Object.keys(g2)) {
+    if (k === "inputs") continue;
+    if ((specProto as Record<string, unknown>)[k] !== g2[k]) slim[k] = g2[k];
+  }
+  slim["inputs"] = slimInputs;
+  return slim as unknown as HeapDrawSpec;
+}
+
+interface SpecShare {
+  first: HeapDrawSpec | undefined;
+  inputsProto?: Record<string, unknown>;
+  specProto?: Record<string, unknown>;
+}
+const specShareCache = new WeakMap<object, SpecShare>();
+
+function buildFlatSpec(
+  ro: RenderObject,
+  token: AdaptiveToken,
+  pool?: AtlasPool,
+  opts?: { readonly enableDerivedUniforms?: boolean },
+): HeapDrawSpec | null {
   // 1. Inputs map: vertex attributes (BufferView) + uniforms, pulled
   //    SHADER-DRIVEN from the providers. We compile `ro.effect` (cached
   //    per Effect by the module-level compile cache) to discover the
@@ -448,7 +535,9 @@ export function renderObjectToHeapSpec(
   // Pull them here so `ruleForUniform`'s bound-leaf check succeeds
   // (e.g. LineColor = select(AnnotationId == SelectedId, …) needs
   // AnnotationId/SelectedId/… in `spec.inputs`).
-  for (const name of Object.keys(inputs)) {
+  // for-in (NOT Object.keys): row specs chain their input bags onto a
+  // template-shared prototype; rule values can live on either level.
+  for (const name in inputs) {
     const v = inputs[name];
     if (isDerivedRule(v)) {
       for (const inp of inputsOf((v as DerivedRule).ir)) {
