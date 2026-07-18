@@ -91,6 +91,7 @@ import {
   ENC_V3F_TIGHT, ENC_OCT32, ENC_C4B, SEM_POSITIONS, SEM_NORMALS,
   COMPACTION_WASTE_FLOOR_BYTES,
   type ArenaState,
+  type PoolPlacement,
 } from "./heapScene/pools.js";
 import { encodeModeKey, type PipelineStateDescriptor } from "./pipelineCache/index.js";
 import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
@@ -385,6 +386,12 @@ interface Bucket {
    * keyed by aval identity.
    */
   readonly localPerDrawAvals: (aval<unknown>[] | undefined)[];
+  /** drawHeader field index per pooled aval — PARALLEL to
+   *  `localPerDrawAvals[slot]`. Lets the sized-repack drain rewrite
+   *  exactly the fields whose aval's allocation moved (matching by
+   *  aval identity, never by numeric offset — a released offset can
+   *  be re-issued to a different aval within the same drain). */
+  readonly localPerDrawAvalFieldIdx: (number[] | undefined)[];
   /** Field indices (into `layout.drawHeaderFields`) whose drawHeader
    *  cells hold RAW arena refs (§7 output slots, no pool entry). */
   readonly localPerDrawRawFieldIdx: (number[] | undefined)[];
@@ -1147,6 +1154,79 @@ export function buildHeapScene(
       const delta = (newIndexCount - oldIndexCount) * instanceCount;
       slot.totalEmitEstimate = Math.max(0, slot.totalEmitEstimate + delta);
       slot.scanDirty = true;
+    }
+  }
+
+  // ─── HeapDrawSpec.instanceCount as an aval ────────────────────────
+  // The geometry-morphing / collection-count path (epoch switches,
+  // point add/remove): a count tick is ONE drawTable write (record
+  // word 4) + emit re-estimate + re-scan — no add/remove churn, no
+  // arena activity. Instance ATTRIBUTE payloads ride the sized-repack
+  // path independently; per-instance UNIFORM arrays (packed per
+  // count) are rejected with an adaptive count at addDraw.
+  const drawIdToCountAval = new Map<number, aval<number>>();
+  const drawIdToCountCallback = new Map<number, IDisposable>();
+  const countDirty = new Set<number>();
+
+  function subscribeCount(av: aval<number>, drawId: number): void {
+    drawIdToCountAval.set(drawId, av);
+    drawIdToCountCallback.set(
+      drawId,
+      addMarkingCallback(av, () => { countDirty.add(drawId); }),
+    );
+  }
+
+  function unsubscribeCount(drawId: number): void {
+    const cb = drawIdToCountCallback.get(drawId);
+    if (cb === undefined) return;
+    cb.dispose();
+    drawIdToCountCallback.delete(drawId);
+    drawIdToCountAval.delete(drawId);
+    countDirty.delete(drawId);
+  }
+
+  /** Update the drawTable record's instanceCount in place — the
+   *  word-4 sibling of `setEffectiveIndexCount`. */
+  function setEffectiveInstanceCount(drawId: number, newCount: number): void {
+    const bucket = drawIdToBucket[drawId];
+    if (bucket === undefined) return;
+    if (bucket.gpuRouted) {
+      const partition = bucket.partitionScene!;
+      const recIdx = bucket.drawIdToRecord!.get(drawId);
+      if (recIdx === undefined) return;
+      const ru32 = partition.recordU32;
+      const indexCount = partition.masterShadow[recIdx * ru32 + 3]!;
+      const oldCount = partition.masterShadow[recIdx * ru32 + 4]!;
+      partition.masterShadow[recIdx * ru32 + 4] = newCount >>> 0;
+      const delta = indexCount * (newCount - oldCount);
+      bucket.partitionDirty = true;
+      for (const sl of bucket.slots) {
+        sl.totalEmitEstimate = Math.max(0, sl.totalEmitEstimate + delta);
+        sl.scanDirty = true;
+      }
+    } else {
+      const slotIdx = drawIdToSlotIdx[drawId];
+      const slot = slotIdx !== undefined ? bucket.slots[slotIdx] : bucket.slots[0];
+      if (slot === undefined) return;
+      const localSlot = drawIdToLocalSlot[drawId];
+      if (localSlot === undefined) return;
+      const recIdx = slot.slotToRecord[localSlot];
+      if (recIdx === undefined || recIdx < 0) return;
+      const shadow = slot.drawTableShadow!;
+      const indexCount = shadow[recIdx * RECORD_U32 + 3]!;
+      const oldCount = shadow[recIdx * RECORD_U32 + 4]!;
+      shadow[recIdx * RECORD_U32 + 4] = newCount >>> 0;
+      const byteOff = recIdx * RECORD_BYTES + 4 * 4;
+      if (byteOff < slot.drawTableDirtyMin) slot.drawTableDirtyMin = byteOff;
+      if (byteOff + 4 > slot.drawTableDirtyMax) slot.drawTableDirtyMax = byteOff + 4;
+      const delta = indexCount * (newCount - oldCount);
+      slot.totalEmitEstimate = Math.max(0, slot.totalEmitEstimate + delta);
+      slot.scanDirty = true;
+    }
+    const localSlot = drawIdToLocalSlot[drawId];
+    if (localSlot !== undefined) {
+      const e = bucket.localEntries[localSlot];
+      if (e !== undefined) e.instanceCount = newCount;
     }
   }
 
@@ -3102,7 +3182,7 @@ export function buildHeapScene(
       headerDirtyMin: Infinity, headerDirtyMax: 0,
       localPosRefs: [], localNorRefs: [],
       localEntries: [], localToDrawId: [],
-      localPerDrawAvals: [], localPerDrawRawFieldIdx: [], localPerDrawRefs: [], localLayoutIds: [],
+      localPerDrawAvals: [], localPerDrawAvalFieldIdx: [], localPerDrawRawFieldIdx: [], localPerDrawRefs: [], localLayoutIds: [],
       fieldIdx,
       posFieldIdx: fieldIdx.get("Positions") ?? -1,
       norFieldIdx: fieldIdx.get("Normals") ?? -1,
@@ -3376,8 +3456,24 @@ export function buildHeapScene(
     const hasIndices = spec.indices !== undefined;
     const indicesAval = hasIndices ? (asAval(spec.indices!) as aval<Uint32Array>) : undefined;
     const indexArr = hasIndices ? (readPlain(spec.indices!) as Uint32Array) : undefined;
+    const icAval =
+      spec.instanceCount !== undefined && typeof spec.instanceCount === "object"
+      && typeof (spec.instanceCount as { getValue?: unknown }).getValue === "function"
+        ? (spec.instanceCount as aval<number>)
+        : undefined;
     const instanceCount = spec.instanceCount !== undefined
       ? (readPlain(spec.instanceCount) as number) : 1;
+    if (icAval !== undefined && perInstanceUniforms.size > 0) {
+      // Per-instance UNIFORM arrays are packed `instanceCount` deep at
+      // addDraw — a changing count would need a repack protocol those
+      // packers don't have. Attribute-backed instancing (BufferViews /
+      // raw arrays) is unaffected: the payload rides the sized-repack
+      // path and the count merely selects a prefix.
+      throw new Error(
+        "heapScene: adaptive instanceCount is not supported together with per-instance UNIFORM values " +
+        `(fields: ${[...perInstanceUniforms].join(", ")}) — use instance attributes instead`,
+      );
+    }
 
     let estBytes = indexArr !== undefined ? ALIGN16(ALLOC_HEADER_PAD_TO + indexArr.byteLength) : 0;
     for (const f of layout.drawHeaderFields) {
@@ -3500,6 +3596,7 @@ export function buildHeapScene(
     // packs as a single value. Both go through the same pool — sharing
     // emerges from aval identity either way.
     const perDrawAvals: aval<unknown>[] = [];
+    const perDrawAvalFieldIdx: number[] = [];
     let perDrawRawFieldIdx: number[] | undefined;
     const perDrawRefs = new Int32Array(bucket.layout.drawHeaderFields.length).fill(-1);
     const setRef = (name: string, ref: number): void => {
@@ -3594,9 +3691,13 @@ export function buildHeapScene(
         let value: unknown;
         let placement: ReturnType<typeof poolPlacementFor>;
         let releasable: { _v: unknown } | undefined;
+        let replanFn: ((v: unknown) => PoolPlacement) | undefined;
         if (f.kind === "attribute-ref" && !isPerInstanceUniformField && isBufferView(provided)) {
           const bv = provided;
           placement = bufferViewPlacement(f, bv);
+          // Size-variable payload: geometry morphing re-derives the
+          // placement from the view's CURRENT buffer value.
+          replanFn = () => bufferViewPlacement(f, bv);
           av = bv.buffer as aval<unknown>;
           value = bv.buffer.getValue(tok);
         } else if (
@@ -3630,14 +3731,19 @@ export function buildHeapScene(
           placement = isPerInstanceUniformField
             ? perInstancePlacementFor(f, value, instanceCount)
             : poolPlacementFor(f, value);
+          if (f.kind === "attribute-ref" && !isPerInstanceUniformField) {
+            replanFn = (v) => poolPlacementFor(f, v);
+          }
         }
         const ref = pool.acquire(
           device, arena.attrs, av, bucket.chunkIdx, value,
           placement.dataBytes, placement.typeId, placement.length, placement.pack,
+          replanFn,
         );
         if (releasable !== undefined) releasable._v = null;   // staged — drop the CPU copy
         setRef(f.name, ref);
         perDrawAvals.push(av);
+        perDrawAvalFieldIdx.push(bucket.fieldIdx.get(f.name)!);
       }
     }
 
@@ -3649,6 +3755,7 @@ export function buildHeapScene(
     bucket.localToDrawId[localSlot] = drawId;
     bucket.drawSlots.add(localSlot);
     bucket.localPerDrawAvals[localSlot] = perDrawAvals;
+    bucket.localPerDrawAvalFieldIdx[localSlot] = perDrawAvalFieldIdx;
     bucket.localPerDrawRawFieldIdx[localSlot] = perDrawRawFieldIdx;
     bucket.localPerDrawRefs[localSlot]  = perDrawRefs;
     const layoutId = fam.schema.layoutIdOf.get(spec.effect)!;
@@ -3850,6 +3957,9 @@ export function buildHeapScene(
         setEffectiveIndexCount(drawId, 0);
       }
     }
+    if (icAval !== undefined) {
+      subscribeCount(icAval, drawId);
+    }
 
     // ─── Reactive rebucket: track PS-modeKey changes ────────────────
     // When any mode-axis aval marks (e.g. cullCval.value = 'front'),
@@ -3966,6 +4076,7 @@ export function buildHeapScene(
     // Tear down `active` subscription (if any) so its callback won't
     // fire after the underlying drawTable record is gone.
     unsubscribeActive(drawId);
+    unsubscribeCount(drawId);
     // §7: deregister this RO's derivation records and release slots.
     if (derivedScene !== undefined) {
       const reg = derivedByDrawId.get(drawId);
@@ -4100,6 +4211,7 @@ export function buildHeapScene(
     bucket.localAtlasArrIdx[localSlot] = undefined;
 
     bucket.localPerDrawAvals[localSlot] = undefined;
+    bucket.localPerDrawAvalFieldIdx[localSlot] = undefined;
     bucket.localPerDrawRefs[localSlot]  = undefined;
     bucket.localLayoutIds[localSlot]    = undefined;
     bucket.localPosRefs[localSlot]  = undefined;
@@ -4490,11 +4602,63 @@ export function buildHeapScene(
       //    One writeBuffer per dirty aval, regardless of how many draws
       //    reference it — sharing pays off here.
       if (allocDirty.size > 0) {
+        // aval → (chunkIdx → newRef) for allocations the sized repack
+        // moved (payload grew/shrank → realloc'd within the chunk).
+        let movedByAval: Map<aval<unknown>, Map<number, number>> | undefined;
         for (const av of allocDirty) {
-          pool.repack(device, arena.attrs, av, av.getValue(tok));
+          const moved = pool.repack(device, arena.attrs, av, av.getValue(tok));
           totalDirtyBytes += pool.totalDataBytes(av);
+          if (moved !== undefined) {
+            for (const m of moved) {
+              let byChunk = (movedByAval ??= new Map()).get(m.av);
+              if (byChunk === undefined) { byChunk = new Map(); movedByAval.set(m.av, byChunk); }
+              byChunk.set(m.chunkIdx, m.newRef);
+            }
+          }
         }
         allocDirty.clear();
+        if (movedByAval !== undefined) {
+          // Re-seat every drawHeader field whose aval's allocation
+          // moved. Matched by AVAL IDENTITY via the parallel
+          // `localPerDrawAvalFieldIdx` — never by numeric offset (a
+          // released offset can be re-issued to a DIFFERENT aval in
+          // this same drain). Mirrors the compaction remap loop.
+          for (const bucket of buckets) {
+            for (const localSlot of bucket.drawSlots) {
+              const avals = bucket.localPerDrawAvals[localSlot];
+              const fidx = bucket.localPerDrawAvalFieldIdx[localSlot];
+              const refs = bucket.localPerDrawRefs[localSlot];
+              if (avals === undefined || fidx === undefined || refs === undefined) continue;
+              let changed = false;
+              for (let i = 0; i < avals.length; i++) {
+                const byChunk = movedByAval.get(avals[i]!);
+                if (byChunk === undefined) continue;
+                const nn = byChunk.get(bucket.chunkIdx);
+                if (nn === undefined) continue;
+                if (bucket.gpuRouted) {
+                  throw new Error(
+                    "heapScene: payload realloc under a GPU-routed (derived-modes) bucket is not supported yet",
+                  );
+                }
+                if (refs[fidx[i]!]! !== nn) { refs[fidx[i]!] = nn; changed = true; }
+              }
+              if (!changed) continue;
+              const pr = bucket.posFieldIdx >= 0 ? refs[bucket.posFieldIdx]! : -1;
+              const nr = bucket.norFieldIdx >= 0 ? refs[bucket.norFieldIdx]! : -1;
+              bucket.localPosRefs[localSlot] = pr < 0 ? undefined : pr;
+              bucket.localNorRefs[localSlot] = nr < 0 ? undefined : nr;
+              packBucketHeader(bucket, localSlot, refs, bucket.localLayoutIds[localSlot] ?? 0);
+              if (bucket.isAtlasBucket) {
+                const ts = bucket.localAtlasTextures[localSlot];
+                if (ts !== undefined) packAtlasTextureFields(bucket, localSlot, ts);
+              }
+              const byteOff = localSlot * bucket.layout.drawHeaderBytes;
+              if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
+              const end = byteOff + bucket.layout.drawHeaderBytes;
+              if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
+            }
+          }
+        }
       }
 
       // 1c. HeapDrawSpec.active drain — flip drawTable.indexCount
@@ -4511,6 +4675,18 @@ export function buildHeapScene(
           setEffectiveIndexCount(did, a ? orig : 0);
         }
         activeDirty.clear();
+      }
+
+      // 1d. HeapDrawSpec.instanceCount aval drain — write the new
+      //     count into drawTable word 4 (emit = indexCount × count;
+      //     0 draws nothing). One record write + re-scan per tick.
+      if (countDirty.size > 0) {
+        for (const did of countDirty) {
+          const av = drawIdToCountAval.get(did);
+          if (av === undefined) continue;
+          setEffectiveInstanceCount(did, Math.max(0, av.getValue(tok) | 0));
+        }
+        countDirty.clear();
       }
 
       // 1b. Atlas-texture aval reactivity: an `aval<ITexture>` that

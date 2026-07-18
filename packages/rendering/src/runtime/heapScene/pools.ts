@@ -67,16 +67,42 @@ export const SEM_NORMALS   = 2;
  * in which chunk's bind group is active at draw time (shaders
  * never decode it).
  */
+/** Fresh placement for a changed value — everything `repack` needs to
+ *  decide whether the allocation still fits and how to re-encode. */
+export interface PoolPlacement {
+  readonly dataBytes: number;
+  readonly typeId: number;
+  readonly length: number;
+  readonly pack: (val: unknown, dst: Float32Array, off: number) => void;
+}
+
 interface PoolEntry {
   readonly chunkIdx: number;
   /** Byte offset within the chunk's GPUBuffer. Mutated by
    *  `UniformPool.remapRefs` when a waste-triggered arena compaction
-   *  relocates the allocation. */
+   *  relocates the allocation, and by the sized-repack realloc path. */
   ref: number;
-  readonly dataBytes: number;
-  readonly typeId: number;
-  readonly pack: (val: unknown, dst: Float32Array, off: number) => void;
+  /** Raw data bytes of the CURRENT allocation. Mutated by the
+   *  sized-repack realloc path. */
+  dataBytes: number;
+  typeId: number;
+  pack: (val: unknown, dst: Float32Array, off: number) => void;
   refcount: number;
+  /** Present for size-variable payloads (attribute buffers): re-derive
+   *  the placement from the CURRENT value so `repack` can realloc when
+   *  the payload grew or shrank (geometry morphing — epoch switches,
+   *  point add/remove). Absent = fixed-size (plain uniforms). */
+  replan?: (val: unknown) => PoolPlacement;
+}
+
+/** A pool allocation that moved during a sized repack — every
+ *  drawHeader field referencing (aval, chunkIdx, oldRef) must be
+ *  rewritten to newRef by the caller. */
+export interface MovedRef {
+  readonly av: aval<unknown>;
+  readonly chunkIdx: number;
+  readonly oldRef: number;
+  readonly newRef: number;
 }
 
 /**
@@ -200,10 +226,12 @@ export class UniformPool {
     typeId: number,
     length: number,
     pack: (val: unknown, dst: Float32Array, off: number) => void,
+    replan?: (val: unknown) => PoolPlacement,
   ): number {
     const existing = this.getEntry(av, chunkIdx);
     if (existing !== undefined) {
       existing.refcount++;
+      if (replan !== undefined && existing.replan === undefined) existing.replan = replan;
       return existing.ref;
     }
     const r = arena.alloc(dataBytes, chunkIdx);
@@ -237,6 +265,7 @@ export class UniformPool {
     void device;
     this.setEntry(av, {
       chunkIdx: finalChunk, ref: r.off, dataBytes, typeId, pack, refcount: 1,
+      ...(replan !== undefined ? { replan } : {}),
     });
     return r.off;
   }
@@ -282,9 +311,44 @@ export class UniformPool {
     arena: ChunkedAttributeArena,
     av: aval<unknown>,
     val: unknown,
-  ): void {
+  ): MovedRef[] | undefined {
     let dst: Float32Array | undefined;
+    let moved: MovedRef[] | undefined;
     for (const e of this.entriesOf(av)) {
+      if (e.replan !== undefined) {
+        // Size-variable payload: re-derive the placement from the new
+        // value. Same size → refresh the encoder and fall through to
+        // the in-place write; different size → realloc within the
+        // same chunk, rewrite header + data, and report the move so
+        // the caller re-seats every drawHeader field.
+        const p = e.replan(val);
+        if (p.dataBytes !== e.dataBytes) {
+          arena.release(e.chunkIdx, e.ref, e.dataBytes);
+          const r = arena.alloc(p.dataBytes, e.chunkIdx);
+          if (r.chunkIdx !== e.chunkIdx) {
+            throw new Error(
+              `UniformPool.repack: realloc spilled from chunk ${e.chunkIdx} to ${r.chunkIdx} ` +
+              `(${p.dataBytes} bytes) — the referencing bucket is bound to chunk ${e.chunkIdx}.`,
+            );
+          }
+          const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + p.dataBytes);
+          const buf = new ArrayBuffer(allocBytes);
+          const u32 = new Uint32Array(buf);
+          const f32 = new Float32Array(buf);
+          u32[0] = p.typeId;
+          u32[1] = p.length;
+          u32[2] = p.length > 0 ? Math.floor(p.dataBytes / p.length) : 0;
+          p.pack(val, f32, ALLOC_HEADER_PAD_TO / 4);
+          arena.write(e.chunkIdx, r.off, new Uint8Array(buf));
+          (moved ??= []).push({ av, chunkIdx: e.chunkIdx, oldRef: e.ref, newRef: r.off });
+          e.ref = r.off;
+          e.dataBytes = p.dataBytes;
+          e.typeId = p.typeId;
+          e.pack = p.pack;
+          continue;
+        }
+        e.pack = p.pack;
+      }
       if (dst === undefined || dst.length !== e.dataBytes / 4) {
         dst = new Float32Array(e.dataBytes / 4);
       }
@@ -296,6 +360,7 @@ export class UniformPool {
       );
     }
     void device;
+    return moved;
   }
   /** Total bytes touched by `repack` for this aval — sum across
    *  chunks. Used by the dirty-bytes diagnostics. */
