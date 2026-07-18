@@ -16,7 +16,8 @@ export type RenderTree =
   | { readonly kind: "Unordered"; readonly children: readonly RenderTree[] }
   | { readonly kind: "Adaptive"; readonly tree: aval<RenderTree> }
   | { readonly kind: "OrderedFromList"; readonly children: alist<RenderTree> }
-  | { readonly kind: "UnorderedFromSet"; readonly children: aset<RenderTree> };
+  | { readonly kind: "UnorderedFromSet"; readonly children: aset<RenderTree> }
+  | { readonly kind: "Rows"; readonly set: import("./rowSet.js").RenderRowSet };
 
 export const RenderTree = {
   empty: { kind: "Empty" } as const satisfies RenderTree,
@@ -26,4 +27,5 @@ export const RenderTree = {
   adaptive: (tree: aval<RenderTree>): RenderTree => ({ kind: "Adaptive", tree }),
   orderedFromList: (children: alist<RenderTree>): RenderTree => ({ kind: "OrderedFromList", children }),
   unorderedFromSet: (children: aset<RenderTree>): RenderTree => ({ kind: "UnorderedFromSet", children }),
+  rows: (set: import("./rowSet.js").RenderRowSet): RenderTree => ({ kind: "Rows", set }),
 } as const;

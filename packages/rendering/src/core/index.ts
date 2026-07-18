@@ -89,6 +89,9 @@ export {
   RenderTree,
 } from "./renderTree.js";
 
+export { materializeRow } from "./rowSet.js";
+export type { RenderRow, RenderRowSet } from "./rowSet.js";
+
 export type {
   IRenderTask,
 } from "./renderTask.js";

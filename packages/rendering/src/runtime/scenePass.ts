@@ -26,11 +26,12 @@ import {
   type aset,
 } from "@aardworx/wombat.adaptive";
 import {
+  RenderTree,
+  materializeRow,
   type CompiledEffect,
   type Effect,
   type FramebufferSignature,
   type RenderObject,
-  type RenderTree,
 } from "../core/index.js";
 import {
   prepareRenderObject,
@@ -238,6 +239,12 @@ function build(tree: RenderTree, ctx: BuildContext): NodeWalker {
     case "Adaptive": return new AdaptiveWalker(tree.tree, ctx);
     case "OrderedFromList": return new OrderedFromListWalker(tree.children, ctx);
     case "UnorderedFromSet": return new UnorderedFromSetWalker(tree.children, ctx);
+    case "Rows":
+      // Desugar to an unordered set of materialized leaves — the
+      // legacy path keeps its per-RO machinery; the row store's fast
+      // path lives in the hybrid renderer.
+      return new UnorderedFromSetWalker(
+        tree.set.rows.map((r) => RenderTree.leaf(materializeRow(tree.set, r))), ctx);
   }
 }
 

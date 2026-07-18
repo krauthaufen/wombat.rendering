@@ -36,6 +36,7 @@ import { RenderTree } from "../core/renderTree.js";
 import type { RenderObject } from "../core/renderObject.js";
 import { ScenePass } from "./scenePass.js";
 import { flattenRenderTree } from "./flattenTree.js";
+import { materializeRow, type RenderRowSet } from "../core/index.js";
 import { isHeapEligible } from "./heapEligibility.js";
 import { renderObjectToHeapSpec } from "./heapAdapter.js";
 import { buildHeapScene, type HeapDrawSpec, type HeapScene } from "./heapScene.js";
@@ -229,7 +230,30 @@ export function compileHybridScene(
     return av;
   };
 
-  const flat = flattenRenderTree(tree);
+  // ─── Row sets (instance-tables M2 proper) ────────────────────────
+  // `Rows` nodes on the STATIC spine are consumed directly: the heap
+  // gets one choose stage per set (row → spec over the shared
+  // template), the flat pipeline never sees per-row RenderObjects.
+  // Rows under reactive containers stay in the tree and go through
+  // the materialization fallback (correct, just not accelerated).
+  // Producer contract (dom row lowering): a Rows node's template is
+  // heap-asserted and seeded before its first row arrives.
+  const rowSets: RenderRowSet[] = [];
+  const stripRows = (t: RenderTree): RenderTree => {
+    switch (t.kind) {
+      case "Rows":
+        rowSets.push(t.set);
+        return RenderTree.empty;
+      case "Ordered":
+        return RenderTree.ordered(...t.children.map(stripRows));
+      case "Unordered":
+        return RenderTree.unordered(...t.children.map(stripRows));
+      default:
+        return t;
+    }
+  };
+  const strippedTree = stripRows(tree);
+  const flat = flattenRenderTree(strippedTree);
 
   // ─── Atlas pool ──────────────────────────────────────────────────
   // Per-scene Tier-S atlas pool. Owned by this hybrid scene; disposed
@@ -266,6 +290,18 @@ export function compileHybridScene(
     }
     return spec;
   };
+  // Row sets: one choose stage per set — row → spec via the cached
+  // materialized RO (prototype over the shared template). `undefined`
+  // (atlas-full) drops the row for the cycle, like the flat path.
+  const rowSpecSets = rowSets.map((set) =>
+    ASet.bind(
+      (on: boolean) =>
+        on
+          ? set.rows.choose((row) => specOf(materializeRow(set, row)))
+          : ASet.empty<HeapDrawSpec>(),
+      heapEnabled,
+    ));
+
   // ONE fused stage: eligibility routes straight into the spec.
   // Constant eligibility (asserted rows, fully-static ROs) takes the
   // closure-free branch: an eager constant wrapper per RO — and the
@@ -284,7 +320,11 @@ export function compileHybridScene(
     return e.map((b) => (b ? specOf(ro) : undefined));
   });
 
-  const heapScene: HeapScene = buildHeapScene(device, signature, heapSpecAset, {
+  const allHeapSpecs = rowSpecSets.length === 0
+    ? heapSpecAset
+    : ASet.unionMany(ASet.ofArray([heapSpecAset, ...rowSpecSets]));
+
+  const heapScene: HeapScene = buildHeapScene(device, signature, allHeapSpecs, {
     fragmentOutputLayout,
     atlasPool,
     ...(opts.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),
@@ -308,17 +348,33 @@ export function compileHybridScene(
     if (l === undefined) { l = RenderTree.leaf(ro); leafCache.set(ro, l); }
     return l;
   };
-  const legacyTree: RenderTree = RenderTree.unorderedFromSet(
-    flat.chooseA((ro: RenderObject) => {
-      const e = elig(ro);
-      if (e.isConstant) {
-        // Why force here: constant — immutable by definition.
-        return e.force(/* allow-force */)
-          ? (CONST_UNDEF as aval<RenderTree | undefined>)
-          : AVal.constant(leafOf(ro));
-      }
-      return e.map((b) => (b ? undefined : leafOf(ro)));
-    }));
+  const legacyFromFlat = flat.chooseA((ro: RenderObject) => {
+    const e = elig(ro);
+    if (e.isConstant) {
+      // Why force here: constant — immutable by definition.
+      return e.force(/* allow-force */)
+        ? (CONST_UNDEF as aval<RenderTree | undefined>)
+        : AVal.constant(leafOf(ro));
+    }
+    return e.map((b) => (b ? undefined : leafOf(ro)));
+  });
+  // Row sets render legacy ONLY when the global heap toggle is off —
+  // with the (default) constant-true toggle the bind collapses and
+  // this contributes nothing.
+  const legacySet = rowSets.length === 0
+    ? legacyFromFlat
+    : ASet.union(
+        legacyFromFlat,
+        ASet.bind(
+          (on: boolean) =>
+            on
+              ? ASet.empty<RenderTree>()
+              : ASet.unionMany(ASet.ofArray(rowSets.map((set) =>
+                  set.rows.map((r) => leafOf(materializeRow(set, r)))))),
+          heapEnabled,
+        ),
+      );
+  const legacyTree: RenderTree = RenderTree.unorderedFromSet(legacySet);
   const scenePass = new ScenePass(device, signature, legacyTree, compileEffect);
   // DEBUG registry: per-hybrid-scene live draw counts (heap vs legacy) so
   // multi-task pipelines (OIT) can be inspected from the console.

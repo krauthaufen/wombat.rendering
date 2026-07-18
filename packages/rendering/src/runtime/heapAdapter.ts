@@ -167,6 +167,46 @@ function currentRefCellFor(av: aval<ITexture>, initial: number): { ref: number }
   }
   return c;
 }
+// ─── Value-interned constant wrappers ───────────────────────────────
+// Collection rows repeat the same uniform VALUES (class colors, line
+// widths) across thousands of rows. Wrapping each pull in a fresh
+// `AVal.constant` costs ~100 B per row-pass AND defeats the pool's
+// aval-identity sharing (every row gets its own arena slot for an
+// identical value). Interning by VALUE makes equal constants share
+// ONE wrapper — and therefore one pool entry per chunk.
+const constPrimIntern = new Map<unknown, aval<unknown>>();
+const constDataIntern = new Map<string, aval<unknown>>();
+const constObjIntern = new WeakMap<object, aval<unknown>>();
+function internConstant(v: unknown): aval<unknown> {
+  const t = typeof v;
+  if (t === "number" || t === "string" || t === "boolean") {
+    let av = constPrimIntern.get(v);
+    if (av === undefined) { av = AVal.constant(v); constPrimIntern.set(v, av); }
+    return av;
+  }
+  if (v !== null && t === "object") {
+    // Vector/matrix values expose `_data` (number[] or typed array) —
+    // key structurally so per-row `new V4f(...)` instances collapse.
+    const data = (v as { _data?: ArrayLike<number> })._data;
+    if (data !== undefined && typeof data.length === "number" && data.length <= 16) {
+      let key = String(data.length);
+      for (let i = 0; i < data.length; i++) key += "," + data[i];
+      let av = constDataIntern.get(key);
+      if (av === undefined) { av = AVal.constant(v); constDataIntern.set(key, av); }
+      return av;
+    }
+    let av = constObjIntern.get(v as object);
+    if (av === undefined) { av = AVal.constant(v); constObjIntern.set(v as object, av); }
+    return av;
+  }
+  return AVal.constant(v);
+}
+/** True when `v` quacks like an aval (matches `asAval`'s test). */
+function isAvalLike(v: unknown): boolean {
+  return typeof v === "object" && v !== null
+    && typeof (v as { getValue?: unknown }).getValue === "function";
+}
+
 function indicesAvalFor(ibAval: aval<IBuffer>, indexFormat: GPUIndexFormat, baseVertex: number): aval<Uint32Array> {
   let byBase = indicesAvalCache.get(ibAval);
   if (byBase === undefined) {
@@ -364,7 +404,11 @@ export function renderObjectToHeapSpec(
   const pullUniform = (name: string): void => {
     if (Object.prototype.hasOwnProperty.call(inputs, name)) return;
     const av = uProv.tryGet(name);
-    if (av !== undefined) inputs[name] = av;
+    if (av === undefined) return;
+    // Plain (non-aval) uniform values — e.g. row-scope constants
+    // resolved through a RowProvider hole — intern by VALUE so equal
+    // constants share one wrapper + one pool entry.
+    inputs[name] = isAvalLike(av) ? av : internConstant(av);
   };
   // §7-covered derived trafos (ModelViewProjTrafo, NormalMatrix, …) are
   // GPU-computed from the M/V/P constituents — addDraw never reads their

@@ -31,6 +31,7 @@ import {
 import { AListBridges } from "@aardworx/wombat.adaptive";
 import type { RenderObject } from "../core/renderObject.js";
 import type { RenderTree } from "../core/renderTree.js";
+import { materializeRow } from "../core/rowSet.js";
 
 /** True when `tree` contains no reactive nodes — its RenderObjects can
  *  be enumerated as a plain iterable (no inner aset / reader needed). */
@@ -168,5 +169,12 @@ export function flattenRenderTree(tree: RenderTree): aset<RenderObject> {
       return flattenChildSet(AListBridges.toASet(tree.children));
     case "UnorderedFromSet":
       return flattenChildSet(tree.children);
+    case "Rows":
+      // Materialization fallback — prototype-derived RenderObjects
+      // with stable per-row identity. The hybrid renderer consumes
+      // row sets DIRECTLY (see hybridScene.collectRowSets) and never
+      // takes this path for them; it exists for the legacy ScenePass
+      // and for row sets under reactive containers.
+      return tree.set.rows.map((r) => materializeRow(tree.set, r));
   }
 }
