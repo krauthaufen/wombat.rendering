@@ -155,6 +155,13 @@ export function writeField(
     view.u32.set(value, offset >> 2);
     return;
   }
+  // Plain number[] — wombat.base's d-types (V*d/M*d/Trafo3d) back
+  // `_data` with packed-double JS arrays (V8-optimal for f64), and
+  // users may hand raw arrays directly. `TypedArray.set` coerces.
+  if (Array.isArray(value)) {
+    view.f32.set(value as number[], offset >> 2);
+    return;
+  }
   // Trafo3d: pack its forward matrix. The runtime treats `Trafo3d`
   // uniforms uniformly as their forward-mat4 — callers who want the
   // inverse should bind a derived uniform that exposes `.backward`
@@ -170,18 +177,18 @@ export function writeField(
   ) {
     const data = ((value as { forward: { _data: unknown } }).forward._data);
     if (data instanceof Float32Array) { view.f32.set(data, offset >> 2); return; }
-    if (data instanceof Float64Array) {
+    if (data instanceof Float64Array || Array.isArray(data)) {
       const dst = view.f32.subarray(offset >> 2, (offset >> 2) + data.length);
-      for (let i = 0; i < data.length; i++) dst[i] = data[i]!;
+      for (let i = 0; i < data.length; i++) dst[i] = data[i] as number;
       return;
     }
   }
   if (value !== null && typeof value === "object" && "_data" in (value as object)) {
     const data = (value as { _data: unknown })._data;
     if (data instanceof Float32Array) { view.f32.set(data, offset >> 2); return; }
-    if (data instanceof Float64Array) {
+    if (data instanceof Float64Array || Array.isArray(data)) {
       const dst = view.f32.subarray(offset >> 2, (offset >> 2) + data.length);
-      for (let i = 0; i < data.length; i++) dst[i] = data[i]!;
+      for (let i = 0; i < data.length; i++) dst[i] = data[i] as number;
       return;
     }
     if (data instanceof Int32Array)   { view.i32.set(data, offset >> 2); return; }

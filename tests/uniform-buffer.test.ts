@@ -90,3 +90,37 @@ describe("prepareUniformBuffer", () => {
     r.release();
   });
 });
+
+describe("prepareUniformBuffer — plain number[] backed d-types", () => {
+  // wombat.base's double types (V*d / M*d / Trafo3d) back `_data`
+  // with plain JS arrays (packed doubles), NOT typed arrays.
+  // Regression: the packer's duck-typed branches must accept them —
+  // a raw Trafo3d / M44d / V4d uniform on the legacy path previously
+  // threw "unsupported uniform value" every frame (the frame loop
+  // then gives up → frozen picture after placing a measurement).
+  it("packs Trafo3d-shaped, M44d-shaped and raw number[] values", () => {
+    const gpu = new MockGPU();
+    const m = [
+      2, 0, 0, 0,
+      0, 3, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1,
+    ];
+    const trafoLike = { forward: { _data: m }, backward: { _data: m } };
+    const v4dLike = { _data: [1, 2, 3, 4] };
+    const inputs = HashMap.empty<string, aval<unknown>>()
+      .add("tint", cval<unknown>(v4dLike))
+      .add("scale", cval<unknown>([9]))
+      .add("viewProj", cval<unknown>(trafoLike));
+    const r = prepareUniformBuffer(gpu.device, layout, inputs, { label: "d-types" });
+    r.acquire();
+    r.getValue(AdaptiveToken.top);
+    const data = gpu.writeBufferCalls[0]!.data as ArrayBuffer;
+    const f = new Float32Array(data.slice(0));
+    expect([f[0], f[1], f[2], f[3]]).toEqual([1, 2, 3, 4]);   // v4d-like
+    expect(f[4]).toBe(9);                                     // number[1]
+    expect(f[8]).toBe(2);                                     // trafo forward[0]
+    expect(f[13]).toBe(3);                                    // forward[5]
+    r.release();
+  });
+});
