@@ -1089,6 +1089,7 @@ export function buildHeapScene(
   const activeDirty = new Set<number>();
 
   function subscribeActive(av: aval<boolean>, drawId: number): void {
+    if (av.isConstant) return; // fixed visibility — nothing will ever tick
     let set = activeAvalToDrawIds.get(av);
     if (set === undefined) {
       set = new Set<number>();
@@ -1169,6 +1170,7 @@ export function buildHeapScene(
   const countDirty = new Set<number>();
 
   function subscribeCount(av: aval<number>, drawId: number): void {
+    if (av.isConstant) return; // fixed count — nothing will ever tick
     drawIdToCountAval.set(drawId, av);
     drawIdToCountCallback.set(
       drawId,
@@ -1231,6 +1233,12 @@ export function buildHeapScene(
   }
 
   function subscribeModeLeaf(av: aval<unknown>, drawId: number): void {
+    // A CONSTANT leaf can never mark — subscribing would allocate a
+    // MultiCallbackObject + callback Map + disposable + a draw-id Set
+    // PER AVAL for nothing. At collection scale the per-row uniform
+    // wrappers are overwhelmingly constants; this guard was worth
+    // ~4-5 KB per row-pass (measured, WBOIT 2k).
+    if (av.isConstant) return;
     let set = modeAvalToDrawIds.get(av);
     if (set === undefined) {
       set = new Set<number>();
