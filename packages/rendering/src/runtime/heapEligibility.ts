@@ -224,7 +224,9 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
     for (const av of textures) if (!isHeapServableTexture(av.getValue(token))) return false;
     for (const av of samplers) if (!isHeapServableSampler(av.getValue(token))) return false;
     const dc = ro.drawCall.getValue(token);
-    if (dc.instanceCount < 1) return false;
+    // 0 is heap-legal (the scan kernel emits indexCount × 0 = nothing,
+    // matching what legacy draws) — only negative counts are malformed.
+    if (dc.instanceCount < 0) return false;
     if (dc.firstInstance !== 0) return false;
     if (dc.kind === "indexed") {
       if (ro.indices === undefined) return false;

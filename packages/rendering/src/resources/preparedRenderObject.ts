@@ -72,6 +72,11 @@ interface VertexBindingInfo {
   readonly slot: number;
   readonly format: GPUVertexFormat;
   readonly byteSize: number;
+  /** Byte offset to apply at `setVertexBuffer` time (the group's
+   *  common base — per-attribute layout offsets are RELATIVE to it).
+   *  Undefined on legacy construction paths → fall back to the
+   *  view's own offset. */
+  readonly baseOffset?: number;
 }
 
 function vertexBindingsFor(iface: ProgramInterface): VertexBindingInfo[] {
@@ -527,7 +532,7 @@ export class PreparedRenderObject {
       if (res === undefined) throw new Error(`PreparedRenderObject.record: missing vertex buffer for "${vb.name}"`);
       const view = this.vertexViews.get(vb.name);
       const buf = res.getValue(token);
-      const offset = view !== undefined ? BufferView.offsetOf(view) : 0;
+      const offset = vb.baseOffset ?? (view !== undefined ? BufferView.offsetOf(view) : 0);
       if (offset > 0) {
         // size omitted → WebGPU uses (buffer.size − offset).
         pass.setVertexBuffer(vb.slot, buf, offset);
@@ -602,6 +607,8 @@ export function prepareRenderObject(
     readonly stepMode: GPUVertexStepMode;
     readonly stride: number;
     readonly offset: number;
+    /** Tight byte size of one element (for the slot-fit rule). */
+    readonly byteSizeOf: number;
     readonly format: GPUVertexFormat;
     readonly view: BufferView;
   }
@@ -631,6 +638,7 @@ export function prepareRenderObject(
       name: vb.name,
       shaderLocation: vb.slot,
       stepMode, stride, offset,
+      byteSizeOf: view.elementType.byteSize,
       format, view,
     });
   }
@@ -645,6 +653,8 @@ export function prepareRenderObject(
     readonly stride: number;
     readonly stepMode: GPUVertexStepMode;
     readonly view: BufferView;
+    /** Byte offset the slot is BOUND at (setVertexBuffer). */
+    readonly base: number;
     readonly bufferRes: AdaptiveResource<GPUBuffer>;
     readonly members: ResolvedBinding[];
   }
@@ -659,9 +669,19 @@ export function prepareRenderObject(
   let nextSlot = 0;
   const vertexBuffers = new Map<string, AdaptiveResource<GPUBuffer>>();
   const vertexViews = new Map<string, BufferView>();
-  for (const r of resolved) {
+  // WebGPU validates `attribute.offset + formatSize <= arrayStride`
+  // (stride > 0), so a view whose offset does not fit RELATIVE to the
+  // group's base must live in its OWN slot, bound with a buffer
+  // offset at `setVertexBuffer` time — the strided-views idiom
+  // (SegA = P[i] at offset 0, SegB = P[i+1] at offset 12, stride 12)
+  // depends on this. Group key therefore includes the byte offset the
+  // slot is BOUND at (`base`); attributes whose offset equals the
+  // base share the slot with relative offset 0, interleaved layouts
+  // (offsets 0/16/32/48 within stride 64) join the base-0 group as
+  // before via the fit rule below.
+  const addToGroup = (r: ResolvedBinding, base: number): void => {
     const bufId = idOf(r.view.buffer as unknown as object);
-    const key = `${bufId}|${r.stride}|${r.stepMode}`;
+    const key = `${bufId}|${r.stride}|${r.stepMode}|${base}`;
     let group = vbGroups.get(key);
     if (!group) {
       const bufferRes = prepareAdaptiveBuffer(device, r.view.buffer, {
@@ -670,13 +690,33 @@ export function prepareRenderObject(
       });
       group = {
         key, slot: nextSlot++, stride: r.stride, stepMode: r.stepMode,
-        view: r.view, bufferRes, members: [],
+        view: r.view, base, bufferRes, members: [],
       };
       vbGroups.set(key, group);
     }
     group.members.push(r);
     vertexBuffers.set(r.name, group.bufferRes);
     vertexViews.set(r.name, r.view);
+  };
+  const fitsAt = (r: ResolvedBinding, base: number): boolean =>
+    r.stride === 0
+      ? r.offset === base
+      : r.offset >= base && r.offset - base + r.byteSizeOf <= r.stride;
+  for (const r of resolved) {
+    // Prefer an existing group of this (buffer, stride, stepMode)
+    // whose base the attribute's offset fits relative to; else open a
+    // group based at the attribute's own offset (relative offset 0 —
+    // always valid).
+    const bufId = idOf(r.view.buffer as unknown as object);
+    let placed = false;
+    for (const g of vbGroups.values()) {
+      if (g.key.startsWith(`${bufId}|${r.stride}|${r.stepMode}|`) && fitsAt(r, g.base)) {
+        addToGroup(r, g.base);
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) addToGroup(r, r.offset);
   }
   const vertexLayouts: GPUVertexBufferLayout[] = [];
   for (const g of vbGroups.values()) {
@@ -685,7 +725,7 @@ export function prepareRenderObject(
       stepMode: g.stepMode,
       attributes: g.members.map((m) => ({
         shaderLocation: m.shaderLocation,
-        offset: m.offset,
+        offset: m.offset - g.base,
         format: m.format,
       })),
     };
@@ -709,6 +749,7 @@ export function prepareRenderObject(
       slot: g.slot,
       format: head.format,
       byteSize: 0,
+      baseOffset: g.base,
     });
   }
   vertexBindings = drawTimeBindings;
