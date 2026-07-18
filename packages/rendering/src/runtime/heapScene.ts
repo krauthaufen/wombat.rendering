@@ -1732,7 +1732,18 @@ export function buildHeapScene(
     // `colorTargets` here silently dropped blends/write-masks from every
     // heap pipeline: transparent heap leaves painted opaque, and the OIT
     // pick passes' write-mask-0 "Colors" leaked color onto the composite.
+    // Locations the family's fragment shader actually writes — a
+    // signature target the shader has NO output for must set
+    // writeMask 0 (WebGPU: non-zero writeMask without a fragment
+    // output is a validation error; e.g. a non-picking leaf in a
+    // Colors+pickId pass writes only Colors).
+    const writtenLocations = new Set<number>();
+    for (const e of fam.schema.effects) {
+      const sc = fam.schema.perEffectSchema.get(e)!;
+      for (const fo of sc.fragmentOutputs) writtenLocations.add(fo.location);
+    }
     const targets: GPUColorTargetState[] = colorTargets.map((t, i) => {
+      if (!writtenLocations.has(i)) return { format: t.format, writeMask: 0 };
       const a = desc.attachments[i];
       if (a === undefined) return { format: t.format };
       return {
