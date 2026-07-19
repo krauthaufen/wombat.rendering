@@ -382,6 +382,9 @@ export function compileHybridScene(
     sig: signature.colorNames.join("+"),
     heap: () => heapScene.stats.totalDraws,
     legacy: () => scenePass.collect().length,
+    /** GPU geometry arena bytes (the arena is SHARED page-wide — any
+     *  entry reports the global figure). */
+    gpuBytes: () => heapScene.stats.geometryBytes,
   };
   const dbgArr = ((globalThis as any).__hybridScenes ??= []) as (typeof dbgEntry)[];
   dbgArr.push(dbgEntry);
