@@ -834,11 +834,11 @@ fn atlasSample(
 `;
 }
 
-import { atlasPageSize } from "./textureAtlas/atlasPool.js";
+import { atlasPageSizeNow } from "./textureAtlas/atlasPool.js";
 function atlasPageSizeConst(): string {
   // Embedded at shader-gen time — matches the pool's configured page
   // size (RuntimeOptions.atlasPageSize; set before any shader gen).
-  return String(atlasPageSize);
+  return String(atlasPageSizeNow());
 }
 
 /**

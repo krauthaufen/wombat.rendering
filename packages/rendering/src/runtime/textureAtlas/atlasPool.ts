@@ -58,9 +58,15 @@ export const ATLAS_MAX_PAGES_PER_FORMAT = 8;
 /** Page edge in texels. Default suits small-memory devices; desktops
  *  pass RuntimeOptions.atlasPageSize = 8192 (must be set BEFORE any
  *  page allocation or shader generation). */
-export let atlasPageSize = 4096;
+// NB: routed through globalThis, NOT a module `let` — bundlers can
+// duplicate this module across the package's entry points, and a
+// module-local value set via one copy is invisible to the other
+// (observed: shader-gen kept emitting 4096 while pages were 8192).
+export function atlasPageSizeNow(): number {
+  return ((globalThis as { __wombatAtlasPageSize?: number }).__wombatAtlasPageSize ?? 4096);
+}
 export function setAtlasPageSize(n: number): void {
-  atlasPageSize = n;
+  (globalThis as { __wombatAtlasPageSize?: number }).__wombatAtlasPageSize = n;
 }
 
 export type AtlasPageFormat = "rgba8unorm" | "rgba8unorm-srgb";
@@ -357,7 +363,7 @@ export class AtlasPool {
     // device and headless-without-canvas edge cases.
     const texture = this.device.createTexture({
       label: `atlas/${format}/${pageId}`,
-      size: { width: atlasPageSize, height: atlasPageSize, depthOrArrayLayers: 1 },
+      size: { width: atlasPageSizeNow(), height: atlasPageSizeNow(), depthOrArrayLayers: 1 },
       format,
       mipLevelCount: 1,
       usage:
@@ -369,7 +375,7 @@ export class AtlasPool {
     return {
       format,
       texture,
-      packing: TexturePacking.empty<number>(new V2i(atlasPageSize, atlasPageSize), false),
+      packing: TexturePacking.empty<number>(new V2i(atlasPageSizeNow(), atlasPageSizeNow()), false),
       pageId,
     };
   }
@@ -526,7 +532,7 @@ export class AtlasPool {
       if (!this.fullWarned.has(format)) {
         this.fullWarned.add(format);
         console.warn(
-          `atlas: FULL for ${format} — ${pages.length} pages × ${atlasPageSize}² all in use ` +
+          `atlas: FULL for ${format} — ${pages.length} pages × ${atlasPageSizeNow()}² all in use ` +
           `(${this.entriesByRef.size} live entries, ${this.lru.size} evictable). ` +
           `New textures are deferred until space frees.`,
         );
@@ -538,7 +544,7 @@ export class AtlasPool {
     const placed = page.packing.tryAdd(this.nextRef, size);
     if (placed === null) {
       throw new Error(
-        `AtlasPool: ${reservedW}×${reservedH} doesn't fit a fresh ${atlasPageSize}² page`,
+        `AtlasPool: ${reservedW}×${reservedH} doesn't fit a fresh ${atlasPageSizeNow()}² page`,
       );
     }
     page.packing = placed;
