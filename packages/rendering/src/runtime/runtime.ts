@@ -1,4 +1,4 @@
-import { setAtlasPageSize } from "./textureAtlas/atlasPool.js";
+import { setAtlasPageSize, setAtlasMaxPages } from "./textureAtlas/atlasPool.js";
 // Runtime — the user-facing entry point. Holds the device +
 // effect-compilation hook, exposes `compile(commands)` and
 // (eventually) `renderTo(...)`.
@@ -59,6 +59,9 @@ export interface RuntimeOptions {
    *  8192 — 4× resident-texture capacity for streaming scenes. Must be
    *  set at Runtime construction (before shader generation). */
   readonly atlasPageSize?: number;
+  /** Max atlas pages (texture-array layers) per format family (default
+   *  16). Layers grow on demand; this caps the growth. */
+  readonly atlasMaxPages?: number;
   /**
    * Heap arena compaction toggle — threaded into
    * `BuildHeapSceneOptions.enableCompaction`. Streaming apps with steady
@@ -95,6 +98,7 @@ export class Runtime {
 
   constructor(opts: RuntimeOptions) {
     if (opts.atlasPageSize !== undefined) setAtlasPageSize(opts.atlasPageSize);
+    if (opts.atlasMaxPages !== undefined) setAtlasMaxPages(opts.atlasMaxPages);
     this.ctx = {
       device: opts.device,
       compileEffect: opts.compileEffect ?? ((e: Effect, sig: FramebufferSignature) => e.compile({

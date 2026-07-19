@@ -66,7 +66,7 @@ import {
   type AtlasPage, type AtlasPageFormat, type AtlasPool,
 } from "./textureAtlas/atlasPool.js";
 import {
-  ATLAS_ARRAY_SIZE, ATLAS_LINEAR_BINDING_BASE,
+  ATLAS_LINEAR_BINDING_BASE,
   ATLAS_SRGB_BINDING_BASE, ATLAS_SAMPLER_BINDING,
 } from "./heapEffect.js";
 import {
@@ -1646,7 +1646,7 @@ export function buildHeapScene(
       format,
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
-    const view = tex.createView();
+    const view = tex.createView({ dimension: "2d-array" });
     atlasPlaceholders.set(format, view);
     return view;
   }
@@ -1703,19 +1703,16 @@ export function buildHeapScene(
       });
     }
     if (withAtlasArrays) {
-      // 2N + 1 entries: N linear textures, N srgb textures, 1 sampler.
-      for (let i = 0; i < ATLAS_ARRAY_SIZE; i++) {
-        entries.push({
-          binding: ATLAS_LINEAR_BINDING_BASE + i, visibility: GPUShaderStage.FRAGMENT,
-          texture: { sampleType: "float" },
-        });
-      }
-      for (let i = 0; i < ATLAS_ARRAY_SIZE; i++) {
-        entries.push({
-          binding: ATLAS_SRGB_BINDING_BASE + i, visibility: GPUShaderStage.FRAGMENT,
-          texture: { sampleType: "float" },
-        });
-      }
+      // 3 entries: linear array texture, srgb array texture, sampler.
+      // Pages are layers — the shader indexes `pageRef` at runtime.
+      entries.push({
+        binding: ATLAS_LINEAR_BINDING_BASE, visibility: GPUShaderStage.FRAGMENT,
+        texture: { sampleType: "float", viewDimension: "2d-array" },
+      });
+      entries.push({
+        binding: ATLAS_SRGB_BINDING_BASE, visibility: GPUShaderStage.FRAGMENT,
+        texture: { sampleType: "float", viewDimension: "2d-array" },
+      });
       entries.push({
         binding: ATLAS_SAMPLER_BINDING, visibility: GPUShaderStage.FRAGMENT,
         sampler: { type: "filtering" },
@@ -2246,24 +2243,19 @@ export function buildHeapScene(
           "heapScene: atlas-variant bucket needs `atlasPool` in BuildHeapSceneOptions",
         );
       }
-      // Bind N consecutive `texture_2d<f32>` slots per format. Slot
-      // i for format F holds the GPUTexture view of `pagesFor(F)[i]`
-      // when present, or a 1×1 placeholder otherwise. drawHeader's
-      // `pageRef` field is exactly that slot index; the shader's
-      // `switch pageRef` ladder picks the matching binding.
+      // One `texture_2d_array` per format family — pages are layers,
+      // drawHeader's `pageRef` is the runtime layer index. A 1×1
+      // single-layer placeholder binds before the first page exists.
       for (const format of ATLAS_PAGE_FORMATS) {
-        const base = format === "rgba8unorm-srgb"
+        const binding = format === "rgba8unorm-srgb"
           ? ATLAS_SRGB_BINDING_BASE : ATLAS_LINEAR_BINDING_BASE;
-        const pages = atlasPool.pagesFor(format);
-        for (let i = 0; i < ATLAS_ARRAY_SIZE; i++) {
-          const page = pages[i];
-          entries.push({
-            binding: base + i,
-            resource: page !== undefined
-              ? page.texture.createView()
-              : getAtlasPlaceholder(format),
-          });
-        }
+        const tex = atlasPool.textureFor(format);
+        entries.push({
+          binding,
+          resource: tex !== undefined
+            ? tex.createView({ dimension: "2d-array" })
+            : getAtlasPlaceholder(format),
+        });
       }
       entries.push({ binding: ATLAS_SAMPLER_BINDING, resource: atlasSampler });
     }
@@ -5135,7 +5127,9 @@ export function buildHeapScene(
       device.queue.submit([enc.finish()]);
 
       await arenaCopy.mapAsync(GPUMapMode.READ);
-      if (indicesCopy !== undefined) await indicesCopy.mapAsync(GPUMapMode.READ);
+      // indicesCopy may alias arenaCopy (indices live in the attr arena) —
+      // mapping the same buffer twice throws "already mapped".
+      if (indicesCopy !== undefined && indicesCopy !== arenaCopy) await indicesCopy.mapAsync(GPUMapMode.READ);
       for (const dc of dcs) {
         await dc.drawHeap.mapAsync(GPUMapMode.READ);
         if (dc.drawTable !== undefined) await dc.drawTable.mapAsync(GPUMapMode.READ);
@@ -5367,12 +5361,16 @@ const KNOWN_TYPE_IDS = new Set<number>([0, 1, 2, 3]);
         return h.toString(16).padStart(8, "0");
       };
       const indicesHash = indicesCopy !== undefined
-        ? fnv1a(new Uint32Array(indicesCopy.getMappedRange(), 0, indicesSize >>> 2))
+        // aliased buffer: reuse the arena mapping (a second getMappedRange
+        // on the same range throws)
+        ? fnv1a(indicesCopy === arenaCopy
+            ? arenaU32.subarray(0, indicesSize >>> 2)
+            : new Uint32Array(indicesCopy.getMappedRange(), 0, indicesSize >>> 2))
         : "—";
 
       arenaCopy.unmap();
       arenaCopy.destroy();
-      if (indicesCopy !== undefined) {
+      if (indicesCopy !== undefined && indicesCopy !== arenaCopy) {
         indicesCopy.unmap();
         indicesCopy.destroy();
       }
@@ -5442,7 +5440,9 @@ const KNOWN_TYPE_IDS = new Set<number>([0, 1, 2, 3]);
       device.queue.submit([enc.finish()]);
 
       await arenaCopy.mapAsync(GPUMapMode.READ);
-      if (indicesCopy !== undefined) await indicesCopy.mapAsync(GPUMapMode.READ);
+      // indicesCopy may alias arenaCopy (indices live in the attr arena) —
+      // mapping the same buffer twice throws "already mapped".
+      if (indicesCopy !== undefined && indicesCopy !== arenaCopy) await indicesCopy.mapAsync(GPUMapMode.READ);
       for (const dc of dcs) {
         await dc.drawHeap.mapAsync(GPUMapMode.READ);
         await dc.drawTable.mapAsync(GPUMapMode.READ);
@@ -5451,7 +5451,8 @@ const KNOWN_TYPE_IDS = new Set<number>([0, 1, 2, 3]);
       const arenaU32 = new Uint32Array(arenaCopy.getMappedRange());
       const arenaF32 = new Float32Array(arenaU32.buffer, arenaU32.byteOffset, arenaU32.length);
       const indicesU32 = indicesCopy !== undefined
-        ? new Uint32Array(indicesCopy.getMappedRange())
+        // aliased buffer: reuse the arena mapping (a second getMappedRange throws)
+        ? (indicesCopy === arenaCopy ? arenaU32 : new Uint32Array(indicesCopy.getMappedRange()))
         : undefined;
 
       // Compute per-bucket cumulative emit ranges + cache mapped views.
@@ -5661,7 +5662,7 @@ const KNOWN_TYPE_IDS = new Set<number>([0, 1, 2, 3]);
 
       // Cleanup
       arenaCopy.unmap(); arenaCopy.destroy();
-      if (indicesCopy !== undefined) { indicesCopy.unmap(); indicesCopy.destroy(); }
+      if (indicesCopy !== undefined && indicesCopy !== arenaCopy) { indicesCopy.unmap(); indicesCopy.destroy(); }
       for (const dc of dcs) {
         dc.drawHeap.unmap(); dc.drawHeap.destroy();
         dc.drawTable.unmap(); dc.drawTable.destroy();
@@ -5716,11 +5717,14 @@ const KNOWN_TYPE_IDS = new Set<number>([0, 1, 2, 3]);
         device.queue.submit([enc.finish()]);
       }
       await arenaCopy.mapAsync(GPUMapMode.READ);
-      if (indicesCopy !== undefined) await indicesCopy.mapAsync(GPUMapMode.READ);
+      // indicesCopy may alias arenaCopy (indices live in the attr arena) —
+      // mapping the same buffer twice throws "already mapped".
+      if (indicesCopy !== undefined && indicesCopy !== arenaCopy) await indicesCopy.mapAsync(GPUMapMode.READ);
       const arenaU32 = new Uint32Array(arenaCopy.getMappedRange());
       const arenaF32 = new Float32Array(arenaU32.buffer, arenaU32.byteOffset, arenaU32.length);
       const indicesU32 = indicesCopy !== undefined
-        ? new Uint32Array(indicesCopy.getMappedRange())
+        // aliased buffer: reuse the arena mapping (a second getMappedRange throws)
+        ? (indicesCopy === arenaCopy ? arenaU32 : new Uint32Array(indicesCopy.getMappedRange()))
         : new Uint32Array(0);
 
       for (const target of buckets) {
@@ -5995,7 +5999,7 @@ const KNOWN_TYPE_IDS = new Set<number>([0, 1, 2, 3]);
       }
 
       arenaCopy.unmap(); arenaCopy.destroy();
-      if (indicesCopy !== undefined) { indicesCopy.unmap(); indicesCopy.destroy(); }
+      if (indicesCopy !== undefined && indicesCopy !== arenaCopy) { indicesCopy.unmap(); indicesCopy.destroy(); }
       void samples;
 
       return { trianglesChecked, crossSlot, issues };

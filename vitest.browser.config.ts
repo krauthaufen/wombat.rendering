@@ -31,7 +31,7 @@ export default defineConfig({
       enabled: true,
       provider: "playwright",
       name: "chromium",
-      headless: true,
+      headless: (process.env.HEADED_TESTS ? false : true),
       providerOptions: {
         launch: {
           // chromium 150 (Debian, 2026-07-07 update) SIGTRAPs on --no-sandbox;

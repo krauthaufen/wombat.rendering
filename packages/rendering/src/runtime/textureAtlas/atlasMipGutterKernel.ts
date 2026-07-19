@@ -255,6 +255,7 @@ function runMipGutter(
   mips: readonly MipSlot[],
   mip0Src: Mip0Source,
   batch?: MipGutterBatch,
+  pageLayer = 0,
 ): void {
   const k = getKernel(device);
   const bufStrideU32 = rowBytes / 4;
@@ -349,7 +350,7 @@ function runMipGutter(
   // Final upload: buffer → page.
   enc.copyBufferToTexture(
     { buffer: scratch, bytesPerRow: rowBytes, rowsPerImage: boundsH },
-    { texture: page, origin: { x: subRectX, y: subRectY, z: 0 } },
+    { texture: page, origin: { x: subRectX, y: subRectY, z: pageLayer } },
     { width: boundsW, height: boundsH, depthOrArrayLayers: 1 },
   );
 
@@ -396,6 +397,7 @@ export function buildMipsAndGutterOnGpu(
   srcW: number, srcH: number,
   mips: readonly MipSlot[],
   batch?: MipGutterBatch,
+  pageLayer = 0,
 ): void {
   if (mips.length === 0) return;
   const { rowBytes, bufSize } = scratchGeom(boundsW, boundsH);
@@ -430,7 +432,7 @@ export function buildMipsAndGutterOnGpu(
 
   runMipGutter(
     device, page, subRectX, subRectY, boundsW, boundsH,
-    rowBytes, scratch, srcW, srcH, mips, { kind: "prefilled" }, batch,
+    rowBytes, scratch, srcW, srcH, mips, { kind: "prefilled" }, batch, pageLayer,
   );
 }
 
@@ -457,6 +459,7 @@ export function buildMipsAndGutterFromTexture(
   srcW: number, srcH: number,
   mips: readonly MipSlot[],
   batch?: MipGutterBatch,
+  pageLayer = 0,
 ): void {
   if (mips.length === 0) return;
   const { rowBytes, bufSize } = scratchGeom(boundsW, boundsH);
@@ -467,6 +470,6 @@ export function buildMipsAndGutterFromTexture(
   });
   runMipGutter(
     device, page, subRectX, subRectY, boundsW, boundsH,
-    rowBytes, scratch, srcW, srcH, mips, { kind: "texture", tex: srcTex }, batch,
+    rowBytes, scratch, srcW, srcH, mips, { kind: "texture", tex: srcTex }, batch, pageLayer,
   );
 }

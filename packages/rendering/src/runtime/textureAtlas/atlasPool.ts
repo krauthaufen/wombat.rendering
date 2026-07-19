@@ -46,14 +46,24 @@ export const ATLAS_MAX_DIM = 1024;
  * `switch pageRef` runs an N-way ladder; the BGL declares N consecutive
  * texture slots per format. Allocations beyond this throw.
  */
-// The page COUNT is fixed at 8 — it must match the shader's binding
-// ladder (heapEffect ATLAS_ARRAY_SIZE; N texture_2d slots per format;
-// WebGPU per-stage sampled-texture limits rule out more). Capacity
-// scales via PAGE SIZE instead: 4096² caps resident textures at ~512
-// (Google tiles ≈ 64 × 512² per page) which starved tile streaming
-// (deferred textures = held draws + black tiles); desktops configure
-// 8192² via RuntimeOptions.atlasPageSize (4× capacity, lazy alloc).
-export const ATLAS_MAX_PAGES_PER_FORMAT = 8;
+// Pages are LAYERS of one `texture_2d_array` per format: the shader
+// indexes `pageRef` at runtime, so the count is no longer pinned to a
+// binding ladder. Layers grow on demand (new array texture + GPU-side
+// layer copy + bind-group rebuild via onPageAdded); this cap only
+// bounds the growth so a runaway streaming scene can't eat unbounded
+// VRAM (16 × 4096² × rgba8 ≈ 1 GB per format family, lazily reached).
+// Configurable via RuntimeOptions.atlasMaxPages.
+export const ATLAS_MAX_PAGES_PER_FORMAT = 16;
+
+/** Runtime-configurable layer cap (RuntimeOptions.atlasMaxPages).
+ *  Routed through globalThis like the page size — bundlers can
+ *  duplicate this module across entry points. */
+export function atlasMaxPagesNow(): number {
+  return ((globalThis as { __wombatAtlasMaxPages?: number }).__wombatAtlasMaxPages ?? ATLAS_MAX_PAGES_PER_FORMAT);
+}
+export function setAtlasMaxPages(n: number): void {
+  (globalThis as { __wombatAtlasMaxPages?: number }).__wombatAtlasMaxPages = n;
+}
 
 /** Page edge in texels. Default suits small-memory devices; desktops
  *  pass RuntimeOptions.atlasPageSize = 8192 (must be set BEFORE any
@@ -80,17 +90,19 @@ export const atlasFormatIndex = (f: AtlasPageFormat): number =>
 export interface AtlasPage {
   readonly format: AtlasPageFormat;
   /**
-   * The page's own independent `GPUTexture` (dimension: "2d", single
-   * 4096² image). Stable for the page's lifetime — never reallocated.
+   * The format family's shared `texture_2d_array` — this page is layer
+   * `pageId` of it. NOT stable across growth: adding pages past the
+   * current layer count reallocates the array (existing layers are
+   * GPU-copied across and `onPageAdded` fires so bind groups rebuild).
+   * Always read through this getter, never cache the GPUTexture.
    */
   readonly texture: GPUTexture;
   /** Immutable packer state — `tryAdd`/`remove` produce new instances. */
   packing: TexturePacking<number>;
   /**
-   * Page slot index in the format's binding sequence (0..N-1). Same
-   * value flows into the drawHeader `pageRef` field; the shader's
-   * `switch pageRef` selects the matching `atlasLinear<i>` /
-   * `atlasSrgb<i>` declaration.
+   * Layer index in the format's array texture (0..N-1). Same value
+   * flows into the drawHeader `pageRef` field; the shader indexes the
+   * array with it at runtime.
    */
   readonly pageId: number;
 }
@@ -251,6 +263,8 @@ function describeAtlasTexture(t: ITexture): {
 export class AtlasPool {
   private readonly pagesByFormat = new Map<AtlasPageFormat, AtlasPage[]>();
   private readonly pageAddedListeners = new Map<AtlasPageFormat, Set<(pageId: number) => void>>();
+  /** Per-format shared array texture (pages = layers). */
+  private readonly storesByFormat = new Map<AtlasPageFormat, { texture: GPUTexture; layers: number }>();
   /**
    * Keyed by `aval<ITexture>` under the aval equality protocol: a
    * `HashTable` (not a JS `Map`) so two distinct `AVal.constant(tex)`
@@ -301,7 +315,7 @@ export class AtlasPool {
   /** True while every page of `format` is packed with live (referenced) entries. */
   isFull(format: AtlasPageFormat): boolean {
     const pages = this.pagesByFormat.get(format);
-    if (pages === undefined || pages.length < ATLAS_MAX_PAGES_PER_FORMAT) return false;
+    if (pages === undefined || pages.length < atlasMaxPagesNow()) return false;
     for (const e of this.lru.values()) if (e.format === format) return false; // something is evictable
     return true;
   }
@@ -351,19 +365,36 @@ export class AtlasPool {
     return typeof (this.device.queue as { onSubmittedWorkDone?: () => Promise<void> }).onSubmittedWorkDone === "function";
   }
 
-  private allocatePage(format: AtlasPageFormat, pageId: number): AtlasPage {
+  /**
+   * Ensure the format's array texture has at least `layers` layers.
+   * Growth allocates a fresh array (pow2 steps up to 8, then +2, capped
+   * at `atlasMaxPagesNow()`), copies every existing layer across in one
+   * `copyTextureToTexture`, and destroys the old texture (safe right
+   * after submit — already-submitted work completes before destruction).
+   * Callers fire `onPageAdded` afterwards, which rebuilds bind groups —
+   * so the stale-texture window never reaches a render pass.
+   */
+  private ensureLayers(format: AtlasPageFormat, layers: number): { texture: GPUTexture; layers: number } {
+    const cap = atlasMaxPagesNow();
+    if (layers > cap) {
+      throw new Error(`AtlasPool: layer request ${layers} exceeds atlasMaxPages ${cap}`);
+    }
+    const store = this.storesByFormat.get(format);
+    if (store !== undefined && store.layers >= layers) return store;
+    // +2 step (capped): a layer is huge (aps² × 4B — 268 MB at 8192²),
+    // pow2 overshoot needlessly spikes VRAM (transient = old + new array
+    // until the queue drains); +2 halves the number of grow-copies vs
+    // exact-need. NO deferral here: a null acquisition for a NEW draw
+    // has no retry path (measured: permanently untextured tiles after a
+    // camera move), so growth must always succeed below the cap.
+    const next = Math.min(Math.max(layers, (store?.layers ?? 0) + 2), cap);
     // The compute mip+gutter kernel works for *all* page formats: it
-    // builds the pyramid + gutters in a scratch storage *buffer* (rgba8
-    // u32s) and finishes with `copyBufferToTexture` into the page, so
-    // the page itself never needs to be a storage texture — srgb pages
-    // included (the copy reinterprets the bytes; no colour conversion).
-    // Pages therefore only need TEXTURE_BINDING | COPY_DST | COPY_SRC |
-    // RENDER_ATTACHMENT (no STORAGE_BINDING). The CPU `buildExtended-
-    // WithGutter` path remains only as a fallback for the node mock-GPU
-    // device and headless-without-canvas edge cases.
+    // builds the pyramid + gutters in a scratch storage *buffer* and
+    // finishes with `copyBufferToTexture` into the layer, so pages
+    // never need STORAGE_BINDING — srgb included.
     const texture = this.device.createTexture({
-      label: `atlas/${format}/${pageId}`,
-      size: { width: atlasPageSizeNow(), height: atlasPageSizeNow(), depthOrArrayLayers: 1 },
+      label: `atlas/${format}[${next}]`,
+      size: { width: atlasPageSizeNow(), height: atlasPageSizeNow(), depthOrArrayLayers: next },
       format,
       mipLevelCount: 1,
       usage:
@@ -372,12 +403,45 @@ export class AtlasPool {
         GPUTextureUsage.COPY_SRC |
         GPUTextureUsage.RENDER_ATTACHMENT,
     });
+    if (store !== undefined && store.layers > 0) {
+      // An OPEN upload batch may hold copies targeting the old texture —
+      // submit it first, or those uploads land in the abandoned array
+      // (and its destroy below invalidates their submit).
+      this.flushUploadBatch();
+      const enc = this.device.createCommandEncoder({ label: `atlas/${format}/grow` });
+      enc.copyTextureToTexture(
+        { texture: store.texture },
+        { texture },
+        { width: atlasPageSizeNow(), height: atlasPageSizeNow(), depthOrArrayLayers: store.layers },
+      );
+      this.device.queue.submit([enc.finish()]);
+      // Immediate destroy is safe: the layer copy is already SUBMITTED
+      // (submitted work completes before destruction takes effect), and
+      // the batch flush above guarantees no later submit references the
+      // old texture.
+      store.texture.destroy();
+    }
+    const fresh = { texture, layers: next };
+    this.storesByFormat.set(format, fresh);
+    return fresh;
+  }
+
+  private allocatePage(format: AtlasPageFormat, pageId: number): AtlasPage {
+    const pool = this;
+    this.ensureLayers(format, pageId + 1);
     return {
       format,
-      texture,
+      // getter: growth reallocates the array; pages must never cache it
+      get texture(): GPUTexture { return pool.storesByFormat.get(format)!.texture; },
       packing: TexturePacking.empty<number>(new V2i(atlasPageSizeNow(), atlasPageSizeNow()), false),
       pageId,
     };
+  }
+
+  /** The format family's current array texture (undefined before the
+   *  first page). Bind-group building reads this — pages are layers. */
+  textureFor(format: AtlasPageFormat): GPUTexture | undefined {
+    return this.storesByFormat.get(format)?.texture;
   }
 
   /**
@@ -515,8 +579,8 @@ export class AtlasPool {
       if (fit !== null) return fit;
     }
 
-    // Allocate a fresh page if we haven't hit the max.
-    if (pages.length >= ATLAS_MAX_PAGES_PER_FORMAT) {
+    // Allocate a fresh page (array layer) if we haven't hit the cap.
+    if (pages.length >= atlasMaxPagesNow()) {
       // The atlas is genuinely full: every page is packed with entries that are
       // still referenced, so there is nothing to evict. That is resource
       // pressure, NOT a program error — and throwing turned it into a fatal
@@ -720,11 +784,10 @@ export class AtlasPool {
     return n;
   }
 
-  /** Destroy every page texture. The pool becomes unusable. */
+  /** Destroy the per-format array textures. The pool becomes unusable. */
   dispose(): void {
-    for (const [, pages] of this.pagesByFormat) {
-      for (const p of pages) p.texture.destroy();
-    }
+    for (const [, store] of this.storesByFormat) store.texture.destroy();
+    this.storesByFormat.clear();
     this.pagesByFormat.clear();
     this.pageAddedListeners.clear();
     this.entriesByAval.clear();
@@ -884,6 +947,7 @@ export class AtlasPool {
             boundsX, boundsY, reservedW, reservedH,
             staging, w, h, slots,
             this.uploadBatch ?? undefined,
+            page.pageId,
           );
           if (this.uploadBatch !== null) this.uploadBatch.trashTextures.push(staging);
           else void this.device.queue.onSubmittedWorkDone().then(() => staging.destroy());
@@ -899,6 +963,8 @@ export class AtlasPool {
             this.device, page.texture,
             boundsX, boundsY, reservedW, reservedH,
             px, w, h, slots,
+            undefined,
+            page.pageId,
           );
           return;
         }
@@ -938,7 +1004,7 @@ export class AtlasPool {
       if (mipCanvas === null) {
         this.device.queue.copyExternalImageToTexture(
           { source: mip as GPUImageCopyExternalImageSource },
-          { texture: page.texture, origin: { x: mx, y: my, z: 0 } },
+          { texture: page.texture, origin: { x: mx, y: my, z: page.pageId } },
           { width: mw, height: mh, depthOrArrayLayers: 1 },
         );
         continue;
@@ -949,7 +1015,7 @@ export class AtlasPool {
       ctx.drawImage(mip as CanvasImageSource, 0, 0, mw, mh);
       const mipPx = new Uint8Array(ctx.getImageData(0, 0, mw, mh).data.buffer);
       const ext = AtlasPool.buildExtendedWithGutter(mipPx, mw, mh);
-      this.writeRgba8Padded(page.texture, mx - 2, my - 2, ext, mw + 4, mh + 4);
+      this.writeRgba8Padded(page.texture, mx - 2, my - 2, ext, mw + 4, mh + 4, page.pageId);
     }
   }
 
@@ -1044,7 +1110,7 @@ export class AtlasPool {
     const px = this.extractPixels(host, w, h);
     if (px === null) return false;
     const ext = AtlasPool.buildExtendedWithGutter(px, w, h);
-    this.writeRgba8Padded(page.texture, x - 2, y - 2, ext, w + 4, h + 4);
+    this.writeRgba8Padded(page.texture, x - 2, y - 2, ext, w + 4, h + 4, page.pageId);
     return true;
   }
 
@@ -1059,7 +1125,7 @@ export class AtlasPool {
     if (host.kind === "external") {
       this.device.queue.copyExternalImageToTexture(
         { source: host.source as GPUImageCopyExternalImageSource },
-        { texture: page.texture, origin: { x, y, z: 0 } },
+        { texture: page.texture, origin: { x, y, z: page.pageId } },
         { width: w, height: h, depthOrArrayLayers: 1 },
       );
       return;
@@ -1067,7 +1133,7 @@ export class AtlasPool {
     const data = host.data instanceof ArrayBuffer
       ? new Uint8Array(host.data)
       : new Uint8Array(host.data.buffer, host.data.byteOffset, host.data.byteLength);
-    this.writeRgba8Padded(page.texture, x, y, data, w, h);
+    this.writeRgba8Padded(page.texture, x, y, data, w, h, page.pageId);
   }
 
   /**
@@ -1079,12 +1145,13 @@ export class AtlasPool {
   private writeRgba8Padded(
     texture: GPUTexture, x: number, y: number,
     src: Uint8Array, w: number, h: number,
+    layer = 0,
   ): void {
     const srcStride = w * 4;
     if (h === 1 || srcStride % 256 === 0) {
       // Single row or already aligned — pass straight through.
       this.device.queue.writeTexture(
-        { texture, origin: { x, y, z: 0 } },
+        { texture, origin: { x, y, z: layer } },
         src as unknown as GPUAllowSharedBufferSource,
         { bytesPerRow: srcStride, rowsPerImage: h },
         { width: w, height: h, depthOrArrayLayers: 1 },
@@ -1097,7 +1164,7 @@ export class AtlasPool {
       padded.set(src.subarray(row * srcStride, (row + 1) * srcStride), row * dstStride);
     }
     this.device.queue.writeTexture(
-      { texture, origin: { x, y, z: 0 } },
+      { texture, origin: { x, y, z: layer } },
       padded as unknown as GPUAllowSharedBufferSource,
       { bytesPerRow: dstStride, rowsPerImage: h },
       { width: w, height: h, depthOrArrayLayers: 1 },

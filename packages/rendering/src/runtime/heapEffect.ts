@@ -113,7 +113,9 @@ export interface FragmentOutputLayout {
 // must be part of the persist key or a cached 4096-shader poisons an
 // 8192-page session (black beyond the first quadrant). The size rides
 // in the version string so any future size change re-keys too.
-export const HEAP_PERSIST_VERSION_BASE = "h12";
+// h13: atlas pages became texture_2d_array layers (2 array bindings +
+// runtime pageRef index instead of the 2×8 single-texture ladder).
+export const HEAP_PERSIST_VERSION_BASE = "h13";
 export const HEAP_PERSIST_VERSION = HEAP_PERSIST_VERSION_BASE; // legacy export (see persistVersionNow)
 export function persistVersionNow(): string {
   return `${HEAP_PERSIST_VERSION_BASE}-aps${atlasPageSizeNow()}`;
@@ -431,19 +433,21 @@ export interface BucketLayout {
 export const HEAP_TEX_BINDING_START = 7;
 
 /**
- * Number of independent pages per format. Drives both the BGL slot
- * count (N consecutive linear bindings + N consecutive srgb bindings
- * + 1 sampler) and the shader's `switch pageRef` ladder. Must match
- * `ATLAS_MAX_PAGES_PER_FORMAT` in `textureAtlas/atlasPool.ts`.
+ * Legacy page-count constant. Pages are now LAYERS of one
+ * `texture_2d_array` per format — the shader indexes `pageRef` at
+ * runtime, so nothing in the binding model depends on a fixed count
+ * anymore. Kept only as the historical default; the real cap lives in
+ * `atlasMaxPagesNow()` (textureAtlas/atlasPool.ts) and layer counts
+ * grow on demand.
  */
 export const ATLAS_ARRAY_SIZE = 8;
 
-/** First atlas binding (linear texture for page 0). */
+/** Linear atlas array binding (`texture_2d_array<f32>`, all pages). */
 export const ATLAS_LINEAR_BINDING_BASE = 11;
-/** First srgb atlas binding (= linear base + N). */
-export const ATLAS_SRGB_BINDING_BASE = ATLAS_LINEAR_BINDING_BASE + ATLAS_ARRAY_SIZE;
-/** Atlas sampler binding (= linear base + 2N). */
-export const ATLAS_SAMPLER_BINDING = ATLAS_LINEAR_BINDING_BASE + 2 * ATLAS_ARRAY_SIZE;
+/** Srgb atlas array binding (`texture_2d_array<f32>`, all pages). */
+export const ATLAS_SRGB_BINDING_BASE = ATLAS_LINEAR_BINDING_BASE + 1;
+/** Atlas sampler binding. */
+export const ATLAS_SAMPLER_BINDING = ATLAS_LINEAR_BINDING_BASE + 2;
 /** First user storage-buffer binding (above the whole atlas range). */
 export const HEAP_USER_STORAGE_BINDING_BASE = ATLAS_SAMPLER_BINDING + 1;
 
@@ -850,40 +854,34 @@ function atlasPageSizeConst(): string {
 }
 
 /**
- * Emit `2 * ATLAS_ARRAY_SIZE + 1` binding declarations: N linear
- * `texture_2d<f32>`, N srgb `texture_2d<f32>`, then the shared
- * atlas sampler.
+ * Emit the 3 atlas binding declarations: one linear
+ * `texture_2d_array<f32>` (all linear pages as layers), one srgb
+ * array, and the shared atlas sampler. `pageRef` is the runtime layer
+ * index — no per-page bindings, no fixed page count.
  */
 export function generateAtlasBindings(): string {
-  const lines: string[] = [];
-  for (let i = 0; i < ATLAS_ARRAY_SIZE; i++) {
-    lines.push(`@group(0) @binding(${ATLAS_LINEAR_BINDING_BASE + i}) var atlasLinear${i}: texture_2d<f32>;`);
-  }
-  for (let i = 0; i < ATLAS_ARRAY_SIZE; i++) {
-    lines.push(`@group(0) @binding(${ATLAS_SRGB_BINDING_BASE + i}) var atlasSrgb${i}: texture_2d<f32>;`);
-  }
-  lines.push(`@group(0) @binding(${ATLAS_SAMPLER_BINDING}) var atlasSampler: sampler;`);
-  return lines.join("\n");
+  return [
+    `@group(0) @binding(${ATLAS_LINEAR_BINDING_BASE}) var atlasLinear: texture_2d_array<f32>;`,
+    `@group(0) @binding(${ATLAS_SRGB_BINDING_BASE}) var atlasSrgb: texture_2d_array<f32>;`,
+    `@group(0) @binding(${ATLAS_SAMPLER_BINDING}) var atlasSampler: sampler;`,
+  ].join("\n");
 }
 
 /**
- * Emit the `switch pageRef` ladder body for `atlasSampleAtMip`. Each
- * case picks the matching `atlasLinear<i>` / `atlasSrgb<i>` decl and
- * blends on `format == 1u`. The fallback (page out of range) is the
- * function-level `vec4<f32>(0.0)` after the switch.
+ * Emit the array sample for `atlasSampleAtMip`: `pageRef` indexes the
+ * format family's layer at runtime. Out-of-range layers (placeholder
+ * bind, page not yet allocated) return vec4(0) via the guard, matching
+ * the old ladder's default case.
  */
 export function generateAtlasSwitch(): string {
-  const lines: string[] = ["  switch pageRef {"];
-  for (let i = 0; i < ATLAS_ARRAY_SIZE; i++) {
-    lines.push(`    case ${i}u: {`);
-    lines.push(`      let lin = textureSampleLevel(atlasLinear${i}, atlasSampler, atlasUv, 0.0);`);
-    lines.push(`      let sr  = textureSampleLevel(atlasSrgb${i},   atlasSampler, atlasUv, 0.0);`);
-    lines.push(`      return select(lin, sr, format == 1u);`);
-    lines.push(`    }`);
-  }
-  lines.push("    default: {}");
-  lines.push("  }");
-  return lines.join("\n");
+  return [
+    `  let _nLayers = select(textureNumLayers(atlasLinear), textureNumLayers(atlasSrgb), format == 1u);`,
+    `  if (pageRef < _nLayers) {`,
+    `    let lin = textureSampleLevel(atlasLinear, atlasSampler, atlasUv, min(pageRef, textureNumLayers(atlasLinear) - 1u), 0.0);`,
+    `    let sr  = textureSampleLevel(atlasSrgb,   atlasSampler, atlasUv, min(pageRef, textureNumLayers(atlasSrgb) - 1u), 0.0);`,
+    `    return select(lin, sr, format == 1u);`,
+    `  }`,
+  ].join("\n");
 }
 
 /** Render one varying as the WGSL field declaration: `[@builtin(...) | @location(N)] [@interpolate(...)] name`. */
