@@ -1004,6 +1004,12 @@ export function buildHeapScene(
   opts: BuildHeapSceneOptions = {},
 ): HeapScene {
   const atlasPool = opts.atlasPool;
+  // Debug/app handle: memory-lean streaming callers pin atlas entries
+  // per retained build (pinEntry/unpinEntry) — reachable without
+  // plumbing through every layer.
+  if (atlasPool !== undefined) {
+    (globalThis as Record<string, unknown>).__wombatAtlasPool = atlasPool;
+  }
   const colorAttachmentName = sig.colorNames[0];
   if (colorAttachmentName === undefined) {
     throw new Error("buildHeapScene: framebuffer signature has no color attachment");

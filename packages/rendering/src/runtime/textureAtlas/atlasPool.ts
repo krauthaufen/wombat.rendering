@@ -789,6 +789,45 @@ export class AtlasPool {
     return n;
   }
 
+  /** Zero-fill an entry's full reserved rect (mip-0 + gutters + mip
+   *  column). Used when an upload source is dead: black is the only
+   *  acceptable content — the packer may hand back a region still
+   *  holding another texture's texels. */
+  private zeroFillReserved(page: AtlasPage, bx: number, by: number, w: number, h: number, numMips: number): void {
+    const reservedW = numMips > 1 ? (w + 4) + Math.max(1, w >> 1) + 4 : w + 4;
+    let reservedH = h + 4;
+    if (numMips > 1) {
+      let stackedH = 0;
+      for (let k = 1; k < numMips; k++) stackedH += Math.max(1, h >> k) + 4;
+      reservedH = Math.max(reservedH, stackedH);
+    }
+    const zeros = new Uint8Array(reservedW * reservedH * 4);
+    this.writeRgba8Padded(page.texture, bx, by, zeros, reservedW, reservedH, page.pageId);
+  }
+
+  /**
+   * PIN an entry by its source aval: bump the refcount so eviction can
+   * never claim it while the owning BUILD is retained app-side. This is
+   * how memory-lean callers (bitmaps closed after ingest) guarantee a
+   * re-show never needs an upload source: the entry simply never leaves
+   * the atlas until `unpinEntry`. Returns false if no live entry exists
+   * (caller should keep its upload source in that case).
+   */
+  pinEntry(sourceAval: aval<ITexture>): boolean {
+    const e = this.entriesByAval.get(sourceAval);
+    if (e === undefined) return false;
+    if (e.refcount === 0) this.lru.delete(e.ref);
+    e.refcount++;
+    return true;
+  }
+
+  /** Release a `pinEntry` ref. No-op if the entry is already gone. */
+  unpinEntry(sourceAval: aval<ITexture>): void {
+    const e = this.entriesByAval.get(sourceAval);
+    if (e === undefined) return;
+    this.release(e.ref);
+  }
+
   /** Destroy the per-format array textures. The pool becomes unusable. */
   dispose(): void {
     for (const [, store] of this.storesByFormat) store.texture.destroy();
@@ -880,25 +919,29 @@ export class AtlasPool {
     w: number,
     h: number,
     numMips: number,
-  ): void {
+  ): boolean {
     // CLOSED-SOURCE GUARD. Memory-lean callers close ImageBitmaps once
     // the pixels are in the atlas; if this entry was later evicted and
     // re-acquired, the upload source is gone (a closed ImageBitmap
     // reports width 0). Uploading would THROW out of the walker's
-    // ingest and poison the whole delta batch — skip instead (the rect
-    // stays uninitialized; callers that can refetch should treat the
-    // draw as stale). One-shot log so the condition is visible.
+    // ingest and poison the whole delta batch. Instead: ZERO-FILL the
+    // rect (the packer may hand back a region still holding another
+    // texture's texels — showing those is unacceptable) and report
+    // failure; `finalize` notifies onUploadSourceLost so the app can
+    // repair asynchronously (re-decode from its own cache +
+    // `repairUpload`).
     if (host.kind === "external") {
       const src = host.source as { width?: number; height?: number };
       if ((src.width ?? 0) === 0 || (src.height ?? 0) === 0) {
         if (!this.closedSourceWarned) {
           this.closedSourceWarned = true;
-          console.warn("atlas: upload source closed/detached (width 0) — sub-rect left uninitialized (re-acquire after eviction with a freed bitmap; refetch to repair)");
+          console.warn("atlas: upload source closed/detached (width 0) — rect zero-filled, awaiting repairUpload");
         }
-        return;
+        this.zeroFillReserved(page, x - 2, y - 2, w, h, numMips);
+        return false;
       }
     }
-    // GPU mip+gutter kernel path (the normal, real-device path).
+// GPU mip+gutter kernel path (the normal, real-device path).
     //
     // Builds the full Iliffe pyramid for the sub-rect — every mip,
     // each surrounded by the proper 2-px gutter ring (inner ring =
@@ -973,7 +1016,7 @@ export class AtlasPool {
           );
           if (this.uploadBatch !== null) this.uploadBatch.trashTextures.push(staging);
           else void this.device.queue.onSubmittedWorkDone().then(() => staging.destroy());
-          return;
+          return true;
         } catch {
           // Source not in a copyable state (e.g. a not-ready video) —
           // fall through to the CPU path below.
@@ -988,7 +1031,7 @@ export class AtlasPool {
             undefined,
             page.pageId,
           );
-          return;
+          return true;
         }
         // `raw` extraction shouldn't fail; if it somehow does, fall
         // through to the CPU path.
@@ -1002,7 +1045,7 @@ export class AtlasPool {
     if (!this.uploadLevelWithGutter(page, x, y, host, w, h)) {
       this.uploadLevel(page, x, y, host, w, h);
     }
-    if (numMips <= 1) return;
+    if (numMips <= 1) return true;
 
     // Mip k≥1: downscale via canvas-2d, upload at the pyramid offset.
     const src = this.toDrawable(host, w, h);
@@ -1010,7 +1053,7 @@ export class AtlasPool {
       // Headless / unsupported source — skip mip generation; level 0
       // is still in place. Callers that need mips should provide a
       // host source the pool can render-2d.
-      return;
+      return true;
     }
     for (let k = 1; k < numMips; k++) {
       const off = mipOffsetInPyramid(w, h, k);
@@ -1039,6 +1082,7 @@ export class AtlasPool {
       const ext = AtlasPool.buildExtendedWithGutter(mipPx, mw, mh);
       this.writeRgba8Padded(page.texture, mx - 2, my - 2, ext, mw + 4, mh + 4, page.pageId);
     }
+    return true;
   }
 
   /**
