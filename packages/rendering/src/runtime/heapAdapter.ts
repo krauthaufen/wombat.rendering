@@ -330,20 +330,23 @@ function describeTexture(t: ITexture): TextureDescriptor | null {
       host: src,
     };
   }
-  // external — read width/height off the source. Most types have it,
-  // HTMLVideoElement uses `videoWidth/videoHeight`.
+  // external — prefer the creation-time snapshot (survives
+  // ImageBitmap.close()); else read width/height off the source
+  // (HTMLVideoElement uses `videoWidth/videoHeight`).
   const ext = src.source as unknown;
-  let w = 0, h = 0;
-  if (typeof HTMLVideoElement !== "undefined" && ext instanceof HTMLVideoElement) {
-    w = ext.videoWidth; h = ext.videoHeight;
-  } else if (
-    typeof ImageData !== "undefined" && ext instanceof ImageData
-  ) {
-    w = ext.width; h = ext.height;
-  } else {
-    const any = ext as { width?: number; height?: number };
-    w = any.width ?? 0;
-    h = any.height ?? 0;
+  let w = src.width ?? 0, h = src.height ?? 0;
+  if (w <= 0 || h <= 0) {
+    if (typeof HTMLVideoElement !== "undefined" && ext instanceof HTMLVideoElement) {
+      w = ext.videoWidth; h = ext.videoHeight;
+    } else if (
+      typeof ImageData !== "undefined" && ext instanceof ImageData
+    ) {
+      w = ext.width; h = ext.height;
+    } else {
+      const any = ext as { width?: number; height?: number };
+      w = any.width ?? 0;
+      h = any.height ?? 0;
+    }
   }
   if (w <= 0 || h <= 0) return null;
   return {

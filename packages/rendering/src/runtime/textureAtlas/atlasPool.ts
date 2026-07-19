@@ -237,14 +237,17 @@ function describeAtlasTexture(t: ITexture): {
     };
   }
   const ext = src.source as unknown;
-  let w = 0, h = 0;
-  if (typeof HTMLVideoElement !== "undefined" && ext instanceof HTMLVideoElement) {
-    w = ext.videoWidth; h = ext.videoHeight;
-  } else if (typeof ImageData !== "undefined" && ext instanceof ImageData) {
-    w = ext.width; h = ext.height;
-  } else {
-    const any = ext as { width?: number; height?: number };
-    w = any.width ?? 0; h = any.height ?? 0;
+  // Prefer the creation-time snapshot (survives ImageBitmap.close()).
+  let w = src.width ?? 0, h = src.height ?? 0;
+  if (w <= 0 || h <= 0) {
+    if (typeof HTMLVideoElement !== "undefined" && ext instanceof HTMLVideoElement) {
+      w = ext.videoWidth; h = ext.videoHeight;
+    } else if (typeof ImageData !== "undefined" && ext instanceof ImageData) {
+      w = ext.width; h = ext.height;
+    } else {
+      const any = ext as { width?: number; height?: number };
+      w = any.width ?? 0; h = any.height ?? 0;
+    }
   }
   if (w <= 0 || h <= 0) return null;
   return {
@@ -312,6 +315,8 @@ export class AtlasPool {
   private readonly lru = new Map<number, AtlasEntry>();
   /** Formats we've already reported as full (once per format, not per frame). */
   private readonly fullWarned = new Set<AtlasPageFormat>();
+  /** One-shot closed-upload-source report (see `upload`). */
+  private closedSourceWarned = false;
   /** True while every page of `format` is packed with live (referenced) entries. */
   isFull(format: AtlasPageFormat): boolean {
     const pages = this.pagesByFormat.get(format);
@@ -876,6 +881,23 @@ export class AtlasPool {
     h: number,
     numMips: number,
   ): void {
+    // CLOSED-SOURCE GUARD. Memory-lean callers close ImageBitmaps once
+    // the pixels are in the atlas; if this entry was later evicted and
+    // re-acquired, the upload source is gone (a closed ImageBitmap
+    // reports width 0). Uploading would THROW out of the walker's
+    // ingest and poison the whole delta batch — skip instead (the rect
+    // stays uninitialized; callers that can refetch should treat the
+    // draw as stale). One-shot log so the condition is visible.
+    if (host.kind === "external") {
+      const src = host.source as { width?: number; height?: number };
+      if ((src.width ?? 0) === 0 || (src.height ?? 0) === 0) {
+        if (!this.closedSourceWarned) {
+          this.closedSourceWarned = true;
+          console.warn("atlas: upload source closed/detached (width 0) — sub-rect left uninitialized (re-acquire after eviction with a freed bitmap; refetch to repair)");
+        }
+        return;
+      }
+    }
     // GPU mip+gutter kernel path (the normal, real-device path).
     //
     // Builds the full Iliffe pyramid for the sub-rect — every mip,
