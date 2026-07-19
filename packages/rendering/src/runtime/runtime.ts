@@ -1,3 +1,4 @@
+import { setAtlasPageSize } from "./textureAtlas/atlasPool.js";
 // Runtime — the user-facing entry point. Holds the device +
 // effect-compilation hook, exposes `compile(commands)` and
 // (eventually) `renderTo(...)`.
@@ -54,6 +55,10 @@ export interface RuntimeOptions {
    * GPU copy + bind-group rebuilds) mid-navigation.
    */
   readonly initialArenaBytes?: number;
+  /** Atlas page edge in texels (default 4096). Desktops should pass
+   *  8192 — 4× resident-texture capacity for streaming scenes. Must be
+   *  set at Runtime construction (before shader generation). */
+  readonly atlasPageSize?: number;
   /**
    * Heap arena compaction toggle — threaded into
    * `BuildHeapSceneOptions.enableCompaction`. Streaming apps with steady
@@ -89,6 +94,7 @@ export class Runtime {
   readonly deviceLost: Promise<GPUDeviceLostInfo>;
 
   constructor(opts: RuntimeOptions) {
+    if (opts.atlasPageSize !== undefined) setAtlasPageSize(opts.atlasPageSize);
     this.ctx = {
       device: opts.device,
       compileEffect: opts.compileEffect ?? ((e: Effect, sig: FramebufferSignature) => e.compile({

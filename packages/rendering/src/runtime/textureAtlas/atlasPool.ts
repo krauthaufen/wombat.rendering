@@ -38,7 +38,7 @@ import {
   beginMipGutterBatch, submitMipGutterBatch, type MipGutterBatch,
 } from "./atlasMipGutterKernel.js";
 
-export const ATLAS_PAGE_SIZE = 4096;
+export const ATLAS_PAGE_SIZE = 4096; // legacy default (see atlasPageSize)
 /** Tier S/M source-side dimension cap. */
 export const ATLAS_MAX_DIM = 1024;
 /**
@@ -46,13 +46,22 @@ export const ATLAS_MAX_DIM = 1024;
  * `switch pageRef` runs an N-way ladder; the BGL declares N consecutive
  * texture slots per format. Allocations beyond this throw.
  */
-// 8 pages capped resident textures at ~512 (Google tiles: ~64 × 512²
-// per 4096² page) — tile streaming at desktop budgets holds 1500-2500
-// tiles, so every texture past ~500 deferred: held draws (holes) and
-// untextured (black) tiles. Pages allocate LAZILY, so a high cap costs
-// nothing until used; small-memory devices are bounded upstream by
-// their tile LRU byte budget.
-export const ATLAS_MAX_PAGES_PER_FORMAT = 48;
+// The page COUNT is fixed at 8 — it must match the shader's binding
+// ladder (heapEffect ATLAS_ARRAY_SIZE; N texture_2d slots per format;
+// WebGPU per-stage sampled-texture limits rule out more). Capacity
+// scales via PAGE SIZE instead: 4096² caps resident textures at ~512
+// (Google tiles ≈ 64 × 512² per page) which starved tile streaming
+// (deferred textures = held draws + black tiles); desktops configure
+// 8192² via RuntimeOptions.atlasPageSize (4× capacity, lazy alloc).
+export const ATLAS_MAX_PAGES_PER_FORMAT = 8;
+
+/** Page edge in texels. Default suits small-memory devices; desktops
+ *  pass RuntimeOptions.atlasPageSize = 8192 (must be set BEFORE any
+ *  page allocation or shader generation). */
+export let atlasPageSize = 4096;
+export function setAtlasPageSize(n: number): void {
+  atlasPageSize = n;
+}
 
 export type AtlasPageFormat = "rgba8unorm" | "rgba8unorm-srgb";
 
@@ -348,7 +357,7 @@ export class AtlasPool {
     // device and headless-without-canvas edge cases.
     const texture = this.device.createTexture({
       label: `atlas/${format}/${pageId}`,
-      size: { width: ATLAS_PAGE_SIZE, height: ATLAS_PAGE_SIZE, depthOrArrayLayers: 1 },
+      size: { width: atlasPageSize, height: atlasPageSize, depthOrArrayLayers: 1 },
       format,
       mipLevelCount: 1,
       usage:
@@ -360,7 +369,7 @@ export class AtlasPool {
     return {
       format,
       texture,
-      packing: TexturePacking.empty<number>(new V2i(ATLAS_PAGE_SIZE, ATLAS_PAGE_SIZE), false),
+      packing: TexturePacking.empty<number>(new V2i(atlasPageSize, atlasPageSize), false),
       pageId,
     };
   }
@@ -517,7 +526,7 @@ export class AtlasPool {
       if (!this.fullWarned.has(format)) {
         this.fullWarned.add(format);
         console.warn(
-          `atlas: FULL for ${format} — ${pages.length} pages × ${ATLAS_PAGE_SIZE}² all in use ` +
+          `atlas: FULL for ${format} — ${pages.length} pages × ${atlasPageSize}² all in use ` +
           `(${this.entriesByRef.size} live entries, ${this.lru.size} evictable). ` +
           `New textures are deferred until space frees.`,
         );
@@ -529,7 +538,7 @@ export class AtlasPool {
     const placed = page.packing.tryAdd(this.nextRef, size);
     if (placed === null) {
       throw new Error(
-        `AtlasPool: ${reservedW}×${reservedH} doesn't fit a fresh ${ATLAS_PAGE_SIZE}² page`,
+        `AtlasPool: ${reservedW}×${reservedH} doesn't fit a fresh ${atlasPageSize}² page`,
       );
     }
     page.packing = placed;
