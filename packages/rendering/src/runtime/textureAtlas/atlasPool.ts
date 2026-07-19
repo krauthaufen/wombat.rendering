@@ -46,7 +46,13 @@ export const ATLAS_MAX_DIM = 1024;
  * `switch pageRef` runs an N-way ladder; the BGL declares N consecutive
  * texture slots per format. Allocations beyond this throw.
  */
-export const ATLAS_MAX_PAGES_PER_FORMAT = 8;
+// 8 pages capped resident textures at ~512 (Google tiles: ~64 × 512²
+// per 4096² page) — tile streaming at desktop budgets holds 1500-2500
+// tiles, so every texture past ~500 deferred: held draws (holes) and
+// untextured (black) tiles. Pages allocate LAZILY, so a high cap costs
+// nothing until used; small-memory devices are bounded upstream by
+// their tile LRU byte budget.
+export const ATLAS_MAX_PAGES_PER_FORMAT = 48;
 
 export type AtlasPageFormat = "rgba8unorm" | "rgba8unorm-srgb";
 
