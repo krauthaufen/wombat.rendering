@@ -109,7 +109,15 @@ export interface FragmentOutputLayout {
 // and on quota; every failure simply degrades to "recompute".
 
 /** Cache-generation stamp for the persistent (localStorage) tier. */
-export const HEAP_PERSIST_VERSION = "h11"; // h11: FS textureSize on atlas-routed textures reads the draw-header size — emitted WGSL changed
+// h12: the atlas PAGE SIZE is embedded in the WGSL (uv divisor) — it
+// must be part of the persist key or a cached 4096-shader poisons an
+// 8192-page session (black beyond the first quadrant). The size rides
+// in the version string so any future size change re-keys too.
+export const HEAP_PERSIST_VERSION_BASE = "h12";
+export const HEAP_PERSIST_VERSION = HEAP_PERSIST_VERSION_BASE; // legacy export (see persistVersionNow)
+export function persistVersionNow(): string {
+  return `${HEAP_PERSIST_VERSION_BASE}-aps${atlasPageSizeNow()}`;
+}
 
 /**
  * Uniforms whose drawHeader word IS the u32 value (no arena
@@ -190,7 +198,7 @@ export function compileHeapEffect(effect: Effect, fragmentOutputLayout?: Fragmen
   const contentKey = effect.id + effectHoleKey(effect) + fboLayoutKey(fragmentOutputLayout);
   const mem = _compiledHeapEffectMemCache.get(contentKey);
   if (mem !== undefined) return mem;
-  const lsKey = persistKey(HEAP_PERSIST_VERSION, "che", contentKey);
+  const lsKey = persistKey(persistVersionNow(), "che", contentKey);
   const persisted = lsLoad(lsKey, isCompiledHeapEffect);
   if (persisted !== undefined) { _compiledHeapEffectMemCache.set(contentKey, persisted); return persisted; }
   const compiled = effect.compile(

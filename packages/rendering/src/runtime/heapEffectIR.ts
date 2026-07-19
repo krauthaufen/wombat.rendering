@@ -30,7 +30,7 @@ import {
 } from "@aardworx/wombat.shader/ir";
 import {
   megacallSearchPrelude, atlasVaryingNames,
-  generateAtlasBindings, generateAtlasSwitch, generateAtlasPrelude,
+  generateAtlasBindings, generateAtlasSwitch, generateAtlasPrelude, persistVersionNow,
   HEAP_PERSIST_VERSION, persistKey, lsLoad, lsStore,
   type BucketLayout,
   type DrawHeaderField,
@@ -987,7 +987,7 @@ export function compileHeapEffectIR(
   const contentKey = `${userEffect.id}${effectHoleKey(userEffect)}|${layout.id}|${mode}|${compileOptionsKey(compileOptions)}`;
   const mem = _heapIrMemCache.get(contentKey);
   if (mem !== undefined) return mem;
-  const lsKey = persistKey(HEAP_PERSIST_VERSION, "ir", contentKey);
+  const lsKey = persistKey(persistVersionNow(), "ir", contentKey);
   const persisted = lsLoad(lsKey, isHeapEffectIR);
   if (persisted !== undefined) { _heapIrMemCache.set(contentKey, persisted); return persisted; }
 
