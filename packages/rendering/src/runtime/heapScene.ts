@@ -1657,6 +1657,22 @@ export function buildHeapScene(
     return view;
   }
 
+  // Map a texture binding's WGSL type to the WebGPU view dimension the
+  // BGL entry and the bound view must BOTH declare. Standalone textures
+  // default to "2d"; a cube / array / 3d sampler needs its dimension so
+  // the bound view matches the layout — and, for cube, so hardware
+  // seamless cross-face filtering kicks in.
+  function viewDimForTex(wgslType: string): GPUTextureViewDimension | undefined {
+    switch (wgslType) {
+      case "texture_cube":       return "cube";
+      case "texture_cube_array": return "cube-array";
+      case "texture_2d_array":   return "2d-array";
+      case "texture_3d":         return "3d";
+      case "texture_1d":         return "1d";
+      default:                   return undefined; // 2d / depth_2d / multisampled_2d
+    }
+  }
+
   // ─── BGL + pipeline-layout cache (schema-driven) ──────────────────
   //
   // Bindings 0–3 are the four heap data views; 4..N are textures
@@ -1689,9 +1705,13 @@ export function buildHeapScene(
       { binding: 6, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
     );
     for (const t of layout.textureBindings) {
+      const vd = viewDimForTex(t.wgslType);
       entries.push({
         binding: t.binding, visibility: GPUShaderStage.FRAGMENT,
-        texture: { sampleType: t.wgslType === "texture_depth_2d" ? "depth" : "float" },
+        texture: {
+          sampleType: t.wgslType === "texture_depth_2d" ? "depth" : "float",
+          ...(vd !== undefined ? { viewDimension: vd } : {}),
+        },
       });
     }
     for (const s of layout.samplerBindings) {
@@ -2202,9 +2222,11 @@ export function buildHeapScene(
               "(adapter is responsible for materialising host textures)",
             );
           }
+          const vd = viewDimForTex(texLayout[0]!.wgslType);
           entries.push({
             binding: texLayout[0]!.binding,
-            resource: ts.textureView ?? ts.texture.texture.createView(),
+            resource: ts.textureView ?? ts.texture.texture.createView(
+              vd !== undefined ? { dimension: vd } : undefined),
           });
         }
         if (smpLayout.length === 1) {

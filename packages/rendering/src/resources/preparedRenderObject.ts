@@ -259,6 +259,23 @@ function isMultisampled(type: Type): boolean {
   return type.kind === "Texture" && type.multisampled;
 }
 
+// The view dimension a texture binding must declare (BGL entry + bound view).
+// `undefined` means the WebGPU default ("2d"). Cube / array / 3d samplers need
+// their dimension so the bound view matches the layout — and, for cube, so the
+// hardware seamless cross-face filtering kicks in.
+function viewDimensionFor(type: Type): GPUTextureViewDimension | undefined {
+  if (type.kind !== "Texture") return undefined;
+  switch (type.target) {
+    case "Cube":      return "cube";
+    case "CubeArray": return "cube-array";
+    case "3D":        return "3d";
+    case "1D":        return "1d";
+    case "2DArray":   return "2d-array";
+    case "2D":        return type.arrayed ? "2d-array" : undefined;
+    default:          return undefined;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Bind-group entry descriptions
 // ---------------------------------------------------------------------------
@@ -266,7 +283,7 @@ function isMultisampled(type: Type): boolean {
 type EntryDesc =
   | { kind: "ubuf";    binding: number; resource: AdaptiveResource<GPUBuffer> }
   | { kind: "sbuf";    binding: number; resource: AdaptiveResource<GPUBuffer>; access: "read" | "read_write" }
-  | { kind: "tex";     binding: number; resource: AdaptiveResource<GPUTexture>; sampleType: GPUTextureSampleType; multisampled: boolean }
+  | { kind: "tex";     binding: number; resource: AdaptiveResource<GPUTexture>; sampleType: GPUTextureSampleType; multisampled: boolean; viewDimension?: GPUTextureViewDimension }
   | { kind: "sampler"; binding: number; resource: AdaptiveResource<GPUSampler> };
 
 interface GroupDesc {
@@ -292,7 +309,7 @@ function buildGroups(device: GPUDevice, descs: readonly EntryDesc[][]): GroupDes
           visibility: e.access === "read_write" ? ShaderStage.FRAGMENT : visibility,
           buffer: { type: e.access === "read_write" ? "storage" : "read-only-storage" },
         };
-        case "tex":    return { binding: e.binding, visibility, texture: { sampleType: e.sampleType, ...(e.multisampled ? { multisampled: true } : {}) } };
+        case "tex":    return { binding: e.binding, visibility, texture: { sampleType: e.sampleType, ...(e.multisampled ? { multisampled: true } : {}), ...(e.viewDimension ? { viewDimension: e.viewDimension } : {}) } };
         case "sampler": return { binding: e.binding, visibility, sampler: { type: "filtering" } };
       }
     });
@@ -504,7 +521,7 @@ export class PreparedRenderObject {
           case "tex": {
             const tex = e.resource.getValue(token);
             cacheKey += `${e.binding}:t${handleId(tex)};`;
-            resolved.push({ binding: e.binding, resource: tex.createView() });
+            resolved.push({ binding: e.binding, resource: tex.createView(e.viewDimension ? { dimension: e.viewDimension } : undefined) });
             break;
           }
           case "sampler": {
@@ -801,7 +818,8 @@ export function prepareRenderObject(
     const res = prepareAdaptiveTexture(device, av, {
       ...(opts.label !== undefined ? { label: `${opts.label}.${t.name}` } : {}),
     });
-    perGroup[t.group]!.push({ kind: "tex", binding: slotOf(t), resource: res, sampleType: sampleTypeFor(t.type), multisampled: isMultisampled(t.type) });
+    const vd = viewDimensionFor(t.type);
+    perGroup[t.group]!.push({ kind: "tex", binding: slotOf(t), resource: res, sampleType: sampleTypeFor(t.type), multisampled: isMultisampled(t.type), ...(vd !== undefined ? { viewDimension: vd } : {}) });
   }
 
   for (const s of iface.samplers) {
