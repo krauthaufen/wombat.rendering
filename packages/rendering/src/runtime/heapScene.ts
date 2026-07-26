@@ -806,6 +806,16 @@ export type HeapTextureSet =
        * leaving the drawHeader pointing at uninitialized atlas pixels.
        */
       readonly host?: HostTextureSource;
+      /**
+       * GPU-resident source captured at adapter time (adapter-packed
+       * textures, e.g. the cube face-grid). Mirrors `host` for the
+       * re-acquire path: when the pool entry is evicted while this spec
+       * sits idle, the re-acquire re-uploads from this retained GPUTexture
+       * via `copyTextureToTexture`. The grid is memoised (retained by the
+       * cube `ITexture` aval), so it stays alive as long as the entry can
+       * be re-acquired. Mutually exclusive with `host`.
+       */
+      readonly gpuTexture?: GPUTexture;
     };
 
 /**
@@ -3163,9 +3173,31 @@ export function buildHeapScene(
   }
 
 
+  // Standalone (non-atlas) textures bind at the BUCKET level (a fixed
+  // texture_2d + sampler in the bind group, shared by every RO in the
+  // bucket). The atlas path threads per-RO texture placement through the
+  // drawHeader, so its bucket key is texture-independent — but standalone
+  // must fold the (texture, sampler) identity into the key so two ROs
+  // sharing an effect but binding DIFFERENT standalone textures land in
+  // separate buckets (each with its own bind group). Atlas / untextured
+  // buckets get an empty suffix.
+  const standaloneTexId = new WeakMap<object, number>();
+  let standaloneTexCounter = 0;
+  const saIdOf = (o: object): number => {
+    let v = standaloneTexId.get(o);
+    if (v === undefined) { v = ++standaloneTexCounter; standaloneTexId.set(o, v); }
+    return v;
+  };
+  function standaloneTexKey(ts: HeapTextureSet | undefined): string {
+    if (ts === undefined || ts.kind !== "standalone") return "";
+    const t = ts.texture.kind === "gpu" ? saIdOf(ts.texture.texture) : 0;
+    const s = ts.sampler.kind === "gpu" ? saIdOf(ts.sampler.sampler) : 0;
+    return `/sa${t}_${s}`;
+  }
+
   function findOrCreateBucket(
     effect: Effect,
-    _textures: HeapTextureSet | undefined,
+    textures: HeapTextureSet | undefined,
     pipelineState: PipelineState | undefined,
     chunkIdx: number,
     /**
@@ -3186,7 +3218,7 @@ export function buildHeapScene(
     // GPUBuffers in its draw call. The shaders are unchanged
     // (refs are byte offsets within whichever chunk's buffer is
     // currently bound).
-    const bk = `family#${fam.schema.id}/c${chunkIdx}`;
+    const bk = `family#${fam.schema.id}/c${chunkIdx}${standaloneTexKey(textures)}`;
     const existing = bucketByKey.get(bk);
     if (existing !== undefined) return existing;
 
@@ -3201,7 +3233,10 @@ export function buildHeapScene(
     const fieldIdx = new Map<string, number>();
     layout.drawHeaderFields.forEach((f, i) => fieldIdx.set(f.name, i));
     const bucket: Bucket = {
-      label: bk, textures: undefined, layout, chunkIdx,
+      // Standalone texture set binds at bucket level (see standaloneTexKey);
+      // atlas/untextured buckets leave this undefined (atlas threads texture
+      // placement per-RO through the drawHeader instead).
+      label: bk, textures: textures?.kind === "standalone" ? textures : undefined, layout, chunkIdx,
       storageBuffers: undefined, storageDirty: false, storageSubs: [],
       slots: [],  // populated lazily by ensureSlot per modeKey
       bindGroup: null as unknown as GPUBindGroup,  // legacy field; slot.bindGroup is the real one
@@ -3821,13 +3856,20 @@ export function buildHeapScene(
           const reW = spec.textures.size.x;
           const reH = spec.textures.size.y;
           const host = spec.textures.host;
+          const gpuTexture = spec.textures.gpuTexture;
           const acq = atlasPool.acquire(
             spec.textures.page.format,
             spec.textures.sourceAval as aval<ITexture>,
             reW, reH,
             {
               wantsMips: spec.textures.numMips > 1,
-              ...(host !== undefined ? { source: { width: reW, height: reH, host } } : {}),
+              // GPU-resident source (cube grid) re-uploads via
+              // copyTextureToTexture; else the host source; else no upload.
+              ...(gpuTexture !== undefined
+                ? { source: { width: reW, height: reH, gpuTexture } }
+                : host !== undefined
+                  ? { source: { width: reW, height: reH, host } }
+                  : {}),
             },
           );
           // ATLAS FULL (acq === null). Every page is packed with textures still

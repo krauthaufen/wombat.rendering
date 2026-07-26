@@ -134,6 +134,11 @@ class AdaptiveTexture extends AdaptiveResource<GPUTexture> {
       // cryptic TypeError from `src.source.kind`.
       throw new Error(`adaptiveTexture: ITexture.kind === "url" must be resolved before binding (url: ${src.url})`);
     }
+    if (src.kind === "cube") {
+      // Cube maps are packed to a 2D grid by heapAdapter and bound as a GPU
+      // texture; a cube should never reach adaptiveTexture directly.
+      throw new Error(`adaptiveTexture: ITexture.kind === "cube" must be packed by heapAdapter before binding`);
+    }
     const desc = descFor(src.source);
     const usage =
       (this.opts.usage ?? 0)

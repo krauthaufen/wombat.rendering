@@ -46,6 +46,14 @@ export interface ExternalTextureSource {
 
 export type HostTextureSource = RawTextureSource | ExternalTextureSource;
 
+/** One cube face's pixel source (uploaded via `copyExternalImageToTexture`). */
+export type CubeFaceSource =
+  | ImageBitmap
+  | HTMLImageElement
+  | HTMLCanvasElement
+  | OffscreenCanvas
+  | ImageData;
+
 // `url` is a *deferred* host source — the runtime can't upload until the
 // browser has fetched + decoded the image. Consumers that route textures
 // to the GPU (adaptiveTexture, atlas pool, heap adapter) refuse to handle
@@ -57,7 +65,12 @@ export type ITexture =
   | { readonly kind: "gpu"; readonly texture: GPUTexture }
   | { readonly kind: "host"; readonly source: HostTextureSource }
   | { readonly kind: "url"; readonly url: string;
-      readonly format?: GPUTextureFormat; readonly generateMips?: boolean };
+      readonly format?: GPUTextureFormat; readonly generateMips?: boolean }
+  // A cube map as 6 faces in order [+X,-X,+Y,-Y,+Z,-Z] (Z-up convention: +Z up).
+  // The heap renders this as a 2D grid texture with cross-face gutters + a
+  // face-projection sample — NO `texture_cube` (Metal/WebKit reject cube views
+  // over array textures). See heapAdapter (packing) + heapEffectIR (rewrite).
+  | { readonly kind: "cube"; readonly faces: readonly CubeFaceSource[]; readonly faceSize?: number };
 
 // ─── Equality / hash protocol ──────────────────────────────────────────
 //
@@ -133,6 +146,12 @@ function iTextureEquals(a: ITexture, o: unknown): boolean {
       && (a.generateMips ?? false) === ((b as { generateMips?: boolean }).generateMips ?? false);
     case "gpu":  return a.texture === (b as { texture: GPUTexture }).texture;
     case "host": return hostSourceEquals(a.source, (b as { source: HostTextureSource }).source);
+    case "cube": {
+      const bc = b as { faces: readonly CubeFaceSource[]; faceSize?: number };
+      if (a.faces.length !== bc.faces.length || a.faceSize !== bc.faceSize) return false;
+      for (let i = 0; i < a.faces.length; i++) if (a.faces[i] !== bc.faces[i]) return false;
+      return true;
+    }
   }
 }
 function iTextureHash(a: ITexture): number {
@@ -140,6 +159,11 @@ function iTextureHash(a: ITexture): number {
     case "url":  return mix(mix(hashStr("url"), hashStr(a.url)), hashStr(a.format ?? "")) | (a.generateMips ? 1 : 0);
     case "gpu":  return mix(hashStr("gpu"), idHash(a.texture));
     case "host": return mix(hashStr("host"), hostSourceHash(a.source));
+    case "cube": {
+      let h = mix(hashStr("cube"), a.faceSize ?? 0);
+      for (const f of a.faces) h = mix(h, idHash(f as object));
+      return h;
+    }
   }
 }
 const ITEXTURE_PROTO = {
@@ -183,6 +207,16 @@ export const ITexture = {
   },
   fromRaw(raw: Omit<RawTextureSource, "kind">): ITexture {
     return withEq({ kind: "host", source: { kind: "raw", ...raw } });
+  },
+  /**
+   * A cube map from 6 face images in order [+X,-X,+Y,-Y,+Z,-Z] (Z-up: +Z up).
+   * The heap packs these into a 2D grid with cross-face gutters and samples
+   * by face-projection — no `texture_cube`, so it works on iOS/Metal.
+   * `faceSize` overrides the per-face packing resolution (default: heap's F0).
+   */
+  fromCubeFaces(faces: readonly CubeFaceSource[], opts: { faceSize?: number } = {}): ITexture {
+    if (faces.length !== 6) throw new Error(`ITexture.fromCubeFaces: expected 6 faces, got ${faces.length}`);
+    return withEq({ kind: "cube", faces, ...(opts.faceSize !== undefined ? { faceSize: opts.faceSize } : {}) });
   },
   fromUrl(url: string, opts: { format?: GPUTextureFormat; generateMips?: boolean } = {}): ITexture {
     const key = `${url} ${opts.format ?? ""} ${opts.generateMips ? 1 : 0}`;

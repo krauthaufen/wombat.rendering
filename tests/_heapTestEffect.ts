@@ -8,7 +8,7 @@
 // the module.
 
 import { effect, vertex, fragment, type Effect } from "@aardworx/wombat.shader";
-import { type Sampler2D, texture, textureSize } from "@aardworx/wombat.shader/types";
+import { type Sampler2D, type SamplerCube, texture, textureSize } from "@aardworx/wombat.shader/types";
 import { uniform } from "@aardworx/wombat.shader/uniforms";
 import { V3f, V4f } from "@aardworx/wombat.base";
 
@@ -21,6 +21,7 @@ declare module "@aardworx/wombat.shader/uniforms" {
 }
 
 const checker: Sampler2D = null as unknown as Sampler2D;
+const envCube: SamplerCube = null as unknown as SamplerCube;
 
 // VS reads Positions + Normals attributes and 4 uniforms (3 built-in,
 // 1 augmented). Writes 5 varyings, every uniform/attribute wired
@@ -58,8 +59,20 @@ const texturedSizeFS = fragment((v: { color: V4f }) => {
   return { outColor: tex.mul(new V4f(v.color.x * ts.x, v.color.y * ts.y, 1.0, 1.0)) };
 });
 
+// Samples a samplerCube with a world-space direction — exercises the
+// heap cube→2D-grid rewrite (textureSample(cube, dir) → sample the
+// packed 3×2 face grid via cubeProjectZup).
+const cubeFS = fragment((v: { worldPos: V3f }) => {
+  const c = texture(envCube, v.worldPos);
+  return { outColor: new V4f(c.x, c.y, c.z, 1.0) };
+});
+
 export function makeHeapTestEffect(): Effect {
   return effect(baseVS, plainFS);
+}
+
+export function makeHeapTestEffectCube(): Effect {
+  return effect(baseVS, cubeFS);
 }
 
 export function makeHeapTestEffectTextured(): Effect {

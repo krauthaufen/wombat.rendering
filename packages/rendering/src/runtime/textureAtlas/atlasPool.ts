@@ -160,6 +160,14 @@ export interface AtlasSource {
    * via canvas-2d and uploads each level into the pyramid sub-region.
    */
   readonly host?: HostTextureSource;
+  /**
+   * A GPU-resident source: the pool copies it into the page region via
+   * `copyTextureToTexture` (instead of the host `copyExternalImageToTexture`
+   * / `writeTexture` path). Used for adapter-packed textures — e.g. the
+   * cube face-grid `heapAdapter` builds on the GPU. Mutually exclusive with
+   * `host`; mip generation is not applied (caller supplies mip 0 only).
+   */
+  readonly gpuTexture?: GPUTexture;
 }
 
 export interface AtlasAcquireOptions {
@@ -229,6 +237,8 @@ function describeAtlasTexture(t: ITexture): {
   }
   // URL-deferred textures are resolved at the Sg layer, never atlas-routed.
   if (t.kind === "url") return null;
+  // Cube maps are packed to a standalone 2D grid by heapAdapter, never atlased.
+  if (t.kind === "cube") return null;
   const src = t.source;
   if (src.kind === "raw") {
     return {
@@ -338,6 +348,12 @@ export class AtlasPool {
       this.pageAddedListeners.set(f, new Set());
     }
   }
+
+  /** The GPU device this pool renders on. Exposed so adapter-side
+   *  resource preparation that needs a device (e.g. packing a cube
+   *  ITexture into a standalone face-grid texture) can reach it without
+   *  a separate device thread. */
+  get gpuDevice(): GPUDevice { return this.device; }
 
   /** All currently allocated pages for a given format. */
   pagesFor(format: AtlasPageFormat): readonly AtlasPage[] {
@@ -907,6 +923,16 @@ export class AtlasPool {
       // samples bleed at exact uv=0 / uv=1. For most atlas content
       // (low-frequency icon edges) this is visually invisible.
       this.upload(page, x + 2, y + 2, source.host, mip0W, mip0H, numMips);
+    } else if (source !== undefined && source.gpuTexture !== undefined) {
+      // GPU-resident source (adapter-packed, e.g. the cube face-grid):
+      // copy mip-0 into the interior (+2, +2). No mip pyramid.
+      const enc = this.device.createCommandEncoder({ label: "atlas/gpuUpload" });
+      enc.copyTextureToTexture(
+        { texture: source.gpuTexture, origin: { x: 0, y: 0 } },
+        { texture: page.texture, origin: { x: x + 2, y: y + 2 } },
+        { width: mip0W, height: mip0H, depthOrArrayLayers: 1 },
+      );
+      this.device.queue.submit([enc.finish()]);
     }
     return this.makeResult(entry);
   }

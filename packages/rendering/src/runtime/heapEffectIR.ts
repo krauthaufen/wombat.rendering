@@ -907,6 +907,108 @@ function rewriteFsAtlasTextures(m: Module, layout: BucketLayout): Module {
   return out;
 }
 
+// ─── FS cube-texture rewrite (samplerCube → 2D face grid) ───────────
+//
+// A `samplerCube` binding must NOT bind a real `texture_cube` on the
+// heap: WebKit/Metal reject cube views over the atlas array texture,
+// crashing iOS. The adapter instead packs the 6 faces into a 3×2 2D
+// grid (see heapAdapter cube path + fillCubeGutters). This rewrite
+// makes the emitted shader sample that grid:
+//   1. Retarget the Sampler decl Cube→2D so WGSL emit produces a
+//      `texture_2d<f32>` binding matching the heap BGL (which
+//      buildSchema already declared as `texture_2d`).
+//   2. Rewrite `textureSample(<cube>, smp, dir:vec3)` →
+//      `textureSample(<cube>, smp, cubeProjectZup(dir))`.
+// `cubeProjectZup` (declared by the prepended FS prelude) maps a Z-up
+// world direction to the grid UV using the SAME face convention as
+// cubeGutter.ts's `dirToFace` and the FIXED layout F0=320,G0=8,3×2.
+
+/** Synthetic `cubeProjectZup(vec3)->vec2` intrinsic for the emit hook. */
+const CUBE_PROJECT_INTRINSIC: IntrinsicRef = {
+  name: "cubeProjectZup",
+  returnTypeOf: () => Tvec2,
+  pure: true,
+  emit: { glsl: "cubeProjectZup", wgsl: "cubeProjectZup" },
+};
+
+/** Match a cube binding by its user name or the emitted `<name>_view`. */
+function cubeNameMatches(name: string, cubeNames: ReadonlySet<string>): boolean {
+  return cubeNames.has(name) || cubeNames.has(`${name}_view`);
+}
+
+/** `textureSample(<cube sampler>, uv)` — the sampler is args[0], uv args[1]
+ *  (pre-splitWgslSamplers 2-arg shape, same as `isAtlasSampleCall`). */
+function isCubeSampleCall(e: Expr, cubeNames: ReadonlySet<string>): { uv: Expr } | null {
+  if (e.kind !== "CallIntrinsic") return null;
+  if (e.op.emit.wgsl !== "textureSample") return null;
+  if (e.args.length < 2) return null;
+  const tex = e.args[0]!;
+  let name: string | undefined;
+  if (tex.kind === "ReadInput" && tex.scope === "Uniform") name = tex.name;
+  else if (tex.kind === "Var") name = (tex as { var: { name: string } }).var.name;
+  if (name === undefined || !cubeNameMatches(name, cubeNames)) return null;
+  return { uv: e.args[1]! };
+}
+
+function rewriteFsCubeTextures(m: Module, layout: BucketLayout): Module {
+  if (layout.cubeTextureBindings.size === 0) return m;
+  // 1. Retarget matching Sampler decls Cube→2D so the emitter produces
+  //    a `texture_2d` binding (matching the schema/BGL). Everything else
+  //    about the sampler (state, binding) is preserved.
+  const values: ValueDef[] = m.values.map(v => {
+    if (v.kind !== "Sampler") return v;
+    if (!cubeNameMatches(v.name, layout.cubeTextureBindings)) return v;
+    const t = v.type as { kind: string; target?: string };
+    if (t.kind !== "Sampler" || t.target !== "Cube") return v;
+    return { ...v, type: { ...t, target: "2D" } as Type };
+  });
+  // 2. Wrap sample dirs with cubeProjectZup wherever the cube is sampled.
+  //    Map EVERY body — Entry AND Function — because at this pre-atlas stage
+  //    the sample can live in a helper function that only gets inlined into
+  //    the entry later (the atlas rewrite runs post-inline). Mapping only
+  //    entry bodies would miss it.
+  const wrap = (body: Stmt): Stmt => mapStmt(body, {
+    expr: e => mapExpr(e, sub => {
+      const hit = isCubeSampleCall(sub, layout.cubeTextureBindings);
+      if (hit === null) return sub;
+      const proj: Expr = { kind: "CallIntrinsic", op: CUBE_PROJECT_INTRINSIC, args: [hit.uv], type: Tvec2 };
+      const call = sub as Extract<Expr, { kind: "CallIntrinsic" }>;
+      // Replace the uv arg (index 1); keep sampler + any trailing args.
+      return { ...call, args: call.args.map((a, i) => (i === 1 ? proj : a)) };
+    }),
+  });
+  const mappedValues: ValueDef[] = values.map(v => {
+    if (v.kind === "Entry") return { ...v, entry: { ...v.entry, body: wrap(v.entry.body) } };
+    if (v.kind === "Function") return { ...v, body: wrap(v.body) };
+    return v;
+  });
+  return { ...m, values: mappedValues };
+}
+
+/**
+ * FS prelude declaring `cubeProjectZup`. Z-up dominant-axis face select
+ * IDENTICAL to cubeGutter.ts `dirToFace`, then face (u,v) → grid uv with
+ * the FIXED packed layout (F0=320, G0=8, cell=336, cols=3, rows=2,
+ * grid 1008×672). Prepended to the emitted FS only when the effect has
+ * cube bindings.
+ */
+const CUBE_PROJECT_PRELUDE = /* wgsl */`
+fn cubeProjectZup(d: vec3<f32>) -> vec2<f32> {
+  let ax = abs(d.x); let ay = abs(d.y); let az = abs(d.z);
+  var f: f32; var s: f32; var t: f32; var m: f32;
+  if (az >= ax && az >= ay) { m = az; if (d.z > 0.0) { f = 4.0; s =  d.x; t =  d.y; } else { f = 5.0; s =  d.x; t = -d.y; } }
+  else if (ax >= ay)        { m = ax; if (d.x > 0.0) { f = 0.0; s =  d.y; t =  d.z; } else { f = 1.0; s = -d.y; t =  d.z; } }
+  else                      { m = ay; if (d.y > 0.0) { f = 2.0; s = -d.x; t =  d.z; } else { f = 3.0; s =  d.x; t =  d.z; } }
+  let u = 0.5 * (s / m + 1.0);
+  let v = 0.5 * (t / m + 1.0);
+  let row = select(0.0, 1.0, f >= 3.0);
+  let col = f - 3.0 * row;
+  let px = col * 336.0 + 8.0 + u * 320.0;
+  let py = row * 336.0 + 8.0 + v * 320.0;
+  return vec2<f32>(px / 1008.0, py / 672.0);
+}
+`;
+
 /** Visit every Expr inside a Stmt tree, read-only. */
 function visitStmtExprs(s: Stmt, fn: (e: Expr) => void): void {
   mapStmt(s, {
@@ -1226,6 +1328,14 @@ function compileHeapEffectIRViaDecoder(
   // fragment stage stops reading, `pruneCrossStage` then drops from the carrier
   // by itself, so the varying count collapses to what genuinely varies per
   // vertex.
+  // 5b. samplerCube bindings: wrap sample dirs with cubeProjectZup (→vec2
+  // grid uv) and retarget the sampler decl Cube→2D — done BEFORE the atlas
+  // rewrite so the (atlas-routed) cube texture's `textureSample(cube, dir)`
+  // becomes `textureSample(cube, cubeProjectZup(dir))`, which the atlas
+  // rewrite then turns into `atlasSample(..., cubeProjectZup(dir))`. The
+  // grid packs the 6 faces (no real texture_cube — iOS-safe).
+  combined = rewriteFsCubeTextures(combined, layout);
+
   combined = rewriteFsHeapDirectViaCarrier(combined, layout);
 
   // 6b. USER storage buffers (the OIT node pool & co): pin each to the
@@ -1275,6 +1385,13 @@ function compileHeapEffectIRViaDecoder(
       fsSrc = stripAtlasTextureSamplerDecls(fsSrc, layout.atlasTextureBindings);
       fsSrc = prependAtlasPrelude(fsSrc);
     }
+  }
+
+  // 9b. Cube bindings: prepend the cubeProjectZup helper the rewrite
+  // emitted calls to. The texture/sampler decls are KEPT (unlike atlas)
+  // — they now bind the packed 2D grid.
+  if (layout.cubeTextureBindings.size > 0 && fsSrc.length > 0) {
+    fsSrc = CUBE_PROJECT_PRELUDE + fsSrc;
   }
 
   return {

@@ -429,6 +429,7 @@ function unionDrawHeaders(
   const textureByName = new Map<string, TexBinding>();
   const samplerByName = new Map<string, TexBinding>();
   const atlasUnion = new Set<string>();
+  const cubeUnion = new Set<string>();
   for (const e of sortedEffects) {
     const layout = perEffectLayout.get(e)!;
     for (const t of layout.textureBindings) {
@@ -452,6 +453,7 @@ function unionDrawHeaders(
       }
     }
     for (const n of layout.atlasTextureBindings) atlasUnion.add(n);
+    for (const n of layout.cubeTextureBindings) cubeUnion.add(n);
   }
 
   // Renumber bindings deterministically — first the unioned textures,
@@ -511,6 +513,7 @@ function unionDrawHeaders(
     textureBindings: orderedTextures,
     samplerBindings: orderedSamplers,
     atlasTextureBindings: atlasUnion,
+    cubeTextureBindings: cubeUnion,
     storageBindings,
   };
   return { id: bucketLayoutId(base), ...base };

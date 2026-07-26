@@ -109,6 +109,87 @@ function getKernel(device: GPUDevice): Cache {
   return entry;
 }
 
+/**
+ * Fixed packed-cube layout, shared by the heap adapter's packer, the FS
+ * `cubeProjectZup` prelude (heapEffectIR), and the viewer's dir→uv math.
+ * F0=320 interior + G0=8 gutter → cell 336; 3×2 grid → 1008×672 (≤ the
+ * 1024 atlas cap, though the packed grid rides the standalone path).
+ * Changing these REQUIRES updating cubeProjectZup in heapEffectIR.ts.
+ */
+export const CUBE_FACE_SIZE = 320;
+export const CUBE_GUTTER = 8;
+export const CUBE_GRID_LAYOUT: CubeGutterLayout = {
+  faceSize: CUBE_FACE_SIZE, gutter: CUBE_GUTTER, cols: 3, rows: 2,
+};
+
+/** A source usable to fill one cube face. */
+export type CubePackSource =
+  | ImageBitmap | HTMLImageElement | HTMLCanvasElement | OffscreenCanvas | ImageData;
+
+function isImageData(f: CubePackSource): f is ImageData {
+  return typeof (f as ImageData).data === "object"
+    && (f as ImageData).data instanceof Uint8ClampedArray;
+}
+
+/**
+ * Pack 6 cube faces (order [+X,-X,+Y,-Y,+Z,-Z], +Z up — matching
+ * `faceToDir`/`dirToFace` above) into a single 2D grid GPUTexture with
+ * cross-face gutters filled, ready to sample as a plain `texture_2d`.
+ * Faces must be exactly `faceSize`² (the viewer pre-orients + scales them).
+ * Returns the destination grid texture (TEXTURE_BINDING); the interim
+ * source texture is destroyed after the gutter pass is submitted.
+ */
+export function packCubeGrid(
+  device: GPUDevice,
+  faces: readonly CubePackSource[],
+  faceSize: number = CUBE_FACE_SIZE,
+): GPUTexture {
+  if (faces.length !== 6) throw new Error(`packCubeGrid: expected 6 faces, got ${faces.length}`);
+  const layout: CubeGutterLayout = { faceSize, gutter: CUBE_GUTTER, cols: 3, rows: 2 };
+  const { width, height } = cubeGridSize(layout);
+  const cell = faceSize + 2 * layout.gutter;
+  const src = device.createTexture({
+    label: "cube/gridSrc",
+    size: { width, height },
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  const dst = device.createTexture({
+    label: "cube/gridDst",
+    size: { width, height },
+    format: "rgba8unorm",
+    // COPY_SRC so the atlas can copyTextureToTexture the packed grid into a page.
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+  });
+  for (let i = 0; i < 6; i++) {
+    const col = i % layout.cols;
+    const row = (i / layout.cols) | 0;
+    const originX = col * cell + layout.gutter;
+    const originY = row * cell + layout.gutter;
+    const f = faces[i]!;
+    if (isImageData(f)) {
+      device.queue.writeTexture(
+        { texture: src, origin: { x: originX, y: originY } },
+        f.data,
+        { bytesPerRow: f.width * 4, rowsPerImage: f.height },
+        { width: faceSize, height: faceSize },
+      );
+    } else {
+      device.queue.copyExternalImageToTexture(
+        { source: f as GPUCopyExternalImageSource },
+        { texture: src, origin: { x: originX, y: originY } },
+        { width: faceSize, height: faceSize },
+      );
+    }
+  }
+  // The face copies above are queue ops ordered before this submit, so
+  // the kernel sees the populated interiors. destroy() after submit is
+  // safe — submitted work still completes.
+  fillCubeGutters(device, src.createView(), dst.createView(), layout);
+  src.destroy();
+  return dst;
+}
+
 /** Grid pixel dimensions for a layout. */
 export function cubeGridSize(layout: CubeGutterLayout): { width: number; height: number } {
   const cell = layout.faceSize + 2 * layout.gutter;

@@ -113,6 +113,13 @@ import type { HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
 import { isBufferView } from "./heapScene/pools.js";
 import { compileHeapEffect } from "./heapEffect.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
+import { packCubeGrid, type CubePackSource } from "./textureAtlas/cubeGutter.js";
+
+// Packed cube-grid cache: one standalone grid GPUTexture per (device,
+// cube ITexture identity). Cube ITextures are value-constant (the viewer
+// binds a fixed instance post-decode), so identity keying packs each set
+// exactly once and survives spec re-materialisation.
+const cubeGridMemo = new WeakMap<GPUDevice, WeakMap<ITexture, GPUTexture>>();
 import { STANDARD_DERIVED_RULES, STANDARD_TRAFO_LEAVES } from "./derivedUniforms/recipes.js";
 import { inputsOf } from "./derivedUniforms/flatten.js";
 import { isDerivedRule, type DerivedRule } from "./derivedUniforms/rule.js";
@@ -320,6 +327,8 @@ function describeTexture(t: ITexture): TextureDescriptor | null {
   // URL-deferred textures are resolved at the Sg layer (placeholder
   // checker until ready); they should never reach the heap adapter.
   if (t.kind === "url") return null;
+  // Cube maps take the dedicated packing path (packCubeToGrid), not this one.
+  if (t.kind === "cube") return null;
   const src = t.source;
   if (src.kind === "raw") {
     return {
@@ -620,13 +629,42 @@ function buildFlatSpec(
       throw new Error("heapAdapter: missing texture/sampler value");
     }
 
-    // Inspect format/dimensions/mipLevels from ITexture. Both
-    // variants expose enough to classify:
-    //   - kind: "host" → carries width/height/format on the source
-    //     descriptor (raw) or implicit (external; default rgba8unorm).
-    //   - kind: "gpu"  → resolved GPUTexture exposes .format/.width/
-    //     .height/.mipLevelCount.
-    const dims = describeTexture(texVal);
+    // ── Cube ITexture → ATLAS-routed 2D face-grid ──
+    // A `samplerCube` binding (schema `dim==="cube"`, IR-retargeted to a 2D
+    // sampler + `cubeProjectZup` by heapEffectIR) is fed a packed 3×2 face
+    // grid, NOT a real texture_cube (iOS-safe). Pack the 6 pre-oriented
+    // faces ONCE per cube ITexture into a GPU grid texture, then route it
+    // through the ATLAS exactly like a 2D texture (uploaded via
+    // copyTextureToTexture). The atlas path composites with the rest of the
+    // heap in the shared render pass; the standalone bucket does NOT (it
+    // fails to draw and breaks the shared megacall — untested in prod since
+    // every texture is atlas-routed). The viewer binds a CONSTANT cube
+    // ITexture (post-decode), so this packs + uploads exactly once.
+    let cubeGpuSource: GPUTexture | undefined;
+    let dims: ReturnType<typeof describeTexture>;
+    if (texVal.kind === "cube") {
+      if (pool === undefined) {
+        throw new Error("heapAdapter: cube ITexture requires an AtlasPool (source of the GPU device)");
+      }
+      const device = pool.gpuDevice;
+      let perTex = cubeGridMemo.get(device);
+      if (perTex === undefined) { perTex = new WeakMap(); cubeGridMemo.set(device, perTex); }
+      let grid = perTex.get(texVal);
+      if (grid === undefined) {
+        grid = packCubeGrid(device, texVal.faces as readonly CubePackSource[], texVal.faceSize);
+        perTex.set(texVal, grid);
+      }
+      cubeGpuSource = grid;
+      dims = { width: grid.width, height: grid.height, format: "rgba8unorm", mipLevelCount: 1 };
+    } else {
+      // Inspect format/dimensions/mipLevels from ITexture. Both variants
+      // expose enough to classify:
+      //   - kind: "host" → carries width/height/format on the source
+      //     descriptor (raw) or implicit (external; default rgba8unorm).
+      //   - kind: "gpu"  → resolved GPUTexture exposes .format/.width/
+      //     .height/.mipLevelCount.
+      dims = describeTexture(texVal);
+    }
 
     // Tier-S routing: pool present, format eligible, dims ≤ cap. Mips
     // are honoured if the source advertises them.
@@ -645,7 +683,11 @@ function buildFlatSpec(
         dims.height,
         {
           wantsMips,
-          ...(dims.host !== undefined ? { source: { width: dims.width, height: dims.height, host: dims.host } } : {}),
+          ...(cubeGpuSource !== undefined
+            ? { source: { width: dims.width, height: dims.height, gpuTexture: cubeGpuSource } }
+            : dims.host !== undefined
+              ? { source: { width: dims.width, height: dims.height, host: dims.host } }
+              : {}),
         },
       );
       // ATLAS FULL — every page is packed with textures still in use. This is
@@ -708,6 +750,10 @@ function buildFlatSpec(
         // points at uninitialized atlas memory (or worse, leftover
         // pixels from the just-evicted neighbor).
         ...(dims.host !== undefined ? { host: dims.host } : {}),
+        // Cube face-grid: retained GPU source so the heap-side re-acquire
+        // re-uploads via copyTextureToTexture after an eviction (the grid
+        // is memoised, so it outlives the entry). Mutually exclusive w/ host.
+        ...(cubeGpuSource !== undefined ? { gpuTexture: cubeGpuSource } : {}),
       };
       (textures as unknown as { __retarget: (r: number) => void }).__retarget = (r: number) => { cell.ref = r; };
     } else {

@@ -98,6 +98,10 @@ function isHeapServableTexture(t: ITexture): boolean {
   if (t.kind === "gpu") return false;
   // URL-deferred — the Sg layer hands us a placeholder while it loads.
   if (t.kind === "url") return false;
+  // Cube maps are heap-served: the adapter packs the 6 faces into a 2D grid
+  // texture with cross-face gutters (fillCubeGutters) and the FS is rewritten
+  // to sample by face-projection. Standalone 2D — no texture_cube.
+  if (t.kind === "cube") return true;
   const src = t.source;
   if (src.kind === "raw") {
     if ((src.depthOrArrayLayers ?? 1) !== 1) return false;

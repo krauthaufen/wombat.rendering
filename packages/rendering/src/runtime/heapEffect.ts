@@ -46,6 +46,15 @@ export interface HeapTextureBinding {
   readonly name: string;
   /** WGSL type expression, e.g. "texture_2d<f32>", "texture_cube<f32>". */
   readonly wgslType: string;
+  /**
+   * Sampler dimension recovered from the effect IR. `"cube"` marks a
+   * `samplerCube` binding: the heap does NOT bind a real `texture_cube`
+   * (WebKit/Metal reject cube views over array textures). Instead the
+   * binding is emitted as `texture_2d<f32>` over a packed 3×2 face grid,
+   * and the IR rewrite maps `textureSample(cube, smp, dir)` →
+   * `textureSample(name, smp, cubeProjectZup(dir))`. Absent → ordinary 2D.
+   */
+  readonly dim?: "2d" | "cube";
 }
 
 /** One sampler binding the effect declares (post link + DCE). */
@@ -115,7 +124,9 @@ export interface FragmentOutputLayout {
 // in the version string so any future size change re-keys too.
 // h13: atlas pages became texture_2d_array layers (2 array bindings +
 // runtime pageRef index instead of the 2×8 single-texture ladder).
-export const HEAP_PERSIST_VERSION_BASE = "h13";
+// h14: samplerCube heap support — cube→2D sampler retarget + cubeProjectZup
+// FS rewrite (heapEffectIR), cube bindings threaded through BucketLayout.
+export const HEAP_PERSIST_VERSION_BASE = "h14";
 export const HEAP_PERSIST_VERSION = HEAP_PERSIST_VERSION_BASE; // legacy export (see persistVersionNow)
 export function persistVersionNow(): string {
   return `${HEAP_PERSIST_VERSION_BASE}-aps${atlasPageSizeNow()}`;
@@ -289,8 +300,18 @@ function buildSchema(iface: ProgramInterface): HeapEffectSchema {
   // specialise further as multi-kind support lands in the DSL.
   const isComparison = (t: unknown): boolean =>
     typeof t === "object" && t !== null && (t as { comparison?: boolean }).comparison === true;
+  // `samplerCube` bindings: the IR sampler Type carries `target: "Cube"`.
+  // Record the dimension so the heap can route them through the packed
+  // 2D face-grid path (buildBucketLayout → cubeTextureBindings) instead
+  // of binding a real `texture_cube`. The wgslType stays `texture_2d<f32>`
+  // — that IS what the heap binds; the IR rewrite retargets the sampler
+  // decl Cube→2D so the emitted shader matches the BGL.
+  const isCube = (t: unknown): boolean =>
+    typeof t === "object" && t !== null && (t as { target?: string }).target === "Cube";
   const textures: HeapTextureBinding[] = iface.textures.map(t => ({
-    name: t.name, wgslType: isComparison(t.type) ? "texture_depth_2d" : "texture_2d<f32>",
+    name: t.name,
+    wgslType: isComparison(t.type) ? "texture_depth_2d" : "texture_2d<f32>",
+    ...(isCube(t.type) ? { dim: "cube" as const } : {}),
   }));
   const samplers: HeapSamplerBinding[] = iface.samplers.map(s => ({
     name: s.name, wgslType: isComparison(s.type) ? "sampler_comparison" : "sampler",
@@ -415,6 +436,15 @@ export interface BucketLayout {
    */
   readonly atlasTextureBindings: ReadonlySet<string>;
   /**
+   * `samplerCube` binding names (schema `dim === "cube"`). Unlike
+   * `atlasTextureBindings` this is a STATIC property of the effect (not
+   * per-draw routing), so it is derived from the schema here rather than
+   * threaded from the scene layer. The FS rewriter (heapEffectIR) uses it
+   * to retarget the sampler decl Cube→2D and wrap sample dirs with
+   * `cubeProjectZup`; the adapter packs the 6 faces into the 3×2 grid.
+   */
+  readonly cubeTextureBindings: ReadonlySet<string>;
+  /**
    * User storage-buffer bindings (allocated from
    * HEAP_USER_STORAGE_BINDING_BASE, above the atlas range). Bound at
    * bucket level from `HeapDrawSpec.storageBuffers` — every RO in the
@@ -470,6 +500,11 @@ export function buildBucketLayout(
   const perInstanceUniforms = opts.perInstanceUniforms ?? new Set<string>();
   const perInstanceAttributes = opts.perInstanceAttributes ?? new Set<string>();
   const atlasTextureBindings = opts.atlasTextureBindings ?? new Set<string>();
+  // Cube bindings are static (effect-level), so derive them from the
+  // schema regardless of the caller — no per-spec threading required.
+  const cubeTextureBindings = new Set<string>(
+    schema.textures.filter(t => t.dim === "cube").map(t => t.name),
+  );
   const drawHeaderFields: DrawHeaderField[] = [];
 
   // Per-draw uniforms → u32 ref slots in the DrawHeader. The runtime
@@ -536,14 +571,21 @@ export function buildBucketLayout(
   const strideU32 = drawHeaderBytes / 4;
 
   // Allocate texture + sampler bindings starting at HEAP_TEX_BINDING_START.
-  // Order: all textures, then all samplers — matches the prelude
-  // layout below and the runtime's BGL/bind-group construction.
-  // Atlas-routed bindings drop out — their data flows through the
-  // drawHeader instead of through individual texture/sampler slots.
-  let nextBinding = HEAP_TEX_BINDING_START;
-  const textureBindings = schema.textures
-    .filter(t => !atlasTextureBindings.has(t.name))
-    .map(t => ({ name: t.name, wgslType: t.wgslType, binding: nextBinding++ }));
+  // Order: all SAMPLERS, then all textures. This matches wombat.shader's
+  // WGSL emit for the STANDALONE path, where the effect's own decls are
+  // kept (not stripped) and their `@binding` numbers come from
+  // `compileModule`: a combined `Sampler X` splits into a `sampler` that
+  // takes the lower slot and the paired `texture_*` the next. The heap is
+  // strictly single-pair (heapScene asserts ≤1 texture + ≤1 sampler per
+  // bucket), so "all samplers then all textures" reproduces exactly what
+  // the emitter assigns — the BGL entry TYPE at each `@binding` then lines
+  // up with the shader decl. Getting this backwards produced a
+  // "Binding type in the shader (sampler) doesn't match the type in the
+  // layout (texture)" validation error → an invalid pipeline that poisoned
+  // the whole shared render pass (every co-resident heap/atlas draw
+  // vanished). Atlas-routed bindings drop out entirely (their decls are
+  // stripped, data flows through the drawHeader), so ordering only ever
+  // matters for the non-atlas standalone bindings.
   // Samplers: drop the matching one when its texture is atlas-routed.
   // Heuristic: assume position-aligned (nth sampler pairs with nth
   // texture). Heap path's v1 surface only ever has 0..1 of each, so
@@ -557,9 +599,13 @@ export function buildBucketLayout(
       if (s !== undefined) atlasSamplerNames.add(s.name);
     }
   }
+  let nextBinding = HEAP_TEX_BINDING_START;
   const samplerBindings = schema.samplers
     .filter(s => !atlasSamplerNames.has(s.name))
     .map(s => ({ name: s.name, wgslType: s.wgslType, binding: nextBinding++ }));
+  const textureBindings = schema.textures
+    .filter(t => !atlasTextureBindings.has(t.name))
+    .map(t => ({ name: t.name, wgslType: t.wgslType, binding: nextBinding++ }));
 
   const isAtlasBucket = atlasTextureBindings.size > 0;
   // Extend the schema's varyings with flat-interpolated atlas threading
@@ -584,7 +630,7 @@ export function buildBucketLayout(
   const base = {
     drawHeaderFields, drawHeaderBytes, preludeWgsl, strideU32,
     perInstanceUniforms, perInstanceAttributes,
-    textureBindings, samplerBindings, atlasTextureBindings,
+    textureBindings, samplerBindings, atlasTextureBindings, cubeTextureBindings,
     storageBindings,
   };
   return { id: bucketLayoutId(base), ...base };
@@ -615,6 +661,7 @@ export function bucketLayoutId(l: Omit<BucketLayout, "id">): string {
   for (const s of l.samplerBindings) parts.push(`S:${s.name}|${s.wgslType}|${s.binding}`);
   for (const sb of l.storageBindings) parts.push(`SB:${sb.name}|${sb.access}|${sb.binding}`);
   parts.push("ATB:" + [...l.atlasTextureBindings].sort().join(","));
+  parts.push("CTB:" + [...l.cubeTextureBindings].sort().join(","));
   // The prelude is derived from the above, but fold its hash in too —
   // cheap insurance against any generator path the field list misses.
   parts.push("PRE:" + fnv1a32(l.preludeWgsl).toString(36));
