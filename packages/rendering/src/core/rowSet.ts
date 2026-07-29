@@ -11,6 +11,7 @@
 
 import type { aval, aset } from "@aardworx/wombat.adaptive";
 import type { Trafo3d } from "@aardworx/wombat.base";
+import type { BufferView } from "./bufferView.js";
 import type { DrawCall } from "./drawCall.js";
 import type { IAttributeProvider, IUniformProvider } from "./provider.js";
 import type { RenderObject } from "./renderObject.js";
@@ -23,6 +24,16 @@ export interface RenderRow {
   readonly pickId?: number;
   readonly modelChain?: readonly aval<Trafo3d>[];
   readonly active?: aval<boolean>;
+  /**
+   * Per-row leaf geometry — LOD-style rows where every row carries its
+   * OWN vertex buffers (and, for indexed rows, its own index view).
+   * Omitted → the template's are shared (auto-instancing-style rows).
+   * Without this, rows that intern into one template (same call site,
+   * same shape) but hold DISTINCT buffers all render the template
+   * row's geometry — silently, since every reference is valid.
+   */
+  readonly vertexAttributes?: IAttributeProvider;
+  readonly indices?: BufferView;
 }
 
 export interface RenderRowSet {
@@ -57,6 +68,8 @@ export function materializeRow(set: RenderRowSet, row: RenderRow): RenderObject 
     if (row.pickId !== undefined) o["pickId"] = row.pickId;
     if (row.modelChain !== undefined) o["modelChain"] = row.modelChain;
     if (row.active !== undefined) o["active"] = row.active;
+    if (row.vertexAttributes !== undefined) o["vertexAttributes"] = row.vertexAttributes;
+    if (row.indices !== undefined) o["indices"] = row.indices;
     ro = o as unknown as RenderObject;
     materialized.set(row, ro);
   }
