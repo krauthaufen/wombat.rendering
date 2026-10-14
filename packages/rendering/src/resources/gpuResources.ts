@@ -87,6 +87,10 @@ function resolveRegion(texture: GPUTexture, region: TextureRegion): ResolvedRegi
 }
 
 function asBytes(data: HostData): Uint8Array {
+  if (Array.isArray(data)) {
+    // e.g. an F# array Fable could not type (a list converted to an array)
+    throw new Error("wombat.rendering: host data must be an ArrayBuffer or typed array, got a plain JS array");
+  }
   return data instanceof ArrayBuffer
     ? new Uint8Array(data)
     : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
