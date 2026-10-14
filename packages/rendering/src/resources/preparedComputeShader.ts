@@ -101,6 +101,12 @@ interface UboField {
   readonly type: import("../core/index.js").UniformFieldInfo["type"];
 }
 
+/** @internal — a uniform block's packed bytes and the binding's own UBO (if created). */
+export interface UniformBlockData {
+  readonly bytes: ArrayBuffer;
+  readonly buffer: GPUBuffer | undefined;
+}
+
 interface UboState {
   readonly group: number;
   readonly binding: number;
@@ -216,17 +222,32 @@ export class ComputeInputBinding {
         ub.dirty = false;
       }
     }
+    return this.buildBindGroups((ub, group, binding) => {
+      if (ub.buffer === undefined) {
+        throw new Error(`ComputeInputBinding.dispatch: UBO at group=${group} binding=${binding} not initialised`);
+      }
+      return { buffer: ub.buffer };
+    });
+  }
 
+  /**
+   * @internal — build bind groups from the current resources, with the
+   * uniform blocks bound wherever `uniform` places them. `ComputeBatch`
+   * uses this to give every dispatch its own snapshot of the uniform
+   * values (the binding's own UBOs would be overwritten by the next
+   * `setUniform` before the batch is submitted).
+   */
+  buildBindGroups(uniform: (ub: UniformBlockData, group: number, binding: number) => GPUBufferBinding): GPUBindGroup[] {
     const out: GPUBindGroup[] = [];
     for (const g of this.groups) {
       const entries: GPUBindGroupEntry[] = g.entries.map(e => {
         switch (e.kind) {
           case "ubuf": {
             const ub = this._ubosByBinding.get(`${g.group}:${e.binding}`);
-            if (!ub || ub.buffer === undefined) {
+            if (!ub) {
               throw new Error(`ComputeInputBinding.dispatch: UBO at group=${g.group} binding=${e.binding} not initialised`);
             }
-            return { binding: e.binding, resource: { buffer: ub.buffer } };
+            return { binding: e.binding, resource: uniform({ bytes: ub.view.bytes, buffer: ub.buffer }, g.group, e.binding) };
           }
           case "sbuf": {
             const buf = this._buffers.get(e.name);

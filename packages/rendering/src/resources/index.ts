@@ -64,6 +64,25 @@ export {
 } from "./preparedComputeShader.js";
 
 export {
+  writeTextureRegion,
+  writeBufferRange,
+  readBuffer,
+  readTextureRegion,
+  MutableTexture,
+  MutableBuffer,
+  type HostData,
+  type TextureRegion,
+  type WriteOptions,
+  type MutableTextureDescriptor,
+  type MutableBufferDescriptor,
+} from "./gpuResources.js";
+
+export {
+  ComputeBatch,
+  type ComputeBatchOptions,
+} from "./computeBatch.js";
+
+export {
   createFramebufferSignature,
   type FramebufferSignatureSpec,
 } from "./framebufferSignature.js";

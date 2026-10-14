@@ -75,6 +75,10 @@ each subdir.
   `vitest.browser.config.ts` with `executablePath: "/usr/bin/chromium"`).
   Playwright's bundled headless shell falls back to SwiftShader
   because it lacks a compositor.
+- `npx vitest run --config vitest.browser.cdp.config.ts` — the same
+  browser tests in an already running Chromium reached over CDP
+  (`WOMBAT_CDP_URL`, default `http://127.0.0.1:9222`) instead of a
+  launched headless one.
 - `npm run test:all` — both.
 - `npm run typecheck` — `tsc -b --noEmit`.
 - `npm run build` — `tsc -b`.
@@ -139,7 +143,25 @@ adaptive walker — Aardvark.GPGPU's pattern. The returned
 encodes the compute pass, submits, awaits — or `encode(encoder, …)`
 for batched submission.
 
+For many dispatches with different small uniforms, `ComputeBatch`
+records them into few command buffers: each `dispatch(shader, binding,
+groups)` snapshots the binding's uniform blocks into its own slot of
+a per-batch uniform arena, so `setUniform` between dispatches works;
+`submit()` cuts a command buffer, `read(buffer)` copies + submits +
+maps, `writeBuffer` is ordered after the recorded work.
+
 No `Compute` command in the alist. The runtime is rendering-only.
+
+## In-place resources
+
+`MutableTexture` / `MutableBuffer` (resources/gpuResources.ts) own a
+GPUTexture / GPUBuffer that is written region by region
+(`writeTextureRegion` / `writeBufferRange`) and are themselves
+`aval<ITexture>` / `aval<IBuffer>`, so they bind like any texture or
+buffer aval. Writes mark the aval in a microtask (pass
+`notify: false` from inside a frame eval); `MutableBuffer.resize` /
+`ensureCapacity` reallocate (contents kept) and change the value.
+`readBuffer` / `readTextureRegion` read back to an `ArrayBuffer`.
 
 ## MSAA
 

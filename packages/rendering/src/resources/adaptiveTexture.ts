@@ -187,7 +187,7 @@ function uploadExternal(device: GPUDevice, tex: GPUTexture, src: ExternalTexture
   );
 }
 
-interface BlockInfo {
+export interface BlockInfo {
   readonly width: number;        // pixels per block in x
   readonly height: number;       // pixels per block in y
   readonly bytesPerBlock: number;
@@ -200,7 +200,7 @@ interface BlockInfo {
  * `writeTexture`'s bytesPerRow / rowsPerImage land on the right
  * block grid.
  */
-function blockInfoFor(format: GPUTextureFormat): BlockInfo {
+export function blockInfoFor(format: GPUTextureFormat): BlockInfo {
   switch (format) {
     // 8-bit
     case "r8unorm": case "r8snorm": case "r8uint": case "r8sint":
