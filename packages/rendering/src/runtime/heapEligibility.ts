@@ -102,7 +102,18 @@ function isHeapServableTexture(t: ITexture): boolean {
   // texture with cross-face gutters (fillCubeGutters) and the FS is rewritten
   // to sample by face-projection. Standalone 2D — no texture_cube.
   if (t.kind === "cube") return true;
+  // Anything else must be `kind: "host"`. Guard explicitly rather than
+  // reaching for `t.source` on faith: a value from a DIFFERENT (older or
+  // newer) copy of this package carries kinds this build has never heard
+  // of, and blind `t.source.kind` turns that into a TypeError inside the
+  // frame callback — which kills the render loop instead of just routing
+  // the texture down the non-heap path. Duplicate-install skew is real
+  // (a nested older wombat.rendering under a consumer package), so treat
+  // an unrecognised kind as "not heap-servable" and let the legacy path
+  // handle it.
+  if (t.kind !== "host") return false;
   const src = t.source;
+  if (src === undefined || src === null) return false;
   if (src.kind === "raw") {
     if ((src.depthOrArrayLayers ?? 1) !== 1) return false;
     if (src.width > LEGACY_MAX_DIM || src.height > LEGACY_MAX_DIM) return false;
