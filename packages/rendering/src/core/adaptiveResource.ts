@@ -71,18 +71,22 @@ export abstract class AdaptiveResource<T> extends AbstractVal<T> {
    * of a complex resource (e.g. the colour textures of a `renderTo`
    * framebuffer) as individual `aval<ITexture>`s.
    */
-  derive<R>(project: (t: T) => R): AdaptiveResource<R> {
+  derive<R>(project: (t: T, token: AdaptiveToken) => R): AdaptiveResource<R> {
     return new DerivedAdaptiveResource<T, R>(this, project);
   }
 }
 
 class DerivedAdaptiveResource<T, R> extends AdaptiveResource<R> {
-  constructor(private readonly parent: AdaptiveResource<T>, private readonly project: (t: T) => R) {
+  constructor(private readonly parent: AdaptiveResource<T>, private readonly project: (t: T, token: AdaptiveToken) => R) {
     super();
   }
   protected override create(): void { this.parent.acquire(); }
   protected override destroy(): void { this.parent.release(); }
   override compute(token: AdaptiveToken): R {
-    return this.project(this.parent.getValue(token));
+    // The token goes to the projection too: a projection that does
+    // more than pick a field apart (a post-processing chain, say) has
+    // adaptive inputs of its own, and reading them with this token is
+    // what makes a change to one of them mark this resource.
+    return this.project(this.parent.getValue(token), token);
   }
 }
