@@ -89,10 +89,16 @@ function indexOf<T>(arr: readonly T[], v: T, name: string): number {
 //   [22:19]  alpha dstFactor  (4 bits)
 //   [26:23]  writeMask        (4 bits, RGBA)
 //
-// At MAX_ATTACHMENTS=2 (v1 cap): header 28 + 2×27 = 82 bits → fits a
-// bigint comfortably; CPU map keys take it natively.
+// At MAX_ATTACHMENTS=4: header 28 + 4×27 = 136 bits. Still a bigint and
+// still exact — bigints are arbitrary precision, so the width costs
+// nothing but the key's own size, and CPU map keys take it natively.
+//
+// Raised from 2 because a target may legitimately carry more than a
+// colour and a pick: a point cloud publishes each point's sub-pixel
+// centre as a third attachment, and the cap rejected every pipeline on
+// that target rather than the one feature that needed it.
 
-export const MAX_ATTACHMENTS = 2;
+export const MAX_ATTACHMENTS = 4;
 
 const HEADER_BITS      = 28n;
 const ATTACHMENT_BITS  = 27n;
