@@ -92,6 +92,7 @@ import {
   COMPACTION_WASTE_FLOOR_BYTES,
   type ArenaState,
   type PoolPlacement,
+  type PoolPack,
 } from "./heapScene/pools.js";
 import { encodeModeKey, type PipelineStateDescriptor } from "./pipelineCache/index.js";
 import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
@@ -135,12 +136,19 @@ const packHostU32Bits: PoolPackFn = (val, dst, off) => {
   // reinterpret the u32 payload as f32 bits for the arena write
   dst.set(new Float32Array(d.buffer, d.byteOffset, d.byteLength >>> 2), off);
 };
-const packHostF32: PoolPackFn = (val, dst, off) => {
+const packHostF32: PoolPack = (val, dst, off) => {
   const ibuf = val as IBuffer;
   if (ibuf.kind !== "host") {
     throw new Error("heapScene: BufferView aval flipped to native GPUBuffer; not supported in heap path");
   }
   dst.set(asFloat32(ibuf.data), off);
+};
+// Tightly packed: the arena stores the caller's bytes, so they upload as they are.
+packHostF32.bytes = (val) => {
+  const data = (val as IBuffer & { kind: "host" }).data;
+  return data instanceof ArrayBuffer
+    ? new Uint8Array(data)
+    : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 };
 /** Broadcast prefix copy — the only variant that genuinely captures. */
 function packHostPrefix(limitFloats: number): PoolPackFn {

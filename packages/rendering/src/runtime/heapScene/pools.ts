@@ -73,7 +73,7 @@ export interface PoolPlacement {
   readonly dataBytes: number;
   readonly typeId: number;
   readonly length: number;
-  readonly pack: (val: unknown, dst: Float32Array, off: number) => void;
+  readonly pack: PoolPack;
 }
 
 interface PoolEntry {
@@ -86,13 +86,49 @@ interface PoolEntry {
    *  sized-repack realloc path. */
   dataBytes: number;
   typeId: number;
-  pack: (val: unknown, dst: Float32Array, off: number) => void;
+  pack: PoolPack;
   refcount: number;
   /** Present for size-variable payloads (attribute buffers): re-derive
    *  the placement from the CURRENT value so `repack` can realloc when
    *  the payload grew or shrank (geometry morphing — epoch switches,
    *  point add/remove). Absent = fixed-size (plain uniforms). */
   replan?: (val: unknown) => PoolPlacement;
+}
+
+/**
+ * Encodes a value into the arena. `bytes`, where present, is the payload
+ * exactly as the arena stores it: it uploads as it is, with no copy in JS.
+ */
+export interface PoolPack {
+  (val: unknown, dst: Float32Array, off: number): void;
+  bytes?: (val: unknown) => Uint8Array;
+}
+
+/** Uploads header + data of one allocation at `off`. */
+export function writeAllocation(
+  arena: Pick<ChunkedAttributeArena, "write">,
+  chunkIdx: number,
+  off: number,
+  val: unknown,
+  dataBytes: number,
+  typeId: number,
+  length: number,
+  pack: PoolPack,
+): void {
+  const stride = length > 0 ? Math.floor(dataBytes / length) : 0;
+  const direct = pack.bytes?.(val);
+  if (direct !== undefined && direct.byteLength === dataBytes) {
+    arena.write(chunkIdx, off, new Uint8Array(new Uint32Array([typeId, length, stride, 0]).buffer));
+    arena.write(chunkIdx, off + ALLOC_HEADER_PAD_TO, direct);
+    return;
+  }
+  const buf = new ArrayBuffer(ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes));
+  const u32 = new Uint32Array(buf);
+  u32[0] = typeId;
+  u32[1] = length;
+  u32[2] = stride;
+  pack(val, new Float32Array(buf), ALLOC_HEADER_PAD_TO / 4);
+  arena.write(chunkIdx, off, new Uint8Array(buf));
 }
 
 /** A pool allocation that moved during a sized repack — every
@@ -225,7 +261,7 @@ export class UniformPool {
     dataBytes: number,
     typeId: number,
     length: number,
-    pack: (val: unknown, dst: Float32Array, off: number) => void,
+    pack: PoolPack,
     replan?: (val: unknown) => PoolPlacement,
   ): number {
     const existing = this.getEntry(av, chunkIdx);
@@ -253,15 +289,7 @@ export class UniformPool {
       );
     }
     const finalChunk = r.chunkIdx;
-    const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes);
-    const buf = new ArrayBuffer(allocBytes);
-    const u32 = new Uint32Array(buf);
-    const f32 = new Float32Array(buf);
-    u32[0] = typeId;
-    u32[1] = length;
-    u32[2] = length > 0 ? Math.floor(dataBytes / length) : 0;
-    pack(value, f32, ALLOC_HEADER_PAD_TO / 4);
-    arena.write(finalChunk, r.off, new Uint8Array(buf));
+    writeAllocation(arena, finalChunk, r.off, value, dataBytes, typeId, length, pack);
     void device;
     this.setEntry(av, {
       chunkIdx: finalChunk, ref: r.off, dataBytes, typeId, pack, refcount: 1,
@@ -331,15 +359,7 @@ export class UniformPool {
               `(${p.dataBytes} bytes) — the referencing bucket is bound to chunk ${e.chunkIdx}.`,
             );
           }
-          const allocBytes = ALIGN16(ALLOC_HEADER_PAD_TO + p.dataBytes);
-          const buf = new ArrayBuffer(allocBytes);
-          const u32 = new Uint32Array(buf);
-          const f32 = new Float32Array(buf);
-          u32[0] = p.typeId;
-          u32[1] = p.length;
-          u32[2] = p.length > 0 ? Math.floor(p.dataBytes / p.length) : 0;
-          p.pack(val, f32, ALLOC_HEADER_PAD_TO / 4);
-          arena.write(e.chunkIdx, r.off, new Uint8Array(buf));
+          writeAllocation(arena, e.chunkIdx, r.off, val, p.dataBytes, p.typeId, p.length, p.pack);
           (moved ??= []).push({ av, chunkIdx: e.chunkIdx, oldRef: e.ref, newRef: r.off });
           e.ref = r.off;
           e.dataBytes = p.dataBytes;
@@ -348,6 +368,11 @@ export class UniformPool {
           continue;
         }
         e.pack = p.pack;
+      }
+      const direct = e.pack.bytes?.(val);
+      if (direct !== undefined && direct.byteLength === e.dataBytes) {
+        arena.write(e.chunkIdx, e.ref + ALLOC_HEADER_PAD_TO, direct);
+        continue;
       }
       if (dst === undefined || dst.length !== e.dataBytes / 4) {
         dst = new Float32Array(e.dataBytes / 4);
