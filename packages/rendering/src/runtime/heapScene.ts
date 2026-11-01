@@ -127,14 +127,13 @@ const packPackedAttr: PoolPackFn = (val, dst, off) => {
 const packF32Verbatim: PoolPackFn = (val, dst, off) => {
   dst.set(val as Float32Array, off);
 };
-const packHostU32Bits: PoolPackFn = (val, dst, off) => {
+export const packHostU32Bits: PoolPackFn = (val, dst, off) => {
   const ibuf = val as IBuffer;
   if (ibuf.kind !== "host") {
     throw new Error("heapScene: packed BufferView aval flipped to native GPUBuffer");
   }
-  const d = ibuf.data as ArrayBufferView;
   // reinterpret the u32 payload as f32 bits for the arena write
-  dst.set(new Float32Array(d.buffer, d.byteOffset, d.byteLength >>> 2), off);
+  dst.set(asFloat32(ibuf.data), off);
 };
 const packHostF32: PoolPack = (val, dst, off) => {
   const ibuf = val as IBuffer;

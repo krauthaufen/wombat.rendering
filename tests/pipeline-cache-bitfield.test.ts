@@ -133,7 +133,7 @@ describe("pipelineCache/bitfield", () => {
   test("rejects out-of-range attachments", () => {
     const tooMany: PipelineStateDescriptor = {
       ...DEFAULT_DESCRIPTOR,
-      attachments: [DEFAULT_ATTACHMENT_BLEND, DEFAULT_ATTACHMENT_BLEND, DEFAULT_ATTACHMENT_BLEND],
+      attachments: Array(5).fill(DEFAULT_ATTACHMENT_BLEND),
     };
     expect(() => encodeModeKey(tooMany)).toThrow(/attachments exceeds/);
   });

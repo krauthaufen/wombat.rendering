@@ -2,6 +2,7 @@
 // the caller's ArrayBuffer, with no copy in JS.
 import { describe, expect, it } from "vitest";
 import { writeAllocation, type PoolPack } from "../packages/rendering/src/runtime/heapScene/pools.js";
+import { packHostU32Bits } from "../packages/rendering/src/runtime/heapScene.js";
 
 function recorder() {
   const writes: { off: number; data: Uint8Array }[] = [];
@@ -39,5 +40,22 @@ describe("writeAllocation", () => {
     writeAllocation(arena as never, 0, 0, source, 24, 7, 2, copying);
     expect(writes.length).toBe(1);
     expect([...new Float32Array(writes[0]!.data.buffer, 16, 6)]).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+});
+
+describe("packHostU32Bits", () => {
+  const colors = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  const written = (data: unknown) => {
+    const dst = new Float32Array(2);
+    packHostU32Bits({ kind: "host", data }, dst, 0);
+    return [...new Uint8Array(dst.buffer)];
+  };
+
+  it("reads a typed array", () => {
+    expect(written(colors)).toEqual([...colors]);
+  });
+
+  it("reads a raw ArrayBuffer", () => {
+    expect(written(colors.buffer)).toEqual([...colors]);
   });
 });
