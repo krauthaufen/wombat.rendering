@@ -187,7 +187,13 @@ function pipelineKeyOf(snap: PipelineSnap): string {
   return JSON.stringify(snap);
 }
 
-function colorTargetsForSnap(
+/**
+ * One color target per attachment of the signature, in its slot order: a
+ * pipeline must match the pass's attachment state, so an attachment the
+ * shader does not write (a leaf without the pick outputs in a pass with the
+ * pick target) still gets its target, with nothing written (writeMask 0).
+ */
+export function colorTargetsForSnap(
   iface: ProgramInterface,
   sig: FramebufferSignature,
   blends: ReadonlyArray<readonly [string, BlendSnap]> | undefined,
@@ -215,6 +221,11 @@ function colorTargetsForSnap(
     }
     out[o.location] = target;
   }
+  sig.colorNames.forEach((name, slot) => {
+    if (out[slot] !== undefined) return;
+    const fmt = sig.colors.tryFind(name);
+    if (fmt !== undefined) out[slot] = { format: fmt, writeMask: 0 };
+  });
   return out;
 }
 
