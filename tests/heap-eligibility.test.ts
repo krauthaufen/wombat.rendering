@@ -121,6 +121,26 @@ describe("isHeapEligible — texture escalation rules", () => {
     expect(isHeapEligible(withTexSampler(tex)).getValue(AdaptiveToken.top)).toBe(false);
   });
 
+  // The heap draws host textures only through the atlas (a hybrid scene
+  // atlas-compiles every textured effect); what the atlas can't take goes
+  // to the legacy renderer instead of throwing in the standalone branch.
+  it("RO with a host texture at the atlas cap (1024²) is eligible", () => {
+    const tex = ITexture.fromRaw({ data: new Uint8Array(4), width: 1024, height: 1024, format: "rgba8unorm" });
+    expect(isHeapEligible(withTexSampler(tex)).getValue(AdaptiveToken.top)).toBe(true);
+  });
+
+  it("RO with a host texture over the atlas cap (2048², 4096²) is ineligible", () => {
+    for (const n of [1025, 2048, 4096]) {
+      const tex = ITexture.fromRaw({ data: new Uint8Array(4), width: n, height: 64, format: "rgba8unorm" });
+      expect(isHeapEligible(withTexSampler(tex)).getValue(AdaptiveToken.top), `${n} wide`).toBe(false);
+    }
+  });
+
+  it("RO with a host texture in a format without an atlas page is ineligible", () => {
+    const tex = ITexture.fromRaw({ data: new Uint8Array(4), width: 64, height: 64, format: "rgba16float" });
+    expect(isHeapEligible(withTexSampler(tex)).getValue(AdaptiveToken.top)).toBe(false);
+  });
+
   it("RO with a kind:'gpu' texture is ineligible (backend-managed)", () => {
     const tex = ITexture.fromGPU(stubGPUTexture());
     expect(isHeapEligible(withTexSampler(tex)).getValue(AdaptiveToken.top)).toBe(false);

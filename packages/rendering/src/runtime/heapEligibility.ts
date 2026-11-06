@@ -10,14 +10,14 @@
 //      Read once from the drawCall snapshot.
 //   3. REACTIVE — every `aval<IBuffer>` (vertex attribs + indices)
 //      must currently resolve to `kind: "host"`. Every `aval<ITexture>`
-//      must be heap-servable: `kind: "host"` (atlasable / Tier-L
-//      host upload), 2D dimension, single array layer, and within
-//      `LEGACY_MAX_DIM` on each side. Anything failing those rules
+//      must be heap-servable: `kind: "host"` and atlasable (an atlas
+//      page format, 2D, single array layer, within ATLAS_MAX_DIM on
+//      each side). Anything failing those rules
 //      escalates to the legacy ScenePass — the user is managing a
 //      backend resource (render-target, video, environment probe,
 //      streaming tile) or asking for a cubemap/array/volume that
-//      the heap shaders don't support, or a texture too large for
-//      heap-side handling to be a win. Every `aval<ISampler>` must
+//      the heap shaders don't support, or a texture the atlas can't
+//      take. Every `aval<ISampler>` must
 //      resolve to `kind: "gpu"`. When any of these mark and flip,
 //      the result aval marks → hybrid task repartitions.
 //
@@ -41,15 +41,22 @@ import type { ITexture } from "../core/texture.js";
 import type { ISampler } from "../core/sampler.js";
 import type { RenderObject } from "../core/renderObject.js";
 import { asAttributeProvider } from "../core/provider.js";
+import { AtlasPool } from "./textureAtlas/atlasPool.js";
 
-/**
- * Maximum texture extent (per side) the heap path is willing to
- * ingest. Anything wider/taller escalates to the legacy renderer
- * which gives each RO its own dedicated GPUTexture — that's a
- * better fit than wasting an atlas page on a single ~4K image
- * (and it sidesteps device-limit risk near `maxTextureDimension2D`).
- */
-const LEGACY_MAX_DIM = 4096;
+// Host textures ride the heap only through the texture atlas. A heap scene
+// with an AtlasPool (every hybrid scene has one) compiles each textured
+// effect with ALL its textures atlas-sampled (`atlasizeAllTextures`), so a
+// texture routed to the standalone (Tier-L) bucket would run the atlas
+// shader against an empty draw-header placement — and the adapter's
+// standalone branch only takes `kind: "gpu"` textures anyway. A host
+// texture the atlas can't take (wider/taller than ATLAS_MAX_DIM, or a
+// format without an atlas page) therefore escalates to the legacy renderer,
+// which gives the RO its own uploaded GPUTexture. (Until 0.25.2 the cap was
+// 4096: a decoded 2048² or 4096² rgba8 texture, e.g. a 3D Tiles leaf's,
+// was heap-eligible and threw "standalone path requires ITexture.kind ===
+// 'gpu'" from the frame callback.)
+const atlasable = (format: GPUTextureFormat, w: number, h: number): boolean =>
+  AtlasPool.eligibleFormat(format) !== null && AtlasPool.eligibleSize(w, h);
 
 /**
  * Total per-RO payload (attribute + instance + index bytes) above
@@ -80,7 +87,7 @@ const isHeapServableSampler = (_s: ISampler): boolean => true;
  *   - `kind === "host"` (the user isn't managing a backend
  *     resource — those go to legacy untouched).
  *   - 2D, single array layer (heap shaders are 2D-only).
- *   - Both extents `<= LEGACY_MAX_DIM`.
+ *   - Atlasable: an atlas page format, both extents `<= ATLAS_MAX_DIM`.
  *
  * For `kind: "gpu"` we currently always reject (rule 1) — even a
  * plain 2D rgba8unorm GPUTexture goes legacy, on the assumption
@@ -116,8 +123,7 @@ function isHeapServableTexture(t: ITexture): boolean {
   if (src === undefined || src === null) return false;
   if (src.kind === "raw") {
     if ((src.depthOrArrayLayers ?? 1) !== 1) return false;
-    if (src.width > LEGACY_MAX_DIM || src.height > LEGACY_MAX_DIM) return false;
-    return true;
+    return atlasable(src.format, src.width, src.height);
   }
   // external — read width/height off the source. Most types have
   // it; HTMLVideoElement uses videoWidth/videoHeight. Sources
@@ -138,8 +144,10 @@ function isHeapServableTexture(t: ITexture): boolean {
       h = any.height ?? 0;
     }
   }
-  if (w > LEGACY_MAX_DIM || h > LEGACY_MAX_DIM) return false;
-  return true;
+  // Still undimensioned (not yet decoded): eligible until it resolves, as
+  // before — heapAdapter handles undimensioned sources gracefully.
+  if (w <= 0 || h <= 0) return AtlasPool.eligibleFormat(src.format ?? "rgba8unorm") !== null;
+  return atlasable(src.format ?? "rgba8unorm", w, h);
 }
 
 // Materialise every attribute view a provider knows about. Eligibility
