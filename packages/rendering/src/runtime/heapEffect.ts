@@ -17,6 +17,7 @@
 
 import type { Effect } from "@aardworx/wombat.shader";
 import { effectHoleKey } from "@aardworx/wombat.shader";
+import * as wombatShader from "@aardworx/wombat.shader";
 
 // ─── Schema (extracted from CompiledEffect.interface) ───────────────
 
@@ -131,8 +132,15 @@ export interface FragmentOutputLayout {
 // a cached pre-fix compile (two @builtin(position) outputs) must not survive.
 export const HEAP_PERSIST_VERSION_BASE = "h15";
 export const HEAP_PERSIST_VERSION = HEAP_PERSIST_VERSION_BASE; // legacy export (see persistVersionNow)
+/** The wombat.shader version compiling the cached WGSL: a compiler change
+ *  (fusion, linking, emit) re-keys the cache instead of serving WGSL the old
+ *  compiler produced. `VERSION` is exported from wombat.shader 0.6.9 on;
+ *  older builds key as "unknown" (the h15 base still re-keys them). */
+export function shaderVersionNow(): string {
+  return ((wombatShader as { VERSION?: string }).VERSION) ?? "unknown";
+}
 export function persistVersionNow(): string {
-  return `${HEAP_PERSIST_VERSION_BASE}-aps${atlasPageSizeNow()}`;
+  return `${HEAP_PERSIST_VERSION_BASE}-aps${atlasPageSizeNow()}-ws${shaderVersionNow()}`;
 }
 
 /**
