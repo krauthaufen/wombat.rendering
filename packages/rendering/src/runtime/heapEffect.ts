@@ -126,7 +126,10 @@ export interface FragmentOutputLayout {
 // runtime pageRef index instead of the 2×8 single-texture ladder).
 // h14: samplerCube heap support — cube→2D sampler retarget + cubeProjectZup
 // FS rewrite (heapEffectIR), cube bindings threaded through BucketLayout.
-export const HEAP_PERSIST_VERSION_BASE = "h14";
+// h15: wombat.shader fuses every spelling of a builtin output into one port
+// (gl_Position / Positions, gl_FragDepth / Depth) — fused WGSL changed, and
+// a cached pre-fix compile (two @builtin(position) outputs) must not survive.
+export const HEAP_PERSIST_VERSION_BASE = "h15";
 export const HEAP_PERSIST_VERSION = HEAP_PERSIST_VERSION_BASE; // legacy export (see persistVersionNow)
 export function persistVersionNow(): string {
   return `${HEAP_PERSIST_VERSION_BASE}-aps${atlasPageSizeNow()}`;
