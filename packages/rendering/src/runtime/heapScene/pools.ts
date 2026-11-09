@@ -647,18 +647,47 @@ export class AttributeArena {
     private readonly device: GPUDevice,
     private readonly buf: GrowBuffer,
   ) {}
-  get buffer(): GPUBuffer { return this.buf.buffer; }
+  /** The GPU buffer, current: pending staged writes are uploaded first. */
+  get buffer(): GPUBuffer { this.flushStage(); return this.buf.buffer; }
   get capacity(): number { return this.buf.capacity; }
   get usedBytes(): number { return this.cursor; }
-  write(dst: number, data: Uint8Array): void {
-    // Immediate upload; Chrome's queue staging does the batching. The
-    // write targets the CURRENT buffer handle — a later grow copies it
-    // forward (queue-ordered), so ordering stays correct.
-    this.device.queue.writeBuffer(this.buf.buffer, dst, data as BufferSource);
+  // Write-combining: consecutive writes to adjacent bytes (an allocation's
+  // header and data, the next bump allocation) are staged in one small
+  // buffer and uploaded with one `writeBuffer` — at a scene's population,
+  // tens of thousands of small calls become a few. Not a mirror: the
+  // stage holds only the current run, and is uploaded before anything
+  // else touches the buffer (a non-adjacent write, a grow, a compaction,
+  // the frame's `flush`, a read of `buffer`).
+  private static readonly STAGE_BYTES = 1 << 20;
+  private stage: Uint8Array | undefined;
+  private stageStart = 0;
+  private stageLen = 0;
+  private flushStage(): void {
+    if (this.stageLen === 0) return;
+    this.device.queue.writeBuffer(this.buf.buffer, this.stageStart, this.stage! as BufferSource, 0, this.stageLen);
+    this.stageLen = 0;
   }
-  /** No-op — kept for call-site compatibility (mirror-less arena uploads
-   *  in `write`). */
-  flush(_device: GPUDevice): void {}
+  write(dst: number, data: Uint8Array): void {
+    const n = data.byteLength;
+    if (this.stageLen > 0 && dst === this.stageStart + this.stageLen && this.stageLen + n <= AttributeArena.STAGE_BYTES) {
+      this.stage!.set(data, this.stageLen);
+      this.stageLen += n;
+      return;
+    }
+    this.flushStage();
+    if (n * 4 > AttributeArena.STAGE_BYTES) {
+      // Large data goes up at once (the write targets the CURRENT buffer
+      // handle; a later grow copies it forward, queue-ordered).
+      this.device.queue.writeBuffer(this.buf.buffer, dst, data as BufferSource);
+      return;
+    }
+    this.stage ??= new Uint8Array(AttributeArena.STAGE_BYTES);
+    this.stage.set(data, 0);
+    this.stageStart = dst;
+    this.stageLen = n;
+  }
+  /** Uploads the staged run. */
+  flush(_device: GPUDevice): void { this.flushStage(); }
   /**
    * Allocate space for one attribute. Returns the byte ref (offset
    * to the header — data lives at ref + 16).
@@ -678,6 +707,8 @@ export class AttributeArena {
     const next = this.cursor + allocBytes;
     if (next > this.buf.maxCapacity) return undefined;
     this.cursor = next;
+    // a grow copies the buffer GPU-side: what is staged goes first
+    if (next > this.buf.capacity) this.flushStage();
     this.buf.ensureCapacity(next);
     this.buf.setUsed(next);
     const ref = next - allocBytes;
@@ -774,6 +805,7 @@ export class AttributeArena {
    * to the GPU buffer (the GPU copy reads the live buffer). O(live).
    */
   compact(device: GPUDevice, wasteFloorBytes: number, force = false): Map<number, number> {
+    this.flushStage();
     const waste = this.cursor - this.liveBytes;
     if (!force && (this.liveBytes * 2 >= this.cursor || waste < wasteFloorBytes)) {
       return new Map();
