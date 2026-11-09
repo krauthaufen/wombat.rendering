@@ -6,36 +6,64 @@
 // set — anything ordering-sensitive belongs at the Command level
 // (separate Render passes, in the Command list's declared order).
 //
-// Reactive variants (`Adaptive`, `OrderedFromList`, `UnorderedFromSet`)
-// stay reactive: marks propagate through the fused reader, and the
-// resulting aset reflects current tree state without a manual rebuild.
+// ONE READER PER TREE. The whole tree is flattened by a single
+// `FlatTreeReader`: its reactive nodes (`Adaptive`, `OrderedFromList`,
+// `UnorderedFromSet`, `Guarded`, `Rows`) are plain records inside it,
+// each registered under the adaptive input it reads (the aval, or the
+// collection's reader). A marked input names the nodes to update
+// (`inputChanged`), so an evaluation touches only what changed; a node
+// replaced or removed takes its objects back and drops its inputs.
+// Before, every reactive node was an aset of its own (an `ASet.bind`,
+// a `toASet` bridge, a union, a fused child-set reader, a guard), each
+// with a History, a reader of it and a copy of its objects: at scale
+// (thousands of similar subtrees) several adaptive objects and two
+// copies of the content per node, for plumbing.
 //
-// `OrderedFromList`'s `alist<RenderTree>` is converted via
-// `AListBridges.toASet` — this drops index/order info, which we
-// wouldn't honor anyway.
-//
-// FUSION: a reactive child-set used to lower through FIVE aset stages
-// (`filter(static).collectSeq(...)` ∪ `filter(!static).collect(...)`),
-// each with its own History + full per-element state — at collection
-// scale that is several complete N-element states of pure plumbing.
-// `FlattenChildSetReader` fuses them into ONE reader: static subtrees
-// (the overwhelmingly common case) enumerate their RenderObjects
-// directly; reactive subtrees get an inner reader exactly like
-// `ASet.collect`'s. One History, one state, two caches.
+// The output is a counting delta: an object reached twice is added
+// twice, and stays until both are gone.
 
 import {
-  ASet, AbstractDirtyReader, AbstractReader as Reader, AdaptiveToken as Token, Cache, HashSetDelta, SetOperation,
-  hashSetDeltaMonoid, type aval,
-  type AbstractReader, type AdaptiveToken, type IHashSetReader, type aset,
+  ASet,
+  AbstractReader,
+  AdaptiveToken as Token,
+  HashSetDelta,
+  IndexList,
+  SetOperation,
+  type IAdaptiveObject,
+  type IOpReader,
+  type IndexListDelta,
+  type aset,
+  type aval,
 } from "@aardworx/wombat.adaptive";
-import { AListBridges } from "@aardworx/wombat.adaptive";
 import type { RenderObject } from "../core/renderObject.js";
 import type { RenderTree } from "../core/renderTree.js";
-import { materializeRow } from "../core/rowSet.js";
+import { materializeRow, type RenderRow, type RenderRowSet } from "../core/rowSet.js";
 import { heapValuesRaise } from "./heapAdapter.js";
 
-/** True when `tree` contains no reactive nodes — its RenderObjects can
- *  be enumerated as a plain iterable (no inner aset / reader needed). */
+/** Objects added (+) and removed (−) in one evaluation, by identity. */
+type Acc = Map<RenderObject, number>;
+
+function put(acc: Acc, ro: RenderObject, n: number): void {
+  const c = (acc.get(ro) ?? 0) + n;
+  if (c === 0) acc.delete(ro);
+  else acc.set(ro, c);
+}
+
+type Node =
+  /** No reactive node below: its objects. */
+  | { k: "static"; readonly objs: readonly RenderObject[] }
+  /** Children of which at least one is reactive. */
+  | { k: "group"; readonly kids: Node[] }
+  | { k: "adaptive"; readonly src: aval<RenderTree>; tree: RenderTree; child: Node }
+  | { k: "list"; readonly reader: IOpReader<IndexListDelta<RenderTree>>; kids: IndexList<{ t: RenderTree; n: Node }> }
+  | { k: "set"; readonly reader: IOpReader<HashSetDelta<RenderTree>>; readonly kids: Map<RenderTree, { c: number; n: Node }> }
+  /** `inner` undefined: left out, waiting for `active` to change. */
+  | { k: "guarded"; readonly active: aval<boolean>; readonly child: RenderTree; inner: Node | undefined }
+  | { k: "rows"; readonly reader: IOpReader<HashSetDelta<RenderRow>>; readonly set: RenderRowSet; readonly objs: Map<RenderRow, RenderObject> };
+
+const EMPTY: Node = { k: "static", objs: [] };
+
+/** True when `tree` contains no reactive nodes. */
 function isStaticTree(tree: RenderTree): boolean {
   switch (tree.kind) {
     case "Empty":
@@ -49,140 +77,301 @@ function isStaticTree(tree: RenderTree): boolean {
   }
 }
 
-/** Enumerate a static subtree's RenderObjects (pre: `isStaticTree`). */
-function* staticObjects(tree: RenderTree): Iterable<RenderObject> {
+function staticObjects(tree: RenderTree, out: RenderObject[]): void {
   switch (tree.kind) {
-    case "Empty":
-      return;
-    case "Leaf":
-      yield tree.object;
-      return;
+    case "Leaf": out.push(tree.object); return;
     case "Ordered":
-    case "Unordered":
-      for (const c of tree.children) yield* staticObjects(c);
-      return;
-    default:
-      throw new Error(`staticObjects: reactive node '${tree.kind}'`);
+    case "Unordered": for (const c of tree.children) staticObjects(c, out); return;
+    default: return;
   }
 }
 
-const INNER_TAG = "FlattenInnerReader";
-const _tagIsInnerTag = (tag: unknown): boolean => tag === INNER_TAG;
+class FlatTreeReader extends AbstractReader<HashSetDelta<RenderObject>> {
+  private _root: Node | undefined;
+  /** The nodes reading each input (one, or several sharing it). */
+  private readonly _inputs = new Map<IAdaptiveObject, Node | Node[]>();
+  private _dirty = new Set<IAdaptiveObject>();
+  /** While reading a hidden guarded subtree: the inputs it registered,
+   *  innermost attempt last (dropped again if the attempt fails). */
+  private readonly _attempts: Array<Array<[IAdaptiveObject, Node]>> = [];
 
-/**
- * Fused flattener for a reactive container of subtrees. Per child
- * delta: a STATIC subtree contributes its objects directly (cached as
- * an array so removal emits exactly what addition emitted); a
- * reactive subtree contributes through an inner reader with
- * `ASet.collect`'s dirty-tracking protocol.
- */
-class FlattenChildSetReader extends AbstractDirtyReader<
-  IHashSetReader<RenderObject>,
-  HashSetDelta<RenderObject>
-> {
-  private readonly _reader: IHashSetReader<RenderTree>;
-  private readonly _static: Cache<RenderTree, RenderObject[]>;
-  private readonly _inner: Cache<RenderTree, IHashSetReader<RenderObject>>;
-
-  constructor(children: aset<RenderTree>) {
-    super(hashSetDeltaMonoid<RenderObject>(), _tagIsInnerTag);
-    this._reader = children.getReader();
-    this._static = new Cache<RenderTree, RenderObject[]>(
-      (t) => [...staticObjects(t)],
-    );
-    this._inner = new Cache<RenderTree, IHashSetReader<RenderObject>>(
-      (t) => {
-        const r = flattenRenderTree(t).getReader();
-        r.tag = INNER_TAG;
-        return r;
-      },
-    );
-  }
-
-  override compute(
-    tok: AdaptiveToken,
-    dirty: Set<IHashSetReader<RenderObject>>,
-  ): HashSetDelta<RenderObject> {
-    let deltas = this._reader.getChanges(tok).collect((d) => {
-      const t = d.value;
-      if (d.count === 1) {
-        if (isStaticTree(t)) {
-          let out = HashSetDelta.empty<RenderObject>();
-          for (const ro of this._static.invoke(t)) out = out.add(SetOperation.add(ro));
-          return out;
-        }
-        const r = this._inner.invoke(t);
-        dirty.delete(r);
-        return r.getChanges(tok);
-      }
-      if (d.count === -1) {
-        if (isStaticTree(t)) {
-          let out = HashSetDelta.empty<RenderObject>();
-          for (const ro of this._static.revokeUnsafe(t)) out = out.add(SetOperation.rem(ro));
-          return out;
-        }
-        const r = this._inner.tryRevokeAndGetDeleted(t);
-        if (r === undefined) return HashSetDelta.empty<RenderObject>();
-        dirty.delete(r.value);
-        if (r.deleted) {
-          r.value.outputs.remove(this);
-          return r.value.state.removeAll();
-        }
-        return r.value.getChanges(tok);
-      }
-      throw new Error("flattenTree: unexpected delta count");
-    });
-    for (const d of dirty) {
-      deltas = deltas.combine(d.getChanges(tok));
-    }
-    return deltas;
-  }
-}
-
-function flattenChildSet(children: aset<RenderTree>): aset<RenderObject> {
-  return ASet.ofReader(
-    () => new FlattenChildSetReader(children) as unknown as AbstractReader<HashSetDelta<RenderObject>>,
-  );
-}
-
-/**
- * `RenderTree.guarded`: while the gate is false the subtree is flattened
- * under a guard, its added draws' values read too (`heapValuesRaise`); a
- * raise leaves it out and drops that attempt's reader, and the gate is
- * then the only input, so it is tried again (afresh) when the gate
- * changes. Taken in (or found active) it is the subtree's own reader from
- * then on: the guard costs nothing more, and a raise surfaces.
- */
-class GuardedReader extends Reader<HashSetDelta<RenderObject>> {
-  private _inner: IHashSetReader<RenderObject> | undefined;
-
-  constructor(private readonly _active: aval<boolean>, private readonly _child: RenderTree) {
+  constructor(private readonly _tree: RenderTree) {
     super(HashSetDelta.empty<RenderObject>());
   }
 
-  override compute(tok: AdaptiveToken): HashSetDelta<RenderObject> {
-    if (this._inner !== undefined) return this._inner.getChanges(tok);
-    const reader = flattenRenderTree(this._child).getReader();
-    // untracked: a subtree taken in keeps no edge on the gate
-    if (this._active.getValue(Token.top)) {
-      this._inner = reader;
-      return reader.getChanges(tok);
-    }
-    try {
-      const delta = reader.getChanges(tok);
-      for (const op of delta) {
-        if (op.count > 0 && heapValuesRaise(op.value)) return this._defer(tok);
+  override inputChanged(_t: unknown, o: IAdaptiveObject): void {
+    if (this._inputs.has(o)) this._dirty.add(o);
+  }
+
+  override compute(tok: Token): HashSetDelta<RenderObject> {
+    const acc: Acc = new Map();
+    if (this._root === undefined) {
+      this._root = this.build(this._tree, tok, acc);
+    } else {
+      const dirty = this._dirty;
+      this._dirty = new Set();
+      for (const o of dirty) {
+        const ns = this._inputs.get(o);
+        if (ns === undefined) continue; // its node went with an update before
+        if (Array.isArray(ns)) {
+          for (const n of [...ns]) if (this.reads(o, n)) this.update(n, tok, acc);
+        } else this.update(ns, tok, acc);
       }
-      this._inner = reader;
-      return delta;
-    } catch {
-      return this._defer(tok);
+    }
+    if (acc.size === 0) return HashSetDelta.empty<RenderObject>();
+    const ops: SetOperation<RenderObject>[] = [];
+    for (const [ro, c] of acc) ops.push(new SetOperation(ro, c));
+    return HashSetDelta.ofArray(ops);
+  }
+
+  // ─── inputs ───────────────────────────────────────────────────────
+
+  /** Whether `n` still reads `o` (an earlier update may have dropped it). */
+  private reads(o: IAdaptiveObject, n: Node): boolean {
+    const ns = this._inputs.get(o);
+    return ns === n || (Array.isArray(ns) && ns.includes(n));
+  }
+
+  private reg(o: IAdaptiveObject, n: Node): void {
+    const ns = this._inputs.get(o);
+    if (ns === undefined) this._inputs.set(o, n);
+    else if (Array.isArray(ns)) ns.push(n);
+    else this._inputs.set(o, [ns, n]);
+    const log = this._attempts[this._attempts.length - 1];
+    if (log !== undefined) log.push([o, n]);
+  }
+
+  private unreg(o: IAdaptiveObject, n: Node): void {
+    const ns = this._inputs.get(o);
+    if (ns === undefined) return;
+    if (Array.isArray(ns)) {
+      const i = ns.indexOf(n);
+      if (i >= 0) ns.splice(i, 1);
+      if (ns.length === 1) this._inputs.set(o, ns[0]!);
+      else if (ns.length > 0) return;
+      else { this._inputs.delete(o); o.outputs.remove(this); this._dirty.delete(o); }
+      return;
+    }
+    if (ns !== n) return;
+    this._inputs.delete(o);
+    o.outputs.remove(this);
+    this._dirty.delete(o);
+  }
+
+  // ─── building and taking back ─────────────────────────────────────
+
+  private build(t: RenderTree, tok: Token, acc: Acc): Node {
+    switch (t.kind) {
+      case "Empty":
+        return EMPTY;
+      case "Leaf":
+        put(acc, t.object, 1);
+        return { k: "static", objs: [t.object] };
+      case "Ordered":
+      case "Unordered": {
+        if (isStaticTree(t)) {
+          const objs: RenderObject[] = [];
+          staticObjects(t, objs);
+          for (const ro of objs) put(acc, ro, 1);
+          return objs.length === 0 ? EMPTY : { k: "static", objs };
+        }
+        return { k: "group", kids: t.children.map((c) => this.build(c, tok, acc)) };
+      }
+      case "Adaptive": {
+        if (t.tree.isConstant) return this.build(t.tree.getValue(Token.top), tok, acc);
+        const tree = t.tree.getValue(tok);
+        const n: Node = { k: "adaptive", src: t.tree, tree, child: EMPTY };
+        this.reg(t.tree, n);
+        n.child = this.build(tree, tok, acc);
+        return n;
+      }
+      case "OrderedFromList": {
+        const n: Node = { k: "list", reader: t.children.getReader(), kids: IndexList.empty() };
+        const changes = n.reader.getChanges(tok);
+        this.reg(n.reader, n);
+        this.applyList(n, changes, tok, acc);
+        return n;
+      }
+      case "UnorderedFromSet": {
+        const n: Node = { k: "set", reader: t.children.getReader(), kids: new Map() };
+        const changes = n.reader.getChanges(tok);
+        this.reg(n.reader, n);
+        this.applySet(n, changes, tok, acc);
+        return n;
+      }
+      case "Rows": {
+        const n: Node = { k: "rows", reader: t.set.rows.getReader(), set: t.set, objs: new Map() };
+        const changes = n.reader.getChanges(tok);
+        this.reg(n.reader, n);
+        this.applyRows(n, changes, acc);
+        return n;
+      }
+      case "Guarded": {
+        if (t.active.isConstant) return this.build(t.child, tok, acc);
+        const n: Node = { k: "guarded", active: t.active, child: t.child, inner: undefined };
+        this.enter(n, tok, acc);
+        return n;
+      }
     }
   }
 
-  private _defer(tok: AdaptiveToken): HashSetDelta<RenderObject> {
-    this._active.getValue(tok);
-    return HashSetDelta.empty<RenderObject>();
+  /** Takes `n` in: shown, as it is; hidden, read under the guard (its
+   *  structure and its draws' values), left out if that raises and read
+   *  again (afresh) when `active` changes. Taken in it is an ordinary
+   *  subtree from then on: the guard costs nothing more, a raise
+   *  surfaces. */
+  private enter(n: Node & { k: "guarded" }, tok: Token, acc: Acc): void {
+    // untracked: a subtree taken in keeps no edge on the gate
+    if (n.active.getValue(Token.top)) {
+      n.inner = this.build(n.child, tok, acc);
+      return;
+    }
+    const log: Array<[IAdaptiveObject, Node]> = [];
+    const sub: Acc = new Map();
+    this._attempts.push(log);
+    let inner: Node | undefined;
+    try {
+      inner = this.build(n.child, tok, sub);
+      for (const [ro, c] of sub) {
+        if (c > 0 && heapValuesRaise(ro)) { inner = undefined; break; }
+      }
+    } catch {
+      inner = undefined;
+    } finally {
+      this._attempts.pop();
+    }
+    if (inner === undefined) {
+      for (const [o, m] of log) this.unreg(o, m);
+      n.active.getValue(tok);
+      this.reg(n.active, n);
+      return;
+    }
+    const outer = this._attempts[this._attempts.length - 1];
+    if (outer !== undefined) outer.push(...log);
+    for (const [ro, c] of sub) put(acc, ro, c);
+    n.inner = inner;
+  }
+
+  /** Takes back what `n` added and drops its inputs. */
+  private drop(n: Node, acc: Acc): void {
+    switch (n.k) {
+      case "static":
+        for (const ro of n.objs) put(acc, ro, -1);
+        return;
+      case "group":
+        for (const c of n.kids) this.drop(c, acc);
+        return;
+      case "adaptive":
+        this.unreg(n.src, n);
+        this.drop(n.child, acc);
+        return;
+      case "list":
+        this.unreg(n.reader, n);
+        for (const { n: c } of n.kids) this.drop(c, acc);
+        return;
+      case "set":
+        this.unreg(n.reader, n);
+        for (const { c, n: m } of n.kids.values()) for (let i = 0; i < c; i++) this.drop(m, acc);
+        return;
+      case "guarded":
+        if (n.inner !== undefined) this.drop(n.inner, acc);
+        else this.unreg(n.active, n);
+        return;
+      case "rows":
+        this.unreg(n.reader, n);
+        for (const ro of n.objs.values()) put(acc, ro, -1);
+        return;
+    }
+  }
+
+  // ─── updates ──────────────────────────────────────────────────────
+
+  private update(n: Node, tok: Token, acc: Acc): void {
+    switch (n.k) {
+      case "adaptive": {
+        const tree = n.src.getValue(tok);
+        if (tree === n.tree) return;
+        this.drop(n.child, acc);
+        n.tree = tree;
+        n.child = EMPTY;
+        n.child = this.build(tree, tok, acc);
+        return;
+      }
+      case "list": this.applyList(n, n.reader.getChanges(tok), tok, acc); return;
+      case "set": this.applySet(n, n.reader.getChanges(tok), tok, acc); return;
+      case "rows": this.applyRows(n, n.reader.getChanges(tok), acc); return;
+      case "guarded":
+        if (n.inner !== undefined) return;
+        this.unreg(n.active, n);
+        this.enter(n, tok, acc);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private applyList(n: Node & { k: "list" }, changes: IndexListDelta<RenderTree>, tok: Token, acc: Acc): void {
+    for (const [i, op] of changes) {
+      const old = n.kids.tryGetByIndex(i);
+      if (op.tag === "Remove") {
+        if (old !== undefined) { this.drop(old.n, acc); n.kids = n.kids.removeByIndex(i); }
+      } else {
+        if (old !== undefined) {
+          if (Object.is(old.t, op.value)) continue;
+          this.drop(old.n, acc);
+        }
+        n.kids = n.kids.setByIndex(i, { t: op.value, n: this.build(op.value, tok, acc) });
+      }
+    }
+  }
+
+  private applySet(n: Node & { k: "set" }, changes: HashSetDelta<RenderTree>, tok: Token, acc: Acc): void {
+    for (const op of changes) {
+      const e = n.kids.get(op.value);
+      if (op.count > 0) {
+        if (e !== undefined) {
+          for (let i = 0; i < op.count; i++) this.addAgain(e.n, acc);
+          e.c += op.count;
+        } else {
+          const m = this.build(op.value, tok, acc);
+          for (let i = 1; i < op.count; i++) this.addAgain(m, acc);
+          n.kids.set(op.value, { c: op.count, n: m });
+        }
+      } else if (e !== undefined) {
+        const k = Math.min(-op.count, e.c);
+        e.c -= k;
+        if (e.c === 0) { n.kids.delete(op.value); this.drop(e.n, acc); }
+        else for (let i = 0; i < k; i++) this.recount(e.n, acc, -1);
+      }
+    }
+  }
+
+  /** A set element counted once more: its objects once more. */
+  private addAgain(n: Node, acc: Acc): void { this.recount(n, acc, 1); }
+
+  private recount(n: Node, acc: Acc, s: number): void {
+    switch (n.k) {
+      case "static": for (const ro of n.objs) put(acc, ro, s); return;
+      case "group": for (const c of n.kids) this.recount(c, acc, s); return;
+      case "adaptive": this.recount(n.child, acc, s); return;
+      case "list": for (const { n: c } of n.kids) this.recount(c, acc, s); return;
+      case "set": for (const { c, n: m } of n.kids.values()) for (let i = 0; i < c; i++) this.recount(m, acc, s); return;
+      case "guarded": if (n.inner !== undefined) this.recount(n.inner, acc, s); return;
+      case "rows": for (const ro of n.objs.values()) put(acc, ro, s); return;
+    }
+  }
+
+  private applyRows(n: Node & { k: "rows" }, changes: HashSetDelta<RenderRow>, acc: Acc): void {
+    for (const op of changes) {
+      if (op.count > 0) {
+        let ro = n.objs.get(op.value);
+        if (ro === undefined) { ro = materializeRow(n.set, op.value); n.objs.set(op.value, ro); }
+        put(acc, ro, 1);
+      } else {
+        const ro = n.objs.get(op.value);
+        if (ro !== undefined) { n.objs.delete(op.value); put(acc, ro, -1); }
+      }
+    }
   }
 }
 
@@ -192,36 +381,14 @@ export function flattenRenderTree(tree: RenderTree): aset<RenderObject> {
       return ASet.empty<RenderObject>();
     case "Leaf":
       return ASet.single(tree.object);
-    case "Ordered":
-    case "Unordered": {
-      // Fully-static subtree → one constant aset over a plain array.
-      if (isStaticTree(tree)) return ASet.ofArray([...staticObjects(tree)]);
-      // N-ary union via `unionMany(aset<aset<T>>)`. The naïve
-      // `children.reduce(ASet.union)` builds a 2N-deep nested-union
-      // tree; the reader's traversal recurses through it and blows
-      // the stack at ~2K leaves. `unionMany` is O(1)-deep regardless.
-      const children = tree.children.map(flattenRenderTree);
-      if (children.length === 0) return ASet.empty<RenderObject>();
-      if (children.length === 1) return children[0]!;
-      return ASet.unionMany(ASet.ofArray(children));
+    default: {
+      // Fully-static tree → one constant aset over a plain array.
+      if (isStaticTree(tree)) {
+        const objs: RenderObject[] = [];
+        staticObjects(tree, objs);
+        return ASet.ofArray(objs);
+      }
+      return ASet.ofReader(() => new FlatTreeReader(tree));
     }
-    case "Adaptive":
-      return ASet.bind(flattenRenderTree, tree.tree);
-    case "OrderedFromList":
-      return flattenChildSet(AListBridges.toASet(tree.children));
-    case "UnorderedFromSet":
-      return flattenChildSet(tree.children);
-    case "Guarded": {
-      const { active, child } = tree;
-      if (active.isConstant) return flattenRenderTree(child);
-      return ASet.ofReader(() => new GuardedReader(active, child) as unknown as AbstractReader<HashSetDelta<RenderObject>>);
-    }
-    case "Rows":
-      // Materialization fallback — prototype-derived RenderObjects
-      // with stable per-row identity. The hybrid renderer consumes
-      // row sets DIRECTLY (see hybridScene.collectRowSets) and never
-      // takes this path for them; it exists for the legacy ScenePass
-      // and for row sets under reactive containers.
-      return tree.set.rows.map((r) => materializeRow(tree.set, r));
   }
 }
