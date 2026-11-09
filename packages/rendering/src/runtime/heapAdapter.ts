@@ -26,7 +26,7 @@
 // No multi-binding texture API yet: `ro.textures.count <= 1` and
 // `ro.samplers.count <= 1` are classifier invariants.
 
-import { type aval, type AdaptiveToken, AVal } from "@aardworx/wombat.adaptive";
+import { type aval, AdaptiveToken, AVal } from "@aardworx/wombat.adaptive";
 import { IBuffer, type HostBufferSource } from "../core/buffer.js";
 import { BufferView } from "../core/bufferView.js";
 import { ITexture, type HostTextureSource } from "../core/texture.js";
@@ -461,6 +461,49 @@ export function renderObjectToHeapSpec(
   }
   slim["inputs"] = slimInputs;
   return slim as unknown as HeapDrawSpec;
+}
+
+/**
+ * Whether reading the values a heap draw of `ro` is built from raises:
+ * the avals `renderObjectToHeapSpec` hands the heap (the shader-declared
+ * attributes and uniforms, a derived uniform's leaves, the trafo
+ * constituents, instance attributes, indices, draw call, model chain and
+ * textures), each read untracked (cached for the heap to read again). It
+ * builds nothing: no spec, no atlas space. For a draw added inactive: one
+ * whose values raise is deferred until it is shown (`compileHybridScene`).
+ */
+export function heapValuesRaise(ro: RenderObject): boolean {
+  const top = AdaptiveToken.top;
+  const read = (v: unknown): void => {
+    if (isBufferView(v)) v.buffer.getValue(top);
+    else if (isAvalLike(v)) (v as aval<unknown>).getValue(top);
+  };
+  try {
+    const schema = compileHeapEffect(ro.effect).schema;
+    const vAttr = asAttributeProvider(ro.vertexAttributes);
+    for (const a of schema.attributes) read(vAttr.tryGet(a.name));
+    const uProv = asUniformProvider(ro.uniforms);
+    const uniform = (name: string): void => {
+      const v = uProv.tryGet(name);
+      if (isDerivedRule(v)) {
+        for (const inp of inputsOf((v as DerivedRule).ir)) read(uProv.tryGet(STANDARD_TRAFO_LEAVES.get(inp.name) ?? inp.name));
+      } else read(v);
+    };
+    // (GPU-derived trafos are computed from the constituents below)
+    for (const u of schema.uniforms) if (!STANDARD_DERIVED_RULES.has(u.name)) uniform(u.name);
+    for (const n of ["ModelTrafo", "ViewTrafo", "ProjTrafo"]) uniform(n);
+    if (ro.instanceAttributes !== undefined) {
+      const iAttr = asAttributeProvider(ro.instanceAttributes);
+      for (const n of iAttr.names()) read(iAttr.tryGet(n));
+    }
+    if (ro.indices !== undefined) read(ro.indices);
+    ro.drawCall.getValue(top);
+    if (ro.modelChain !== undefined) for (const t of ro.modelChain) read(t);
+    ro.textures.iter((_n, av) => read(av));
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 interface SpecShare {

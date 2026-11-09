@@ -24,14 +24,15 @@
 // `ASet.collect`'s. One History, one state, two caches.
 
 import {
-  ASet, AbstractDirtyReader, Cache, HashSetDelta, SetOperation,
-  hashSetDeltaMonoid,
+  ASet, AbstractDirtyReader, AbstractReader as Reader, AdaptiveToken as Token, Cache, HashSetDelta, SetOperation,
+  hashSetDeltaMonoid, type aval,
   type AbstractReader, type AdaptiveToken, type IHashSetReader, type aset,
 } from "@aardworx/wombat.adaptive";
 import { AListBridges } from "@aardworx/wombat.adaptive";
 import type { RenderObject } from "../core/renderObject.js";
 import type { RenderTree } from "../core/renderTree.js";
 import { materializeRow } from "../core/rowSet.js";
+import { heapValuesRaise } from "./heapAdapter.js";
 
 /** True when `tree` contains no reactive nodes — its RenderObjects can
  *  be enumerated as a plain iterable (no inner aset / reader needed). */
@@ -144,6 +145,47 @@ function flattenChildSet(children: aset<RenderTree>): aset<RenderObject> {
   );
 }
 
+/**
+ * `RenderTree.guarded`: while the gate is false the subtree is flattened
+ * under a guard, its added draws' values read too (`heapValuesRaise`); a
+ * raise leaves it out and drops that attempt's reader, and the gate is
+ * then the only input, so it is tried again (afresh) when the gate
+ * changes. Taken in (or found active) it is the subtree's own reader from
+ * then on: the guard costs nothing more, and a raise surfaces.
+ */
+class GuardedReader extends Reader<HashSetDelta<RenderObject>> {
+  private _inner: IHashSetReader<RenderObject> | undefined;
+
+  constructor(private readonly _active: aval<boolean>, private readonly _child: RenderTree) {
+    super(HashSetDelta.empty<RenderObject>());
+  }
+
+  override compute(tok: AdaptiveToken): HashSetDelta<RenderObject> {
+    if (this._inner !== undefined) return this._inner.getChanges(tok);
+    const reader = flattenRenderTree(this._child).getReader();
+    // untracked: a subtree taken in keeps no edge on the gate
+    if (this._active.getValue(Token.top)) {
+      this._inner = reader;
+      return reader.getChanges(tok);
+    }
+    try {
+      const delta = reader.getChanges(tok);
+      for (const op of delta) {
+        if (op.count > 0 && heapValuesRaise(op.value)) return this._defer(tok);
+      }
+      this._inner = reader;
+      return delta;
+    } catch {
+      return this._defer(tok);
+    }
+  }
+
+  private _defer(tok: AdaptiveToken): HashSetDelta<RenderObject> {
+    this._active.getValue(tok);
+    return HashSetDelta.empty<RenderObject>();
+  }
+}
+
 export function flattenRenderTree(tree: RenderTree): aset<RenderObject> {
   switch (tree.kind) {
     case "Empty":
@@ -169,6 +211,11 @@ export function flattenRenderTree(tree: RenderTree): aset<RenderObject> {
       return flattenChildSet(AListBridges.toASet(tree.children));
     case "UnorderedFromSet":
       return flattenChildSet(tree.children);
+    case "Guarded": {
+      const { active, child } = tree;
+      if (active.isConstant) return flattenRenderTree(child);
+      return ASet.ofReader(() => new GuardedReader(active, child) as unknown as AbstractReader<HashSetDelta<RenderObject>>);
+    }
     case "Rows":
       // Materialization fallback — prototype-derived RenderObjects
       // with stable per-row identity. The hybrid renderer consumes

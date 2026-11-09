@@ -239,6 +239,8 @@ function build(tree: RenderTree, ctx: BuildContext): NodeWalker {
     case "Adaptive": return new AdaptiveWalker(tree.tree, ctx);
     case "OrderedFromList": return new OrderedFromListWalker(tree.children, ctx);
     case "UnorderedFromSet": return new UnorderedFromSetWalker(tree.children, ctx);
+    // (the legacy walker reads it as it is; the guard is the flattening's)
+    case "Guarded": return build(tree.child, ctx);
     case "Rows":
       // Desugar to an unordered set of materialized leaves — the
       // legacy path keeps its per-RO machinery; the row store's fast
