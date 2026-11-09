@@ -381,6 +381,9 @@ export function compileHybridScene(
   const dbgEntry = {
     sig: signature.colorNames.join("+"),
     heap: () => heapScene.stats.totalDraws,
+    /** Pool avals set aside unread / re-queued on activation (in total). */
+    deferred: () => heapScene.stats.deferredAvals,
+    requeued: () => heapScene.stats.requeuedAvals,
     legacy: () => scenePass.collect().length,
     /** GPU geometry arena bytes (the arena is SHARED page-wide — any
      *  entry reports the global figure). */

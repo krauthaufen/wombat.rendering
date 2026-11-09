@@ -686,6 +686,10 @@ export interface HeapSceneStats {
   derivedUploadMs: number;
   derivedEncodeMs: number;
   derivedRecords:  number;
+  /** Pool avals set aside unread (all their draws inactive), now. */
+  deferredAvals:   number;
+  /** Set-aside avals re-queued by a draw turning active, in total. */
+  requeuedAvals:   number;
 }
 
 export interface HeapScene {
@@ -1161,7 +1165,7 @@ export function buildHeapScene(
     for (const av of avals) {
       const n = (activeUses.get(av) ?? 0) + delta;
       if (n > 0) activeUses.set(av, n); else activeUses.delete(av);
-      if (delta > 0 && n === 1 && deferredAlloc.delete(av)) allocDirty.add(av);
+      if (delta > 0 && n === 1 && deferredAlloc.delete(av)) { allocDirty.add(av); stats.requeuedAvals++; }
     }
   }
 
@@ -3483,6 +3487,8 @@ export function buildHeapScene(
     derivedUploadMs: 0,
     derivedEncodeMs: 0,
     derivedRecords:  0,
+    deferredAvals:   0,
+    requeuedAvals:   0,
   };
   Object.defineProperty(stats, "groups", { get: () => buckets.length, configurable: true });
   Object.defineProperty(stats, "slotCount", {
@@ -4761,6 +4767,7 @@ export function buildHeapScene(
           }
         }
         allocDirty.clear();
+        stats.deferredAvals = deferredAlloc.size;
         if (movedByAval !== undefined) {
           // Re-seat every drawHeader field whose aval's allocation
           // moved. Matched by AVAL IDENTITY via the parallel
