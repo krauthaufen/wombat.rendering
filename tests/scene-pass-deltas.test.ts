@@ -77,6 +77,30 @@ function makeRO(eff = flatRedEffect()): RenderObject {
   };
 }
 
+describe("ScenePass: guarded subtrees", () => {
+  it("a hidden subtree that raises does not break resolution; shown, it is prepared", () => {
+    const gpu = new MockGPU();
+    const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
+    const active = cval(false);
+    const valid = cval(false);
+    const ro: RenderObject = {
+      ...makeRO(),
+      active,
+      drawCall: valid.map((v): DrawCall => {
+        if (!v) throw new Error("read outside its guard");
+        return { kind: "non-indexed", vertexCount: 3, instanceCount: 1, firstVertex: 0, firstInstance: 0 };
+      }),
+    };
+    const tree = RenderTree.ordered(RenderTree.leaf(makeRO()), RenderTree.guarded(active, RenderTree.leaf(ro)));
+    const scene = new ScenePass(gpu.device, sig, tree, e => e.compile({ target: "wgsl" }));
+    expect(() => scene.resolve(AdaptiveToken.top)).not.toThrow();
+    expect(scene.resolve(AdaptiveToken.top)).toHaveLength(1);
+    transact(() => { valid.value = true; active.value = true; });
+    expect(scene.resolve(AdaptiveToken.top)).toHaveLength(2);
+    scene.dispose();
+  });
+});
+
 describe("ScenePass: delta-driven resolution", () => {
   it("static N-leaf scene: N prepareRenderObject calls total across many frames", () => {
     const gpu = new MockGPU();

@@ -1139,6 +1139,41 @@ export function buildHeapScene(
     activeDirty.delete(drawId);
   }
 
+  // ─── Inactive draws do not pull ───────────────────────────────────
+  // A pool aval is repacked (read) only while some draw using it is
+  // active. A marked aval whose draws are all inactive is set aside in
+  // `deferredAlloc` instead of read: unread it stays outdated and marks
+  // nothing more, so a hidden subtree's values cost nothing while they
+  // change. The first draw using it that turns active re-queues it into
+  // `allocDirty`, drained in the same update before anything is drawn.
+  // `activeUses` counts, per pool aval, the uses by active draws (a draw
+  // without an `active` gate is always active).
+  const activeUses = new Map<aval<unknown>, number>();
+  const deferredAlloc = new Set<aval<unknown>>();
+  const drawIsActive = new Map<number, boolean>();
+
+  function countActiveUses(drawId: number, delta: 1 | -1): void {
+    const bucket = drawIdToBucket[drawId];
+    const localSlot = drawIdToLocalSlot[drawId];
+    if (bucket === undefined || localSlot === undefined) return;
+    const avals = bucket.localPerDrawAvals[localSlot];
+    if (avals === undefined) return;
+    for (const av of avals) {
+      const n = (activeUses.get(av) ?? 0) + delta;
+      if (n > 0) activeUses.set(av, n); else activeUses.delete(av);
+      if (delta > 0 && n === 1 && deferredAlloc.delete(av)) allocDirty.add(av);
+    }
+  }
+
+  /** A draw's activity changed (or it was added): its avals' uses follow. */
+  function setDrawActive(drawId: number, active: boolean): void {
+    const was = drawIsActive.get(drawId);
+    if (was === active) return;
+    drawIsActive.set(drawId, active);
+    if (active) countActiveUses(drawId, 1);
+    else if (was === true) countActiveUses(drawId, -1);
+  }
+
   /** Update the drawTable record's effective indexCount in place
    *  (GPU-routed: masterShadow + partition re-dispatch; legacy:
    *  drawTableShadow + scan re-dispatch). Common helper used by the
@@ -4033,6 +4068,9 @@ export function buildHeapScene(
         // we wait for the next update tick).
         setEffectiveIndexCount(drawId, 0);
       }
+      setDrawActive(drawId, initial !== false);
+    } else {
+      setDrawActive(drawId, true);
     }
     if (icAval !== undefined) {
       subscribeCount(icAval, drawId);
@@ -4150,6 +4188,9 @@ export function buildHeapScene(
     const bucket    = drawIdToBucket[drawId];
     const localSlot = drawIdToLocalSlot[drawId];
     if (bucket === undefined || localSlot === undefined) return;
+    // Its avals' active uses go (before the pool entries do, below).
+    setDrawActive(drawId, false);
+    drawIsActive.delete(drawId);
     // Tear down `active` subscription (if any) so its callback won't
     // fire after the underlying drawTable record is gone.
     unsubscribeActive(drawId);
@@ -4240,7 +4281,12 @@ export function buildHeapScene(
 
     // Release pool entries — refcount drops; if zero, allocation freed.
     const avals = bucket.localPerDrawAvals[localSlot];
-    if (avals !== undefined) for (const av of avals) pool.release(arena.attrs, av, bucket.chunkIdx);
+    if (avals !== undefined) {
+      for (const av of avals) {
+        pool.release(arena.attrs, av, bucket.chunkIdx);
+        if (!pool.hasAny(av)) deferredAlloc.delete(av);
+      }
+    }
     // Raw §7 slots: the live ref is the drawHeader cell (compaction
     // keeps it current); free it directly.
     const rawIdxs = bucket.localPerDrawRawFieldIdx[localSlot];
@@ -4675,6 +4721,25 @@ export function buildHeapScene(
         }
       }
 
+      // 1c. HeapDrawSpec.active drain — flip drawTable.indexCount
+      //     between origIndexCount (visible) and 0 (hidden) for any RO
+      //     whose active aval ticked since last frame. Set is small in
+      //     steady state (only the ROs whose visibility actually
+      //     changed). No pool / arena / freelist activity.
+      if (activeDirty.size > 0) {
+        for (const did of activeDirty) {
+          const av = drawIdToActiveAval.get(did);
+          if (av === undefined) continue;
+          const a = av.getValue(tok);
+          const orig = drawIdToOrigIndexCount.get(did) ?? 0;
+          setEffectiveIndexCount(did, a ? orig : 0);
+          // (before the pool drain: avals set aside while hidden are
+          // re-queued and drained below, this update)
+          setDrawActive(did, a);
+        }
+        activeDirty.clear();
+      }
+
       // 1. Pool: re-pack any aval whose value changed since last frame.
       //    One writeBuffer per dirty aval, regardless of how many draws
       //    reference it — sharing pays off here.
@@ -4683,6 +4748,8 @@ export function buildHeapScene(
         // moved (payload grew/shrank → realloc'd within the chunk).
         let movedByAval: Map<aval<unknown>, Map<number, number>> | undefined;
         for (const av of allocDirty) {
+          // used by inactive draws only: set aside, unread
+          if (!activeUses.has(av)) { deferredAlloc.add(av); continue; }
           const moved = pool.repack(device, arena.attrs, av, av.getValue(tok));
           totalDirtyBytes += pool.totalDataBytes(av);
           if (moved !== undefined) {
@@ -4736,22 +4803,6 @@ export function buildHeapScene(
             }
           }
         }
-      }
-
-      // 1c. HeapDrawSpec.active drain — flip drawTable.indexCount
-      //     between origIndexCount (visible) and 0 (hidden) for any RO
-      //     whose active aval ticked since last frame. Set is small in
-      //     steady state (only the ROs whose visibility actually
-      //     changed). No pool / arena / freelist activity.
-      if (activeDirty.size > 0) {
-        for (const did of activeDirty) {
-          const av = drawIdToActiveAval.get(did);
-          if (av === undefined) continue;
-          const a = av.getValue(tok);
-          const orig = drawIdToOrigIndexCount.get(did) ?? 0;
-          setEffectiveIndexCount(did, a ? orig : 0);
-        }
-        activeDirty.clear();
       }
 
       // 1d. HeapDrawSpec.instanceCount aval drain — write the new
