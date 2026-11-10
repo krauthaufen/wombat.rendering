@@ -166,5 +166,6 @@ export {
   reportDeviceError,
   onDeviceError,
   deviceErrors,
+  describeDevice,
   type DeviceError,
 } from "./deviceErrors.js";

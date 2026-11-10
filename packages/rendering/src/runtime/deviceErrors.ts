@@ -12,7 +12,8 @@
 
 /** One device error. */
 export interface DeviceError {
-  /** "out-of-memory", "validation", "internal" or "unknown". */
+  /** "out-of-memory", "validation", "internal", "unknown" (uncaptured device
+   *  errors), "device-lost", or "frame" (an exception in a frame callback). */
   readonly kind: string;
   readonly message: string;
   /** The renderer recovered from it (the scene keeps rendering, maybe degraded). */
@@ -46,13 +47,42 @@ function watchFor(device: GPUDevice): Watch {
   return w;
 }
 
-/** Logs and dispatches a device error. */
-export function reportDeviceError(device: GPUDevice, error: DeviceError): void {
+/** The limits that most often explain a scene that renders on one GPU and
+ *  not another (texture and buffer sizes, binding counts). */
+const LIMITS = [
+  "maxTextureDimension2D", "maxTextureArrayLayers", "maxBufferSize", "maxStorageBufferBindingSize",
+  "maxStorageBuffersPerShaderStage", "maxSampledTexturesPerShaderStage", "maxBindGroups",
+  "maxUniformBufferBindingSize", "maxComputeWorkgroupStorageSize", "maxComputeInvocationsPerWorkgroup",
+] as const;
+
+/** The device's adapter (vendor, architecture, description) and its
+ *  key limits, as one line: what to quote next to an error report. */
+export function describeDevice(device: GPUDevice): string {
+  const info = (device as { adapterInfo?: { vendor?: string; architecture?: string; device?: string; description?: string } }).adapterInfo;
+  const who = info === undefined
+    ? "adapter info unavailable"
+    : [info.vendor, info.architecture, info.device, info.description].filter((x) => x !== undefined && x !== "").join(" / ") || "adapter info empty";
+  const limits = (device as unknown as { limits?: Record<string, number> }).limits;
+  const mb = (n: number) => (n >= 1 << 20 ? `${Math.round(n / (1 << 20))} MB` : String(n));
+  const lim = limits === undefined ? "no limits" : LIMITS
+    .filter((k) => typeof limits[k] === "number")
+    .map((k) => `${k} ${/Size$/.test(k) && !/Workgroup/.test(k) ? mb(limits[k]!) : limits[k]}`)
+    .join(", ");
+  const mem = (globalThis as { navigator?: { deviceMemory?: number } }).navigator?.deviceMemory;
+  return `${who}; ${lim}${mem !== undefined ? `; deviceMemory ${mem} GB` : ""}`;
+}
+
+/** Logs and dispatches a device error (`log` false: the caller logged it).
+ *  The first error of a device also logs the device (`describeDevice`). */
+export function reportDeviceError(device: GPUDevice, error: DeviceError, log = true): void {
   const w = watchFor(device);
+  if (w.errors.length === 0) {
+    try { console.error(`[wombat] GPU device: ${describeDevice(device)}`); } catch { /* best effort */ }
+  }
   w.errors.push(error);
   // keep the record bounded: a broken pass can raise one per frame
   if (w.errors.length > 256) w.errors.splice(0, w.errors.length - 256);
-  console.error(`[wombat] GPU device error (${error.kind}${error.recovered ? ", recovered" : ""}): ${error.message}`);
+  if (log) console.error(`[wombat] GPU device error (${error.kind}${error.recovered ? ", recovered" : ""}): ${error.message}`);
   for (const l of w.listeners) {
     try { l(error); } catch (e) { console.error("[wombat] device error listener threw", e); }
   }

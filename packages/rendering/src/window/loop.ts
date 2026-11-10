@@ -22,6 +22,7 @@
 //
 // Returns a `stop()` to cancel the loop and clear the subscription.
 
+import { reportDeviceError } from "../runtime/deviceErrors.js";
 import type { aval, AdaptiveToken, IDisposable } from "@aardworx/wombat.adaptive";
 import { AVal, transact } from "@aardworx/wombat.adaptive";
 import type { CanvasAttachment } from "./canvas.js";
@@ -158,6 +159,16 @@ export function runFrame(
       console.error(
         `runFrame: error in frame callback (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS})`, e,
       );
+      // through the device-error channel too (a page's note shows it): an
+      // exception in a frame leaves the canvas as blank as a device error
+      if (attachment.device !== undefined && (consecutiveErrors === 1 || consecutiveErrors === MAX_CONSECUTIVE_ERRORS)) {
+        reportDeviceError(attachment.device, {
+          kind: "frame",
+          recovered: consecutiveErrors < MAX_CONSECUTIVE_ERRORS,
+          message: (consecutiveErrors < MAX_CONSECUTIVE_ERRORS ? "" : "render loop stopped after repeated errors: ") +
+            (e instanceof Error ? `${e.name}: ${e.message}` : String(e)),
+        }, false);
+      }
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
         stopped = true;
         console.error("runFrame: giving up after repeated frame errors — render loop stopped");

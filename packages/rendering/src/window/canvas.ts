@@ -58,6 +58,8 @@ export interface CanvasAttachment {
   readonly size: aval<{ readonly width: number; readonly height: number }>;
   /** The signature derived from the chosen formats. */
   readonly signature: FramebufferSignature;
+  /** The device it renders with (frame errors are reported against it). */
+  readonly device?: GPUDevice;
   /** Mark a new frame: invalidates the framebuffer aval so its next read produces a fresh swap-chain texture. */
   markFrame(): void;
   /** Disconnect the resize observer + clear the canvas context. Idempotent. */
@@ -182,6 +184,7 @@ export function attachCanvas(
     framebuffer,
     size: sizeC,
     signature,
+    device,
     markFrame() {
       transact(() => { frameC.value = frameC.value + 1; });
     },

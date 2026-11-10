@@ -1,5 +1,5 @@
 import { setAtlasPageSize, setAtlasMaxPages, setAtlasGrowthLayers, atlasLimitsFor } from "./textureAtlas/atlasPool.js";
-import { watchDeviceErrors } from "./deviceErrors.js";
+import { watchDeviceErrors, reportDeviceError } from "./deviceErrors.js";
 // Runtime — the user-facing entry point. Holds the device +
 // effect-compilation hook, exposes `compile(commands)` and
 // (eventually) `renderTo(...)`.
@@ -136,6 +136,9 @@ export class Runtime {
     this.deviceLost = lost !== undefined
       ? lost.then((info) => {
           this._deviceLost = true;
+          if (info?.reason !== "destroyed") {
+            reportDeviceError(opts.device, { kind: "device-lost", recovered: false, message: `${info?.reason ?? "unknown"}: ${info?.message ?? ""}` });
+          }
           // Best-effort: dispose all outstanding tasks so user code
           // that still holds them stops trying to encode against a
           // dead device.
