@@ -89,6 +89,10 @@ export {
   ATLAS_MAX_PAGES_PER_FORMAT,
   ATLAS_PAGE_FORMATS,
   atlasFormatIndex,
+  atlasLimitsFor,
+  atlasPageSizeNow,
+  atlasMaxPagesNow,
+  atlasGrowthLayersNow,
   type AtlasPage,
   type AtlasPageFormat,
   type AtlasAcquisition,
@@ -156,3 +160,11 @@ export {
   rewriteOutputsToSlotIndices,
   type RuleCodegenSpec, type KernelCodegenSpec,
 } from "./derivedModes/kernelCodegen.js";
+
+export {
+  watchDeviceErrors,
+  reportDeviceError,
+  onDeviceError,
+  deviceErrors,
+  type DeviceError,
+} from "./deviceErrors.js";

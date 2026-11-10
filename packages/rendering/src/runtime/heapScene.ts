@@ -45,7 +45,7 @@
 import { Trafo3d, V3d, V4f, M44d, type V2f } from "@aardworx/wombat.base";
 import type { HostTextureSource, ITexture } from "../core/texture.js";
 import type { ISampler } from "../core/sampler.js";
-import { AVal, AdaptiveObject, AdaptiveToken, HashTable } from "@aardworx/wombat.adaptive";
+import { AVal, AdaptiveObject, AdaptiveToken, HashTable, markOutdated, transact } from "@aardworx/wombat.adaptive";
 import type { aval, aset, IAdaptiveObject, IDisposable, IHashSetReader } from "@aardworx/wombat.adaptive";
 import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
 import type { PipelineState } from "../core/pipelineState.js";
@@ -2386,10 +2386,76 @@ export function buildHeapScene(
     // GPUBuffer; the dispatcher's bind groups consult it per
     // dispatch, so no explicit rebind needed here.
   });
+  // Atlas placements lost with a layer the device could not allocate
+  // (AtlasPool out of memory): their draws sample nothing until placed
+  // again, which `update` retries every frame until there is room.
+  let atlasLostPending = false;
   if (atlasPool !== undefined) {
     for (const f of ATLAS_PAGE_FORMATS) {
       atlasPool.onPageAdded(f, () => rebuildAllBindGroups(true));
+      // (the loss is reported asynchronously: mark the scene so a frame
+      // runs and places them)
+      atlasPool.onLayersLost(f, () => {
+        atlasLostPending = true;
+        redoGpuWork();
+        transact(() => markOutdated(sceneObj));
+      });
     }
+  }
+
+  /** The scene's GPU-side work encoded since the invalid array went into the
+   *  bind groups was in command buffers the device rejected (the scans, the
+   *  derived uniforms): run all of it again with the next frame. */
+  let redoDerived = false;
+  function redoGpuWork(): void {
+    redoDerived = true;
+    for (const b of buckets) {
+      if (b.gpuRouted) b.partitionDirty = true;
+      for (const slot of b.slots) slot.scanDirty = true;
+    }
+  }
+
+  /** Places every live atlas draw whose placement was lost again; returns
+   *  the header bytes rewritten. Draws that do not fit stay pending. */
+  function replaceLostAtlasPlacements(): number {
+    if (!atlasLostPending || atlasPool === undefined) return 0;
+    let pending = false;
+    let bytes = 0;
+    for (const bucket of buckets) {
+      if (!bucket.isAtlasBucket) continue;
+      for (let localSlot = 0; localSlot < bucket.localAtlasTextures.length; localSlot++) {
+        const ts = bucket.localAtlasTextures[localSlot];
+        if (ts === undefined || atlasPool.isLive(ts.poolRef)) continue;
+        const sourceAval = ts.sourceAval as aval<ITexture> | undefined;
+        if (sourceAval === undefined) continue;
+        const w = ts.size.x, h = ts.size.y;
+        const acq = atlasPool.acquire(ts.page.format, sourceAval, w, h, {
+          wantsMips: ts.numMips > 1,
+          ...(ts.gpuTexture !== undefined
+            ? { source: { width: w, height: h, gpuTexture: ts.gpuTexture } }
+            : ts.host !== undefined
+              ? { source: { width: w, height: h, host: ts.host } }
+              : {}),
+        });
+        if (acq === null) { pending = true; continue; }
+        (ts as { pageId: number }).pageId = acq.pageId;
+        (ts as { origin: V2f }).origin = acq.origin;
+        (ts as { size: V2f }).size = acq.size;
+        (ts as { numMips: number }).numMips = acq.numMips;
+        (ts as { page: AtlasPage }).page = acq.page;
+        (ts as { poolRef: number }).poolRef = acq.ref;
+        const retarget = (ts as unknown as { __retarget?: (ref: number) => void }).__retarget;
+        if (retarget !== undefined) retarget(acq.ref);
+        packAtlasTextureFields(bucket, localSlot, ts);
+        const byteOff = localSlot * bucket.layout.drawHeaderBytes;
+        if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
+        const end = byteOff + bucket.layout.drawHeaderBytes;
+        if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
+        bytes += bucket.layout.drawHeaderBytes;
+      }
+    }
+    atlasLostPending = pending;
+    return bytes;
   }
   // ─── findOrCreateBucket ───────────────────────────────────────────
   // Slice 3c: the bucket key collapses to (familyId, pipelineState).
@@ -4868,6 +4934,9 @@ export function buildHeapScene(
         atlasAvalDirty.clear();
       }
 
+      // 1e. Atlas placements lost with an out-of-memory layer: place again.
+      totalDirtyBytes += replaceLostAtlasPlacements();
+
       // 2. Per-bucket: (rare) header re-pack — only fires when the
       //    bucket's drawHeap GrowBuffer reallocated and we need to
       //    re-write all live slots into the new staging mirror.
@@ -4993,7 +5062,8 @@ export function buildHeapScene(
       const _t1 = performance.now();
       derivedScene.uploadDirty(dirty!);
       const _t2 = performance.now();
-      if (dirty!.size > 0) derivedScene.encode(enc);
+      if (dirty!.size > 0 || redoDerived) derivedScene.encode(enc);
+      redoDerived = false;
       const _t3 = performance.now();
       stats.derivedPullMs   = _t1 - _t0;
       stats.derivedUploadMs = _t2 - _t1;

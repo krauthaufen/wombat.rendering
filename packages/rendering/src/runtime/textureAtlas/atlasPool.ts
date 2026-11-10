@@ -33,6 +33,7 @@ import { V2f, V2i } from "@aardworx/wombat.base";
 import { type aval, HashTable } from "@aardworx/wombat.adaptive";
 import type { ITexture, HostTextureSource } from "../../core/texture.js";
 import { TexturePacking } from "./packer.js";
+import { reportDeviceError } from "../deviceErrors.js";
 import {
   buildMipsAndGutterOnGpu, buildMipsAndGutterFromTexture, type MipSlot,
   beginMipGutterBatch, submitMipGutterBatch, type MipGutterBatch,
@@ -77,6 +78,30 @@ export function atlasPageSizeNow(): number {
 }
 export function setAtlasPageSize(n: number): void {
   (globalThis as { __wombatAtlasPageSize?: number }).__wombatAtlasPageSize = n;
+}
+
+/** Layers one growth of a format's array adds (RuntimeOptions.atlasGrowthLayers).
+ *  Growing copies the whole array into a new one, so the old and the new
+ *  array are resident together for a moment: one layer at a time keeps that
+ *  peak lowest (a layer is pageSize² × 4 B: 64 MB at 4096²). */
+export function atlasGrowthLayersNow(): number {
+  return Math.max(1, (globalThis as { __wombatAtlasGrowthLayers?: number }).__wombatAtlasGrowthLayers ?? 1);
+}
+export function setAtlasGrowthLayers(n: number): void {
+  (globalThis as { __wombatAtlasGrowthLayers?: number }).__wombatAtlasGrowthLayers = n;
+}
+
+/** Atlas page edge and page cap for a device's limits, where the caller set
+ *  none: the page edge 4096 (the largest a 1024² tier-S texture with its mips
+ *  and gutters needs no more than; 2048 where the device's largest 2D texture
+ *  is smaller), the page cap the default 16, at most the device's array layers.
+ *  WebGPU does not tell how much memory there is: growth is one layer at a
+ *  time and an allocation the device refuses caps the atlas where it is
+ *  (`AtlasPool`, out of memory). */
+export function atlasLimitsFor(limits: { readonly maxTextureDimension2D?: number; readonly maxTextureArrayLayers?: number } | undefined): { pageSize: number; maxPages: number } {
+  const dim = limits?.maxTextureDimension2D ?? 8192;
+  const layers = limits?.maxTextureArrayLayers ?? 256;
+  return { pageSize: dim >= 4096 ? 4096 : 2048, maxPages: Math.max(1, Math.min(ATLAS_MAX_PAGES_PER_FORMAT, layers)) };
 }
 
 export type AtlasPageFormat = "rgba8unorm" | "rgba8unorm-srgb";
@@ -279,6 +304,17 @@ export class AtlasPool {
   /** Per-format shared array texture (pages = layers). */
   private readonly storesByFormat = new Map<AtlasPageFormat, { texture: GPUTexture; layers: number }>();
   /**
+   * Per format, the array textures of growths not yet confirmed by the
+   * device, oldest first, after the last confirmed one (`ok`). A growth's
+   * allocation may fail for lack of memory, which WebGPU reports only
+   * later (`popErrorScope`): until then the array it copied from stays
+   * alive, so a failure can go back to it.
+   */
+  private readonly growthsByFormat = new Map<AtlasPageFormat, { texture: GPUTexture; layers: number; state: "pending" | "ok" | "failed"; firstRef: number }[]>();
+  /** Per format, the layer count the device could not grow past (out of memory). */
+  private readonly oomCapByFormat = new Map<AtlasPageFormat, number>();
+  private readonly layersLostListeners = new Map<AtlasPageFormat, Set<(firstLostPage: number) => void>>();
+  /**
    * Keyed by `aval<ITexture>` under the aval equality protocol: a
    * `HashTable` (not a JS `Map`) so two distinct `AVal.constant(tex)`
    * built at different call sites — including ones wrapping
@@ -330,7 +366,7 @@ export class AtlasPool {
   /** True while every page of `format` is packed with live (referenced) entries. */
   isFull(format: AtlasPageFormat): boolean {
     const pages = this.pagesByFormat.get(format);
-    if (pages === undefined || pages.length < atlasMaxPagesNow()) return false;
+    if (pages === undefined || pages.length < this.capFor(format)) return false;
     for (const e of this.lru.values()) if (e.format === format) return false; // something is evictable
     return true;
   }
@@ -346,7 +382,34 @@ export class AtlasPool {
     for (const f of ATLAS_PAGE_FORMATS) {
       this.pagesByFormat.set(f, []);
       this.pageAddedListeners.set(f, new Set());
+      this.layersLostListeners.set(f, new Set());
     }
+  }
+
+  /** The most pages `format` may have: the configured cap, the device's
+   *  array layers, and where growth ran out of memory. */
+  capFor(format: AtlasPageFormat): number {
+    const layers = (this.device as { limits?: { maxTextureArrayLayers?: number } }).limits?.maxTextureArrayLayers ?? Infinity;
+    return Math.min(atlasMaxPagesNow(), layers, this.oomCapByFormat.get(format) ?? Infinity);
+  }
+
+  /** True while the pool holds `ref` (a placement lost with its layer does not). */
+  isLive(ref: number): boolean {
+    return this.entriesByRef.has(ref);
+  }
+
+  /**
+   * Subscribe to lost layers: a growth of `format`'s array that the device
+   * refused (out of memory) is undone, the pages from `firstLostPage` on are
+   * gone and so are their placements (`isLive` false); `onPageAdded` fires
+   * too (the bind groups take the restored array). The holder of a lost
+   * placement acquires a new one: until then its draws sample nothing
+   * (the shader returns vec4(0) for a layer past the array).
+   */
+  onLayersLost(format: AtlasPageFormat, cb: (firstLostPage: number) => void): { dispose(): void } {
+    const set = this.layersLostListeners.get(format)!;
+    set.add(cb);
+    return { dispose: () => { set.delete(cb); } };
   }
 
   /** The GPU device this pool renders on. Exposed so adapter-side
@@ -388,31 +451,35 @@ export class AtlasPool {
 
   /**
    * Ensure the format's array texture has at least `layers` layers.
-   * Growth allocates a fresh array (pow2 steps up to 8, then +2, capped
-   * at `atlasMaxPagesNow()`), copies every existing layer across in one
-   * `copyTextureToTexture`, and destroys the old texture (safe right
-   * after submit — already-submitted work completes before destruction).
-   * Callers fire `onPageAdded` afterwards, which rebuilds bind groups —
-   * so the stale-texture window never reaches a render pass.
+   * Growth allocates a fresh array (`atlasGrowthLayersNow()` more layers,
+   * capped at `capFor(format)`), copies every existing layer across in one
+   * `copyTextureToTexture` and binds the new array from then on; callers
+   * fire `onPageAdded`, which rebuilds bind groups — so the stale-texture
+   * window never reaches a render pass.
+   *
+   * Out of memory: the device may refuse the new array, and says so only
+   * asynchronously. The allocation runs in an out-of-memory error scope and
+   * the old array stays alive until the device confirms it; a refusal
+   * restores the old array (`rollBack`), caps the format there and reports
+   * the error, and the scene keeps rendering: new textures take the full
+   * atlas's path (heapAdapter: an ordinary texture binding), those placed
+   * on the lost layers are placed again (`onLayersLost`). Before, the invalid
+   * array went into the heap's bind group and invalidated every draw of it.
    */
   private ensureLayers(format: AtlasPageFormat, layers: number): { texture: GPUTexture; layers: number } {
-    const cap = atlasMaxPagesNow();
+    const cap = this.capFor(format);
     if (layers > cap) {
-      throw new Error(`AtlasPool: layer request ${layers} exceeds atlasMaxPages ${cap}`);
+      throw new Error(`AtlasPool: layer request ${layers} exceeds the atlas cap ${cap}`);
     }
     const store = this.storesByFormat.get(format);
     if (store !== undefined && store.layers >= layers) return store;
-    // +2 step (capped): a layer is huge (aps² × 4B — 268 MB at 8192²),
-    // pow2 overshoot needlessly spikes VRAM (transient = old + new array
-    // until the queue drains); +2 halves the number of grow-copies vs
-    // exact-need. NO deferral here: a null acquisition for a NEW draw
-    // has no retry path (measured: permanently untextured tiles after a
-    // camera move), so growth must always succeed below the cap.
-    const next = Math.min(Math.max(layers, (store?.layers ?? 0) + 2), cap);
+    const next = Math.min(Math.max(layers, (store?.layers ?? 0) + atlasGrowthLayersNow()), cap);
     // The compute mip+gutter kernel works for *all* page formats: it
     // builds the pyramid + gutters in a scratch storage *buffer* and
     // finishes with `copyBufferToTexture` into the layer, so pages
     // never need STORAGE_BINDING — srgb included.
+    const scoped = typeof (this.device as { pushErrorScope?: unknown }).pushErrorScope === "function";
+    if (scoped) this.device.pushErrorScope("out-of-memory");
     const texture = this.device.createTexture({
       label: `atlas/${format}[${next}]`,
       size: { width: atlasPageSizeNow(), height: atlasPageSizeNow(), depthOrArrayLayers: next },
@@ -424,10 +491,10 @@ export class AtlasPool {
         GPUTextureUsage.COPY_SRC |
         GPUTextureUsage.RENDER_ATTACHMENT,
     });
+    const scope = scoped ? this.device.popErrorScope() : undefined;
     if (store !== undefined && store.layers > 0) {
       // An OPEN upload batch may hold copies targeting the old texture —
-      // submit it first, or those uploads land in the abandoned array
-      // (and its destroy below invalidates their submit).
+      // submit it first, or those uploads land in the abandoned array.
       this.flushUploadBatch();
       const enc = this.device.createCommandEncoder({ label: `atlas/${format}/grow` });
       enc.copyTextureToTexture(
@@ -436,15 +503,89 @@ export class AtlasPool {
         { width: atlasPageSizeNow(), height: atlasPageSizeNow(), depthOrArrayLayers: store.layers },
       );
       this.device.queue.submit([enc.finish()]);
-      // Immediate destroy is safe: the layer copy is already SUBMITTED
-      // (submitted work completes before destruction takes effect), and
-      // the batch flush above guarantees no later submit references the
-      // old texture.
-      store.texture.destroy();
     }
     const fresh = { texture, layers: next };
     this.storesByFormat.set(format, fresh);
+    if (scope === undefined) {
+      // no error scopes (mock devices): the old array goes at once
+      // (submitted work completes before destruction takes effect)
+      store?.texture.destroy();
+      return fresh;
+    }
+    let chain = this.growthsByFormat.get(format);
+    if (chain === undefined) {
+      // the array before this growth, confirmed: what a failure goes back to
+      chain = store !== undefined ? [{ texture: store.texture, layers: store.layers, state: "ok", firstRef: 0 }] : [];
+      this.growthsByFormat.set(format, chain);
+    }
+    // placements from here on are uploaded into the new array only
+    const growth: { texture: GPUTexture; layers: number; state: "pending" | "ok" | "failed"; firstRef: number } = { texture, layers: next, state: "pending", firstRef: this.nextRef };
+    chain.push(growth);
+    void scope.then(
+      (error) => this.settleGrowth(format, growth, error),
+      (error) => this.settleGrowth(format, growth, error instanceof Error ? error : new Error(String(error))),
+    );
     return fresh;
+  }
+
+  /** A growth's allocation, confirmed (error null) or refused. */
+  private settleGrowth(format: AtlasPageFormat, growth: { texture: GPUTexture; layers: number; state: "pending" | "ok" | "failed"; firstRef: number }, error: { message: string } | null): void {
+    const chain = this.growthsByFormat.get(format);
+    if (chain === undefined || !chain.includes(growth)) return;
+    growth.state = error === null ? "ok" : "failed";
+    const i = chain.findIndex((g) => g.state === "failed");
+    if (i >= 0) {
+      // every growth from the failed one on copied from it: all are lost
+      this.rollBack(format, chain[i - 1], chain.slice(i), chain[i]!.layers, chain[i]!.firstRef, error?.message ?? chain[i]!.texture.label);
+      return;
+    }
+    // an array whose successor is confirmed is no longer needed
+    while (chain.length > 1 && chain[0]!.state === "ok" && chain[1]!.state === "ok") chain.shift()!.texture.destroy();
+    if (chain.length === 1 && chain[0]!.state === "ok") this.growthsByFormat.delete(format);
+  }
+
+  /** Undoes the growths from a refused one on: back to `keep` (or no array).
+   *  Lost: the pages past it, and every placement made since the refused
+   *  growth (`firstLostRef` on; uploaded into the refused array only). */
+  private rollBack(
+    format: AtlasPageFormat,
+    keep: { texture: GPUTexture; layers: number } | undefined,
+    lost: readonly { texture: GPUTexture }[],
+    refusedLayers: number,
+    firstLostRef: number,
+    message: string,
+  ): void {
+    const layers = keep?.layers ?? 0;
+    if (keep !== undefined) this.storesByFormat.set(format, { texture: keep.texture, layers });
+    else this.storesByFormat.delete(format);
+    for (const g of lost) g.texture.destroy();
+    this.growthsByFormat.delete(format);
+    this.oomCapByFormat.set(format, layers);
+    // the pages past the kept layers and every placement on them are gone
+    const pages = this.pagesByFormat.get(format)!;
+    const lostPages = pages.length - Math.min(pages.length, layers);
+    pages.length = Math.min(pages.length, layers);
+    let lostEntries = 0;
+    for (const e of [...this.entriesByRef.values()]) {
+      if (e.format !== format || (e.pageId < layers && e.ref < firstLostRef)) continue;
+      const page = pages[e.pageId];
+      if (page !== undefined) page.packing = page.packing.remove(e.ref);
+      this.entriesByRef.delete(e.ref);
+      for (const a of e.aliases) this.entriesByAval.delete(a);
+      if (e.valueKey !== undefined) this.entriesByValueKey.delete(e.valueKey);
+      this.lru.delete(e.ref);
+      lostEntries++;
+    }
+    reportDeviceError(this.device, {
+      kind: "out-of-memory",
+      recovered: true,
+      message:
+        `texture atlas ${format}: the device could not allocate ${refusedLayers} layers of ${atlasPageSizeNow()}² (${message.split("\n")[0]}); ` +
+        `kept ${layers} layer(s), ${lostPages} page(s) and ${lostEntries} placement(s) lost and placed again where they fit; ` +
+        `textures that do not fit take an ordinary binding.`,
+    });
+    for (const cb of this.pageAddedListeners.get(format)!) cb(Math.max(0, layers - 1));
+    for (const cb of this.layersLostListeners.get(format)!) cb(layers);
   }
 
   private allocatePage(format: AtlasPageFormat, pageId: number): AtlasPage {
@@ -601,7 +742,7 @@ export class AtlasPool {
     }
 
     // Allocate a fresh page (array layer) if we haven't hit the cap.
-    if (pages.length >= atlasMaxPagesNow()) {
+    if (pages.length >= this.capFor(format)) {
       // The atlas is genuinely full: every page is packed with entries that are
       // still referenced, so there is nothing to evict. That is resource
       // pressure, NOT a program error — and throwing turned it into a fatal
@@ -670,7 +811,16 @@ export class AtlasPool {
   ): AtlasAcquisition | null {
     const old = this.entriesByAval.get(sourceAval);
     if (old === undefined) {
-      throw new Error("AtlasPool.repack: source aval has no live entry");
+      // its placement was lost with its layer (out of memory): place it afresh
+      const d = describeAtlasTexture(newTexture);
+      const f = d === null ? null : AtlasPool.eligibleFormat(d.format);
+      if (d === null || f === null || !AtlasPool.eligibleSize(d.width, d.height)) {
+        throw new Error("AtlasPool.repack: source aval has no live entry");
+      }
+      return this.acquire(f, sourceAval, d.width, d.height, {
+        ...opts,
+        ...(opts.source === undefined && d.host !== undefined ? { source: { width: d.width, height: d.height, host: d.host } } : {}),
+      });
     }
     // Resolve the new texture's eligibility + dimensions.
     const desc = describeAtlasTexture(newTexture);

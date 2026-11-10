@@ -1,4 +1,5 @@
-import { setAtlasPageSize, setAtlasMaxPages } from "./textureAtlas/atlasPool.js";
+import { setAtlasPageSize, setAtlasMaxPages, setAtlasGrowthLayers, atlasLimitsFor } from "./textureAtlas/atlasPool.js";
+import { watchDeviceErrors } from "./deviceErrors.js";
 // Runtime — the user-facing entry point. Holds the device +
 // effect-compilation hook, exposes `compile(commands)` and
 // (eventually) `renderTo(...)`.
@@ -55,13 +56,21 @@ export interface RuntimeOptions {
    * GPU copy + bind-group rebuilds) mid-navigation.
    */
   readonly initialArenaBytes?: number;
-  /** Atlas page edge in texels (default 4096). Desktops should pass
-   *  8192 — 4× resident-texture capacity for streaming scenes. Must be
-   *  set at Runtime construction (before shader generation). */
+  /** Atlas page edge in texels. Default: from the device's limits
+   *  (`atlasLimitsFor`: 4096, 2048 on devices whose 2D textures are
+   *  smaller). Desktops may pass 8192 — 4× resident-texture capacity
+   *  for streaming scenes. Must be set at Runtime construction (before
+   *  shader generation). */
   readonly atlasPageSize?: number;
-  /** Max atlas pages (texture-array layers) per format family (default
-   *  16). Layers grow on demand; this caps the growth. */
+  /** Max atlas pages (texture-array layers) per format family. Default:
+   *  16, at most the device's `maxTextureArrayLayers`. Layers grow on
+   *  demand; this caps the growth (as does the device running out of
+   *  memory, see AtlasPool). */
   readonly atlasMaxPages?: number;
+  /** Layers one atlas growth adds (default 1: the old and the new array
+   *  are resident together while it copies, so small steps keep that
+   *  peak low). */
+  readonly atlasGrowthLayers?: number;
   /**
    * Heap arena compaction toggle — threaded into
    * `BuildHeapSceneOptions.enableCompaction`. Streaming apps with steady
@@ -97,8 +106,16 @@ export class Runtime {
   readonly deviceLost: Promise<GPUDeviceLostInfo>;
 
   constructor(opts: RuntimeOptions) {
+    // atlas sizes: what the caller asks for, else (unless set before) the device's
+    const g = globalThis as { __wombatAtlasPageSize?: number; __wombatAtlasMaxPages?: number };
+    const limits = atlasLimitsFor((opts.device as { limits?: GPUSupportedLimits }).limits);
     if (opts.atlasPageSize !== undefined) setAtlasPageSize(opts.atlasPageSize);
+    else if (g.__wombatAtlasPageSize === undefined) setAtlasPageSize(limits.pageSize);
     if (opts.atlasMaxPages !== undefined) setAtlasMaxPages(opts.atlasMaxPages);
+    else if (g.__wombatAtlasMaxPages === undefined) setAtlasMaxPages(limits.maxPages);
+    if (opts.atlasGrowthLayers !== undefined) setAtlasGrowthLayers(opts.atlasGrowthLayers);
+    // device errors are logged (console.error) and observable (onDeviceError)
+    watchDeviceErrors(opts.device);
     this.ctx = {
       device: opts.device,
       compileEffect: opts.compileEffect ?? ((e: Effect, sig: FramebufferSignature) => e.compile({
