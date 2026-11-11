@@ -46,7 +46,7 @@ export {
 
 export { flattenRenderTree } from "./flattenTree.js";
 export { isHeapEligible } from "./heapEligibility.js";
-export { renderObjectToHeapSpec } from "./heapAdapter.js";
+export { renderObjectToHeapSpec, heapValuesRaise } from "./heapAdapter.js";
 
 // ─── Cross-face cube-gutter kernel (seamless cube-in-2D-atlas without a cube texture) ──
 export { fillCubeGutters, cubeGridSize, type CubeGutterLayout } from "./textureAtlas/cubeGutter.js";
