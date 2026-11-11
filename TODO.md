@@ -13,17 +13,6 @@ IR; inverses = CPU backward halves composed in reverse, never inverted on GPU) +
 derived modes (pipeline-state-as-fn-of-uniforms via GPU partition kernel); texture
 atlasing (tiers S/M/L, reactive residency); per-RO instancing.
 
-Heap shader cache serves stale WGSL (2026-11-08, found from wombat.dom): the
-persistent (localStorage) `compileHeapEffect` tier returned an old module after
-a test effect's source changed. Repro: wombat.dom
-`tests-browser/active-toggle.browser.test.ts`, first written with `declare const
-ModelTrafo: M44f` and `ModelTrafo.mul(input.Positions)`, entry points `vsMain` /
-`fsMain`; after dropping ModelTrafo, runs in the same profile still failed with
-`unresolved value 'ModelTrafo'` from module `heapScene/standalone/8f4fd1023d7028d7/vs`
-(pipeline `heapScene/cached/f8f4fd1023d7028d7|mk78000000010003`); renaming the
-entry points (new key) fixed it. The persist key seems not to cover the shader
-source / IR. (heapEffect.ts persistence helpers.)
-
 Heap follow-ups: drop fully-drained pages (free a whole `GPUBuffer` back); optional
 constituent sharing for cross-heap derived uniforms.
 
