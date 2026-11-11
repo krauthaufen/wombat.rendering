@@ -40,7 +40,10 @@ describe("cube gutter kernel (real GPU)", () => {
     const device = await adapter.requestDevice();
     const { fillCubeGutters, cubeGridSize } = await import("../packages/rendering/src/runtime/textureAtlas/cubeGutter.js");
 
-    const layout: CubeGutterLayout = { faceSize: 48, gutter: 3, cols: 3, rows: 2 };
+    // Small faces, a wide gutter: the direction changes fast enough that a
+    // clamp fill would be up to 18 levels off the true neighbour (48/3 gave
+    // at most 5, under the precondition below, so the test could not pass).
+    const layout: CubeGutterLayout = { faceSize: 16, gutter: 4, cols: 3, rows: 2 };
     const { width, height } = cubeGridSize(layout);
     const { faceSize: F, gutter: G, cols: C } = layout;
     const CELL = F + 2 * G;

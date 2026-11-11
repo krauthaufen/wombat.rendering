@@ -65,7 +65,9 @@ describe("GPU transform propagation — modelChain (real GPU)", () => {
     }));
     runFrame(scene, device);
 
-    const want = a.forward.mul(b.forward).mul(c.forward);
+    // the chain is [leaf, …, root] (SG order): a first, then b, then c —
+    // p' = c · b · a · p (the order 7de8d0a fixed; this expected the old one)
+    const want = a.mul(b).mul(c).forward;
     expectMatClose(await readConstituent(device, scene, reg.modelLeaf!.modelPair.fwd), want);
     expectMatClose(await readConstituent(device, scene, reg.modelLeaf!.modelPair.inv), want.inverse());
     scene.dispose(); heap.destroy();
@@ -88,7 +90,7 @@ describe("GPU transform propagation — modelChain (real GPU)", () => {
     }));
     runFrame(scene, device);
 
-    const want = view.forward.mul(m0.forward.mul(m1.forward)); // View · Model
+    const want = view.forward.mul(m0.mul(m1).forward); // View · Model, Model = m0 then m1 (chain [leaf, root])
     expectMatClose(await readFloats(device, heap, 0, 16), want);
     scene.dispose(); heap.destroy();
   });

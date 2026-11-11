@@ -122,7 +122,7 @@ export interface RenderObject {
   };
   /**
    * GPU transform propagation: this RO's `Model` as an ancestor trafo CHAIN
-   * (root→leaf order, constant runs folded) instead of a single composed
+   * (`[leaf, …, root]` order, constant runs folded) instead of a single composed
    * `ModelTrafo` aval. The scene-graph emits this so a shared root trafo over
    * N objects never fans out to N composed CPU avals — the heap composes each
    * RO's Model on the GPU. Heap-path only (the legacy path composes on CPU).
