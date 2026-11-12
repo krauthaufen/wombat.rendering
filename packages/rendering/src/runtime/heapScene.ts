@@ -3675,9 +3675,12 @@ export function buildHeapScene(
     let specCur = specIn;
     if (specIn.geometry !== undefined) {
       const g = specIn.geometry.getValue(outerTok);
-      specCur = specIn.indices !== undefined
-        ? { ...specIn, indexCount: g.count, firstIndex: g.firstIndex }
-        : { ...specIn, vertexCount: g.count };
+      // Chained, not spread: row specs (heapAdapter) keep shared fields
+      // like `effect` on their prototype, which a spread would drop.
+      const own = (value: unknown): PropertyDescriptor => ({ value, enumerable: true });
+      specCur = Object.create(specIn, specIn.indices !== undefined
+        ? { indexCount: own(g.count), firstIndex: own(g.firstIndex) }
+        : { vertexCount: own(g.count) }) as HeapDrawSpec;
       subscribeGeometry(specIn.geometry, drawId);
     }
     // A strip is drawn as the list of its primitives — a bucket is ONE
