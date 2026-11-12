@@ -127,6 +127,28 @@ function releaseShared(device: GPUDevice, src: RawTextureSource | ExternalTextur
   if (--e.refs === 0) { table.delete(src); e.texture.destroy(); }
 }
 
+/**
+ * A resource that is the ONLY user of `from`'s texture and moves to a source
+ * of the same shape keeps that texture: the new pixels are uploaded into it
+ * (a texture updated every frame must not be reallocated every frame).
+ * Undefined when the texture is shared, the shape differs, or `to` already
+ * has a texture of its own.
+ */
+function retargetShared(
+  device: GPUDevice,
+  from: RawTextureSource | ExternalTextureSource,
+  to: RawTextureSource | ExternalTextureSource,
+): SharedTexture | undefined {
+  const table = sharedByDevice.get(device);
+  const e = table?.get(from);
+  if (table === undefined || e === undefined || e.refs !== 1 || table.has(to)) return undefined;
+  if (from.kind !== to.kind || !descsEqual(descFor(from), descFor(to))) return undefined;
+  table.delete(from);
+  table.set(to, e);
+  if (to.kind === "raw") uploadRaw(device, e.texture, to); else uploadExternal(device, e.texture, to);
+  return e;
+}
+
 function mipCount(w: number, h: number): number {
   return Math.floor(Math.log2(Math.max(w, h))) + 1;
 }
@@ -191,6 +213,10 @@ class AdaptiveTexture extends AdaptiveResource<GPUTexture> {
     }
     if ((this.opts.usage ?? 0) === 0) {
       if (this._shared !== src.source) {
+        if (this._shared !== undefined) {
+          const kept = retargetShared(this.device, this._shared, src.source);
+          if (kept !== undefined) { this._shared = src.source; return kept.texture; }
+        }
         const e = acquireShared(this.device, src.source, this.opts.label);
         this.dropShared();
         this._shared = src.source;

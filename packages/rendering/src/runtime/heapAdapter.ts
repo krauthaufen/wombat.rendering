@@ -776,7 +776,7 @@ function buildFlatSpec(
       // via incRef per cycle (paired with our release closure). Without
       // this drop, every cached HeapDrawSpec (re-introduced across
       // aset add/remove cycles) leaves the atlas entry pinned forever.
-      pool.release(acq.ref);
+      pool.release(acq.ref, texAvalTyped);
       // Heap-side re-acquire hook (attached after the literal so the
       // strict HeapTextureSet typing stays clean): if the entry was
       // evicted between heap remove/add cycles, addDraw acquires a
@@ -793,7 +793,7 @@ function buildFlatSpec(
         sampler: samplerVal,
         page: acq.page,
         poolRef: acq.ref,
-        release: () => pool.release(cell.ref),
+        release: () => pool.release(cell.ref, texAvalTyped),
         // Reactivity hooks: heapScene subscribes to `sourceAval`; on
         // mark, drains via `repack(newTex)` — the pool frees the old
         // sub-rect, acquires a new one, and the heap path rewrites

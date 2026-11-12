@@ -156,9 +156,17 @@ interface AtlasEntry {
    */
   aliases: aval<ITexture>[];
   /**
-   * Inner-resource reference used as the byValueKey for §5b dedup
-   * (GPUTexture for kind:"gpu", HostTextureSource for kind:"host").
-   * Undefined for non-constant avals (identity-only path).
+   * How many of `refcount` each alias holds (the refs taken with that
+   * aval: `acquire`, `incRef`, `pinEntry`, less its `release`s). When a
+   * changing alias moves to another texture (`repack`) exactly its
+   * share leaves this entry and goes to the new one.
+   */
+  aliasRefs: Map<aval<ITexture>, number>;
+  /**
+   * The host source this sub-rect was uploaded from (HostTextureSource
+   * for kind:"host"): every aval whose value has that source shares the
+   * entry, constant or not. Undefined when the entry has no host source
+   * (GPU-backed).
    */
   readonly valueKey: GPUTexture | HostTextureSource | undefined;
   readonly format: AtlasPageFormat;
@@ -204,6 +212,12 @@ export interface AtlasAcquireOptions {
    * `floor(log2(max(w,h))) + 1` (full chain to 1×1).
    */
   readonly numMips?: number;
+}
+
+/** Adds `d` to the refs `av` holds on `e` (see `AtlasEntry.aliasRefs`). */
+function bumpAlias(e: { aliasRefs: Map<aval<ITexture>, number> }, av: aval<ITexture>, d: number): void {
+  const n = (e.aliasRefs.get(av) ?? 0) + d;
+  if (n > 0) e.aliasRefs.set(av, n); else e.aliasRefs.delete(av);
 }
 
 /**
@@ -641,37 +655,30 @@ export class AtlasPool {
     if (existing !== undefined) {
       const wasIdle = existing.refcount === 0;
       existing.refcount++;
+      bumpAlias(existing, sourceAval, 1);
       if (wasIdle) this.lru.delete(existing.ref);
       return this.makeResult(existing);
     }
 
-    // §5b: value-equality dedup for constant avals. Two distinct
-    // constant avals wrapping the same inner GPUTexture or
-    // HostTextureSource share one sub-rect. We need a *value* (not
-    // just dimensions) to compute the key; pull from `opts.source`
-    // if provided, otherwise skip dedup (fresh allocation).
-    let valueKey: GPUTexture | HostTextureSource | undefined;
-    if (sourceAval.isConstant) {
-      const sourceVal = opts.source;
-      if (sourceVal !== undefined && sourceVal.host !== undefined) {
-        valueKey = sourceVal.host;
-      }
-      // For kind:"gpu" sources, opts.source.host is undefined; the
-      // caller (heapAdapter) provides the GPUTexture via a different
-      // path and we'd need to thread it through. v1: skip dedup for
-      // GPU-backed constants, dedup only host-backed constants. The
-      // realistic dedup case is shared ImageBitmap / ImageData; GPU
-      // textures are typically already deduped at the user layer.
-      if (valueKey !== undefined) {
-        const shared = this.entriesByValueKey.get(valueKey);
-        if (shared !== undefined) {
-          const wasIdle = shared.refcount === 0;
-          shared.refcount++;
-          shared.aliases.push(sourceAval);
-          this.entriesByAval.set(sourceAval, shared);
-          if (wasIdle) this.lru.delete(shared.ref);
-          return this.makeResult(shared);
-        }
+    // Sharing by source: every aval whose value has the same host source
+    // (the same ImageBitmap / raw pixels object) shares ONE sub-rect —
+    // changing avals too. (Until 0.25.15 only constant avals did, so N
+    // draws that each read "their" texture from a cell of their own took
+    // N sub-rects of the same image and filled the atlas.) A changing
+    // aval leaves the shared entry again when its value changes: see
+    // `repack`. We need the source to key on; without `opts.source.host`
+    // (GPU-backed textures) the entry is the aval's own.
+    const valueKey: HostTextureSource | undefined = opts.source?.host;
+    if (valueKey !== undefined) {
+      const shared = this.entriesByValueKey.get(valueKey);
+      if (shared !== undefined) {
+        const wasIdle = shared.refcount === 0;
+        shared.refcount++;
+        shared.aliases.push(sourceAval);
+        bumpAlias(shared, sourceAval, 1);
+        this.entriesByAval.set(sourceAval, shared);
+        if (wasIdle) this.lru.delete(shared.ref);
+        return this.makeResult(shared);
       }
     }
 
@@ -839,21 +846,46 @@ export class AtlasPool {
       );
     }
 
-    // Repack on a deduped entry (multiple aliases sharing one
-    // sub-rect) is undefined: we'd be free-and-realloc'ing the
-    // sub-rect underneath the OTHER aliases. The dedup path only
-    // engages for `isConstant` avals, which can't fire mark
-    // callbacks → repack(constant) shouldn't ever happen via the
-    // reactivity loop. If a caller invokes it manually we'd rather
-    // throw than silently corrupt the other aliases.
+    const acqOpts: AtlasAcquireOptions = {
+      ...opts,
+      ...(opts.source === undefined && desc.host !== undefined
+        ? { source: { width: desc.width, height: desc.height, host: desc.host } }
+        : {}),
+    };
+    const newKey = acqOpts.source?.host;
+    // The refs this aval holds on its entry: they move with it.
+    const share = old.aliasRefs.get(sourceAval)
+      ?? (old.aliases.length === 1 ? old.refcount : 0);
+
     if (old.aliases.length > 1) {
-      throw new Error(
-        "AtlasPool.repack: cannot repack a deduped entry shared by multiple constant avals",
-      );
+      // The entry is SHARED with other avals: it stays as it is for them.
+      // Only this aval leaves, taking its share of the refcount along.
+      // An aval that ticked but still has the source the entry was
+      // uploaded from stays where it is (a value recomputed to the same
+      // image; nothing is uploaded again). Pixels changed in place are
+      // not seen through a shared entry: hand over a new source object.
+      if (newKey !== undefined && newKey === old.valueKey) return this.makeResult(old);
+      this.entriesByAval.delete(sourceAval);
+      const acq = this.acquire(fmt, sourceAval, desc.width, desc.height, acqOpts);
+      if (acq === null) {                  // atlas full: nothing changed
+        this.entriesByAval.set(sourceAval, old);
+        return null;
+      }
+      // `acquire` bound the aval to its new entry and counted one ref.
+      const target = this.entriesByRef.get(acq.ref)!;
+      target.refcount += share - 1;
+      bumpAlias(target, sourceAval, share - 1);
+      if (target.refcount === 0) { this.lru.delete(target.ref); this.lru.set(target.ref, target); }
+      // leave the old entry
+      old.aliases.splice(old.aliases.indexOf(sourceAval), 1);
+      old.aliasRefs.delete(sourceAval);
+      old.refcount -= share;
+      if (old.refcount <= 0) { old.refcount = 0; this.lru.delete(old.ref); this.lru.set(old.ref, old); }
+      return this.makeResult(target);
     }
 
+    // The aval's own entry.
     // 1. Free the old rect from its page's packer + drop the maps.
-    const savedRefcount = old.refcount;
     const oldPages = this.pagesByFormat.get(old.format)!;
     const oldPage = oldPages[old.pageId];
     if (oldPage !== undefined) {
@@ -862,25 +894,20 @@ export class AtlasPool {
     this.entriesByRef.delete(old.ref);
     this.entriesByAval.delete(sourceAval);
     if (old.valueKey !== undefined) this.entriesByValueKey.delete(old.valueKey);
+    this.lru.delete(old.ref);
 
-    // 2. Acquire a fresh placement for the new texture. Reuse the
-    //    `acquire` algorithm — entriesByAval no longer has us, so it
-    //    picks the existing-pages-first path naturally.
-    const acqOpts: AtlasAcquireOptions = {
-      ...opts,
-      ...(opts.source === undefined && desc.host !== undefined
-        ? { source: { width: desc.width, height: desc.height, host: desc.host } }
-        : {}),
-    };
+    // 2. Acquire a placement for the new texture: a sub-rect another
+    //    aval already holds for the same source, or a fresh one.
     const acq = this.acquire(fmt, sourceAval, desc.width, desc.height, acqOpts);
-    // Atlas full: the caller keeps the OLD sub-rect (already freed above is not
-    // possible here — repack only frees after a successful acquire), so the
-    // texture simply doesn't update this cycle.
     if (acq === null) return null;
 
-    // 3. Restore the original refcount (acquire set it to 1).
+    // 3. The aval's refs move to the new entry (acquire counted one).
     const newEntry = this.entriesByRef.get(acq.ref);
-    if (newEntry !== undefined) newEntry.refcount = savedRefcount;
+    if (newEntry !== undefined) {
+      newEntry.refcount += share - 1;
+      bumpAlias(newEntry, sourceAval, share - 1);
+      if (newEntry.refcount === 0) { this.lru.delete(newEntry.ref); this.lru.set(newEntry.ref, newEntry); }
+    }
     return acq;
   }
 
@@ -891,10 +918,11 @@ export class AtlasPool {
    * texture. Eviction (actual `actuallyFree`) happens lazily when a
    * fresh acquire can't fit and we need to reclaim packer space.
    */
-  release(ref: number): void {
+  release(ref: number, sourceAval?: aval<ITexture>): void {
     const e = this.entriesByRef.get(ref);
     if (e === undefined) return;
     e.refcount--;
+    if (sourceAval !== undefined) bumpAlias(e, sourceAval, -1);
     if (e.refcount > 0) return;
     // Hold the entry idle in the LRU. Move-to-end (Map insertion-order
     // semantics): delete + set re-positions a key that was already
@@ -915,11 +943,12 @@ export class AtlasPool {
    * Returns `true` if the bump was applied; `false` if the entry has
    * been evicted in the meantime (caller must fall back to re-acquire).
    */
-  incRef(ref: number): boolean {
+  incRef(ref: number, sourceAval?: aval<ITexture>): boolean {
     const e = this.entriesByRef.get(ref);
     if (e === undefined) return false;
     if (e.refcount === 0) this.lru.delete(e.ref);
     e.refcount++;
+    if (sourceAval !== undefined) bumpAlias(e, sourceAval, 1);
     return true;
   }
 
@@ -984,6 +1013,7 @@ export class AtlasPool {
     if (e === undefined) return false;
     if (e.refcount === 0) this.lru.delete(e.ref);
     e.refcount++;
+    bumpAlias(e, sourceAval, 1);
     return true;
   }
 
@@ -991,7 +1021,7 @@ export class AtlasPool {
   unpinEntry(sourceAval: aval<ITexture>): void {
     const e = this.entriesByAval.get(sourceAval);
     if (e === undefined) return;
-    this.release(e.ref);
+    this.release(e.ref, sourceAval);
   }
 
   /** Destroy the per-format array textures. The pool becomes unusable. */
@@ -1049,6 +1079,7 @@ export class AtlasPool {
     const h = placed.max.y - placed.min.y + 1;
     const entry: AtlasEntry = {
       aliases: [aval],
+      aliasRefs: new Map([[aval, 1]]),
       valueKey,
       format,
       pageId,

@@ -3975,7 +3975,7 @@ export function buildHeapScene(
       // (pageId, origin, size) are stale and the new acquire's values
       // overwrite them before packAtlasTextureFields is re-called.
       if (atlasPool !== undefined) {
-        const ok = atlasPool.incRef(spec.textures.poolRef);
+        const ok = atlasPool.incRef(spec.textures.poolRef, spec.textures.sourceAval as aval<ITexture> | undefined);
         if (!ok) {
           // Entry was evicted while the cached spec was idle in heap-
           // remove state. Acquire a fresh sub-rect, redirect the spec
