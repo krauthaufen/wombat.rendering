@@ -738,7 +738,9 @@ function buildFlatSpec(
       pool !== undefined &&
       dims !== null &&
       atlasFormat !== null &&
-      AtlasPool.eligibleSize(dims.width, dims.height)
+      // a texture too large for the shared pages gets a page of its own
+      // (a solo page: docs/heap-large-textures.md)
+      (AtlasPool.eligibleSize(dims.width, dims.height) || AtlasPool.soloSize(dims.width, dims.height, dims.mipLevelCount > 1))
     ) {
       const wantsMips = dims.mipLevelCount > 1;
       const acq = pool.acquire(

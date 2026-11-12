@@ -5,12 +5,12 @@
 // the heap; the atlas can't take it, heapAdapter routed it to the standalone
 // (Tier-L) branch, which only takes `kind: "gpu"` textures and threw
 // "standalone path requires ITexture.kind === 'gpu'" from the frame callback
-// (a decoded 4096² GLB texture in a 3D Tiles leaf). It must go to the legacy
-// renderer instead: a hybrid scene atlas-compiles every textured effect, so
-// even an uploaded standalone texture would be sampled through the atlas.
+// (a decoded 4096² GLB texture in a 3D Tiles leaf). It went to the legacy
+// renderer then; since solo pages it is a heap draw on a page of its own
+// (docs/heap-large-textures.md).
 //
 // One hybrid scene, two ROs with the same textured effect:
-//   - LEFT:  2048×2048 solid-red host texture  → legacy.
+//   - LEFT:  2048×2048 solid-red host texture  → heap, a solo page.
 //   - RIGHT: 64×64 solid-blue host texture     → heap, atlas.
 // Asserts both render with their own texture, and no GPU errors.
 
@@ -71,7 +71,7 @@ function quadRO(xMin: number, xMax: number, tex: ITexture): RenderObject {
 }
 
 describe("host texture over the atlas cap — real GPU", () => {
-  it("a 2048² host texture renders through the legacy path next to an atlas draw", async () => {
+  it("a 2048² host texture renders on a page of its own next to an atlas draw", async () => {
     const device = await requestRealDevice();
     const errors: GPUError[] = [];
     device.onuncapturederror = (e) => errors.push(e.error);
@@ -109,13 +109,13 @@ describe("host texture over the atlas cap — real GPU", () => {
       if (errors.length > 0) {
         throw new Error("GPU errors:\n  " + errors.map(e => (e as { message?: string }).message ?? String(e)).join("\n  "));
       }
-      expect(scene.heapTotalDraws(), "the 64² RO rides the heap").toBe(1);
-      expect(scene.__legacyCount(), "the 2048² RO goes legacy").toBe(1);
+      expect(scene.heapTotalDraws(), "both ride the heap").toBe(2);
+      expect(scene.__legacyCount(), "none goes legacy").toBe(0);
 
       const pixels = await readTexturePixels(device, colorTex);
       const at = (x: number, y: number) => { const o = (y * W + x) * 4; return [pixels[o]!, pixels[o + 1]!, pixels[o + 2]!]; };
       const [lr, lg, lb] = at(8, 8);
-      expect(lr, `left red (legacy 2048² host texture), got ${[lr, lg, lb]} / right ${at(24, 8)}`).toBeGreaterThan(200);
+      expect(lr, `left red (2048² host texture, solo page), got ${[lr, lg, lb]} / right ${at(24, 8)}`).toBeGreaterThan(200);
       expect(lg).toBeLessThan(60); expect(lb).toBeLessThan(60);
       const [rr, rg, rb] = at(24, 8);
       expect(rb, "right blue (atlas)").toBeGreaterThan(200);

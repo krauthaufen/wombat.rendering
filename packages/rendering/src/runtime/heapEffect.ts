@@ -130,7 +130,9 @@ export interface FragmentOutputLayout {
 // h15: wombat.shader fuses every spelling of a builtin output into one port
 // (gl_Position / Positions, gl_FragDepth / Depth) — fused WGSL changed, and
 // a cached pre-fix compile (two @builtin(position) outputs) must not survive.
-export const HEAP_PERSIST_VERSION_BASE = "h15";
+// h16: atlas UVs normalized by the bound array's size (solo pages for large
+// textures, docs/heap-large-textures.md) instead of the page-size constant.
+export const HEAP_PERSIST_VERSION_BASE = "h16";
 export const HEAP_PERSIST_VERSION = HEAP_PERSIST_VERSION_BASE; // legacy export (see persistVersionNow)
 /** The wombat.shader version compiling the cached WGSL: a compiler change
  *  (fusion, linking, emit) re-keys the cache instead of serving WGSL the old
@@ -866,7 +868,9 @@ fn atlasSampleAtMip(
     px = floor(px) + 0.5;
     py = floor(py) + 0.5;
   }
-  let atlasUv = vec2<f32>(px, py) / ${atlasPageSizeConst()}.0;
+  // by the bound array's size: the shared pages, or a solo page sized to
+  // one large texture (docs/heap-large-textures.md)
+  let atlasUv = vec2<f32>(px, py) / select(vec2<f32>(textureDimensions(atlasLinear)), vec2<f32>(textureDimensions(atlasSrgb)), format == 1u);
 ${generateAtlasSwitch()}
   return vec4<f32>(0.0);
 }
@@ -905,11 +909,6 @@ fn atlasSample(
 }
 
 import { atlasPageSizeNow } from "./textureAtlas/atlasPool.js";
-function atlasPageSizeConst(): string {
-  // Embedded at shader-gen time — matches the pool's configured page
-  // size (RuntimeOptions.atlasPageSize; set before any shader gen).
-  return String(atlasPageSizeNow());
-}
 
 /**
  * Emit the 3 atlas binding declarations: one linear

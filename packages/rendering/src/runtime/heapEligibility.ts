@@ -55,8 +55,11 @@ import { AtlasPool } from "./textureAtlas/atlasPool.js";
 // 4096: a decoded 2048² or 4096² rgba8 texture, e.g. a 3D Tiles leaf's,
 // was heap-eligible and threw "standalone path requires ITexture.kind ===
 // 'gpu'" from the frame callback.)
-const atlasable = (format: GPUTextureFormat, w: number, h: number): boolean =>
-  AtlasPool.eligibleFormat(format) !== null && AtlasPool.eligibleSize(w, h);
+// (A texture too large for the shared pages gets a page of its own, a
+// solo page: docs/heap-large-textures.md. Only one too large even for that
+// goes to legacy.)
+const atlasable = (format: GPUTextureFormat, w: number, h: number, mips: boolean): boolean =>
+  AtlasPool.eligibleFormat(format) !== null && (AtlasPool.eligibleSize(w, h) || AtlasPool.soloSize(w, h, mips));
 
 /**
  * Total per-RO payload (attribute + instance + index bytes) above
@@ -123,7 +126,7 @@ function isHeapServableTexture(t: ITexture): boolean {
   if (src === undefined || src === null) return false;
   if (src.kind === "raw") {
     if ((src.depthOrArrayLayers ?? 1) !== 1) return false;
-    return atlasable(src.format, src.width, src.height);
+    return atlasable(src.format, src.width, src.height, (src.mipLevelCount ?? 1) > 1);
   }
   // external — read width/height off the source. Most types have
   // it; HTMLVideoElement uses videoWidth/videoHeight. Sources
@@ -147,7 +150,7 @@ function isHeapServableTexture(t: ITexture): boolean {
   // Still undimensioned (not yet decoded): eligible until it resolves, as
   // before — heapAdapter handles undimensioned sources gracefully.
   if (w <= 0 || h <= 0) return AtlasPool.eligibleFormat(src.format ?? "rgba8unorm") !== null;
-  return atlasable(src.format ?? "rgba8unorm", w, h);
+  return atlasable(src.format ?? "rgba8unorm", w, h, src.generateMips === true);
 }
 
 // Materialise every attribute view a provider knows about. Eligibility

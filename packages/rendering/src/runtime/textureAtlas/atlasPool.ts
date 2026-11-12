@@ -130,6 +130,30 @@ export interface AtlasPage {
    * array with it at runtime.
    */
   readonly pageId: number;
+  /**
+   * Set on a *solo page*: a texture too large for the shared pages, given a
+   * one-layer array of its own sized to it (docs/heap-large-textures.md).
+   * `pageId` is then 0 (its only layer); heap buckets bind the page in place
+   * of the format's array and key on this id.
+   */
+  readonly soloId?: number;
+}
+
+/** The largest texture side a solo page is made for (WebGPU's guaranteed
+ *  `maxTextureDimension2D`, less the gutters and the mip column). */
+export const SOLO_MAX_DIM = 8192;
+
+/** The reserved rect of one entry: mip 0 plus its 2-px gutters, and with
+ *  mips the Iliffe column beside it. */
+export function reservedSize(width: number, height: number, numMips: number): { w: number; h: number } {
+  const w = numMips > 1 ? (width + 4) + Math.max(1, width >> 1) + 4 : width + 4;
+  let h = height + 4;
+  if (numMips > 1) {
+    let stackedH = 0;
+    for (let k = 1; k < numMips; k++) stackedH += Math.max(1, height >> k) + 4;
+    h = Math.max(h, stackedH);
+  }
+  return { w, h };
 }
 
 export interface AtlasAcquisition {
@@ -179,6 +203,8 @@ interface AtlasEntry {
   refcount: number;
   /** Stable handle returned to callers. */
   readonly ref: number;
+  /** The entry's own page when it is a solo page (destroyed with it). */
+  solo?: AtlasPage;
 }
 
 /** Source descriptor accepted by `acquire` (small enough not to need a full ITexture). */
@@ -381,7 +407,7 @@ export class AtlasPool {
   isFull(format: AtlasPageFormat): boolean {
     const pages = this.pagesByFormat.get(format);
     if (pages === undefined || pages.length < this.capFor(format)) return false;
-    for (const e of this.lru.values()) if (e.format === format) return false; // something is evictable
+    for (const e of this.lru.values()) if (e.format === format && e.solo === undefined) return false; // something is evictable
     return true;
   }
   private nextRef = 1;
@@ -635,6 +661,88 @@ export class AtlasPool {
     return width > 0 && height > 0 && width <= ATLAS_MAX_DIM && height <= ATLAS_MAX_DIM;
   }
 
+  /** Too large for the shared pages, but a solo page can hold it (with
+   *  mips: its column beside mip 0 must fit too). */
+  static soloSize(width: number, height: number, wantsMips = false): boolean {
+    if (width <= 0 || height <= 0 || AtlasPool.eligibleSize(width, height)) return false;
+    const r = reservedSize(width, height, wantsMips ? defaultMipCount(width, height) : 1);
+    return r.w <= SOLO_MAX_DIM && r.h <= SOLO_MAX_DIM;
+  }
+
+  private nextSoloId = 1;
+  private readonly soloLostListeners = new Set<() => void>();
+  /** Solo pages the device refused (out of memory): their draws are placed
+   *  again later, as for lost atlas layers. */
+  onSoloLost(cb: () => void): { dispose(): void } {
+    this.soloLostListeners.add(cb);
+    return { dispose: () => { this.soloLostListeners.delete(cb); } };
+  }
+
+  /** A page of its own for one large texture: a one-layer array sized to
+   *  its reserved rect, filled like an atlas entry. Null when the device
+   *  limit is exceeded. */
+  private acquireSolo(
+    format: AtlasPageFormat, sourceAval: aval<ITexture>, width: number, height: number,
+    numMips: number, source: AtlasSource | undefined, valueKey: HostTextureSource | undefined,
+  ): AtlasAcquisition | null {
+    const r = reservedSize(width, height, numMips);
+    const max = (this.device as { limits?: { maxTextureDimension2D?: number } }).limits?.maxTextureDimension2D ?? SOLO_MAX_DIM;
+    if (r.w > max || r.h > max) return null;
+    const scoped = typeof (this.device as { pushErrorScope?: unknown }).pushErrorScope === "function";
+    if (scoped) this.device.pushErrorScope("out-of-memory");
+    const texture = this.device.createTexture({
+      label: `atlas/solo/${format}/${width}x${height}`,
+      size: { width: r.w, height: r.h, depthOrArrayLayers: 1 },
+      format,
+      mipLevelCount: 1,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    const scope = scoped ? this.device.popErrorScope() : undefined;
+    const page: AtlasPage = {
+      format, texture, pageId: 0, soloId: this.nextSoloId++,
+      packing: TexturePacking.empty<number>(new V2i(r.w, r.h), false),
+    };
+    const placed = page.packing.tryAdd(this.nextRef, new V2i(r.w, r.h));
+    if (placed === null) { texture.destroy(); return null; }
+    page.packing = placed;
+    const acq = this.finalize(sourceAval, format, 0, page, source, width, height, numMips, valueKey, page);
+    if (scope !== undefined) {
+      void scope.then((error) => {
+        if (error === null) return;
+        console.warn(`texture atlas: the device could not allocate a ${r.w}×${r.h} page for a large texture (${error.message.split("\n")[0]}); its draws are placed again later`);
+        const e = this.entriesByRef.get(acq.ref);
+        if (e !== undefined) this.dropSolo(e);
+        for (const cb of this.soloLostListeners) cb();
+      });
+    }
+    return acq;
+  }
+
+  /** Free a solo entry and its page. */
+  private dropSolo(e: AtlasEntry): void {
+    this.entriesByRef.delete(e.ref);
+    for (const a of e.aliases) this.entriesByAval.delete(a);
+    if (e.valueKey !== undefined && this.entriesByValueKey.get(e.valueKey) === e) this.entriesByValueKey.delete(e.valueKey);
+    this.lru.delete(e.ref);
+    e.solo?.texture.destroy();
+  }
+
+  /** Free every solo page no draw has held for a whole frame (no LRU for
+   *  them: they are big). The heap calls this once per update. */
+  freeIdleSolo(): number {
+    let n = 0;
+    // idle across two calls (a frame): a page released while its draw's
+    // spec is built and taken again when the draw is added stays
+    for (const [, e] of this.lru) {
+      if (e.solo === undefined) continue;
+      if (this.soloIdle.has(e.ref)) { this.soloIdle.delete(e.ref); this.dropSolo(e); n++; }
+      else this.soloIdle.add(e.ref);
+    }
+    for (const ref of this.soloIdle) if (!this.lru.has(ref)) this.soloIdle.delete(ref);
+    return n;
+  }
+  private readonly soloIdle = new Set<number>();
+
   /**
    * Acquire (or share) a sub-rect. The returned `AtlasAcquisition`
    * gives the page slot index plus the mip-0 `origin`/`size` (in
@@ -687,6 +795,11 @@ export class AtlasPool {
       ? Math.max(1, Math.min(opts.numMips ?? defaultMipCount(width, height),
                              defaultMipCount(width, height)))
       : 1;
+
+    // Too large for the shared pages: a page of its own.
+    if (!AtlasPool.eligibleSize(width, height)) {
+      return this.acquireSolo(format, sourceAval, width, height, numMips, opts.source, valueKey);
+    }
 
     // Every sub-rect (and every mip slot in mipped pyramids) carries a
     // 2-px gutter on each side. Inner ring = clamp-replicate edge
@@ -741,7 +854,8 @@ export class AtlasPool {
     // existing gaps. Only entries with `format` matching the request
     // can help — wrong-format entries live on different pages.
     for (const [ref, entry] of this.lru) {
-      if (entry.format !== format) continue;
+      // (a solo page frees no room on the shared pages)
+      if (entry.format !== format || entry.solo !== undefined) continue;
       this.actuallyFree(entry);
       void ref;
       const fit = tryFitInExisting();
@@ -821,7 +935,7 @@ export class AtlasPool {
       // its placement was lost with its layer (out of memory): place it afresh
       const d = describeAtlasTexture(newTexture);
       const f = d === null ? null : AtlasPool.eligibleFormat(d.format);
-      if (d === null || f === null || !AtlasPool.eligibleSize(d.width, d.height)) {
+      if (d === null || f === null || !(AtlasPool.eligibleSize(d.width, d.height) || AtlasPool.soloSize(d.width, d.height))) {
         throw new Error("AtlasPool.repack: source aval has no live entry");
       }
       return this.acquire(f, sourceAval, d.width, d.height, {
@@ -840,7 +954,7 @@ export class AtlasPool {
         `AtlasPool.repack: new texture format ${desc.format} is not Tier-S eligible`,
       );
     }
-    if (!AtlasPool.eligibleSize(desc.width, desc.height)) {
+    if (!(AtlasPool.eligibleSize(desc.width, desc.height) || AtlasPool.soloSize(desc.width, desc.height, opts.wantsMips === true))) {
       throw new Error(
         `AtlasPool.repack: new texture ${desc.width}×${desc.height} exceeds Tier-S cap`,
       );
@@ -887,10 +1001,12 @@ export class AtlasPool {
     // The aval's own entry.
     // 1. Free the old rect from its page's packer + drop the maps.
     const oldPages = this.pagesByFormat.get(old.format)!;
-    const oldPage = oldPages[old.pageId];
+    const oldPage = old.solo === undefined ? oldPages[old.pageId] : undefined;
     if (oldPage !== undefined) {
       oldPage.packing = oldPage.packing.remove(old.ref);
     }
+    // a solo page goes with its entry (the new texture gets a page of its own)
+    old.solo?.texture.destroy();
     this.entriesByRef.delete(old.ref);
     this.entriesByAval.delete(sourceAval);
     if (old.valueKey !== undefined) this.entriesByValueKey.delete(old.valueKey);
@@ -957,6 +1073,7 @@ export class AtlasPool {
    * from every lookup map. Caller must guarantee `refcount === 0`.
    */
   private actuallyFree(e: AtlasEntry): void {
+    if (e.solo !== undefined) { this.dropSolo(e); return; }
     const pages = this.pagesByFormat.get(e.format)!;
     const page = pages[e.pageId];
     if (page !== undefined) {
@@ -1067,6 +1184,7 @@ export class AtlasPool {
     mip0H: number,
     numMips: number,
     valueKey: GPUTexture | HostTextureSource | undefined,
+    solo?: AtlasPage,
   ): AtlasAcquisition {
     const ref = this.nextRef++;
     const placed = page.packing.used.get(ref);
@@ -1088,6 +1206,7 @@ export class AtlasPool {
       numMips,
       refcount: 1,
       ref,
+      ...(solo !== undefined ? { solo } : {}),
     };
     this.entriesByAval.set(aval, entry);
     this.entriesByRef.set(ref, entry);
@@ -1510,7 +1629,7 @@ export class AtlasPool {
   }
 
   private makeResult(e: AtlasEntry): AtlasAcquisition {
-    const page = this.pagesByFormat.get(e.format)![e.pageId]!;
+    const page = e.solo ?? this.pagesByFormat.get(e.format)![e.pageId]!;
     // Mip-0 interior sits at +2/+2 inside the reserved rect (skipping
     // the 2-px gutter ring on the top and left).
     return {

@@ -445,6 +445,12 @@ interface Bucket {
    * format page list, plus the shared atlas sampler).
    */
   isAtlasBucket: boolean;
+  /**
+   * The solo page every draw of this bucket samples (a texture too large for
+   * the shared pages, docs/heap-large-textures.md): bound in place of its
+   * format's array. Part of the bucket key.
+   */
+  soloPage?: AtlasPage;
   /** Per-local-slot atlas release callbacks. Drains on removeDraw. */
   readonly localAtlasReleases: ((() => void) | undefined)[];
   /**
@@ -2346,7 +2352,8 @@ export function buildHeapScene(
       for (const format of ATLAS_PAGE_FORMATS) {
         const binding = format === "rgba8unorm-srgb"
           ? ATLAS_SRGB_BINDING_BASE : ATLAS_LINEAR_BINDING_BASE;
-        const tex = atlasPool.textureFor(format);
+        const solo = bucket.soloPage !== undefined && bucket.soloPage.format === format ? bucket.soloPage.texture : undefined;
+        const tex = solo ?? atlasPool.textureFor(format);
         entries.push({
           binding,
           resource: tex !== undefined
@@ -2404,6 +2411,14 @@ export function buildHeapScene(
   // again, which `update` retries every frame until there is room.
   let atlasLostPending = false;
   if (atlasPool !== undefined) {
+    // a solo page the device refused: its draws are placed again, as lost layers are
+    atlasPool.onSoloLost(() => {
+      atlasLostPending = true;
+      redoGpuWork();
+      transact(() => markOutdated(sceneObj));
+    });
+  }
+  if (atlasPool !== undefined) {
     for (const f of ATLAS_PAGE_FORMATS) {
       atlasPool.onPageAdded(f, () => rebuildAllBindGroups(true));
       // (the loss is reported asynchronously: mark the scene so a frame
@@ -2430,6 +2445,38 @@ export function buildHeapScene(
 
   /** Places every live atlas draw whose placement was lost again; returns
    *  the header bytes rewritten. Draws that do not fit stay pending. */
+  // Draws whose texture moved to another page kind or solo page (a texture
+  // that grew past the shared pages' cap, or a solo page placed again):
+  // their bucket key changed, so they are added again (`update`).
+  const soloMoves = new Set<number>();
+  const soloIdOf = (p: AtlasPage | undefined): number => p?.soloId ?? 0;
+  /** Point a draw's atlas texture set at a new placement; a draw whose
+   *  page kind changed is queued to move bucket. Returns true if it moves. */
+  function retargetAtlas(bucket: Bucket, localSlot: number, ts: HeapTextureSet & { kind: "atlas" }, acq: { pageId: number; origin: V2f; size: V2f; numMips: number; page: AtlasPage; ref: number }): boolean {
+    (ts as { pageId: number }).pageId = acq.pageId;
+    (ts as { origin: V2f }).origin = acq.origin;
+    (ts as { size: V2f }).size = acq.size;
+    (ts as { numMips: number }).numMips = acq.numMips;
+    (ts as { page: AtlasPage }).page = acq.page;
+    (ts as { poolRef: number }).poolRef = acq.ref;
+    if (soloIdOf(acq.page) === soloIdOf(bucket.soloPage)) return false;
+    const drawId = bucket.localToDrawId[localSlot];
+    const spec = drawId === undefined ? undefined : drawIdToSpec[drawId];
+    if (drawId === undefined || spec === undefined) return false;
+    // the spec carries the texture set the draw is added with again
+    if (spec.textures !== ts && spec.textures?.kind === "atlas") retargetAtlasSet(spec.textures, acq);
+    soloMoves.add(drawId);
+    return true;
+  }
+  function retargetAtlasSet(ts: HeapTextureSet & { kind: "atlas" }, acq: { pageId: number; origin: V2f; size: V2f; numMips: number; page: AtlasPage; ref: number }): void {
+    (ts as { pageId: number }).pageId = acq.pageId;
+    (ts as { origin: V2f }).origin = acq.origin;
+    (ts as { size: V2f }).size = acq.size;
+    (ts as { numMips: number }).numMips = acq.numMips;
+    (ts as { page: AtlasPage }).page = acq.page;
+    (ts as { poolRef: number }).poolRef = acq.ref;
+  }
+
   function replaceLostAtlasPlacements(): number {
     if (!atlasLostPending || atlasPool === undefined) return 0;
     let pending = false;
@@ -2451,14 +2498,9 @@ export function buildHeapScene(
               : {}),
         });
         if (acq === null) { pending = true; continue; }
-        (ts as { pageId: number }).pageId = acq.pageId;
-        (ts as { origin: V2f }).origin = acq.origin;
-        (ts as { size: V2f }).size = acq.size;
-        (ts as { numMips: number }).numMips = acq.numMips;
-        (ts as { page: AtlasPage }).page = acq.page;
-        (ts as { poolRef: number }).poolRef = acq.ref;
         const retarget = (ts as unknown as { __retarget?: (ref: number) => void }).__retarget;
         if (retarget !== undefined) retarget(acq.ref);
+        if (retargetAtlas(bucket, localSlot, ts, acq)) continue;
         packAtlasTextureFields(bucket, localSlot, ts);
         const byteOff = localSlot * bucket.layout.drawHeaderBytes;
         if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
@@ -3343,7 +3385,8 @@ export function buildHeapScene(
     // GPUBuffers in its draw call. The shaders are unchanged
     // (refs are byte offsets within whichever chunk's buffer is
     // currently bound).
-    const bk = `family#${fam.schema.id}/c${chunkIdx}${standaloneTexKey(textures)}`;
+    const solo = textures?.kind === "atlas" ? textures.page.soloId : undefined;
+    const bk = `family#${fam.schema.id}/c${chunkIdx}${standaloneTexKey(textures)}${solo !== undefined ? `/solo${solo}` : ""}`;
     const existing = bucketByKey.get(bk);
     if (existing !== undefined) return existing;
 
@@ -3376,6 +3419,7 @@ export function buildHeapScene(
       norFieldIdx: fieldIdx.get("Normals") ?? -1,
       drawSlots: new Set<number>(), dirty: new Set<number>(),
       isAtlasBucket,
+      ...(solo !== undefined && textures?.kind === "atlas" ? { soloPage: textures.page } : {}),
       localAtlasReleases: [],
       localAtlasTextures: [],
       localAtlasArrIdx: [],
@@ -3714,6 +3758,26 @@ export function buildHeapScene(
         preferred !== undefined && fits(preferred) ? preferred
           : fits(newest) ? newest
             : arena.attrs.openPage();
+    }
+    // A solo page freed while the spec sat idle (a removed draw added again
+    // a frame later): placed again BEFORE the bucket is chosen, since the new
+    // page is another bucket's (the shared pages are one array, so atlas
+    // entries are re-placed further down, in the bucket they had).
+    if (atlasPool !== undefined && spec.textures?.kind === "atlas" && spec.textures.page.soloId !== undefined
+        && !atlasPool.isLive(spec.textures.poolRef) && spec.textures.sourceAval !== undefined) {
+      const ts = spec.textures;
+      const w = ts.size.x, h = ts.size.y;
+      const acq = atlasPool.acquire(ts.page.format as AtlasPageFormat, ts.sourceAval as aval<ITexture>, w, h, {
+        wantsMips: ts.numMips > 1,
+        ...(ts.host !== undefined ? { source: { width: w, height: h, host: ts.host } } : {}),
+      });
+      if (acq !== null) {
+        retargetAtlasSet(ts, acq);
+        const retarget = (ts as unknown as { __retarget?: (ref: number) => void }).__retarget;
+        if (retarget !== undefined) retarget(acq.ref);
+        // the ref counted below (incRef) is the draw's
+        atlasPool.release(acq.ref);
+      }
     }
     const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, chunkIdx, precomputedDescriptor);
     // User storage buffers (layout.storageBindings): bucket-level, set once.
@@ -4940,7 +5004,13 @@ export function buildHeapScene(
           // Atlas full → the texture keeps its current sub-rect this cycle; the
           // draw shows the previous pixels rather than the pass dying.
           if (acq === null) continue;
-          for (const r of refs) {
+          for (const r of [...refs]) {
+            const cur = r.bucket.localAtlasTextures[r.localSlot];
+            if (cur !== undefined && soloIdOf(acq.page) !== soloIdOf(r.bucket.soloPage)) {
+              // another page kind: the draw moves bucket (below)
+              retargetAtlas(r.bucket, r.localSlot, cur, acq);
+              continue;
+            }
             const newTextures: HeapTextureSet & { kind: "atlas" } = {
               kind: "atlas",
               format: acq.page.format,
@@ -4969,6 +5039,21 @@ export function buildHeapScene(
 
       // 1e. Atlas placements lost with an out-of-memory layer: place again.
       totalDirtyBytes += replaceLostAtlasPlacements();
+
+      // 1f. Draws whose texture moved between page kinds: added again, so
+      //     they land in the bucket of their page.
+      if (soloMoves.size > 0) {
+        const moves = [...soloMoves];
+        soloMoves.clear();
+        for (const drawId of moves) {
+          const spec = drawIdToSpec[drawId];
+          if (spec === undefined) continue;
+          removeDraw(drawId);
+          addDrawImpl(spec, tok, drawId);
+        }
+      }
+      // solo pages no draw holds any more go now (no LRU for them)
+      atlasPool?.freeIdleSolo();
 
       // 2. Per-bucket: (rare) header re-pack — only fires when the
       //    bucket's drawHeap GrowBuffer reallocated and we need to

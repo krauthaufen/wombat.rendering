@@ -1,14 +1,16 @@
 // Real-GPU regression: many legacy-path RenderObjects sampling one host
 // texture upload it once.
 //
-// A texture over the atlas cap (ATLAS_MAX_DIM) sends its draws to the legacy
+// A texture too large for the heap (since solo pages: wider than a page of
+// its own can be, docs/heap-large-textures.md) sends its draws to the legacy
 // renderer, and prepareRenderObject gave every draw its own GPUTexture: a
 // 2432² sprite sheet under a few thousand quads (PoEtry's passive tree) ran
 // the GPU out of memory. The texture is now one GPU texture per host source
 // (per device), whether the draws share the aval or only its value.
 //
-// The repro is small on purpose: a 1100×4 texture (just over the cap) and
-// 40 draws, counting texture creations and uploads.
+// The repro is small on purpose: a 6000×4 texture with mips (too wide for a
+// page of its own with its mip column) and 40 draws, counting texture
+// creations and uploads.
 
 import { describe, expect, it } from "vitest";
 import { AVal, AdaptiveToken, HashMap, type aval } from "@aardworx/wombat.adaptive";
@@ -23,12 +25,12 @@ import { createFramebufferSignature } from "@aardworx/wombat.rendering/resources
 import { readTexturePixels, requestRealDevice } from "./_realGpu.js";
 import { makeHeapTestEffectTextured } from "../tests/_heapTestEffect.js";
 
-const TW = 1100, TH = 4;
+const TW = 6000, TH = 4;
 
 function solidRed(): ITexture {
   const data = new Uint8Array(TW * TH * 4);
   for (let i = 0; i < TW * TH; i++) { data[i * 4] = 255; data[i * 4 + 3] = 255; }
-  return ITexture.fromRaw({ data, width: TW, height: TH, format: "rgba8unorm" });
+  return ITexture.fromRaw({ data, width: TW, height: TH, format: "rgba8unorm", mipLevelCount: 2 });
 }
 
 function quadRO(i: number, n: number, texAval: aval<ITexture>): RenderObject {
@@ -99,7 +101,7 @@ async function run(makeAval: (tex: ITexture, i: number) => aval<ITexture>) {
     }
     await device.queue.onSubmittedWorkDone();
     if (errors.length > 0) throw new Error("GPU errors: " + errors.map(e => (e as { message?: string }).message).join("; "));
-    expect(scene.__legacyCount(), "over the atlas cap: legacy").toBe(N);
+    expect(scene.__legacyCount(), "too large for the heap: legacy").toBe(N);
     const pixels = await readTexturePixels(device, colorTex);
     for (const x of [1, 40, 78]) expect(pixels[(4 * W + x) * 4], `red at x=${x}`).toBeGreaterThan(200);
     return { created, uploads };

@@ -113,26 +113,28 @@ describe("isHeapEligible — texture escalation rules", () => {
     expect(isHeapEligible(withTexSampler(tex)).getValue(AdaptiveToken.top)).toBe(true);
   });
 
-  it("RO with an oversized host texture (5000×500) is ineligible", () => {
+  it("RO with a host texture too large even for a page of its own (9000×500) is ineligible", () => {
     const tex = ITexture.fromRaw({
       data: new Uint8Array(4),     // payload size doesn't matter for the predicate
-      width: 5000, height: 500, format: "rgba8unorm",
+      width: 9000, height: 500, format: "rgba8unorm",
     });
     expect(isHeapEligible(withTexSampler(tex)).getValue(AdaptiveToken.top)).toBe(false);
   });
 
   // The heap draws host textures only through the atlas (a hybrid scene
-  // atlas-compiles every textured effect); what the atlas can't take goes
-  // to the legacy renderer instead of throwing in the standalone branch.
+  // atlas-compiles every textured effect): the shared pages, or a page of
+  // its own; what neither can take goes to the legacy renderer.
   it("RO with a host texture at the atlas cap (1024²) is eligible", () => {
     const tex = ITexture.fromRaw({ data: new Uint8Array(4), width: 1024, height: 1024, format: "rgba8unorm" });
     expect(isHeapEligible(withTexSampler(tex)).getValue(AdaptiveToken.top)).toBe(true);
   });
 
-  it("RO with a host texture over the atlas cap (2048², 4096²) is ineligible", () => {
-    for (const n of [1025, 2048, 4096]) {
-      const tex = ITexture.fromRaw({ data: new Uint8Array(4), width: n, height: 64, format: "rgba8unorm" });
-      expect(isHeapEligible(withTexSampler(tex)).getValue(AdaptiveToken.top), `${n} wide`).toBe(false);
+  // Over the atlas cap: a page of its own (a solo page,
+  // docs/heap-large-textures.md), not the legacy renderer.
+  it("RO with a host texture over the atlas cap (2048², 4096², 5000×500) is eligible", () => {
+    for (const [w, h] of [[1025, 64], [2048, 2048], [4096, 4096], [5000, 500]]) {
+      const tex = ITexture.fromRaw({ data: new Uint8Array(4), width: w!, height: h!, format: "rgba8unorm" });
+      expect(isHeapEligible(withTexSampler(tex)).getValue(AdaptiveToken.top), `${w}×${h}`).toBe(true);
     }
   });
 

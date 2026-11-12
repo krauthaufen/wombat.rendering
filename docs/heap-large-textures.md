@@ -1,6 +1,7 @@
 # Large host textures on the heap: a page of their own
 
-Status: design (2026-11-12). Asked for by PoEtry (2432² sprite sheets under 9,000 sprites) and the
+Status: implemented (2026-11-12): `AtlasPool` solo pages, heapScene bucket key and binding,
+eligibility; tests `tests-browser/heap-solo-page-real.test.ts`, `tests/atlas-solo-routing.test.ts`. Asked for by PoEtry (2432² sprite sheets under 9,000 sprites) and the
 user: "ideally the heap would just accept large textures and make them a chunk on their own since
 they often are atlases already".
 
@@ -26,7 +27,8 @@ A large host texture becomes a **page of its own**: an atlas-shaped texture size
   column beside mip 0: `(W+4) + (W/2+4)` wide). It is created when the first draw of that source
   arrives and filled with the same upload and gutter/mip kernels as an atlas entry. One solo page
   per source (keyed like atlas entries: by source, so draws that only share the value share it),
-  refcounted, destroyed when its last draw goes (no LRU: they are big).
+  refcounted, destroyed when no draw has held it for a whole frame (`freeIdleSolo`, once per
+  heap update; no LRU: they are big, and atlas eviction never frees one).
 - **Draws.** The draw header is the atlas placement: layer 0, the whole page's inner rectangle,
   mips and sampler bits as for any atlas entry. The shader is the atlas variant unchanged.
 - **Binding.** A solo page cannot be a layer of the format's array (its size differs), so the
@@ -39,14 +41,19 @@ A large host texture becomes a **page of its own**: an atlas-shaped texture size
   borders thanks to the gutters.
 - **Standalone branch.** Left as it is for `kind: "gpu"` textures (user-managed resources keep
   their own path); solo pages replace legacy for host textures only.
-- **Reactivity.** A texture aval that changes repacks as atlas entries do; when its size moves it
-  across the cap, the draw moves between an atlas entry and a solo page (remove + add, as a repack
-  that changes bucket).
+- **Reactivity.** A texture aval that changes repacks as atlas entries do; a draw whose page kind
+  or solo page changes (a new large texture is a new page, a size across the cap moves it between
+  atlas and solo) is removed and added again under its id, landing in its page's bucket. A solo
+  page freed while a draw's spec sat idle is placed again before the bucket is chosen.
+- **Shader.** Atlas coordinates are normalized by the bound array's size (`textureDimensions`)
+  instead of the page-size constant, so the same shader samples shared and solo pages
+  (heap persist version h16).
 - **Out of memory.** The solo page is allocated in the same device-error scope as atlas growth;
   if it fails the draw falls back to legacy for that texture (as atlas-full does today: the draw
   stays visible), retried when memory frees.
 - **Eligibility** then rejects only what cannot be sampled this way: cube (packed elsewhere),
-  array, 3D, external/video, and sizes whose solo page exceeds `maxTextureDimension2D`.
+  array, 3D, external/video, and sizes whose solo page exceeds `SOLO_MAX_DIM` (8192, with mips the
+  column beside mip 0 included).
 
 ## Tests
 
