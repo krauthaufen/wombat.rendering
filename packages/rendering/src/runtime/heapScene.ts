@@ -601,6 +601,14 @@ export interface HeapDrawSpec {
   readonly firstIndex?: number;
   readonly indexCount?: number;
   /**
+   * The draw's count and first index as they change (a mesh whose data
+   * changes: wombat.dom's heap-safe draw call). Overrides `vertexCount`
+   * (non-indexed) or `indexCount` / `firstIndex` (indexed) with its current
+   * value; a change adds the draw again under its id, so the record follows
+   * the data (it kept its first count: an empty mesh was never drawn).
+   */
+  readonly geometry?: aval<{ readonly count: number; readonly firstIndex: number }>;
+  /**
    * Optional texture set. When present, adds a `texture_2d<f32>` at
    * binding 4 and a sampler at binding 5; the FS must declare them.
    * Buckets with different `textures` (by reference) cannot share a
@@ -1266,6 +1274,20 @@ export function buildHeapScene(
     drawIdToCountCallback.delete(drawId);
     drawIdToCountAval.delete(drawId);
     countDirty.delete(drawId);
+  }
+
+  // ─── HeapDrawSpec.geometry: a count that changes ──────────────────
+  const drawIdToGeometryCallback = new Map<number, IDisposable>();
+  const geometryDirty = new Set<number>();
+  function subscribeGeometry(av: aval<unknown>, drawId: number): void {
+    if (av.isConstant || drawIdToGeometryCallback.has(drawId)) return;
+    drawIdToGeometryCallback.set(drawId, addMarkingCallback(av, () => { geometryDirty.add(drawId); }));
+  }
+  function unsubscribeGeometry(drawId: number): void {
+    const cb = drawIdToGeometryCallback.get(drawId);
+    if (cb === undefined) return;
+    cb.dispose();
+    drawIdToGeometryCallback.delete(drawId);
   }
 
   /** Update the drawTable record's instanceCount in place — the
@@ -3648,12 +3670,22 @@ export function buildHeapScene(
     // `reuseDrawId`: the strip re-add below keeps the draw's id, which
     // the caller (specToDrawId, addDraw's result) already holds.
     const drawId = reuseDrawId ?? nextDrawId++;
+    // A changing count (spec.geometry): its current value, read with the
+    // scene's token so a change marks the scene (and `geometryDirty`).
+    let specCur = specIn;
+    if (specIn.geometry !== undefined) {
+      const g = specIn.geometry.getValue(outerTok);
+      specCur = specIn.indices !== undefined
+        ? { ...specIn, indexCount: g.count, firstIndex: g.firstIndex }
+        : { ...specIn, vertexCount: g.count };
+      subscribeGeometry(specIn.geometry, drawId);
+    }
     // A strip is drawn as the list of its primitives — a bucket is ONE
     // draw over all its records, which would join the strips of
     // different records (see heapScene/stripToList.ts). Everything
     // below sees the list spec; `drawIdToSpec` keeps the original.
-    const stripKind = stripKindOfSpec(specIn);
-    const spec = stripKind !== undefined ? stripSpecToList(specIn, stripKind) : specIn;
+    const stripKind = stripKindOfSpec(specCur);
+    const spec = stripKind !== undefined ? stripSpecToList(specCur, stripKind) : specCur;
     drawIdToStripKind[drawId] = stripKind;
     // Family-merge (slice 3c): build the family lazily from this
     // single spec when no batched lazy-build occurred earlier (e.g.
@@ -4353,6 +4385,7 @@ export function buildHeapScene(
     // fire after the underlying drawTable record is gone.
     unsubscribeActive(drawId);
     unsubscribeCount(drawId);
+    unsubscribeGeometry(drawId);
     // §7: deregister this RO's derivation records and release slots.
     if (derivedScene !== undefined) {
       const reg = derivedByDrawId.get(drawId);
@@ -4972,6 +5005,20 @@ export function buildHeapScene(
               if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
             }
           }
+        }
+      }
+
+      // 1g. A count that changed (HeapDrawSpec.geometry): the draw is added
+      //     again under its id with the current count (its index and vertex
+      //     data follow their own avals).
+      if (geometryDirty.size > 0) {
+        const ids = [...geometryDirty];
+        geometryDirty.clear();
+        for (const id of ids) {
+          const spec = drawIdToSpec[id];
+          if (spec === undefined) continue;
+          removeDraw(id);
+          addDrawImpl(spec, tok, id);
         }
       }
 

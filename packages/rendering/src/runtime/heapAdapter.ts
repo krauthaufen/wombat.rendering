@@ -863,6 +863,14 @@ function buildFlatSpec(
   const geom = dc.kind === "indexed"
     ? { indices: indices!, firstIndex: dc.firstIndex, indexCount: dc.indexCount }
     : { vertexCount: dc.vertexCount };
+  // A draw call that changes (a mesh whose data changes size) keeps its
+  // count live: the snapshot above is only the first value (an empty mesh
+  // was never drawn, a grown one drew its first vertices only).
+  const geometry = ro.drawCall.isConstant
+    ? undefined
+    : ro.drawCall.map((d) => d.kind === "indexed"
+        ? { count: d.indexCount, firstIndex: d.firstIndex }
+        : { count: d.vertexCount, firstIndex: 0 });
 
   return {
     effect: ro.effect,
@@ -887,6 +895,7 @@ function buildFlatSpec(
       return dc.instanceCount !== 1 ? { instanceCount: dc.instanceCount } : {};
     })(),
     ...geom,
+    ...(geometry !== undefined ? { geometry } : {}),
     ...(textures !== undefined ? { textures } : {}),
     ...(ro.injectedStorage !== undefined && ro.injectedStorage.count > 0
       ? { storageBuffers: (() => { const m = new Map<string, aval<IBuffer>>(); ro.injectedStorage!.iter((n, av) => { m.set(n, av); }); return m; })() }
