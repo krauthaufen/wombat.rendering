@@ -34,7 +34,7 @@ A large host texture becomes a **page of its own**: an atlas-shaped texture size
 - **Binding.** A solo page cannot be a layer of the format's array (its size differs), so the
   bucket binds it *in place of* the format array at the same binding. The bucket key becomes
   (effect family, pipeline, chunk, solo page id) for draws on a solo page; atlas draws keep their
-  key. Decided when the draw is added: no per-frame case distinction, no shader change.
+  key. Decided when the draw is added: no per-frame case distinction.
 - **Wrap and filtering.** Kept as the atlas does it (shader emulation inside the placement, filter
   and wrap from the header's format bits), so one shader serves both. Real sampler addressing would
   need a second sampler binding per bucket and a shader branch; the emulation already works at the
@@ -48,9 +48,9 @@ A large host texture becomes a **page of its own**: an atlas-shaped texture size
 - **Shader.** Atlas coordinates are normalized by the bound array's size (`textureDimensions`)
   instead of the page-size constant, so the same shader samples shared and solo pages
   (heap persist version h16).
-- **Out of memory.** The solo page is allocated in the same device-error scope as atlas growth;
-  if it fails the draw falls back to legacy for that texture (as atlas-full does today: the draw
-  stays visible), retried when memory frees.
+- **Out of memory.** The solo page is allocated in an out-of-memory error scope, as atlas growth
+  is; a refused page drops its entry and its draws are placed again on a later frame (as lost
+  atlas layers are: they sample nothing until then), so the loop goes on.
 - **Eligibility** then rejects only what cannot be sampled this way: cube (packed elsewhere),
   array, 3D, external/video, and sizes whose solo page exceeds `SOLO_MAX_DIM` (8192, with mips the
   column beside mip 0 included).
@@ -59,5 +59,6 @@ A large host texture becomes a **page of its own**: an atlas-shaped texture size
 
 Real GPU: a texture over the cap under many draws (one GPU texture, heap draws, right pixels); two
 large textures in one scene (two buckets); large and atlas textures mixed; a texture that changes
-(and one that crosses the cap); removal (page destroyed); allocation failure falls back. Unit:
-routing (atlas / solo / legacy) by size, format and kind. Then PoEtry's full tree before/after.
+(and one that crosses the cap); removal (page destroyed). Unit: routing (atlas / solo / legacy)
+by size and mips; eligibility. Not tested: a refused allocation (no way to make the device refuse a
+small texture on demand). Then PoEtry's full tree before/after.
