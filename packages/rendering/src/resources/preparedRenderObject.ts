@@ -645,7 +645,11 @@ export function prepareRenderObject(
     const fromVertex = vertexMap.tryGet(vb.name);
     const fromInstance = instanceMap.tryGet(vb.name);
     if (fromVertex === undefined && fromInstance === undefined) {
-      throw new Error(`prepareRenderObject: missing vertex attribute "${vb.name}"`);
+      const has = [...new Set([...vertexMap.names(), ...instanceMap.names()])];
+      throw new Error(
+        `prepareRenderObject: ${obj.debugName ?? `a draw (effect ${obj.effect.id})`}: missing vertex attribute "${vb.name}" ` +
+        `(it has ${has.length === 0 ? "none" : has.join(", ")})`,
+      );
     }
     const isInstance = fromVertex === undefined && fromInstance !== undefined;
     const stepMode: GPUVertexStepMode = isInstance ? "instance" : "vertex";

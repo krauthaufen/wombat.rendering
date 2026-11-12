@@ -875,6 +875,7 @@ function buildFlatSpec(
   return {
     effect: ro.effect,
     ...(ro.pickId !== undefined ? { pickId: ro.pickId } : {}),
+    ...(ro.debugName !== undefined ? { debugName: ro.debugName } : {}),
     pipelineState: ro.pipelineState,
     inputs,
     ...(instanceAttributes !== undefined ? { instanceAttributes } : {}),

@@ -169,3 +169,9 @@ export {
   describeDevice,
   type DeviceError,
 } from "./deviceErrors.js";
+
+export {
+  missingAttributes,
+  missingAttributesMessage,
+  checkAttributes,
+} from "./missingAttributes.js";

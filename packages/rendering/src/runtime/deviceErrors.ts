@@ -13,7 +13,8 @@
 /** One device error. */
 export interface DeviceError {
   /** "out-of-memory", "validation", "internal", "unknown" (uncaptured device
-   *  errors), "device-lost", or "frame" (an exception in a frame callback). */
+   *  errors), "device-lost", "frame" (an exception in a frame callback), or
+   *  "scene" (a draw left out of the scene, e.g. one missing an attribute). */
   readonly kind: string;
   readonly message: string;
   /** The renderer recovered from it (the scene keeps rendering, maybe degraded). */

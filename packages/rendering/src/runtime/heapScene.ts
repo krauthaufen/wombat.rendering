@@ -536,6 +536,8 @@ export interface HeapDrawSpec {
    * pool entry, no per-draw aval.
    */
   readonly pickId?: number;
+  /** What this draw is, for messages (`RenderObject.debugName`). */
+  readonly debugName?: string;
   /**
    * Per-name inputs covering both vertex attributes (e.g. `Positions`,
    * `Normals`) and uniforms (e.g. `ModelTrafo`, `Color`, `ViewProjTrafo`)
@@ -3970,11 +3972,16 @@ export function buildHeapScene(
           const where = isPerInstanceAttrField
             ? "spec.instanceAttributes"
             : "spec.inputs";
+          const given = [
+            ...Object.keys(spec.inputs).filter((n) => isBufferView(spec.inputs[n])),
+            ...Object.keys(spec.instanceAttributes ?? {}),
+          ];
           throw new Error(
-            `heapScene: ${where} missing required entry '${f.name}' ` +
+            `heapScene: ${spec.debugName ?? `a draw (effect ${spec.effect.id})`}: ${where} missing required entry '${f.name}' ` +
             `(effect declares ${f.kind === "uniform-ref"
               ? `uniform ${f.uniformWgslType ?? "unknown"}`
-              : `attribute ${f.attributeWgslType ?? "unknown"}`})`,
+              : `attribute ${f.attributeWgslType ?? "unknown"}`}; ` +
+            `attributes given: ${given.length === 0 ? "none" : given.join(", ")})`,
           );
         }
 

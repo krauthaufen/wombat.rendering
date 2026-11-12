@@ -77,6 +77,12 @@ export interface RenderObject {
   readonly indices?: BufferView;
   readonly drawCall: aval<DrawCall>;
   /**
+   * What this draw is, for messages (wombat.dom: the leaf's call site
+   * and effect). Named when the draw cannot be drawn, e.g. when its
+   * shader reads an attribute it does not have.
+   */
+  readonly debugName?: string;
+  /**
    * Optional picking id (u32 < 2^24). First-class instead of a
    * `PickId` uniform: one unique `AVal.constant` per RO would drag a
    * pool entry + per-RO provider identity + adaptive bookkeeping in —

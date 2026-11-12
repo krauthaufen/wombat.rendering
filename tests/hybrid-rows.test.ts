@@ -121,3 +121,24 @@ describe("hybrid — Rows direct consumption", () => {
     expect(scene.__legacyCount()).toBe(0);
   });
 });
+
+describe("hybrid — a row missing an attribute its shader reads", () => {
+  it("is left out on both paths and reported once; the other rows draw", async () => {
+    const { deviceErrors } = await import("../packages/rendering/src/runtime/deviceErrors.js");
+    const gpu = new MockGPU();
+    const bad: RenderRow = { ...row(9), vertexAttributes: AttributeProvider.ofObject({}) };
+    const rows = cset<RenderRow>(new Set([row(1), row(2), bad]));
+    const set: RenderRowSet = { template: { ...templateRO(), debugName: "row leaf" }, rows };
+    const heapEnabled = cval(true);
+    const scene = compileHybridScene(gpu.device, sig(), RenderTree.unordered(RenderTree.rows(set)), { heapEnabled });
+    scene.update(AdaptiveToken.top);
+    expect(scene.heapTotalDraws()).toBe(2);
+    transact(() => { heapEnabled.value = false; });
+    scene.update(AdaptiveToken.top);
+    expect(scene.__legacyCount()).toBe(2);
+    const errs = deviceErrors(gpu.device).filter((e) => e.kind === "scene");
+    expect(errs.map((e) => e.message)).toEqual([
+      `row leaf: its shader reads attribute "position", which it does not have (it has none); not drawn`,
+    ]);
+  });
+});

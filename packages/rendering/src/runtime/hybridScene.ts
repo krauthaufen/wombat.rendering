@@ -42,6 +42,7 @@ import { renderObjectToHeapSpec } from "./heapAdapter.js";
 import { buildHeapScene, type HeapDrawSpec, type HeapScene } from "./heapScene.js";
 import type { FragmentOutputLayout } from "./heapEffect.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
+import { checkAttributes } from "./missingAttributes.js";
 
 void (null as AdaptiveToken | _T | null);
 
@@ -290,6 +291,12 @@ export function compileHybridScene(
     }
     return spec;
   };
+  // A draw whose linked shader reads an attribute it lacks reaches
+  // neither path: reported once, left out, the rest of the scene draws
+  // (runtime/missingAttributes.ts). The choose stages below call this
+  // once per RO (the compile it reads is memoized per effect), so it
+  // keeps no per-RO state.
+  const drawable = (ro: RenderObject): boolean => checkAttributes(device, ro, fragmentOutputLayout);
   // Row sets: one choose stage per set — row → spec via the cached
   // materialized RO (prototype over the shared template). `undefined`
   // (atlas-full) drops the row for the cycle, like the flat path.
@@ -297,7 +304,10 @@ export function compileHybridScene(
     ASet.bind(
       (on: boolean) =>
         on
-          ? set.rows.choose((row) => specOf(materializeRow(set, row)))
+          ? set.rows.choose((row) => {
+              const ro = materializeRow(set, row);
+              return drawable(ro) ? specOf(ro) : undefined;
+            })
           : ASet.empty<HeapDrawSpec>(),
       heapEnabled,
     ));
@@ -310,6 +320,7 @@ export function compileHybridScene(
   // holds a single entry for the whole eligible population.
   const CONST_UNDEF = AVal.constant(undefined);
   const heapSpecAset = flat.chooseA((ro: RenderObject) => {
+    if (!drawable(ro)) return CONST_UNDEF as aval<HeapDrawSpec | undefined>;
     const e = elig(ro);
     if (e.isConstant) {
       // Why force here: constant — immutable by definition.
@@ -349,6 +360,7 @@ export function compileHybridScene(
     return l;
   };
   const legacyFromFlat = flat.chooseA((ro: RenderObject) => {
+    if (!drawable(ro)) return CONST_UNDEF as aval<RenderTree | undefined>;
     const e = elig(ro);
     if (e.isConstant) {
       // Why force here: constant — immutable by definition.
@@ -370,7 +382,10 @@ export function compileHybridScene(
             on
               ? ASet.empty<RenderTree>()
               : ASet.unionMany(ASet.ofArray(rowSets.map((set) =>
-                  set.rows.map((r) => leafOf(materializeRow(set, r)))))),
+                  set.rows.choose((r) => {
+                    const ro = materializeRow(set, r);
+                    return drawable(ro) ? leafOf(ro) : undefined;
+                  })))),
           heapEnabled,
         ),
       );
