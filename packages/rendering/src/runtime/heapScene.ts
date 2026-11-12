@@ -96,6 +96,7 @@ import {
 } from "./heapScene/pools.js";
 import { encodeModeKey, type PipelineStateDescriptor } from "./pipelineCache/index.js";
 import { snapshotDescriptor, ModeKeyTracker } from "./derivedModes/modeKeyCpu.js";
+import { stripKindOfSpec, stripSpecToList, type StripKind } from "./heapScene/stripToList.js";
 import { GpuPartitionScene } from "./derivedModes/partitionDispatcher.js";
 import {
   emitPartitionKernel,
@@ -621,6 +622,15 @@ export interface HeapDrawSpec {
    *
    * Omitted ⇒ defaults: triangle-list / cull back / ccw / depth-less
    * with depth write enabled. Matches the demo's existing visuals.
+   *
+   * STRIP topologies (`triangle-strip`, `line-strip`) are drawn as the
+   * list of the same primitives: a bucket is one draw over all its
+   * records, which would join the strips of different draws. The list
+   * is built once per index source / vertex count when the draw is
+   * added (see `heapScene/stripToList.ts`); an index `0xFFFFFFFF` is a
+   * primitive restart. A topology aval that later changes between a
+   * strip and a list re-adds the draw. Not covered: a strip chosen by
+   * a `modeRules.topology` rule (the rule decides per draw on the GPU).
    */
   readonly pipelineState?: PipelineState;
   /**
@@ -1083,6 +1093,9 @@ export function buildHeapScene(
    * references.
    */
   const drawIdToSpec:        (HeapDrawSpec | undefined)[] = [];
+  /** The strip kind a draw was added as (it is in its bucket as the
+   *  list of that strip); undefined for list/point draws. */
+  const drawIdToStripKind:   (StripKind | undefined)[] = [];
   /** Per-draw ModeKeyTracker — recomputes the modeKey on demand. Does
    *  NOT install per-instance marking callbacks; subscriptions are
    *  scene-level (deduped by aval identity below). */
@@ -3586,9 +3599,18 @@ export function buildHeapScene(
     });
     return id;
   }
-  function addDrawImpl(spec: HeapDrawSpec, outerTok: AdaptiveToken): number {
+  function addDrawImpl(specIn: HeapDrawSpec, outerTok: AdaptiveToken, reuseDrawId?: number): number {
     __addDrawCalls++;
-    const drawId = nextDrawId++;
+    // `reuseDrawId`: the strip re-add below keeps the draw's id, which
+    // the caller (specToDrawId, addDraw's result) already holds.
+    const drawId = reuseDrawId ?? nextDrawId++;
+    // A strip is drawn as the list of its primitives — a bucket is ONE
+    // draw over all its records, which would join the strips of
+    // different records (see heapScene/stripToList.ts). Everything
+    // below sees the list spec; `drawIdToSpec` keeps the original.
+    const stripKind = stripKindOfSpec(specIn);
+    const spec = stripKind !== undefined ? stripSpecToList(specIn, stripKind) : specIn;
+    drawIdToStripKind[drawId] = stripKind;
     // Family-merge (slice 3c): build the family lazily from this
     // single spec when no batched lazy-build occurred earlier (e.g.
     // direct addDraw at runtime). The aset / array initial-population
@@ -4154,7 +4176,7 @@ export function buildHeapScene(
     // bucket key is the modeKey VALUE (Phase 5b), so changing the
     // value must move the RO to a different bucket. Without this
     // tracker the cval flip would be silently ignored.
-    drawIdToSpec[drawId] = spec;
+    drawIdToSpec[drawId] = specIn;
     // skipSubscribe: this tracker doesn't install its own callbacks.
     // The scene-level `modeAvalToDrawIds` does it once per unique aval
     // (the 20k-ROs-share-one-cullCval optimization).
@@ -4422,6 +4444,7 @@ export function buildHeapScene(
     drawIdToSlotIdx[drawId]   = undefined;
     drawIdToIndexAval[drawId] = undefined;
     drawIdToSpec[drawId]      = undefined;
+    drawIdToStripKind[drawId] = undefined;
     const oldTracker = drawIdToModeTracker[drawId];
     if (oldTracker !== undefined) {
       oldTracker.forEachLeaf((av) => unsubscribeModeLeaf(av, drawId));
@@ -4703,6 +4726,16 @@ export function buildHeapScene(
         for (const drawId of dirty) {
           const tracker = drawIdToModeTracker[drawId];
           if (tracker === undefined) continue;
+          // A topology that changed between a strip and a list (or
+          // between the two strips) needs other index data, not just
+          // another slot: take the draw out and add it again, under
+          // its id.
+          const original = drawIdToSpec[drawId];
+          if (original !== undefined && stripKindOfSpec(original) !== drawIdToStripKind[drawId]) {
+            removeDraw(drawId);
+            addDrawImpl(original, tok, drawId);
+            continue;
+          }
           const bucket = drawIdToBucket[drawId];
           // Phase 5c.3: GPU-routed buckets never reslot CPU-side.
           // The partition kernel handles re-routing per frame.
@@ -5062,7 +5095,7 @@ export function buildHeapScene(
       const _t1 = performance.now();
       derivedScene.uploadDirty(dirty!);
       const _t2 = performance.now();
-      if (dirty!.size > 0 || redoDerived) derivedScene.encode(enc);
+      if (dirty!.size > 0 || redoDerived || derivedScene.recordsChanged) derivedScene.encode(enc);
       redoDerived = false;
       const _t3 = performance.now();
       stats.derivedPullMs   = _t1 - _t0;

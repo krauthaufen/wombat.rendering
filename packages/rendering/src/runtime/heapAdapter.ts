@@ -113,6 +113,7 @@ import type { HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
 import { isBufferView } from "./heapScene/pools.js";
 import { compileHeapEffect } from "./heapEffect.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
+import { STRIP_RESTART, stripKindOfSpec } from "./heapScene/stripToList.js";
 import { packCubeGrid, type CubePackSource } from "./textureAtlas/cubeGutter.js";
 
 // Packed cube-grid cache: one standalone grid GPUTexture per (device,
@@ -159,7 +160,10 @@ function widenU16(data: HostBufferSource): Uint32Array {
 // baseVertex offsets needs two distinct transcoded arrays — but the common
 // case (baseVertex 0, or per-primitive index buffers that aren't shared)
 // keeps one entry per buffer and preserves the pool's identity sharing.
-const indicesAvalCache = new WeakMap<aval<IBuffer>, Map<number, aval<Uint32Array>>>();
+// A STRIP's index buffer may hold primitive restarts (the format's largest
+// value, as WebGPU defines for strip topologies): those become the heap's u32
+// restart value and take no baseVertex, so strips are transcoded separately.
+const indicesAvalCache = new WeakMap<aval<IBuffer>, Map<string, aval<Uint32Array>>>();
 
 // Per-aval shared "current pool ref" cell. ROs that share an
 // `aval<ITexture>` (and therefore one AtlasPool entry) all read
@@ -214,28 +218,41 @@ function isAvalLike(v: unknown): boolean {
     && typeof (v as { getValue?: unknown }).getValue === "function";
 }
 
-function indicesAvalFor(ibAval: aval<IBuffer>, indexFormat: GPUIndexFormat, baseVertex: number): aval<Uint32Array> {
+function indicesAvalFor(
+  ibAval: aval<IBuffer>, indexFormat: GPUIndexFormat, baseVertex: number, strip: boolean,
+): aval<Uint32Array> {
   let byBase = indicesAvalCache.get(ibAval);
   if (byBase === undefined) {
     byBase = new Map();
     indicesAvalCache.set(ibAval, byBase);
   }
-  let av = byBase.get(baseVertex);
+  const key = strip ? `${baseVertex}:strip` : `${baseVertex}`;
+  let av = byBase.get(key);
   if (av === undefined) {
     av = ibAval.map((ib: IBuffer) => {
       if (ib.kind !== "host") {
         throw new Error("heapAdapter: index buffer flipped to native GPUBuffer; classifier should have caught this");
       }
       const u32 = indexFormat === "uint16" ? widenU16(ib.data) : asUint32(ib.data);
-      if (baseVertex === 0) return u32;
-      // Fold baseVertex into the index values so the megacall decode
-      // (vid = indexStorage[...]) lands on the right vertex with no
-      // extra record field. Copy (don't mutate the shared view).
+      if (!strip) {
+        if (baseVertex === 0) return u32;
+        // Fold baseVertex into the index values so the megacall decode
+        // (vid = indexStorage[...]) lands on the right vertex with no
+        // extra record field. Copy (don't mutate the shared view).
+        const out = new Uint32Array(u32.length);
+        for (let i = 0; i < u32.length; i++) out[i] = u32[i]! + baseVertex;
+        return out;
+      }
+      const restart = indexFormat === "uint16" ? 0xFFFF : STRIP_RESTART;
+      if (baseVertex === 0 && restart === STRIP_RESTART) return u32;
       const out = new Uint32Array(u32.length);
-      for (let i = 0; i < u32.length; i++) out[i] = u32[i]! + baseVertex;
+      for (let i = 0; i < u32.length; i++) {
+        const v = u32[i]!;
+        out[i] = v === restart ? STRIP_RESTART : v + baseVertex;
+      }
       return out;
     });
-    byBase.set(baseVertex, av);
+    byBase.set(key, av);
   }
   return av;
 }
@@ -631,7 +648,12 @@ function buildFlatSpec(
   //    Non-indexed ROs (no `ro.indices`) carry no index aval — the spec
   //    then sets `vertexCount` and the megacall decodes the vertex directly.
   const indices: aval<Uint32Array> | undefined =
-    ro.indices !== undefined ? indicesAvalFor(ro.indices.buffer, ro.indices.elementType.indexFormat ?? "uint32", baseVertex) : undefined;
+    ro.indices !== undefined
+      ? indicesAvalFor(
+          ro.indices.buffer, ro.indices.elementType.indexFormat ?? "uint32", baseVertex,
+          stripKindOfSpec(ro) !== undefined,
+        )
+      : undefined;
 
   // 3. Texture/sampler: single-pair v1. The Sg compile layer binds
   //    each texture aval under both `name` and `${name}_view` so the

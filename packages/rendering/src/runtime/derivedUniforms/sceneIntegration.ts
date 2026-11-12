@@ -167,11 +167,31 @@ export class DerivedUniformsScene {
     uploadConstituentsRange(this.device, this.constituentsBuf, this.constituents.cpuMirror, dirty);
   }
 
+  /** Sum of the record buffers' generations: moves whenever a record is added or removed. */
+  private recordsGeneration(): number {
+    let g = 0;
+    for (const r of this.chainByLevel.values()) g += r.generation;
+    for (const r of this.recordsByChunk.values()) g += r.generation;
+    return g;
+  }
+  private encodedGeneration = 0;
+  /**
+   * True when records were added (or removed) since the last `encode`.
+   * A new record's output has never been computed, also when all the
+   * constituents it reads are live and unchanged (a draw added under
+   * trafos other draws already use) — `pullDirty` is empty then, so the
+   * caller must look here too before skipping `encode`.
+   */
+  get recordsChanged(): boolean {
+    return this.recordsGeneration() !== this.encodedGeneration;
+  }
+
   /** Run the uber-kernel once per chunk that holds records. No-op
    *  when no chunk has records. Each dispatch binds that chunk's
    *  main heap buffer. */
   encode(enc: GPUCommandEncoder): boolean {
     let any = false;
+    this.encodedGeneration = this.recordsGeneration();
     // Chain pass — writes per-RO/per-node Model constituents (fwd+inv) into the
     // shared constituents buffer. Dispatch trie LEVELS in ascending order: a
     // level-L node reads its parent's (level L-1) output. Must run BEFORE the
