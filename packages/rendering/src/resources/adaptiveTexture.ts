@@ -7,8 +7,13 @@
 // queue (writeTexture for raw, copyExternalImageToTexture for
 // external sources).
 //
-// Reuse: a host source with the same dimensions + format reuses
-// the existing texture; mismatch triggers a fresh allocation.
+// Sharing: a host source is one GPU texture per device, however many
+// resources bind it (one per RenderObject on the legacy path, whether they
+// share the aval or only its value): uploaded once, ref-counted, destroyed
+// with its last user. Before, every RenderObject uploaded its own copy, and
+// a large sprite sheet under a few thousand draws ran the GPU out of memory.
+// (With extra `usage` flags a resource owns its texture, as before: the same
+// dimensions + format reuse it, a mismatch allocates afresh.)
 //
 // Mip-map generation is not implemented in this first cut —
 // `generateMips: true` on an external source allocates the mip
@@ -90,6 +95,38 @@ function descFor(src: RawTextureSource | ExternalTextureSource): OwnedDesc {
   };
 }
 
+/** A host source's GPU texture on one device, and how many resources use it. */
+interface SharedTexture { readonly texture: GPUTexture; refs: number }
+const sharedByDevice = new WeakMap<GPUDevice, Map<RawTextureSource | ExternalTextureSource, SharedTexture>>();
+
+function acquireShared(device: GPUDevice, src: RawTextureSource | ExternalTextureSource, label: string | undefined): SharedTexture {
+  let table = sharedByDevice.get(device);
+  if (table === undefined) { table = new Map(); sharedByDevice.set(device, table); }
+  let e = table.get(src);
+  if (e === undefined) {
+    const desc = descFor(src);
+    const texture = device.createTexture({
+      size: { width: desc.width, height: desc.height, depthOrArrayLayers: desc.depthOrArrayLayers },
+      format: desc.format,
+      mipLevelCount: desc.mipLevelCount,
+      usage: TextureUsage.COPY_DST | TextureUsage.TEXTURE_BINDING | (src.kind === "external" ? TextureUsage.RENDER_ATTACHMENT : 0),
+      ...(label !== undefined ? { label } : {}),
+    });
+    if (src.kind === "raw") uploadRaw(device, texture, src); else uploadExternal(device, texture, src);
+    e = { texture, refs: 0 };
+    table.set(src, e);
+  }
+  e.refs++;
+  return e;
+}
+
+function releaseShared(device: GPUDevice, src: RawTextureSource | ExternalTextureSource): void {
+  const table = sharedByDevice.get(device);
+  const e = table?.get(src);
+  if (table === undefined || e === undefined) return;
+  if (--e.refs === 0) { table.delete(src); e.texture.destroy(); }
+}
+
 function mipCount(w: number, h: number): number {
   return Math.floor(Math.log2(Math.max(w, h))) + 1;
 }
@@ -97,6 +134,8 @@ function mipCount(w: number, h: number): number {
 class AdaptiveTexture extends AdaptiveResource<GPUTexture> {
   private _owned: GPUTexture | undefined = undefined;
   private _ownedDesc: OwnedDesc | undefined = undefined;
+  /** The host source whose shared texture this resource holds. */
+  private _shared: RawTextureSource | ExternalTextureSource | undefined = undefined;
 
   constructor(
     private readonly device: GPUDevice,
@@ -108,7 +147,17 @@ class AdaptiveTexture extends AdaptiveResource<GPUTexture> {
 
   protected create(): void { tryAcquire(this.source); }
 
+  private dropShared(): void {
+    if (this._shared !== undefined) {
+      releaseShared(this.device, this._shared);
+      this._shared = undefined;
+    }
+  }
+
   protected destroy(): void {
+    this.dropShared();
+    // The texture handed out is gone: the next acquire computes again.
+    this.outOfDate = true;
     if (this._owned !== undefined) {
       this._owned.destroy();
       this._owned = undefined;
@@ -120,6 +169,7 @@ class AdaptiveTexture extends AdaptiveResource<GPUTexture> {
   override compute(token: AdaptiveToken): GPUTexture {
     const src = this.source.getValue(token);
     if (src.kind === "gpu") {
+      this.dropShared();
       if (this._owned !== undefined) {
         this._owned.destroy();
         this._owned = undefined;
@@ -139,6 +189,16 @@ class AdaptiveTexture extends AdaptiveResource<GPUTexture> {
       // texture; a cube should never reach adaptiveTexture directly.
       throw new Error(`adaptiveTexture: ITexture.kind === "cube" must be packed by heapAdapter before binding`);
     }
+    if ((this.opts.usage ?? 0) === 0) {
+      if (this._shared !== src.source) {
+        const e = acquireShared(this.device, src.source, this.opts.label);
+        this.dropShared();
+        this._shared = src.source;
+        return e.texture;
+      }
+      return sharedByDevice.get(this.device)!.get(src.source)!.texture;
+    }
+    this.dropShared();
     const desc = descFor(src.source);
     const usage =
       (this.opts.usage ?? 0)
