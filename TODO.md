@@ -151,6 +151,19 @@ GPU-resident source). Depends on the transform-propagation scan above (for the
 per-id `ModelForward` gather) and on the existing OIT A-buffer (for the ordered
 layers).
 
+## Heap gaps (found 2026-11-13)
+
+- **Integer vector uniforms** (`vec2/3/4<i32|u32>`) are not supported on the heap
+  path: `heapDecoder.wgslTypeToIrType` throws ("cannot translate WGSL type
+  'vec2<i32>'"), and `heapEffectIR`'s loaders (`loadUniformByRef`, per-instance,
+  `wgslTypeFromHeapField`) and `heapScene/packers` have no case; `i32` scalars are
+  missing in the loaders too. An F# shader reading `uniform.ViewportSize : V2i`
+  hits it. wombat.dom's text and path shaders read `ViewportSize` as floats.
+- **One atlas pool per compiled task** (`hybridScene`): with order-independent
+  transparency (`transparencyTask`: opaque, build and pick tasks over the same
+  scene) a texture is uploaded once per task. A pool shared per runtime would
+  need every scene's bind groups rebuilt when a page array grows.
+
 ## Conditional (only if profiling demands)
 
 - **Per-vertex (drawIdx, vid) lookup table** to replace the megacall binary
