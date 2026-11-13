@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 import { AdaptiveToken, HashMap, cval, transact, type aval } from "@aardworx/wombat.adaptive";
-import { V4f, M44f } from "@aardworx/wombat.base";
+import { V2f, V2i, V4f, M44f } from "@aardworx/wombat.base";
 import { prepareUniformBuffer } from "@aardworx/wombat.rendering/resources";
 import type { UniformBlockInfo } from "@aardworx/wombat.rendering/core";
 import type { Type } from "@aardworx/wombat.shader/ir";
@@ -122,5 +122,33 @@ describe("prepareUniformBuffer — plain number[] backed d-types", () => {
     expect(f[8]).toBe(2);                                     // trafo forward[0]
     expect(f[13]).toBe(3);                                    // forward[5]
     r.release();
+  });
+});
+
+describe("writeField — packed data goes in as the field's element type", () => {
+  const i32: Type = { kind: "Int", signed: true, width: 32 };
+  const vec2f: Type = { kind: "Vector", element: f32, dim: 2 };
+  const vec2i: Type = { kind: "Vector", element: i32, dim: 2 };
+  const pack = (type: Type, value: unknown): ArrayBuffer => {
+    const gpu = new MockGPU();
+    const block: UniformBlockInfo = {
+      name: "B", group: 0, slot: 0, size: 8,
+      fields: [{ name: "v", type, offset: 0, size: 8, align: 8 }],
+    };
+    const r = prepareUniformBuffer(gpu.device, block, HashMap.empty<string, aval<unknown>>().add("v", cval(value)));
+    r.acquire();
+    r.getValue(AdaptiveToken.top);
+    return gpu.writeBufferCalls[0]!.data as ArrayBuffer;
+  };
+
+  it("a V2i for a vec2<f32> field is written as floats (ViewportSize)", () => {
+    expect([...new Float32Array(pack(vec2f, new V2i(640, 480)))]).toEqual([640, 480]);
+  });
+  it("a V2f for a vec2<i32> field is written as integers", () => {
+    expect([...new Int32Array(pack(vec2i, new V2f(640, 480)))]).toEqual([640, 480]);
+  });
+  it("matching types are copied as they are", () => {
+    expect([...new Int32Array(pack(vec2i, new V2i(-3, 7)))]).toEqual([-3, 7]);
+    expect([...new Float32Array(pack(vec2f, new V2f(0.5, -2)))]).toEqual([0.5, -2]);
   });
 });

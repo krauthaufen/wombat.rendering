@@ -133,35 +133,25 @@ export function writeField(
     }
     return;
   }
-  if (value instanceof Float32Array) {
-    view.f32.set(value, offset >> 2);
-    return;
-  }
-  if (value instanceof Float64Array) {
-    // Downcast to f32 in-place. Aardvark's V/M types in the F#-on-JS
-    // path use Float64Array internally (V4d / M44d / Trafo3d) but
-    // GPU uniforms are always f32 — converting here saves every
-    // F# user from sprinkling V4f / V3f conversions across their
-    // Sg.Uniform values.
-    const dst = view.f32.subarray(offset >> 2, (offset >> 2) + value.length);
-    for (let i = 0; i < value.length; i++) dst[i] = value[i]!;
-    return;
-  }
-  if (value instanceof Int32Array) {
-    view.i32.set(value, offset >> 2);
-    return;
-  }
-  if (value instanceof Uint32Array) {
-    view.u32.set(value, offset >> 2);
-    return;
-  }
+  // Packed data goes in as the field's declared element type: a value of
+  // another one is converted (`TypedArray.set` coerces each element), so
+  // a `V2i` feeds a `vec2<f32>` field and a `V2f` a `vec2<i32>` one.
+  // Without a declared type the data's own type decides.
+  const el = elementOf(fieldType);
+  const put = (data: ArrayLike<number>, own: "f32" | "i32" | "u32"): void => {
+    view[el ?? own].set(data, offset >> 2);
+  };
+  if (value instanceof Float32Array) { put(value, "f32"); return; }
+  // Aardvark's V/M types in the F#-on-JS path use Float64Array internally
+  // (V4d / M44d / Trafo3d) but GPU uniforms are f32: converted here, so
+  // no F# user sprinkles V4f / V3f conversions across Sg.Uniform values.
+  if (value instanceof Float64Array) { put(value, "f32"); return; }
+  if (value instanceof Int32Array) { put(value, "i32"); return; }
+  if (value instanceof Uint32Array) { put(value, "u32"); return; }
   // Plain number[] — wombat.base's d-types (V*d/M*d/Trafo3d) back
   // `_data` with packed-double JS arrays (V8-optimal for f64), and
-  // users may hand raw arrays directly. `TypedArray.set` coerces.
-  if (Array.isArray(value)) {
-    view.f32.set(value as number[], offset >> 2);
-    return;
-  }
+  // users may hand raw arrays directly.
+  if (Array.isArray(value)) { put(value as number[], "f32"); return; }
   // Trafo3d: pack its forward matrix. The runtime treats `Trafo3d`
   // uniforms uniformly as their forward-mat4 — callers who want the
   // inverse should bind a derived uniform that exposes `.backward`
@@ -176,25 +166,34 @@ export function writeField(
     "_data" in ((value as { forward: object }).forward as object)
   ) {
     const data = ((value as { forward: { _data: unknown } }).forward._data);
-    if (data instanceof Float32Array) { view.f32.set(data, offset >> 2); return; }
-    if (data instanceof Float64Array || Array.isArray(data)) {
-      const dst = view.f32.subarray(offset >> 2, (offset >> 2) + data.length);
-      for (let i = 0; i < data.length; i++) dst[i] = data[i] as number;
+    if (data instanceof Float32Array || data instanceof Float64Array || Array.isArray(data)) {
+      view.f32.set(data as ArrayLike<number>, offset >> 2);
       return;
     }
   }
   if (value !== null && typeof value === "object" && "_data" in (value as object)) {
     const data = (value as { _data: unknown })._data;
-    if (data instanceof Float32Array) { view.f32.set(data, offset >> 2); return; }
-    if (data instanceof Float64Array || Array.isArray(data)) {
-      const dst = view.f32.subarray(offset >> 2, (offset >> 2) + data.length);
-      for (let i = 0; i < data.length; i++) dst[i] = data[i] as number;
+    if (data instanceof Float32Array || data instanceof Float64Array || Array.isArray(data)) {
+      put(data as ArrayLike<number>, "f32");
       return;
     }
-    if (data instanceof Int32Array)   { view.i32.set(data, offset >> 2); return; }
-    if (data instanceof Uint32Array)  { view.u32.set(data, offset >> 2); return; }
+    if (data instanceof Int32Array)   { put(data, "i32"); return; }
+    if (data instanceof Uint32Array)  { put(data, "u32"); return; }
   }
   throw new Error(`prepareUniformBuffer: unsupported uniform value at offset ${offset}: ${String(value)}`);
+}
+
+/** The element type a field's data is stored as, if the field says. */
+function elementOf(
+  t: import("../core/index.js").UniformFieldInfo["type"] | undefined,
+): "f32" | "i32" | "u32" | undefined {
+  type T = { kind: string; signed?: boolean; element?: unknown };
+  let e = t as T | undefined;
+  while (e !== undefined && (e.kind === "Vector" || e.kind === "Matrix")) e = e.element as T | undefined;
+  if (e === undefined) return undefined;
+  if (e.kind === "Float") return "f32";
+  if (e.kind === "Int") return e.signed ? "i32" : "u32";
+  return undefined;
 }
 
 function roundUp4(n: number): number {
