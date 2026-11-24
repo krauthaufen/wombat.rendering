@@ -122,6 +122,9 @@ export interface FrameInfo {
   readonly deltaMs: number;
 }
 
+/** How long a frame waits for its pacer before the loop goes on without it. */
+const PACER_TIMEOUT_MS = 2000;
+
 export function runFrame(
   attachment: CanvasAttachment,
   frame: FrameCallback,
@@ -132,6 +135,13 @@ export function runFrame(
   let lastTime = performance.now();
   let rafId = 0;
   let pending = false;
+  // A frame whose pacer (GPU completion) has not resolved yet, and whether
+  // an input marked the frame meanwhile. The next frame waits for the pacer
+  // WHATEVER asks for it: a mark from an input (a camera drag) must not
+  // encode into a GPU that is still drawing the frame before, or frames
+  // queue up and the picture arrives in bursts.
+  let inFlight = false;
+  let markedInFlight = false;
   let consecutiveErrors = 0;
   const MAX_CONSECUTIVE_ERRORS = 30;
   const UNCAPPED = isUncapped();
@@ -224,12 +234,28 @@ export function runFrame(
     // `outOfDate=false` reset and animation would stall after one
     // frame.
     if (opts.pacer !== undefined) {
-      opts.pacer().then(finalizeFrame, (e) => {
+      inFlight = true;
+      let settled = false;
+      const done = (): void => {
+        if (settled) return;
+        settled = true;
+        inFlight = false;
+        finalizeFrame();
+        // an input marked the frame while the GPU was busy: draw it now
+        if (markedInFlight) {
+          markedInFlight = false;
+          if (!pending && !stopped) { pending = true; rafId = schedule(tick); }
+        }
+      };
+      opts.pacer().then(done, (e) => {
         // A rejected pacer (GPU hiccup) must not brick the loop either — the
         // frame is done as far as we're concerned; carry on.
         console.error("runFrame: pacer rejected", e);
-        finalizeFrame();
+        done();
       });
+      // Nor must a pacer that never settles (a lost device): after a long
+      // wait the frame counts as done.
+      setTimeout(done, PACER_TIMEOUT_MS);
     } else {
       finalizeFrame();
     }
@@ -239,6 +265,7 @@ export function runFrame(
     addMarkingCallback(cb: () => void): IDisposable;
   }).addMarkingCallback(() => {
     if (pending || stopped) return;
+    if (inFlight) { markedInFlight = true; return; }
     pending = true;
     rafId = schedule(tick);
   });
