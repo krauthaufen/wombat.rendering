@@ -38,6 +38,10 @@ describe("allocateFramebuffer", () => {
     expect(ifb.depthStencil).toBeDefined();
     const albedoTex = gpu.textures.find(t => t.descriptor.label === "gbuffer.albedo");
     expect(albedoTex?.descriptor.format).toBe("rgba8unorm");
+    // The depth attachment can be sampled by a later pass, as the colours can (TEXTURE_BINDING 0x04, RENDER_ATTACHMENT 0x10).
+    const depthTex = gpu.textures.find(t => t.descriptor.label === "gbuffer.depthStencil");
+    expect((depthTex!.descriptor.usage & 0x04) !== 0).toBe(true);
+    expect((depthTex!.descriptor.usage & 0x10) !== 0).toBe(true);
     fbo.release();
     expect(gpu.textures.every(t => t.destroyed)).toBe(true);
   });

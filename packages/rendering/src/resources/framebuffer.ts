@@ -149,7 +149,13 @@ class AdaptiveFramebuffer extends AdaptiveResource<IFramebuffer> {
       this._ownedDepth = this.device.createTexture({
         size: { width: size.width, height: size.height, depthOrArrayLayers: 1 },
         format: this.signature.depthStencil.format,
-        usage: TextureUsage.RENDER_ATTACHMENT,
+        // Sampleable like the colours when single-sample: it is the
+        // `depthStencilTexture` a later pass reads (`renderSceneTo`'s
+        // `depthStencil()`), and with render-attachment usage alone
+        // binding it fails validation.
+        usage: msaa
+          ? TextureUsage.RENDER_ATTACHMENT
+          : TextureUsage.RENDER_ATTACHMENT | TextureUsage.TEXTURE_BINDING,
         sampleCount,
         label: `${labelPrefix}.depthStencil`,
       });
