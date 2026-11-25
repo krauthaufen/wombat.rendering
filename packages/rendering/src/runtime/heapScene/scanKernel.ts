@@ -29,7 +29,8 @@ export const HEAP_SCAN_WGSL = `
 struct Params {
   numRecords: u32,
   numBlocks:  u32,
-  _pad0:      u32,
+  // != 0: a record emits nothing unless \`visible[i]\` is set (culling)
+  useVisible: u32,
   _pad1:      u32,
 };
 
@@ -47,6 +48,7 @@ struct Record {
 @group(0) @binding(3) var<storage, read_write> indirect:         array<u32>;
 @group(0) @binding(4) var<uniform>             params:           Params;
 @group(0) @binding(5) var<storage, read_write> firstDrawInTile:  array<u32>;
+@group(0) @binding(6) var<storage, read>       visible:          array<u32>;
 
 const TILE_SIZE: u32 = 512u;
 const WG_SIZE:   u32 = 256u;
@@ -91,6 +93,10 @@ fn scanTile(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id)
   var v1: u32 = 0u;
   if (i0 < n) { v0 = drawTable[i0].indexCount * drawTable[i0].instanceCount; }
   if (i1 < n) { v1 = drawTable[i1].indexCount * drawTable[i1].instanceCount; }
+  if (params.useVisible != 0u) {
+    if (i0 < n) { v0 = v0 * visible[i0]; }
+    if (i1 < n) { v1 = v1 * visible[i1]; }
+  }
   sdata[tid]           = v0;
   sdata[tid + WG_SIZE] = v1;
   workgroupBarrier();
@@ -180,5 +186,87 @@ fn buildTileIndex(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (drawTable[mid].firstEmit <= tileStart) { lo = mid; } else { hi = mid - 1u; }
   }
   firstDrawInTile[tileIdx] = lo;
+}
+`;
+
+// ─── Frustum culling ──────────────────────────────────────────────────
+//
+// One invocation per drawTable record. A record whose draw carries a
+// bounding box (a `bounds-ref` in its drawHeader, 0 = none) is tested:
+// the box's eight corners go through the draw's own transforms — read
+// from the arena through the same header refs the shader uses — and the
+// record is visible unless every corner lies outside ONE clip plane
+// (conservative: no visible draw is ever dropped). The scan then lets
+// an invisible record emit nothing. A draw without a box is visible.
+//
+// `mat0..2` are drawHeader field offsets (u32 words) of up to three 4x4
+// matrices applied in that order (e.g. ModelTrafo, then ViewProjTrafo),
+// NONE where unused. Matrices are stored row-major.
+export const HEAP_CULL_WG_SIZE = 64;
+export const HEAP_CULL_WGSL = `
+struct Record {
+  firstEmit:     u32,
+  drawIdx:       u32,
+  indexStart:    u32,
+  indexCount:    u32,
+  instanceCount: u32,
+};
+struct Params {
+  numRecords:  u32,
+  strideU32:   u32,
+  boundsField: u32,
+  mat0:        u32,
+  mat1:        u32,
+  mat2:        u32,
+  _pad0:       u32,
+  _pad1:       u32,
+};
+@group(0) @binding(0) var<storage, read>       drawTable: array<Record>;
+@group(0) @binding(1) var<storage, read>       headers:   array<u32>;
+@group(0) @binding(2) var<storage, read>       heapF32:   array<f32>;
+@group(0) @binding(3) var<storage, read_write> visible:   array<u32>;
+@group(0) @binding(4) var<uniform>             params:    Params;
+
+const NONE: u32 = 0xffffffffu;
+
+fn xform(h: u32, field: u32, p: vec4<f32>) -> vec4<f32> {
+  if (field == NONE) { return p; }
+  let b = (headers[h + field] + 16u) / 4u;
+  return vec4<f32>(
+    dot(vec4<f32>(heapF32[b],        heapF32[b + 1u],  heapF32[b + 2u],  heapF32[b + 3u]),  p),
+    dot(vec4<f32>(heapF32[b + 4u],   heapF32[b + 5u],  heapF32[b + 6u],  heapF32[b + 7u]),  p),
+    dot(vec4<f32>(heapF32[b + 8u],   heapF32[b + 9u],  heapF32[b + 10u], heapF32[b + 11u]), p),
+    dot(vec4<f32>(heapF32[b + 12u],  heapF32[b + 13u], heapF32[b + 14u], heapF32[b + 15u]), p));
+}
+
+@compute @workgroup_size(${HEAP_CULL_WG_SIZE})
+fn cull(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= params.numRecords) { return; }
+  let h = drawTable[i].drawIdx * params.strideU32;
+  let bref = headers[h + params.boundsField];
+  if (bref == 0u) { visible[i] = 1u; return; }
+  let b = (bref + 16u) / 4u;
+  let lo = vec3<f32>(heapF32[b],      heapF32[b + 1u], heapF32[b + 2u]);
+  let hi = vec3<f32>(heapF32[b + 3u], heapF32[b + 4u], heapF32[b + 5u]);
+  // the clip planes EVERY corner is outside of
+  var outside: u32 = 63u;
+  for (var c: u32 = 0u; c < 8u; c = c + 1u) {
+    let corner = vec4<f32>(
+      select(lo.x, hi.x, (c & 1u) != 0u),
+      select(lo.y, hi.y, (c & 2u) != 0u),
+      select(lo.z, hi.z, (c & 4u) != 0u),
+      1.0);
+    let p = xform(h, params.mat2, xform(h, params.mat1, xform(h, params.mat0, corner)));
+    var m: u32 = 0u;
+    if (p.x < -p.w) { m = m | 1u; }
+    if (p.x >  p.w) { m = m | 2u; }
+    if (p.y < -p.w) { m = m | 4u; }
+    if (p.y >  p.w) { m = m | 8u; }
+    if (p.z <  0.0) { m = m | 16u; }
+    if (p.z >  p.w) { m = m | 32u; }
+    outside = outside & m;
+  }
+  visible[i] = select(1u, 0u, outside != 0u);
 }
 `;

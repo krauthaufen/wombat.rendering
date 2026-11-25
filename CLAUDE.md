@@ -46,6 +46,15 @@ ref plus a per-draw byte offset (`localRefDeltas`), read by the
 unchanged uniform loader. So effects stay untouched, column-backed and
 plain draws share a bucket, and changing every value is one upload
 with no aval evaluated or marked per draw.
+**Frustum culling**: a RenderObject may carry `bounds` (an aval of a
+box in the space of its Positions). That also declares that the shader
+places it with the standard transforms only. Each frame a GPU pass
+(`HEAP_CULL_WGSL`, in front of the scan) takes the box through the
+draw's own ModelTrafo/ViewProjTrafo (or ModelViewProjTrafo) — read
+through the header refs, so table-backed and derived matrices both
+work — and the scan lets records outside the frustum emit nothing. The
+draw stays resident. No `bounds` ⇒ always drawn; GPU-routed
+(derived-modes) buckets are not culled yet.
 Open items live in `TODO.md`; the larger architectural threads are
 tracked in `~/claude/wombat-todo.md`.
 

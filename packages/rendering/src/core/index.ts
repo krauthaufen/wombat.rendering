@@ -91,7 +91,7 @@ export {
 
 export { materializeRow } from "./rowSet.js";
 export {
-  uniformColumn, uniformTable, tableLayout, isUniformColumnCell,
+  uniformColumn, uniformTable, tableLayout, isUniformColumnCell, uniformColumnStats,
   type UniformColumn, type UniformColumnCell, type UniformColumnData, type UniformColumnType, type UniformTable,
 } from "./uniformColumn.js";
 export type { RenderRow, RenderRowSet } from "./rowSet.js";

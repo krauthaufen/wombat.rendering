@@ -416,6 +416,14 @@ function unionDrawHeaders(
   };
   fields.push(layoutIdField);
   off += 4;
+  // The draw's bounding box, for the culling pass (0 = none). Always
+  // present, so whether a draw is culled is its own business and does
+  // not depend on what the first draw of its effect supplied.
+  fields.push({
+    name: "__bounds", wgslName: "bounds", wgslType: "u32",
+    byteOffset: off, byteSize: 4, kind: "bounds-ref",
+  });
+  off += 4;
 
   const drawHeaderBytes = roundUp(off, 16);
   const strideU32 = drawHeaderBytes / 4;

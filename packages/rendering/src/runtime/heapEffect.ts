@@ -134,7 +134,9 @@ export interface FragmentOutputLayout {
 // textures, docs/heap-large-textures.md) instead of the page-size constant.
 // h17: heap-managed storage buffers — host-backed read-only `var<storage>`
 // reads are rewritten into arena loads (storage-ref drawHeader fields).
-export const HEAP_PERSIST_VERSION_BASE = "h17";
+// h18: every drawHeader carries a `__bounds` ref (frustum culling), which
+// can widen the header stride baked into the shaders.
+export const HEAP_PERSIST_VERSION_BASE = "h18";
 export const HEAP_PERSIST_VERSION = HEAP_PERSIST_VERSION_BASE; // legacy export (see persistVersionNow)
 /** The wombat.shader version compiling the cached WGSL: a compiler change
  *  (fusion, linking, emit) re-keys the cache instead of serving WGSL the old
@@ -386,8 +388,12 @@ export interface DrawHeaderField {
    * storage buffer (a host-backed, read-only `var<storage>` of the
    * effect). The shader's `Name[i]` reads are rewritten into loads
    * relative to this ref; the bytes are the host buffer's, verbatim.
+   *
+   * `bounds-ref` (`__bounds`, present in every layout): ref to the
+   * draw's bounding box (6 floats: min xyz, max xyz), 0 when the draw
+   * has none. Read by the culling pass only, never by the shader.
    */
-  readonly kind: "uniform-ref" | "attribute-ref" | "texture-ref" | "storage-ref";
+  readonly kind: "uniform-ref" | "attribute-ref" | "texture-ref" | "storage-ref" | "bounds-ref";
   /**
    * For `uniform-ref`: the uniform's underlying WGSL type. The
    * rewriter uses this to pick the right inline read expression

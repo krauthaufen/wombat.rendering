@@ -49,8 +49,21 @@ const TYPES: Record<UniformColumnType, ColumnTypeInfo> = {
   "vec3<f32>": { bytes: 12, align: 4, decode: (f, _u, _i, w) => new V3f(f[w]!, f[w + 1]!, f[w + 2]!) },
   "vec4<f32>": { bytes: 16, align: 16, decode: (f, _u, _i, w) => new V4f(f[w]!, f[w + 1]!, f[w + 2]!, f[w + 3]!) },
   // A Trafo3d, so the value also serves where an inverse is wanted.
-  "mat4x4<f32>": { bytes: 64, align: 16, decode: (f, _u, _i, w) => Trafo3d.fromMatrix(M44d.fromArray(f.subarray(w, w + 16))) },
+  "mat4x4<f32>": { bytes: 64, align: 16, decode: (f, _u, _i, w) => trafoOf(M44d.fromArray(f.subarray(w, w + 16))) },
 };
+
+/** A row nobody has filled in yet is all zeros: no inverse, but still a value. */
+function trafoOf(m: M44d): Trafo3d {
+  try { return Trafo3d.fromMatrix(m); }
+  catch { return Trafo3d.fromMatrices(m, m); }
+}
+
+/**
+ * How often a cell was read as an aval (by the classic path, a derived
+ * rule, user code). The heap path never does: a scene that is supposed
+ * to ride it should leave this counter still.
+ */
+export const uniformColumnStats = { cellEvaluations: 0 };
 
 interface ColumnValueOf {
   "f32": number; "u32": number; "i32": number;
@@ -95,6 +108,7 @@ function makeColumn<K extends UniformColumnType>(
     type, bytes: info.bytes, stride, offset, data,
     at(index) {
       const cell = AVal.custom((token: AdaptiveToken) => {
+        uniformColumnStats.cellEvaluations++;
         const d = data.getValue(token);
         if (d !== viewsOf) {
           viewsOf = d;

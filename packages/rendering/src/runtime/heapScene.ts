@@ -78,7 +78,7 @@ import {
 } from "./derivedUniforms/index.js";
 import { packerForWgslType, PACKER_MAT4, type WgslPacker } from "./heapScene/packers.js";
 import {
-  HEAP_SCAN_WGSL, SCAN_TILE_SIZE, SCAN_WG_SIZE, SCAN_MAX_RECORDS,
+  HEAP_SCAN_WGSL, HEAP_CULL_WGSL, HEAP_CULL_WG_SIZE, SCAN_TILE_SIZE, SCAN_WG_SIZE, SCAN_MAX_RECORDS,
   TILE_K, RECORD_U32, RECORD_BYTES,
 } from "./heapScene/scanKernel.js";
 import {
@@ -151,6 +151,42 @@ packHostF32.bytes = (val) => {
     ? new Uint8Array(data)
     : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 };
+/** A bounding box as the heap takes it: anything with `min` / `max` points. */
+export interface BoundsLike {
+  readonly min: { readonly x: number; readonly y: number; readonly z: number };
+  readonly max: { readonly x: number; readonly y: number; readonly z: number };
+}
+const BOUNDS_BYTES = 24;
+const packBounds: PoolPackFn = (val, dst, off) => {
+  const b = val as BoundsLike;
+  dst[off] = b.min.x; dst[off + 1] = b.min.y; dst[off + 2] = b.min.z;
+  dst[off + 3] = b.max.x; dst[off + 4] = b.max.y; dst[off + 5] = b.max.z;
+};
+/**
+ * Which transforms a bounding box goes through for a layout: the first
+ * of these the effect reads in full, applied left to right.
+ */
+const CULL_TRANSFORMS: readonly (readonly string[])[] = [
+  ["ModelViewProjTrafo"],
+  ["ModelTrafo", "ViewProjTrafo"],
+  ["ModelViewTrafo", "ProjTrafo"],
+  ["ModelTrafo", "ViewTrafo", "ProjTrafo"],
+];
+function cullFieldsOf(layout: BucketLayout): { bounds: number; mats: number[] } | undefined {
+  const word = (name: string): number | undefined => {
+    const f = layout.drawHeaderFields.find(x => x.name === name);
+    if (f === undefined) return undefined;
+    if (f.kind === "uniform-ref" && (f.uniformWgslType !== "mat4x4<f32>" || layout.perInstanceUniforms.has(name))) return undefined;
+    return f.byteOffset / 4;
+  };
+  const bounds = word("__bounds");
+  if (bounds === undefined) return undefined;
+  for (const names of CULL_TRANSFORMS) {
+    const mats = names.map(word);
+    if (mats.every(m => m !== undefined)) return { bounds, mats: mats as number[] };
+  }
+  return undefined;
+}
 /** A heap-managed storage buffer: the host bytes, verbatim. */
 const packStorageBytes: PoolPack = (val, dst, off) => {
   const src = packStorageBytes.bytes!(val);
@@ -333,6 +369,12 @@ interface BucketSlot {
   /** numRecords used to size the current render bindGroup; rebuild when it changes. */
   renderBoundRecordCount?: number;
   scanDirty: boolean;
+  // ─── Frustum culling (only once the bucket has a draw with bounds) ──
+  /** One u32 per record, written by the culling pass each frame. */
+  visibleBuf?: GPUBuffer;
+  /** Records `visibleBuf` has room for. */
+  visibleCap?: number;
+  cullParamsBuf?: GPUBuffer;
 }
 
 /**
@@ -517,6 +559,15 @@ interface Bucket {
    */
   gpuRouted: boolean;
   /**
+   * Frustum culling: the drawHeader words (u32 offsets) of the bounds
+   * ref and of the matrices a box goes through, in order. `undefined`
+   * when the effect reads no transform the heap recognises — its draws
+   * are then never culled.
+   */
+  cull: { readonly bounds: number; readonly mats: readonly number[] } | undefined;
+  /** Live draws that supplied a bounding box. Culling runs while > 0. */
+  cullCount: number;
+  /**
    * Per-bucket partition dispatcher. Owns the master record buffer
    * + per-slot atomic counters + params. Slot draw buffers are
    * externally owned (point at `bucket.slots[i].drawTableBuf.buffer`).
@@ -680,6 +731,14 @@ export interface HeapDrawSpec {
    * the same NAMES (the set is fixed when the effect is first seen).
    */
   readonly storageArrays?: ReadonlyMap<string, aval<IBuffer>>;
+  /**
+   * The draw's bounding box in the space of its `Positions` (before the
+   * model transform), see `RenderObject.bounds`. A draw with a box is
+   * left out of a frame in which the box, taken through the draw's own
+   * ModelTrafo / ViewProjTrafo (or ModelViewProjTrafo), is outside the
+   * view frustum. Without one the draw is always drawn.
+   */
+  readonly bounds?: aval<BoundsLike>;
   /**
    * Optional pipeline state (rasterizer / depth / blend). Two specs
    * sharing the SAME `PipelineState` object share a bucket; distinct
@@ -1743,6 +1802,12 @@ export function buildHeapScene(
     if (derivedScene === undefined) return undefined;
     const v = spec.inputs[name];
     const explicit = isDerivedRule(v);
+    // A uniform supplied straight from a uniform column is taken from the
+    // column: a standard recipe for the same name (ModelTrafo is one — it
+    // is normally produced on the GPU from the supplied transform) would
+    // read the cell as an aval, once per draw, which is exactly what a
+    // column is there to avoid.
+    if (!explicit && isUniformColumnCell(v)) return undefined;
     const rule = explicit ? v : STANDARD_DERIVED_RULES.get(name);
     if (rule === undefined) return undefined;
     // Each input leaf must be a uniform bound on this RO (a value, not another rule): a
@@ -1940,6 +2005,7 @@ export function buildHeapScene(
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       ],
     });
     const scanLayout = device.createPipelineLayout({ bindGroupLayouts: [scanBgl] });
@@ -1975,8 +2041,85 @@ export function buildHeapScene(
         { binding: 3, resource: { buffer: s.indirectBuf! } },
         { binding: 4, resource: { buffer: s.paramsBuf! } },
         { binding: 5, resource: { buffer: s.firstDrawInTileBuf!.buffer } },
+        // per-record visibility; a placeholder while the bucket does not cull
+        { binding: 6, resource: { buffer: s.visibleBuf ?? noVisibility() } },
       ],
     });
+  }
+
+  // ─── Frustum culling ──────────────────────────────────────────────
+  // Runs for every bucket that holds a draw with a bounding box, in front
+  // of the scan, each frame: the view changes without anything else in
+  // the bucket changing. See HEAP_CULL_WGSL.
+  let noVisibilityBuf: GPUBuffer | undefined;
+  function noVisibility(): GPUBuffer {
+    return noVisibilityBuf ??= device.createBuffer({
+      label: "heapScene/noVisibility", size: 4, usage: GPUBufferUsage.STORAGE,
+    });
+  }
+  let cullBgl: GPUBindGroupLayout | undefined;
+  let cullPipe: GPUComputePipeline | undefined;
+  function ensureCullPipeline(): void {
+    if (cullPipe !== undefined) return;
+    const ro = { type: "read-only-storage" as const };
+    cullBgl = device.createBindGroupLayout({
+      label: "heapScene/cullBgl",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: ro },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: ro },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: ro },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+      ],
+    });
+    cullPipe = device.createComputePipeline({
+      label: "heapScene/cull",
+      layout: device.createPipelineLayout({ bindGroupLayouts: [cullBgl] }),
+      compute: { module: device.createShaderModule({ code: HEAP_CULL_WGSL, label: "heapScene/cull" }), entryPoint: "cull" },
+    });
+  }
+  /** Whether this bucket's draws are culled this frame. */
+  function bucketCulls(b: Bucket): boolean {
+    // (a GPU-routed bucket's draw tables are rewritten by the partition
+    // kernel each frame; culling those is not wired up)
+    return b.cullCount > 0 && b.cull !== undefined && !b.gpuRouted;
+  }
+  /** Encode the culling pass of one slot (its `visibleBuf` is current afterwards). */
+  function encodeCull(pass: GPUComputePassEncoder, b: Bucket, slotIdx: number): void {
+    const slot = b.slots[slotIdx]!;
+    const n = slot.recordCount;
+    if (slot.visibleBuf === undefined || (slot.visibleCap ?? 0) < n) {
+      slot.visibleBuf?.destroy();
+      slot.visibleCap = Math.max(256, 2 ** Math.ceil(Math.log2(Math.max(1, n))));
+      slot.visibleBuf = device.createBuffer({
+        label: `heapScene/${b.label}/slot${slotIdx}/visible`,
+        size: slot.visibleCap * 4, usage: GPUBufferUsage.STORAGE,
+      });
+      slot.scanBindGroup = buildScanBindGroup(b, slotIdx);
+    }
+    slot.cullParamsBuf ??= device.createBuffer({
+      label: `heapScene/${b.label}/slot${slotIdx}/cullParams`, size: 32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const c = b.cull!, NONE = 0xffffffff;
+    device.queue.writeBuffer(slot.cullParamsBuf, 0, new Uint32Array([
+      n, b.layout.strideU32, c.bounds, c.mats[0] ?? NONE, c.mats[1] ?? NONE, c.mats[2] ?? NONE, 0, 0,
+    ]));
+    // (rebuilt each time: the arena, the header heap and the draw table
+    // can all have been reallocated since the last frame)
+    const bg = device.createBindGroup({
+      layout: cullBgl!,
+      entries: [
+        { binding: 0, resource: { buffer: slot.drawTableBuf!.buffer } },
+        { binding: 1, resource: { buffer: b.drawHeap.buffer } },
+        { binding: 2, resource: { buffer: arena.attrs.chunk(b.chunkIdx).buffer } },
+        { binding: 3, resource: { buffer: slot.visibleBuf } },
+        { binding: 4, resource: { buffer: slot.cullParamsBuf } },
+      ],
+    });
+    pass.setPipeline(cullPipe!);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(Math.max(1, Math.ceil(n / HEAP_CULL_WG_SIZE)));
   }
 
   // ─── Buckets ──────────────────────────────────────────────────────
@@ -3506,6 +3649,7 @@ export function buildHeapScene(
       // placement per-RO through the drawHeader instead).
       label: bk, textures: textures?.kind === "standalone" ? textures : undefined, layout, chunkIdx,
       storageBuffers: undefined, storageDirty: false, storageSubs: [],
+      cull: cullFieldsOf(layout), cullCount: 0,
       slots: [],  // populated lazily by ensureSlot per modeKey
       bindGroup: null as unknown as GPUBindGroup,  // legacy field; slot.bindGroup is the real one
       drawHeap,
@@ -3841,6 +3985,10 @@ export function buildHeapScene(
       if (!shared.some(e => e.av === av)) shared.push({ av, bytes: ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes) });
     };
     for (const f of layout.drawHeaderFields) {
+      if (f.kind === "bounds-ref") {
+        if (spec.bounds !== undefined) estBytes += ALIGN16(ALLOC_HEADER_PAD_TO + BOUNDS_BYTES);
+        continue;
+      }
       if (f.kind === "texture-ref" || f.name === "__layoutId" || INLINE_HEADER_UNIFORMS.has(f.name) || !effectFields.has(f.name)) continue;
       if (ruleForUniform(spec, f.name) !== undefined) {
         estBytes += ALIGN16(ALLOC_HEADER_PAD_TO + PACKER_MAT4.dataBytes); // §7 derived dummy mat4
@@ -4025,6 +4173,23 @@ export function buildHeapScene(
         // Atlas-variant texture bindings carry inline values rather than
         // pool refs; packAtlasTextureFields fills them after this loop.
         if (f.kind === "texture-ref") continue;
+        // The draw's bounding box, for the culling pass: pooled like a
+        // uniform (draws sharing the aval share the allocation), 0 when
+        // the draw has none or its effect's transforms are not known.
+        if (f.kind === "bounds-ref") {
+          if (spec.bounds !== undefined && bucket.cull !== undefined) {
+            const bav = spec.bounds as aval<unknown>;
+            const ref = pool.acquire(
+              device, arena.attrs, bav, bucket.chunkIdx, bav.getValue(tok),
+              BOUNDS_BYTES, 0, 1, packBounds,
+            );
+            setRef(f.name, ref);
+            perDrawAvals.push(bav);
+            perDrawAvalFieldIdx.push(bucket.fieldIdx.get(f.name)!);
+            bucket.cullCount++;
+          }
+          continue;
+        }
         // Family-merge: the union drawHeader includes fields from every
         // member effect. Skip fields this effect doesn't declare — its
         // layoutId branch never reads them, so the slot stays zero.
@@ -4710,6 +4875,14 @@ export function buildHeapScene(
 
     bucket.localPerDrawAvals[localSlot] = undefined;
     bucket.localPerDrawAvalFieldIdx[localSlot] = undefined;
+    {
+      const bi = bucket.fieldIdx.get("__bounds");
+      const refs = bucket.localPerDrawRefs[localSlot];
+      if (bi !== undefined && refs !== undefined && refs[bi]! >= 0) {
+        // the last culled draw leaving: one more scan, now without visibility
+        if (--bucket.cullCount === 0) for (const sl of bucket.slots) sl.scanDirty = true;
+      }
+    }
     bucket.localPerDrawRefs[localSlot]  = undefined;
     bucket.localRefDeltas[localSlot] = undefined;
     bucket.localLayoutIds[localSlot]    = undefined;
@@ -5446,11 +5619,30 @@ export function buildHeapScene(
     let anyDirty = false;
     outer: for (const b of buckets) {
       if (b.gpuRouted && b.partitionDirty) { anyDirty = true; break outer; }
+      if (bucketCulls(b)) { anyDirty = true; break outer; }
       for (const s of b.slots) {
         if (s.scanDirty) { anyDirty = true; break outer; }
       }
     }
     if (!anyDirty) return;
+    // Culling: which records are in view this frame. Its own pass, in
+    // front of the scan, which then lets the others emit nothing.
+    {
+      let cullPass: GPUComputePassEncoder | undefined;
+      for (const b of buckets) {
+        if (!bucketCulls(b)) continue;
+        for (let i = 0; i < b.slots.length; i++) {
+          const slot = b.slots[i]!;
+          if (slot.recordCount === 0) continue;
+          // records added or changed this frame: the draw table the pass reads must be current
+          ensureCullPipeline();
+          cullPass ??= enc.beginComputePass({ label: "heapScene/cull" });
+          encodeCull(cullPass, b, i);
+          slot.scanDirty = true;
+        }
+      }
+      cullPass?.end();
+    }
     // Phase 5c.3: per GPU-routed bucket — dispatch partition (its own
     // compute pass), then copyBufferToBuffer slot counts into scan
     // paramsBuf. Must happen BEFORE the shared scan pass below.
@@ -5473,7 +5665,7 @@ export function buildHeapScene(
         const numBlocks = Math.max(1, Math.ceil(numRecords / SCAN_TILE_SIZE));
         device.queue.writeBuffer(
           slot.paramsBuf!, 0,
-          new Uint32Array([numRecords, numBlocks, 0, 0]),
+          new Uint32Array([numRecords, numBlocks, bucketCulls(b) && slot.visibleBuf !== undefined ? 1 : 0, 0]),
         );
         pass.setBindGroup(0, slot.scanBindGroup!);
         pass.setPipeline(scanPipeTile!);
@@ -5534,6 +5726,8 @@ export function buildHeapScene(
       slot.blockOffsetsBuf?.destroy();
       slot.firstDrawInTileBuf?.destroy();
       slot.indirectBuf?.destroy();
+      slot.visibleBuf?.destroy();
+      slot.cullParamsBuf?.destroy();
       slot.paramsBuf?.destroy();
     }
   }

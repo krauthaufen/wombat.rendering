@@ -73,6 +73,21 @@ export interface RenderObject {
    */
   readonly injectedStorage?: HashMap<string, aval<IBuffer>>;
 
+  /**
+   * The draw's bounding box, in the space its `Positions` are in — i.e.
+   * BEFORE the model transform. Supplying it says two things: where the
+   * geometry is, and that the shader places it with the standard
+   * transforms (ModelTrafo / ViewProjTrafo, or a derived
+   * ModelViewProjTrafo) and nothing else. The heap path then leaves the
+   * draw out of a frame in which the transformed box is outside the
+   * view frustum (it stays resident; only its vertices are not emitted).
+   *
+   * Omit it for anything the shader moves on its own (the draw is then
+   * always drawn), and make it cover every pose of an animated mesh.
+   * With instancing it must cover all instances.
+   */
+  readonly bounds?: aval<{ readonly min: { x: number; y: number; z: number }; readonly max: { x: number; y: number; z: number } }>;
+
   /** Index buffer for indexed draws. */
   readonly indices?: BufferView;
   readonly drawCall: aval<DrawCall>;

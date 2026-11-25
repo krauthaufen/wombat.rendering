@@ -20,7 +20,7 @@ import {
   type BufferView, type DrawCall, type RenderObject,
 } from "@aardworx/wombat.rendering/core";
 import { AttributeProvider, UniformProvider } from "../packages/rendering/src/core/provider.js";
-import { tableLayout, uniformTable, uniformColumn } from "../packages/rendering/src/core/uniformColumn.js";
+import { tableLayout, uniformTable, uniformColumn, uniformColumnStats } from "../packages/rendering/src/core/uniformColumn.js";
 import { compileHybridScene } from "../packages/rendering/src/runtime/hybridScene.js";
 import { createFramebufferSignature } from "@aardworx/wombat.rendering/resources";
 import { readTexturePixels, requestRealDevice } from "./_realGpu.js";
@@ -110,6 +110,7 @@ describe("uniform columns through the scene (real GPU)", () => {
         };
         const R = [255, 0, 0], G = [0, 255, 0], B = [0, 0, 255], Y = [255, 255, 0], C = [0, 255, 255], M = [255, 0, 255], Wh = [255, 255, 255];
 
+        const evaluationsBefore = uniformColumnStats.cellEvaluations;
         expect(await render(), "each draw reads its own row").toEqual([R, G, B]);
         expect(scene.heapTotalDraws()).toBe(heap ? 3 : 0);
 
@@ -136,6 +137,12 @@ describe("uniform columns through the scene (real GPU)", () => {
         ]); });
         expect(await render(), "after the table grew").toEqual([B, R, G]);
         expect(scene.heapTotalDraws(), "still on the heap").toBe(heap ? 3 : 0);
+        // The point of a column: the heap never reads a cell as an aval, not
+        // even ModelTrafo (which it otherwise derives per draw). The classic
+        // path reads every cell.
+        const evaluations = uniformColumnStats.cellEvaluations - evaluationsBefore;
+        if (heap) expect(evaluations, "cells read as avals on the heap path").toBe(0);
+        else expect(evaluations).toBeGreaterThan(0);
       } finally { device.destroy(); }
     });
 
