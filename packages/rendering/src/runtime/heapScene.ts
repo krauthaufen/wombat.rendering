@@ -51,8 +51,9 @@ import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
 import type { PipelineState } from "../core/pipelineState.js";
 import type { BufferView } from "../core/bufferView.js";
 import type { IBuffer, HostBufferSource } from "../core/buffer.js";
+import { isUniformColumnCell, type UniformColumnData } from "../core/uniformColumn.js";
 import { INLINE_HEADER_UNIFORMS,
-  buildBucketLayout, compileHeapEffect,
+  buildBucketLayout, compileHeapEffect, type DrawHeaderField,
   type BucketLayout, type FragmentOutputLayout,
   type HeapEffectSchema,
 } from "./heapEffect.js";
@@ -150,6 +151,40 @@ packHostF32.bytes = (val) => {
     ? new Uint8Array(data)
     : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 };
+/** A heap-managed storage buffer: the host bytes, verbatim. */
+const packStorageBytes: PoolPack = (val, dst, off) => {
+  const src = packStorageBytes.bytes!(val);
+  new Uint8Array(dst.buffer, dst.byteOffset + off * 4, src.byteLength).set(src);
+};
+packStorageBytes.bytes = (val) => {
+  const ibuf = val as IBuffer;
+  if (ibuf.kind !== "host") {
+    throw new Error("heapScene: a heap-managed storage buffer flipped to a native GPUBuffer; not supported in heap path");
+  }
+  const data = ibuf.data;
+  return data instanceof ArrayBuffer
+    ? new Uint8Array(data)
+    : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+};
+/** Placement of a heap-managed storage buffer (whole words; the header's length/stride are informational). */
+function storagePlacement(val: unknown): PoolPlacement {
+  const bytes = packStorageBytes.bytes!(val).byteLength;
+  const dataBytes = Math.ceil(bytes / 4) * 4;
+  return { dataBytes, typeId: 0, length: dataBytes / 4, pack: packStorageBytes };
+}
+/** A uniform column (core/uniformColumn.ts): the caller's array, verbatim. */
+const packColumnBytes: PoolPack = (val, dst, off) => {
+  const src = packColumnBytes.bytes!(val);
+  new Uint8Array(dst.buffer, dst.byteOffset + off * 4, src.byteLength).set(src);
+};
+packColumnBytes.bytes = (val) => {
+  const d = val as UniformColumnData;
+  return new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+};
+function columnPlacement(val: unknown): PoolPlacement {
+  const dataBytes = (val as UniformColumnData).byteLength;
+  return { dataBytes, typeId: 0, length: dataBytes / 4, pack: packColumnBytes };
+}
 /** Broadcast prefix copy — the only variant that genuinely captures. */
 function packHostPrefix(limitFloats: number): PoolPackFn {
   return (val, dst, off) => {
@@ -413,6 +448,15 @@ interface Bucket {
    * DrawHeader after the drawHeap GrowBuffer reallocates.
    */
   readonly localPerDrawRefs: (Int32Array | undefined)[];
+  /**
+   * Per slot, per field: bytes ADDED to the field's ref when the header
+   * is written. A uniform taken from a uniform column references the
+   * column's (shared) allocation plus the offset of its own value, so
+   * the ordinary uniform load reads that value. `localPerDrawRefs`
+   * keeps the allocation's ref, which is what moves on compaction and
+   * resize. `undefined` for a draw without column-backed uniforms.
+   */
+  readonly localRefDeltas: (Int32Array | undefined)[];
   /** drawHeaderFields name → array index (built once per bucket). */
   readonly fieldIdx: Map<string, number>;
   /** fieldIdx.get("Positions") / ("Normals"), −1 when absent. */
@@ -626,6 +670,16 @@ export interface HeapDrawSpec {
    * construction). Buffers must be GPU-backed IBuffers.
    */
   readonly storageBuffers?: ReadonlyMap<string, aval<IBuffer>>;
+  /**
+   * Heap-managed storage buffers: host-backed data for the effect's
+   * read-only `var<storage>` arrays (a baked bone table, a lookup table).
+   * Unlike `storageBuffers` these are per draw and live IN the arena —
+   * allocated once per distinct aval, like an attribute — and the
+   * shader's `Name[i]` reads are rewritten into arena loads, in the
+   * vertex and the fragment stage. Every draw of an effect must supply
+   * the same NAMES (the set is fixed when the effect is first seen).
+   */
+  readonly storageArrays?: ReadonlyMap<string, aval<IBuffer>>;
   /**
    * Optional pipeline state (rasterizer / depth / blend). Two specs
    * sharing the SAME `PipelineState` object share a bucket; distinct
@@ -1280,6 +1334,7 @@ export function buildHeapScene(
 
   // ─── HeapDrawSpec.geometry: a count that changes ──────────────────
   const drawIdToGeometryCallback = new Map<number, IDisposable>();
+  const drawIdToColumnIndexCallbacks = new Map<number, IDisposable[]>();
   const geometryDirty = new Set<number>();
   function subscribeGeometry(av: aval<unknown>, drawId: number): void {
     if (av.isConstant || drawIdToGeometryCallback.has(drawId)) return;
@@ -1287,9 +1342,24 @@ export function buildHeapScene(
   }
   function unsubscribeGeometry(drawId: number): void {
     const cb = drawIdToGeometryCallback.get(drawId);
-    if (cb === undefined) return;
-    cb.dispose();
-    drawIdToGeometryCallback.delete(drawId);
+    if (cb !== undefined) {
+      cb.dispose();
+      drawIdToGeometryCallback.delete(drawId);
+    }
+    const rows = drawIdToColumnIndexCallbacks.get(drawId);
+    if (rows !== undefined) {
+      for (const r of rows) r.dispose();
+      drawIdToColumnIndexCallbacks.delete(drawId);
+    }
+  }
+  /** A draw whose uniform-column row is an aval: when it changes the draw
+   *  is added again under its id (like a changed count), so its header
+   *  points at the new row. */
+  function subscribeColumnIndex(av: aval<number>, drawId: number): void {
+    if (av.isConstant) return;
+    let list = drawIdToColumnIndexCallbacks.get(drawId);
+    if (list === undefined) { list = []; drawIdToColumnIndexCallbacks.set(drawId, list); }
+    list.push(addMarkingCallback(av, () => { geometryDirty.add(drawId); }));
   }
 
   /** Update the drawTable record's instanceCount in place — the
@@ -1386,7 +1456,7 @@ export function buildHeapScene(
    * attribute arrays — the latter measured from the value itself.
    */
   function poolPlacementFor(
-    f: { kind: "uniform-ref" | "attribute-ref" | "texture-ref"; uniformWgslType?: string; attributeWgslType?: string },
+    f: { kind: DrawHeaderField["kind"]; uniformWgslType?: string | undefined; attributeWgslType?: string | undefined },
     value: unknown,
   ): { dataBytes: number; typeId: number; length: number; pack: (val: unknown, dst: Float32Array, off: number) => void } {
     if (f.kind === "uniform-ref") {
@@ -2021,7 +2091,7 @@ export function buildHeapScene(
 
   function compileFamilyFor(
     effects: readonly Effect[],
-    perInstanceByEffect: ReadonlyMap<Effect, { attributes: Set<string>; uniforms: Set<string> }>,
+    perInstanceByEffect: ReadonlyMap<Effect, { attributes: Set<string>; uniforms: Set<string>; storage?: Set<string> }>,
   ): FamilyState {
     // Family-merge (multi-effect dispatch via layoutId switch) has been
     // disabled — it was a perf illusion. Every effect compiles to its
@@ -2061,6 +2131,7 @@ export function buildHeapScene(
     for (const a of s.attributes) fields.add(a.name);
     for (const u of s.uniforms)   fields.add(u.name);
     for (const t of s.textures)   fields.add(t.name);
+    for (const n of schema.drawHeaderUnion.heapStorageBuffers) fields.add(n);
     fieldsForEffect.set(effect.id, fields);
     return {
       schema, vsModule, fsModule, fieldsForEffect,
@@ -2087,14 +2158,16 @@ export function buildHeapScene(
     const perInstanceByEffectId = new Map<string, {
       attributes: Set<string>;
       uniforms: Set<string>;
+      storage: Set<string>;
     }>();
     for (const spec of specs) {
       const e = spec.effect;
       let entry = perInstanceByEffectId.get(e.id);
       if (entry === undefined) {
-        entry = { attributes: new Set<string>(), uniforms: new Set<string>() };
+        entry = { attributes: new Set<string>(), uniforms: new Set<string>(), storage: new Set<string>() };
         perInstanceByEffectId.set(e.id, entry);
       }
+      if (spec.storageArrays !== undefined) for (const name of spec.storageArrays.keys()) entry.storage.add(name);
       if (spec.instanceAttributes !== undefined) {
         for (const name of Object.keys(spec.instanceAttributes)) entry.attributes.add(name);
       }
@@ -2105,7 +2178,7 @@ export function buildHeapScene(
     void enableFamilyMerge;
     for (const e of unique) {
       const perI = perInstanceByEffectId.get(e.id);
-      const singleMap = new Map<Effect, { attributes: Set<string>; uniforms: Set<string> }>();
+      const singleMap = new Map<Effect, { attributes: Set<string>; uniforms: Set<string>; storage?: Set<string> }>();
       if (perI !== undefined) singleMap.set(e, perI);
       familyByEffectId.set(e.id, compileFamilyFor([e], singleMap));
     }
@@ -2141,11 +2214,14 @@ export function buildHeapScene(
   function ensureFamilyForSpec(spec: HeapDrawSpec): void {
     if (!familyBuilt) { buildFamilyFromSpecs([spec]); return; }
     if (familyByEffectId.has(spec.effect.id)) return;
-    const entry = { attributes: new Set<string>(), uniforms: new Set<string>() };
+    const entry = {
+      attributes: new Set<string>(), uniforms: new Set<string>(),
+      storage: new Set<string>(spec.storageArrays?.keys() ?? []),
+    };
     if (spec.instanceAttributes !== undefined) {
       for (const name of Object.keys(spec.instanceAttributes)) entry.attributes.add(name);
     }
-    const singleMap = new Map<Effect, { attributes: Set<string>; uniforms: Set<string> }>();
+    const singleMap = new Map<Effect, { attributes: Set<string>; uniforms: Set<string>; storage?: Set<string> }>();
     singleMap.set(spec.effect, entry);
     familyByEffectId.set(spec.effect.id, compileFamilyFor([spec.effect], singleMap));
   }
@@ -3277,7 +3353,7 @@ export function buildHeapScene(
           const uRefs = bucket.uniformOrder!.map(n => {
             const i = bucket.fieldIdx.get(n);
             const r = i === undefined ? -1 : m.perDrawRefs[i]!;
-            return r < 0 ? 0 : r;
+            return r < 0 ? 0 : r + (bucket.localRefDeltas[m.localSlot]?.[i!] ?? 0);
           });
           const recIdx = partition.appendRecord(
             m.localSlot, m.firstIndex, m.indexCount, m.instanceCount, m.targetComboId, uRefs,
@@ -3437,7 +3513,7 @@ export function buildHeapScene(
       headerDirtyMin: Infinity, headerDirtyMax: 0,
       localPosRefs: [], localNorRefs: [],
       localEntries: [], localToDrawId: [],
-      localPerDrawAvals: [], localPerDrawAvalFieldIdx: [], localPerDrawRawFieldIdx: [], localPerDrawRefs: [], localLayoutIds: [],
+      localPerDrawAvals: [], localPerDrawAvalFieldIdx: [], localPerDrawRawFieldIdx: [], localPerDrawRefs: [], localRefDeltas: [], localLayoutIds: [],
       fieldIdx,
       posFieldIdx: fieldIdx.get("Positions") ?? -1,
       norFieldIdx: fieldIdx.get("Normals") ?? -1,
@@ -3518,6 +3594,7 @@ export function buildHeapScene(
     const u32 = new Uint32Array(dst.buffer, dst.byteOffset, dst.length);
     const baseFloat = (localSlot * bucket.layout.drawHeaderBytes) / 4;
     const fields = bucket.layout.drawHeaderFields;
+    const deltas = bucket.localRefDeltas[localSlot];
     for (let i = 0; i < fields.length; i++) {
       const f = fields[i]!;
       // texture-ref fields carry inline values (pageRef/formatBits as u32,
@@ -3536,7 +3613,7 @@ export function buildHeapScene(
       // Family-merge: a slot's effect doesn't populate every field of
       // the union (−1); leave the unused slots zero — the layoutId
       // switch ensures they're never read by the wrong effect's helper.
-      u32[fOff] = ref < 0 ? 0 : ref;
+      u32[fOff] = ref < 0 ? 0 : ref + (deltas !== undefined ? deltas[i]! : 0);
     }
   }
 
@@ -3756,11 +3833,30 @@ export function buildHeapScene(
     }
 
     let estBytes = indexArr !== undefined ? ALIGN16(ALLOC_HEADER_PAD_TO + indexArr.byteLength) : 0;
+    // Large allocations many draws share (a uniform column, a storage
+    // array): they cost a page nothing when it already holds them, so
+    // they are counted per candidate page instead of once up front.
+    const shared: { av: aval<unknown>; bytes: number }[] = [];
+    const addShared = (av: aval<unknown>, dataBytes: number): void => {
+      if (!shared.some(e => e.av === av)) shared.push({ av, bytes: ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes) });
+    };
     for (const f of layout.drawHeaderFields) {
       if (f.kind === "texture-ref" || f.name === "__layoutId" || INLINE_HEADER_UNIFORMS.has(f.name) || !effectFields.has(f.name)) continue;
       if (ruleForUniform(spec, f.name) !== undefined) {
         estBytes += ALIGN16(ALLOC_HEADER_PAD_TO + PACKER_MAT4.dataBytes); // §7 derived dummy mat4
         continue;
+      }
+      if (f.kind === "storage-ref") {
+        const sav = spec.storageArrays?.get(f.name);
+        if (sav !== undefined) addShared(sav as aval<unknown>, storagePlacement(sav.getValue(outerTok)).dataBytes);
+        continue; // (a missing one throws in the acquire loop)
+      }
+      if (f.kind === "uniform-ref") {
+        const cell = spec.inputs[f.name];
+        if (isUniformColumnCell(cell)) {
+          addShared(cell.column.data as aval<unknown>, columnPlacement(cell.column.data.getValue(outerTok)).dataBytes);
+          continue;
+        }
       }
       const perInstUniform = f.kind === "uniform-ref" && perInstanceUniforms.has(f.name);
       const perInstAttr = f.kind === "attribute-ref" && perInstanceAttributes.has(f.name);
@@ -3789,7 +3885,18 @@ export function buildHeapScene(
           if (where !== undefined) { preferred = where; break; }
         }
       }
-      const fits = (c: number): boolean => arena.attrs.bumpHeadroom(c) >= estBytes;
+      // ... or a shared allocation (a uniform column, a bone table)
+      if (preferred === undefined) {
+        for (const e of shared) {
+          const where = pool.firstChunkContaining(e.av);
+          if (where !== undefined) { preferred = where; break; }
+        }
+      }
+      const fits = (c: number): boolean => {
+        let need = estBytes;
+        for (const e of shared) if (!pool.has(e.av, c)) need += e.bytes;
+        return arena.attrs.bumpHeadroom(c) >= need;
+      };
       const newest = arena.attrs.chunkCount - 1;
       chunkIdx =
         preferred !== undefined && fits(preferred) ? preferred
@@ -3903,11 +4010,14 @@ export function buildHeapScene(
       const i = bucket.fieldIdx.get(name);
       if (i !== undefined) perDrawRefs[i] = ref;
     };
+    /** Column-backed uniforms: offset of this draw's value within the column (see `localRefDeltas`). */
+    let refDeltas: Int32Array | undefined;
+    /** What the header holds for a field: the allocation's ref plus the draw's offset into it. */
     const getRef = (name: string): number | undefined => {
       const i = bucket.fieldIdx.get(name);
       if (i === undefined) return undefined;
       const r = perDrawRefs[i]!;
-      return r < 0 ? undefined : r;
+      return r < 0 ? undefined : r + (refDeltas !== undefined ? refDeltas[i]! : 0);
     };
     {
       const tok = outerTok;
@@ -3960,6 +4070,69 @@ export function buildHeapScene(
           setRef(f.name, ref);
           (perDrawRawFieldIdx ??= []).push(bucket.fieldIdx.get(f.name)!);
           continue;
+        }
+        // Heap-managed storage buffer: one arena allocation per distinct
+        // aval (draws sharing the buffer share the bytes), re-placed like
+        // an attribute when its size changes.
+        if (f.kind === "storage-ref") {
+          const sav = spec.storageArrays?.get(f.name);
+          if (sav === undefined) {
+            throw new Error(
+              `heapScene: ${spec.debugName ?? `a draw (effect ${spec.effect.id})`}: spec.storageArrays missing ` +
+              `required entry '${f.name}' (the effect reads it as a heap-managed storage buffer)`,
+            );
+          }
+          const sval = sav.getValue(tok);
+          const sp = storagePlacement(sval);
+          const ref = pool.acquire(
+            device, arena.attrs, sav as aval<unknown>, bucket.chunkIdx, sval,
+            sp.dataBytes, sp.typeId, sp.length, sp.pack, storagePlacement,
+          );
+          setRef(f.name, ref);
+          perDrawAvals.push(sav as aval<unknown>);
+          perDrawAvalFieldIdx.push(bucket.fieldIdx.get(f.name)!);
+          continue;
+        }
+        // A cell of a uniform column (core/uniformColumn.ts): the WHOLE
+        // column is one allocation, shared by every draw that takes a
+        // value from it and uploaded as one piece when it changes; the
+        // draw's header points at its own value inside it. The cell is
+        // never evaluated here, so nothing is marked per draw.
+        if (f.kind === "uniform-ref" && !INLINE_HEADER_UNIFORMS.has(f.name)) {
+          const cell = spec.inputs[f.name];
+          if (isUniformColumnCell(cell)) {
+            const col = cell.column;
+            const who = spec.debugName ?? `a draw (effect ${spec.effect.id})`;
+            const want = packerForWgslType(f.uniformWgslType ?? "").dataBytes;
+            if (col.bytes !== want) {
+              throw new Error(
+                `heapScene: ${who}: uniform '${f.name}' is ${f.uniformWgslType ?? "?"} (${want} bytes) ` +
+                `but is supplied from a column of '${col.type}' (${col.bytes} bytes)`,
+              );
+            }
+            const data = col.data.getValue(tok);
+            // (read with the scene's token: a changed row marks the scene)
+            const row = typeof cell.index === "number" ? cell.index : cell.index.getValue(tok);
+            const delta = row * col.stride + col.offset;
+            if (!(row >= 0) || delta + col.bytes > data.byteLength) {
+              throw new Error(
+                `heapScene: ${who}: uniform '${f.name}' takes row ${row} of a column with ` +
+                `${Math.floor(data.byteLength / col.stride)} rows`,
+              );
+            }
+            if (typeof cell.index !== "number") subscribeColumnIndex(cell.index, drawId);
+            const cp = columnPlacement(data);
+            const ref = pool.acquire(
+              device, arena.attrs, col.data as aval<unknown>, bucket.chunkIdx, data,
+              cp.dataBytes, cp.typeId, cp.length, cp.pack, columnPlacement,
+            );
+            const fi = bucket.fieldIdx.get(f.name)!;
+            perDrawRefs[fi] = ref;
+            (refDeltas ??= new Int32Array(perDrawRefs.length))[fi] = delta;
+            perDrawAvals.push(col.data as aval<unknown>);
+            perDrawAvalFieldIdx.push(fi);
+            continue;
+          }
         }
         const isPerInstanceUniformField =
           f.kind === "uniform-ref" && perInstanceUniforms.has(f.name);
@@ -4063,6 +4236,7 @@ export function buildHeapScene(
     bucket.localPerDrawAvalFieldIdx[localSlot] = perDrawAvalFieldIdx;
     bucket.localPerDrawRawFieldIdx[localSlot] = perDrawRawFieldIdx;
     bucket.localPerDrawRefs[localSlot]  = perDrawRefs;
+    bucket.localRefDeltas[localSlot] = refDeltas;
     const layoutId = fam.schema.layoutIdOf.get(spec.effect)!;
     bucket.localLayoutIds[localSlot] = layoutId;
 
@@ -4537,6 +4711,7 @@ export function buildHeapScene(
     bucket.localPerDrawAvals[localSlot] = undefined;
     bucket.localPerDrawAvalFieldIdx[localSlot] = undefined;
     bucket.localPerDrawRefs[localSlot]  = undefined;
+    bucket.localRefDeltas[localSlot] = undefined;
     bucket.localLayoutIds[localSlot]    = undefined;
     bucket.localPosRefs[localSlot]  = undefined;
     bucket.localNorRefs[localSlot]  = undefined;
@@ -4668,7 +4843,30 @@ export function buildHeapScene(
   // refs, drawHeader cells, and index `_indexStart` — everything this scene
   // caches that points into the arena. (The storage-level uniform/index pools
   // are re-seated by the store itself, around this call.)
-  function applyRemap(chunkIdx: number, remap: ReadonlyMap<number, number>): void {
+  function applyRemap(chunkIdx: number, remapIn: ReadonlyMap<number, number>): void {
+    // `remapIn` maps allocation starts. A column-backed uniform's header
+    // cell (and whatever was told that address: the partition kernel's
+    // uniform refs, §7's host offsets) points INSIDE an allocation, so
+    // those interior addresses are added for the consumers that match by
+    // exact address. The per-draw refs below hold allocation starts and
+    // use the same map.
+    let remap = remapIn;
+    for (const bucket of buckets) {
+      if (bucket.chunkIdx !== chunkIdx) continue;
+      for (const localSlot of bucket.drawSlots) {
+        const deltas = bucket.localRefDeltas[localSlot];
+        const refs = bucket.localPerDrawRefs[localSlot];
+        if (deltas === undefined || refs === undefined) continue;
+        for (let i = 0; i < deltas.length; i++) {
+          const d = deltas[i]!;
+          if (d === 0 || refs[i]! < 0) continue;
+          const nn = remapIn.get(refs[i]!);
+          if (nn === undefined) continue;
+          if (remap === remapIn) remap = new Map(remapIn);
+          (remap as Map<number, number>).set(refs[i]! + d, nn + d);
+        }
+      }
+    }
     if (derivedScene !== undefined) {
       // §7 handles store DATA offsets (ref + header pad), not header refs.
       const dataRemap = new Map<number, number>();
@@ -6347,8 +6545,10 @@ const KNOWN_TYPE_IDS = new Set<number>([0, 1, 2, 3]);
         for (let slot = 0; slot < target.slots[0]!.recordCount; slot++) {
           for (const f of target.layout.drawHeaderFields) {
             if (f.kind !== "uniform-ref" && f.kind !== "attribute-ref") continue;
-            const ref = dhU32[(slot * stride2 + f.byteOffset) >>> 2];
-            if (ref === undefined || ref === 0) continue;
+            const cellRef = dhU32[(slot * stride2 + f.byteOffset) >>> 2];
+            if (cellRef === undefined || cellRef === 0) continue;
+            // (a column-backed uniform points inside its allocation: back to the start)
+            const ref = cellRef - (target.localRefDeltas[slot]?.[target.fieldIdx.get(f.name) ?? -1] ?? 0);
             // Read alloc length (u32 at ref/4 + 1) → derive bytes.
             const len = arenaU32[(ref >>> 2) + 1]!;
             const stride = arenaU32[(ref >>> 2) + 2]!;  // stride bytes

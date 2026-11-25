@@ -901,6 +901,9 @@ function buildFlatSpec(
     ...(ro.injectedStorage !== undefined && ro.injectedStorage.count > 0
       ? { storageBuffers: (() => { const m = new Map<string, aval<IBuffer>>(); ro.injectedStorage!.iter((n, av) => { m.set(n, av); }); return m; })() }
       : {}),
+    ...(ro.storageBuffers !== undefined && ro.storageBuffers.count > 0
+      ? { storageArrays: (() => { const m = new Map<string, aval<IBuffer>>(); ro.storageBuffers!.iter((n, av) => { m.set(n, av); }); return m; })() }
+      : {}),
     ...(ro.modeRules !== undefined ? { modeRules: ro.modeRules } : {}),
     ...(ro.modelChain !== undefined ? { modelChain: ro.modelChain } : {}),
     // Pass `active` through unforced so the heap path can subscribe

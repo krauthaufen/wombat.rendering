@@ -143,6 +143,8 @@ export interface BuildShaderFamilyOptions {
   readonly perEffectPerInstance?: ReadonlyMap<Effect, {
     readonly attributes: ReadonlySet<string>;
     readonly uniforms?: ReadonlySet<string>;
+    /** Storage buffers the draws supply as host data (heap-managed). */
+    readonly storage?: ReadonlySet<string>;
   }>;
 }
 
@@ -317,6 +319,7 @@ function unionDrawHeaders(
   perEffectPerInstance: ReadonlyMap<Effect, {
     readonly attributes: ReadonlySet<string>;
     readonly uniforms?: ReadonlySet<string>;
+    readonly storage?: ReadonlySet<string>;
   }> | undefined,
 ): BucketLayout {
   // Build each effect's BucketLayout with default opts. The v1 PoC's
@@ -334,6 +337,7 @@ function unionDrawHeaders(
       atlasTextureBindings: atlasNames,
       ...(perI?.attributes !== undefined ? { perInstanceAttributes: perI.attributes } : {}),
       ...(perI?.uniforms !== undefined ? { perInstanceUniforms: perI.uniforms } : {}),
+      ...(perI?.storage !== undefined ? { heapStorageBuffers: perI.storage } : {}),
     }));
   }
 
@@ -502,6 +506,10 @@ function unionDrawHeaders(
     }
   }
   const storageBindings = [...storageByName.values()].sort((a, b) => a.binding - b.binding);
+  const heapStorageBuffers = new Set<string>();
+  for (const e of sortedEffects) {
+    for (const n of perEffectLayout.get(e)!.heapStorageBuffers) heapStorageBuffers.add(n);
+  }
 
   const base = {
     drawHeaderFields: fields,
@@ -514,7 +522,7 @@ function unionDrawHeaders(
     samplerBindings: orderedSamplers,
     atlasTextureBindings: atlasUnion,
     cubeTextureBindings: cubeUnion,
-    storageBindings,
+    storageBindings, heapStorageBuffers,
   };
   return { id: bucketLayoutId(base), ...base };
 }

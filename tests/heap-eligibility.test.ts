@@ -21,6 +21,8 @@ import type { DrawCall } from "../packages/rendering/src/core/drawCall.js";
 import type { Effect } from "../packages/rendering/src/core/shader.js";
 import type { RenderObject } from "../packages/rendering/src/core/renderObject.js";
 import { isHeapEligible } from "../packages/rendering/src/runtime/heapEligibility.js";
+import { makeHeapTestEffectStorage } from "./_heapTestEffect.js";
+import { renderObjectToHeapSpec } from "../packages/rendering/src/runtime/heapAdapter.js";
 
 // Eligibility never reads the effect / pipelineState — we just need
 // a placeholder for typing. `as unknown as Effect` is safe because
@@ -246,5 +248,36 @@ describe("isHeapEligible — large-object eject (§2)", () => {
       indices: iview,
     });
     expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(false);
+  });
+
+  // ── storage buffers: heap-managed when host-backed and read-only ──
+  const storage = (make: (data: Float32Array) => IBuffer): HashMap<string, aval<IBuffer>> =>
+    HashMap.empty<string, aval<IBuffer>>()
+      .add("Offsets", cval(make(new Float32Array(8))))
+      .add("Palette", cval(make(new Float32Array(8))));
+
+  it("RO with host-backed storage buffers its effect declares read-only is eligible", () => {
+    const ro = baseRO({ effect: makeHeapTestEffectStorage(), storageBuffers: storage((d) => IBuffer.fromHost(d)) });
+    expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(true);
+  });
+
+  it("RO with a GPU-backed storage buffer is ineligible", () => {
+    const gpu = { size: 32 } as unknown as GPUBuffer;
+    const ro = baseRO({ effect: makeHeapTestEffectStorage(), storageBuffers: storage(() => IBuffer.fromGPU(gpu)) });
+    expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(false);
+  });
+
+  it("RO with storage buffers whose effect cannot be inspected is ineligible", () => {
+    const ro = baseRO({ storageBuffers: storage((d) => IBuffer.fromHost(d)) });
+    expect(isHeapEligible(ro).getValue(AdaptiveToken.top)).toBe(false);
+  });
+
+  it("the adapter hands an RO's storage buffers to the heap as storage arrays", () => {
+    const buffers = storage((d) => IBuffer.fromHost(d));
+    const ro = baseRO({ effect: makeHeapTestEffectStorage(), storageBuffers: buffers });
+    const spec = renderObjectToHeapSpec(ro, AdaptiveToken.top)!;
+    expect([...spec.storageArrays!.keys()].sort()).toEqual(["Offsets", "Palette"]);
+    expect(spec.storageArrays!.get("Palette")).toBe(buffers.tryFind("Palette"));
+    expect(spec.storageBuffers).toBeUndefined();
   });
 });

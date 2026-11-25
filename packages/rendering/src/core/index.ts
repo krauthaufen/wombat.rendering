@@ -90,6 +90,10 @@ export {
 } from "./renderTree.js";
 
 export { materializeRow } from "./rowSet.js";
+export {
+  uniformColumn, uniformTable, tableLayout, isUniformColumnCell,
+  type UniformColumn, type UniformColumnCell, type UniformColumnData, type UniformColumnType, type UniformTable,
+} from "./uniformColumn.js";
 export type { RenderRow, RenderRowSet } from "./rowSet.js";
 
 export type {

@@ -8,7 +8,7 @@
 // the module.
 
 import { effect, vertex, fragment, type Effect } from "@aardworx/wombat.shader";
-import { type Sampler2D, type SamplerCube, texture, textureSize } from "@aardworx/wombat.shader/types";
+import { type Sampler2D, type SamplerCube, type Storage, type i32, texture, textureSize } from "@aardworx/wombat.shader/types";
 import { uniform } from "@aardworx/wombat.shader/uniforms";
 import { V3f, V4f } from "@aardworx/wombat.base";
 
@@ -81,4 +81,42 @@ export function makeHeapTestEffectTextured(): Effect {
 
 export function makeHeapTestEffectTexturedSize(): Effect {
   return effect(baseVS, texturedSizeFS);
+}
+
+// ─── heap-managed storage buffers ──────────────────────────────────────
+// Two read-only storage arrays, read in BOTH stages:
+//   Offsets (vec3 elements — 16-byte stride in WGSL's layout) moves the
+//   vertices by its SECOND element; Palette (vec4 elements) gives the
+//   fragment colour, picked by `Color.x`.
+declare const Offsets: Storage<V3f[], "read">;
+declare const Palette: Storage<V4f[], "read">;
+
+const storageVS = vertex((v: { Positions: V4f }) => {
+  const I1: i32 = 1 as i32;
+  const o = Offsets[I1];
+  const wp = uniform.ModelTrafo.mul(new V4f(v.Positions.x + o.x, v.Positions.y + o.y, v.Positions.z + o.z, 1.0));
+  return {
+    gl_Position: uniform.ViewProjTrafo.mul(wp),
+    color:       uniform.Color,
+  };
+});
+
+const storageFS = fragment((v: { color: V4f }) => {
+  const idx: i32 = (v.color.x + 0.5) as i32;
+  return { outColor: Palette[idx] };
+});
+
+export function makeHeapTestEffectStorage(): Effect {
+  return effect(storageVS, storageFS);
+}
+
+// Reads ONLY the derived ModelViewProjTrafo (the heap computes it on the
+// GPU from ModelTrafo / ViewTrafo / ProjTrafo) and the colour.
+const mvpVS = vertex((v: { Positions: V4f }) => ({
+  gl_Position: uniform.ModelViewProjTrafo.mul(v.Positions),
+  color:       uniform.Color,
+}));
+
+export function makeHeapTestEffectMvp(): Effect {
+  return effect(mvpVS, plainFS);
 }

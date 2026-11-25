@@ -132,7 +132,9 @@ export interface FragmentOutputLayout {
 // a cached pre-fix compile (two @builtin(position) outputs) must not survive.
 // h16: atlas UVs normalized by the bound array's size (solo pages for large
 // textures, docs/heap-large-textures.md) instead of the page-size constant.
-export const HEAP_PERSIST_VERSION_BASE = "h16";
+// h17: heap-managed storage buffers — host-backed read-only `var<storage>`
+// reads are rewritten into arena loads (storage-ref drawHeader fields).
+export const HEAP_PERSIST_VERSION_BASE = "h17";
 export const HEAP_PERSIST_VERSION = HEAP_PERSIST_VERSION_BASE; // legacy export (see persistVersionNow)
 /** The wombat.shader version compiling the cached WGSL: a compiler change
  *  (fusion, linking, emit) re-keys the cache instead of serving WGSL the old
@@ -379,7 +381,13 @@ export interface DrawHeaderField {
   readonly wgslType: string;        // "u32" for refs; "scalar"-packed for atlas texture-ref entries
   readonly byteOffset: number;
   readonly byteSize: number;
-  readonly kind: "uniform-ref" | "attribute-ref" | "texture-ref";
+  /**
+   * `storage-ref`: ref to the arena allocation holding a heap-managed
+   * storage buffer (a host-backed, read-only `var<storage>` of the
+   * effect). The shader's `Name[i]` reads are rewritten into loads
+   * relative to this ref; the bytes are the host buffer's, verbatim.
+   */
+  readonly kind: "uniform-ref" | "attribute-ref" | "texture-ref" | "storage-ref";
   /**
    * For `uniform-ref`: the uniform's underlying WGSL type. The
    * rewriter uses this to pick the right inline read expression
@@ -466,6 +474,12 @@ export interface BucketLayout {
    * writable storage in vertex stages).
    */
   readonly storageBindings: readonly { readonly name: string; readonly access: "read" | "read_write"; readonly binding: number }[];
+  /**
+   * Storage buffers of the effect that live IN the arena instead of
+   * being bound (each has a `storage-ref` drawHeader field and no entry
+   * in `storageBindings`). Per draw, value-keyed like attributes.
+   */
+  readonly heapStorageBuffers: ReadonlySet<string>;
 }
 
 /**
@@ -508,6 +522,13 @@ export function buildBucketLayout(
      * (default) for the standalone texture path.
      */
     atlasTextureBindings?: ReadonlySet<string>;
+    /**
+     * Names of the effect's storage buffers that are heap-managed: the
+     * draw supplies host data, the arena holds it, and the shader reads
+     * it through a `storage-ref` drawHeader field. Must be declared
+     * read-only. The remaining storage buffers keep a bucket binding.
+     */
+    heapStorageBuffers?: ReadonlySet<string>;
   } = {},
 ): BucketLayout {
   const perInstanceUniforms = opts.perInstanceUniforms ?? new Set<string>();
@@ -541,6 +562,24 @@ export function buildBucketLayout(
       name: a.name, wgslName: lowerFirst(a.name) + "Ref", wgslType: "u32",
       byteOffset: dhOff, byteSize: 4, kind: "attribute-ref",
       attributeWgslType: a.wgslType,
+    });
+    dhOff += 4;
+  }
+
+  // Heap-managed storage buffers: one ref each, like an attribute.
+  const heapStorageBuffers = new Set<string>();
+  for (const sb of schema.storageBuffers ?? []) {
+    if (opts.heapStorageBuffers?.has(sb.name) !== true) continue;
+    if (sb.access !== "read") {
+      throw new Error(
+        `heap: storage buffer '${sb.name}' is declared read_write; only read-only storage buffers can be heap-managed`,
+      );
+    }
+    heapStorageBuffers.add(sb.name);
+    dhOff = roundUp(dhOff, 4);
+    drawHeaderFields.push({
+      name: sb.name, wgslName: lowerFirst(sb.name) + "Ref", wgslType: "u32",
+      byteOffset: dhOff, byteSize: 4, kind: "storage-ref",
     });
     dhOff += 4;
   }
@@ -637,6 +676,7 @@ export function buildBucketLayout(
   // the atlas binding range.
   let nextStorageBinding = HEAP_USER_STORAGE_BINDING_BASE;
   const storageBindings = [...(schema.storageBuffers ?? [])]
+    .filter(sb => !heapStorageBuffers.has(sb.name))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
     .map(sb => ({ name: sb.name, access: sb.access, binding: nextStorageBinding++ }));
 
@@ -644,7 +684,7 @@ export function buildBucketLayout(
     drawHeaderFields, drawHeaderBytes, preludeWgsl, strideU32,
     perInstanceUniforms, perInstanceAttributes,
     textureBindings, samplerBindings, atlasTextureBindings, cubeTextureBindings,
-    storageBindings,
+    storageBindings, heapStorageBuffers,
   };
   return { id: bucketLayoutId(base), ...base };
 }
@@ -673,6 +713,7 @@ export function bucketLayoutId(l: Omit<BucketLayout, "id">): string {
   for (const t of l.textureBindings) parts.push(`T:${t.name}|${t.wgslType}|${t.binding}`);
   for (const s of l.samplerBindings) parts.push(`S:${s.name}|${s.wgslType}|${s.binding}`);
   for (const sb of l.storageBindings) parts.push(`SB:${sb.name}|${sb.access}|${sb.binding}`);
+  parts.push("HSB:" + [...l.heapStorageBuffers].sort().join(","));
   parts.push("ATB:" + [...l.atlasTextureBindings].sort().join(","));
   parts.push("CTB:" + [...l.cubeTextureBindings].sort().join(","));
   // The prelude is derived from the above, but fold its hash in too —

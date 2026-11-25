@@ -26,7 +26,26 @@ derived uniforms (registry / rule IR; inverses are CPU-precomputed
 backward halves composed in reverse — the GPU never inverts) + derived
 modes (pipeline-state as a function of uniforms, via a GPU partition
 kernel), texture atlasing (tiers S/M/L, reactive residency), and
-per-RenderObject instancing.
+per-RenderObject instancing, and **heap-managed storage buffers**: a
+RenderObject's host-backed `storageBuffers` that its effect declares
+read-only (a baked bone table, a lookup table) live in the arena like
+an attribute — one allocation per distinct aval, a `storage-ref` in the
+draw header — and the shader's `Name[i]` / `Name[i].field` reads are
+rewritten into arena loads in the vertex and the fragment stage (WGSL
+element layout, bytes verbatim). GPU-backed or `read_write` storage
+keeps the RO on the classic path; the scene-level `injectedStorage`
+(OIT node pool) stays a real bucket binding.
+**Uniform columns / tables** (`core/uniformColumn.ts`: `uniformColumn`,
+`uniformTable`) batch uniforms that change together: one array behind
+one aval holds a value (or a struct of several fields) per row, and a
+draw supplies `column.at(i)` / `table.row(i)` as its uniform values.
+A cell is an ordinary aval, so it works everywhere (classic path,
+derived-uniform rules); the heap recognises it, stores the whole array
+once in the arena and makes the draw's header point at its row — the
+ref plus a per-draw byte offset (`localRefDeltas`), read by the
+unchanged uniform loader. So effects stay untouched, column-backed and
+plain draws share a bucket, and changing every value is one upload
+with no aval evaluated or marked per draw.
 Open items live in `TODO.md`; the larger architectural threads are
 tracked in `~/claude/wombat-todo.md`.
 

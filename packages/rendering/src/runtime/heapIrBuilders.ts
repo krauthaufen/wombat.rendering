@@ -421,3 +421,149 @@ export function buildMegacallPrelude(emitIdx: Expr): { stmts: Stmt[]; locals: Me
 
   return { stmts, locals: { heapDrawIdx, instId, vid } };
 }
+
+// ─── Heap-managed storage buffers ─────────────────────────────────────
+//
+// A host-backed, read-only `var<storage>` of the user effect lives in the
+// arena like any other per-draw input: the drawHeader holds a ref to its
+// allocation and `Name[i]` (optionally `.field`) becomes a read at
+// `ref + header + i * stride (+ field offset)`. The bytes are the host
+// buffer's, verbatim, so every offset below follows WGSL's own layout
+// rules (a `vec3<f32>` element takes 16 bytes, a struct member sits at
+// its aligned offset, …).
+
+/** Size and alignment of a type in a WGSL storage buffer (bytes). */
+export function storageLayoutOf(t: Type): { size: number; align: number } {
+  switch (t.kind) {
+    case "Float": case "Int": case "Bool":
+      return { size: 4, align: 4 };
+    case "Vector": {
+      const n = t.dim;
+      return n === 2 ? { size: 8, align: 8 } : n === 3 ? { size: 12, align: 16 } : { size: 16, align: 16 };
+    }
+    case "Matrix": {
+      // `cols` column vectors of `rows` components, each column padded to its alignment.
+      const col = storageLayoutOf({ kind: "Vector", element: t.element, dim: t.rows } as Type);
+      const colStride = roundUpTo(col.size, col.align);
+      return { size: colStride * t.cols, align: col.align };
+    }
+    case "Array": {
+      if (t.length === "runtime") throw new Error("heap storage: a runtime-sized array has no size");
+      const e = storageLayoutOf(t.element);
+      return { size: roundUpTo(e.size, e.align) * t.length, align: e.align };
+    }
+    case "Struct": {
+      let off = 0, align = 4;
+      for (const f of t.fields) {
+        const l = storageLayoutOf(f.type);
+        off = roundUpTo(off, l.align) + l.size;
+        if (l.align > align) align = l.align;
+      }
+      return { size: roundUpTo(off, align), align };
+    }
+    default:
+      throw new Error(`heap storage: type kind '${t.kind}' cannot live in a heap-managed storage buffer`);
+  }
+}
+
+/** Bytes from one array element to the next. */
+export function storageStrideOf(elem: Type): number {
+  const l = storageLayoutOf(elem);
+  return roundUpTo(l.size, l.align);
+}
+
+/** Byte offset of a struct member, by WGSL's layout rules. */
+export function storageFieldOffset(struct: Type, name: string): { offset: number; type: Type } {
+  if (struct.kind !== "Struct") throw new Error(`heap storage: '.${name}' on a non-struct element`);
+  let off = 0;
+  for (const f of struct.fields) {
+    const l = storageLayoutOf(f.type);
+    off = roundUpTo(off, l.align);
+    if (f.name === name) return { offset: off, type: f.type };
+    off += l.size;
+  }
+  throw new Error(`heap storage: struct '${struct.name}' has no member '${name}'`);
+}
+
+function roundUpTo(v: number, m: number): number { return Math.ceil(v / m) * m; }
+
+const Ti32: Type = { kind: "Int", signed: true, width: 32 } as Type;
+const bitcastI32 = (e: Expr): Expr => callIntrinsic("bitcast<i32>", "int", Ti32, [e]);
+
+/** `base + k` in bytes, folded when `k` is 0. */
+function plusBytes(base: Expr, k: number): Expr {
+  return k === 0 ? base : add(base, constU32(k), Tu32);
+}
+
+/**
+ * Read a value of type `t` stored at arena BYTE offset `byteOff` (a u32
+ * expression). Floats come from the f32 view, vec4s from the vec4 view
+ * (their offsets are 16-aligned by construction), integers from the u32
+ * view; vectors, matrices and whole structs are assembled from those.
+ */
+export function loadStorageValue(byteOff: Expr, t: Type): Expr {
+  const word = (k: number): Expr => div(plusBytes(byteOff, k), constU32(4), Tu32);
+  switch (t.kind) {
+    case "Float":
+      return item(heapF32, word(0), Tf32);
+    case "Int":
+      return t.signed ? bitcastI32(item(heapU32, word(0), Tu32)) : item(heapU32, word(0), Tu32);
+    case "Vector": {
+      const e = t.element;
+      if (e.kind === "Float" && t.dim === 4) {
+        return item(heapV4f, div(byteOff, constU32(16), Tu32), Tvec4);
+      }
+      const comps: Expr[] = [];
+      for (let i = 0; i < t.dim; i++) {
+        const w = item(e.kind === "Float" ? heapF32 : heapU32, word(i * 4), e.kind === "Float" ? Tf32 : Tu32);
+        comps.push(e.kind === "Int" && e.signed ? bitcastI32(w) : w);
+      }
+      return newVec(comps, t);
+    }
+    case "Matrix": {
+      const colType = { kind: "Vector", element: t.element, dim: t.rows } as Type;
+      const colStride = storageStrideOf(colType);
+      const cols: Expr[] = [];
+      for (let c = 0; c < t.cols; c++) cols.push(loadStorageValue(plusBytes(byteOff, c * colStride), colType));
+      return { kind: "MatrixFromCols", cols, type: t } as Expr;
+    }
+    case "Struct": {
+      // A whole struct: every member loaded at its offset, handed to the
+      // struct's constructor (`Name(a, b, …)` in WGSL and GLSL alike).
+      let off = 0;
+      const members: Expr[] = [];
+      for (const f of t.fields) {
+        const l = storageLayoutOf(f.type);
+        off = roundUpTo(off, l.align);
+        members.push(loadStorageValue(plusBytes(byteOff, off), f.type));
+        off += l.size;
+      }
+      return callIntrinsic(t.name, t.name, t, members);
+    }
+    default:
+      throw new Error(
+        `heap storage: cannot read a value of kind '${t.kind}' from a heap-managed storage buffer`,
+      );
+  }
+}
+
+/**
+ * `Name[index]` (and `Name[index].field…`) for a heap-managed storage
+ * buffer whose allocation ref is `refIdent`. `elem` is the array's
+ * element type, `path` the member names applied to the element.
+ */
+export function loadStorageElement(refIdent: Expr, index: Expr, elem: Type, path: readonly string[] = []): Expr {
+  const idx: Expr = index.type.kind === "Int" && !index.type.signed
+    ? index
+    : ({ kind: "Convert", value: index, type: Tu32 } as Expr);
+  const stride = storageStrideOf(elem);
+  let t = elem, fieldOff = 0;
+  for (const name of path) {
+    const f = storageFieldOffset(t, name);
+    fieldOff += f.offset;
+    t = f.type;
+  }
+  // data starts one allocation header (16 bytes) after the ref
+  const byteOff = add(plusBytes(refIdent, 16 + fieldOff), mul(idx, constU32(stride), Tu32), Tu32);
+  return loadStorageValue(byteOff, t);
+}

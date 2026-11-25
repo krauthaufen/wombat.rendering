@@ -3,8 +3,8 @@
 //
 // Three classes of conditions:
 //   1. STATIC HARD WEDGES — features the heap path doesn't ingest
-//      yet (instanceAttributes, storageBuffers, > 1 texture or
-//      sampler). Decided once at classifier time.
+//      (a storage buffer the effect declares read_write, > 1 texture
+//      or sampler). Decided once at classifier time.
 //   2. STATIC SOFT WEDGES — supported with limits (indexed-only,
 //      instanceCount=1, baseVertex/firstIndex/firstInstance=0).
 //      Read once from the drawCall snapshot.
@@ -22,7 +22,10 @@
 //      the result aval marks → hybrid task repartitions.
 //
 // Out-of-scope blockers (return false unconditionally if present):
-//   - `storageBuffers`         — same.
+//   - a `storageBuffers` entry the effect declares `read_write` (or
+//     whose effect cannot be inspected). Read-only ones are
+//     heap-managed: host-backed like every other buffer (rule 3), their
+//     bytes live in the arena and the shader reads them from there.
 //   - >1 texture or sampler    — multi-binding API not in v1.
 //
 // Per-RO instancing IS supported: `instanceAttributes` are accepted as
@@ -42,6 +45,7 @@ import type { ISampler } from "../core/sampler.js";
 import type { RenderObject } from "../core/renderObject.js";
 import { asAttributeProvider } from "../core/provider.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
+import { compileHeapEffect } from "./heapEffect.js";
 
 // Host textures ride the heap only through the texture atlas. A heap scene
 // with an AtlasPool (every hybrid scene has one) compiles each textured
@@ -170,7 +174,24 @@ function bufferAvals(ro: RenderObject): aval<IBuffer>[] {
     for (const v of attrViews(asAttributeProvider(ro.instanceAttributes))) out.push(v.buffer);
   }
   if (ro.indices !== undefined) out.push(ro.indices.buffer);
+  // Storage buffers ride in the arena too (heap-managed), so they are
+  // subject to the same rules: host-backed, and within the payload budget.
+  if (ro.storageBuffers !== undefined) ro.storageBuffers.iter((_k, av) => { out.push(av); });
   return out;
+}
+
+/** Every storage buffer the RO supplies is declared read-only by its effect. */
+function storageIsReadOnly(ro: RenderObject): boolean {
+  let declared: readonly { readonly name: string; readonly access: "read" | "read_write" }[];
+  try { declared = compileHeapEffect(ro.effect).schema.storageBuffers ?? []; }
+  catch { return false; }
+  let ok = true;
+  ro.storageBuffers!.iter((name) => {
+    const d = declared.find(sb => sb.name === name);
+    // (a supplied buffer the effect does not declare is simply unused)
+    if (d !== undefined && d.access !== "read") ok = false;
+  });
+  return ok;
 }
 
 function textureAvals(ro: RenderObject): aval<ITexture>[] {
@@ -192,7 +213,11 @@ function samplerAvals(ro: RenderObject): aval<ISampler>[] {
  */
 export function isHeapEligible(ro: RenderObject): aval<boolean> {
   // 1. Static hard wedges.
-  if (ro.storageBuffers !== undefined && ro.storageBuffers.count > 0) {
+  // Storage buffers are heap-managed (their bytes live in the arena and
+  // the shader's reads are rewritten into arena loads), which only works
+  // for read-only ones. Whether they are host-backed is checked with the
+  // other buffers below.
+  if (ro.storageBuffers !== undefined && ro.storageBuffers.count > 0 && !storageIsReadOnly(ro)) {
     return AVal.constant(false);
   }
   // Heap path serves at most one distinct texture + sampler per bucket

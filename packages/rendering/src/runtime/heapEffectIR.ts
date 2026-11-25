@@ -23,6 +23,7 @@ import type { Effect, CompileOptions } from "@aardworx/wombat.shader";
 import { substituteInputsInStage, readInputs, mapExpr, mapStmt, liftReturns, uniformsToInputs, resolveHoles } from "@aardworx/wombat.shader/passes";
 import type { HoleValue } from "@aardworx/wombat.shader/passes";
 import { synthesizeHeapDecoderModule, HEAP_FS_DRAWIDX, HEAP_FS_INSTID } from "./heapDecoder.js";
+import { loadStorageElement } from "./heapIrBuilders.js";
 import {
   type Module, type Expr, type Stmt, type Type, type ValueDef,
   type EntryDef, type EntryParameter, type ParamDecoration,
@@ -1275,6 +1276,99 @@ function rewriteFsHeapDirectViaCarrier(m: Module, layout: BucketLayout): Module 
   return substituteInputsInStage(out, "fragment", "Input", n => subst.get(n));
 }
 
+/**
+ * Heap-managed storage buffers (`storage-ref` drawHeader fields): the
+ * buffer's bytes sit in the arena, so every `Name[i]` / `Name[i].field`
+ * read in the user module — vertex stage, fragment stage and helper
+ * functions alike — becomes an arena load relative to the draw's ref,
+ * and the buffer's own declaration is dropped (it has no binding).
+ *
+ * The ref is read from the drawHeader through the draw index the decoder
+ * puts on the carrier (`_h_drawIdx`): the vertex stage receives it by
+ * stage fusion, the fragment stage as a flat varying.
+ */
+function rewriteHeapStorageReads(m: Module, layout: BucketLayout): Module {
+  const fields = new Map<string, DrawHeaderField>();
+  for (const f of layout.drawHeaderFields) if (f.kind === "storage-ref") fields.set(f.name, f);
+  if (fields.size === 0) return m;
+
+  // element type per buffer, from its declaration
+  const elemOf = new Map<string, Type>();
+  for (const v of m.values) {
+    if (v.kind !== "StorageBuffer" || !fields.has(v.name)) continue;
+    if (v.layout.kind !== "Array") {
+      throw new Error(`heap: storage buffer '${v.name}' must be an array to be heap-managed`);
+    }
+    elemOf.set(v.name, v.layout.element);
+  }
+
+  const drawIdx = readScope("Input", HEAP_FS_DRAWIDX, Tu32);
+  const refOf = (name: string): Expr => loadHeaderRef(drawIdx, fields.get(name)!.byteOffset, layout.strideU32);
+  /** `Name[i]` with `Name` heap-managed → its name and index. */
+  const asElement = (e: Expr): { name: string; index: Expr } | null => {
+    if (e.kind !== "Item") return null;
+    const t = e.target;
+    if (t.kind !== "ReadInput" || t.scope !== "Uniform" || !elemOf.has(t.name)) return null;
+    return { name: t.name, index: e.index };
+  };
+  // The visitor is bottom-up, so `Name[i]` is seen before an enclosing
+  // `.field`. Two walks keep a member read from loading the whole struct:
+  //   1. member chains (and non-struct elements) become a single load of
+  //      just that value; struct-typed nodes are left alone, since a
+  //      `.field` further out may still narrow them;
+  //   2. what is left is genuinely read as a whole struct (`let s =
+  //      Name[i]`) and becomes a load of every member.
+  // Anything still naming the buffer after that uses it as a whole value.
+  const rewriteWith = (wholeStructs: boolean) => (e: Expr): Expr => {
+    const path: string[] = [];
+    let cur = e;
+    while (cur.kind === "Field") { path.unshift(cur.name); cur = cur.target; }
+    const el = asElement(cur);
+    if (el === null || (!wholeStructs && e.type.kind === "Struct")) return e;
+    return loadStorageElement(refOf(el.name), el.index, elemOf.get(el.name)!, path);
+  };
+  const body = (s: Stmt): Stmt => {
+    const out = mapStmt(mapStmt(s, { expr: rewriteWith(false) }), { expr: rewriteWith(true) });
+    for (const sn of readInputs(out).values()) {
+      if (sn.scope === "Uniform" && elemOf.has(sn.name)) {
+        throw new Error(
+          `heap: storage buffer '${sn.name}' is used as a whole value; ` +
+          `only its elements ('${sn.name}[i]') can be read from a heap-managed storage buffer`,
+        );
+      }
+    }
+    return out;
+  };
+
+  const carrier: EntryParameter = {
+    name: HEAP_FS_DRAWIDX, type: Tu32, semantic: HEAP_FS_DRAWIDX,
+    decorations: [{ kind: "Interpolation", mode: "flat" } as ParamDecoration],
+  };
+  const values: ValueDef[] = [];
+  for (const v of m.values) {
+    if (v.kind === "StorageBuffer" && elemOf.has(v.name)) continue; // lives in the arena now
+    if (v.kind === "Function") { values.push({ ...v, body: body(v.body) }); continue; }
+    if (v.kind !== "Entry") { values.push(v); continue; }
+    let newBody = body(v.entry.body);
+    // Declare the carrier on every entry: a read may also sit in a helper
+    // the entry calls, and an unused input is pruned again.
+    const inputs = v.entry.inputs.some(p => p.name === HEAP_FS_DRAWIDX)
+      ? v.entry.inputs : [...v.entry.inputs, carrier];
+    let outputs = v.entry.outputs;
+    if (v.entry.stage === "vertex") {
+      // A vertex stage that takes the carrier as an input has consumed it:
+      // stage fusion no longer passes the decoder's value on. Hand it on
+      // explicitly, or the fragment stage (which reads per-draw data by
+      // this index) is left without it.
+      if (!outputs.some(p => p.name === HEAP_FS_DRAWIDX)) outputs = [...outputs, carrier];
+      const forward: Stmt = { kind: "WriteOutput", name: HEAP_FS_DRAWIDX, value: { kind: "Expr", value: drawIdx } };
+      newBody = { kind: "Sequential", body: [forward, ...(newBody.kind === "Sequential" ? newBody.body : [newBody])] };
+    }
+    values.push({ ...v, entry: { ...v.entry, body: newBody, inputs, outputs } });
+  }
+  return { ...m, values };
+}
+
 function compileHeapEffectIRViaDecoder(
   userEffect: Effect,
   layout: BucketLayout,
@@ -1302,6 +1396,9 @@ function compileHeapEffectIRViaDecoder(
     if (f.kind === "uniform-ref" || f.kind === "attribute-ref") uniformRefNames.add(f.name);
   }
   userModule = uniformsToInputs(userModule, uniformRefNames);
+
+  // 2b. Heap-managed storage buffers: `Name[i]` → arena loads.
+  userModule = rewriteHeapStorageReads(userModule, layout);
 
   // 3. Build the decoder Module. Mode flows through: standalone owns
   // the megacall search; family-member receives drawIdx/instId/vid
