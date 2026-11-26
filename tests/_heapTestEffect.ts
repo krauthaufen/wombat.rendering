@@ -75,6 +75,20 @@ export function makeHeapTestEffectCube(): Effect {
   return effect(baseVS, cubeFS);
 }
 
+// Three textures in one effect (a material: colour, detail, mask), each
+// sampled on its own: every one is an atlas lookup with its own placement.
+const detail: Sampler2D = null as unknown as Sampler2D;
+const mask: Sampler2D = null as unknown as Sampler2D;
+const threeTexturesFS = fragment((v: { color: V4f }) => {
+  const a = texture(checker, v.color.xy);
+  const b = texture(detail, v.color.xy);
+  const c = texture(mask, v.color.xy);
+  return { outColor: a.mul(b).add(c) };
+});
+export function makeHeapTestEffectThreeTextures(): Effect {
+  return effect(baseVS, threeTexturesFS);
+}
+
 export function makeHeapTestEffectTextured(): Effect {
   return effect(baseVS, texturedFS);
 }

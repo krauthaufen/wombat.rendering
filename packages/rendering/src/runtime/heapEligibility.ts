@@ -194,6 +194,15 @@ function storageIsReadOnly(ro: RenderObject): boolean {
   return ok;
 }
 
+/** A host texture that fits the atlas's shared pages (not a cube, not one needing a page of its own). */
+function isSharedPageTexture(t: ITexture): boolean {
+  if (t.kind !== "host") return false;
+  const src = t.source;
+  if (src.kind === "raw") return AtlasPool.eligibleSize(src.width, src.height);
+  const live = src.source as { width?: number; height?: number };
+  return AtlasPool.eligibleSize(src.width ?? live.width ?? 0, src.height ?? live.height ?? 0);
+}
+
 function textureAvals(ro: RenderObject): aval<ITexture>[] {
   const out: aval<ITexture>[] = [];
   ro.textures.iter((_k, av) => { out.push(av); });
@@ -233,12 +242,12 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
   // closure below shares this function's V8 scope context, so any
   // temporary Set here would be retained per-RO for the scene's
   // lifetime (measured: 1 Set/RO of pure ballast at heap scale).
-  if (countDistinct(ro.textures) > 1) {
-    return AVal.constant(false);
-  }
-  if (countDistinct(ro.samplers) > 1) {
-    return AVal.constant(false);
-  }
+  // (That is the single-texture story. An object with SEVERAL textures or
+  // samplers is heap-served as well: every texture binding of its effect
+  // gets an atlas placement of its own in the draw header. All of them must
+  // then live on the shared pages: a texture on a page of its own is bound
+  // in place of its format's array, which a second texture could not share.)
+  const several = countDistinct(ro.textures) > 1 || countDistinct(ro.samplers) > 1;
 
   // 2. Interleaved / offset attributes are handled by de-interleaving at
   //    ingest (heapAdapter.tightenBufferView gathers a tight, offset-0
@@ -276,7 +285,10 @@ export function isHeapEligible(ro: RenderObject): aval<boolean> {
       // walking the rest of the buffer list for a guaranteed reject.
       if (payloadBytes > HEAP_PAYLOAD_EJECT_BYTES) return false;
     }
-    for (const av of textures) if (!isHeapServableTexture(av.getValue(token))) return false;
+    for (const av of textures) {
+      const t = av.getValue(token);
+      if (!isHeapServableTexture(t) || (several && !isSharedPageTexture(t))) return false;
+    }
     for (const av of samplers) if (!isHeapServableSampler(av.getValue(token))) return false;
     const dc = ro.drawCall.getValue(token);
     // 0 is heap-legal (the scan kernel emits indexCount × 0 = nothing,

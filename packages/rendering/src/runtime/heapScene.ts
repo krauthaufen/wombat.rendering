@@ -543,13 +543,13 @@ interface Bucket {
    * Per-local-slot atlas HeapTextureSet for re-packing on drawHeap
    * GrowBuffer reallocation. Standalone-only buckets keep this empty.
    */
-  readonly localAtlasTextures: ((HeapTextureSet & { kind: "atlas" }) | undefined)[];
+  readonly localAtlasTextures: (HeapBoundTexture[] | undefined)[];
   /**
    * Per-local-slot index into `atlasAvalRefs[sourceAval]` — lets
    * removeDraw do swap-pop without an O(N) findIndex scan. `undefined`
    * for slots without an atlas source aval.
    */
-  readonly localAtlasArrIdx: (number | undefined)[];
+  readonly localAtlasArrIdx: ((number | undefined)[] | undefined)[];
 
   // ─── Phase 5c.3 GPU-routed bucket state ─────────────────────────
   /**
@@ -736,6 +736,12 @@ export interface HeapDrawSpec {
    */
   readonly textures?: HeapTextureSet;
   /**
+   * Several atlas textures, one per texture binding of the effect (by the
+   * binding's name in the effect's schema). When present, `textures` is
+   * the first of them.
+   */
+  readonly textureSets?: readonly HeapBoundTexture[];
+  /**
    * Scene-shared storage buffers for effects that declare
    * `var<storage>` bindings (e.g. the OIT node pool injected by the
    * transparency task). Bound ONCE at bucket level — every RO in a
@@ -914,6 +920,19 @@ export interface HeapScene {
  *                    NOT YET WIRED through the heap path; the BGL/
  *                    bind-group/drawHeader work lands in a follow-up PR.
  */
+/**
+ * One atlas texture of a draw and the texture binding of the effect it
+ * feeds. A draw has one of these per texture its effect samples: every
+ * texture is an atlas lookup with a placement of its own in the draw
+ * header (page, origin, size, mips, sampler state).
+ * `binding: undefined` is the single-texture form: that one texture feeds
+ * every texture binding of the effect.
+ */
+export interface HeapBoundTexture {
+  readonly binding: string | undefined;
+  set: HeapTextureSet & { kind: "atlas" };
+}
+
 export type HeapTextureSet =
   | {
       readonly kind: "standalone";
@@ -1745,6 +1764,8 @@ export function buildHeapScene(
     readonly localSlot: number;
     readonly repack: (newTex: ITexture) => import("./textureAtlas/atlasPool.js").AtlasAcquisition | null;
     readonly sampler: ISampler;
+    /** Which of the slot's textures this is (index into `localAtlasTextures[localSlot]`). */
+    readonly k: number;
   }
   // Content-keyed (`HashTable`, not a JS `Map`) so distinct
   // `AVal.constant(tex)` wrappers sharing the same texture collapse to
@@ -2752,29 +2773,33 @@ export function buildHeapScene(
     for (const bucket of buckets) {
       if (!bucket.isAtlasBucket) continue;
       for (let localSlot = 0; localSlot < bucket.localAtlasTextures.length; localSlot++) {
-        const ts = bucket.localAtlasTextures[localSlot];
-        if (ts === undefined || atlasPool.isLive(ts.poolRef)) continue;
-        const sourceAval = ts.sourceAval as aval<ITexture> | undefined;
-        if (sourceAval === undefined) continue;
-        const w = ts.size.x, h = ts.size.y;
-        const acq = atlasPool.acquire(ts.page.format, sourceAval, w, h, {
-          wantsMips: ts.numMips > 1,
-          ...(ts.gpuTexture !== undefined
-            ? { source: { width: w, height: h, gpuTexture: ts.gpuTexture } }
-            : ts.host !== undefined
-              ? { source: { width: w, height: h, host: ts.host } }
-              : {}),
-        });
-        if (acq === null) { pending = true; continue; }
-        const retarget = (ts as unknown as { __retarget?: (ref: number) => void }).__retarget;
-        if (retarget !== undefined) retarget(acq.ref);
-        if (retargetAtlas(bucket, localSlot, ts, acq)) continue;
-        packAtlasTextureFields(bucket, localSlot, ts);
-        const byteOff = localSlot * bucket.layout.drawHeaderBytes;
-        if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
-        const end = byteOff + bucket.layout.drawHeaderBytes;
-        if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
-        bytes += bucket.layout.drawHeaderBytes;
+        const list = bucket.localAtlasTextures[localSlot];
+        if (list === undefined) continue;
+        for (const bound of list) {
+          const ts = bound.set;
+          if (atlasPool.isLive(ts.poolRef)) continue;
+          const sourceAval = ts.sourceAval as aval<ITexture> | undefined;
+          if (sourceAval === undefined) continue;
+          const w = ts.size.x, h = ts.size.y;
+          const acq = atlasPool.acquire(ts.page.format, sourceAval, w, h, {
+            wantsMips: ts.numMips > 1,
+            ...(ts.gpuTexture !== undefined
+              ? { source: { width: w, height: h, gpuTexture: ts.gpuTexture } }
+              : ts.host !== undefined
+                ? { source: { width: w, height: h, host: ts.host } }
+                : {}),
+          });
+          if (acq === null) { pending = true; continue; }
+          const retarget = (ts as unknown as { __retarget?: (ref: number) => void }).__retarget;
+          if (retarget !== undefined) retarget(acq.ref);
+          if (retargetAtlas(bucket, localSlot, ts, acq)) continue;
+          packAtlasTextureFields(bucket, localSlot, ts, bound.binding);
+          const byteOff = localSlot * bucket.layout.drawHeaderBytes;
+          if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
+          const end = byteOff + bucket.layout.drawHeaderBytes;
+          if (end > bucket.headerDirtyMax) bucket.headerDirtyMax = end;
+          bytes += bucket.layout.drawHeaderBytes;
+        }
       }
     }
     atlasLostPending = pending;
@@ -3822,9 +3847,22 @@ export function buildHeapScene(
     );
   }
 
+  /** Write every atlas texture of a draw into its header. */
+  function packAtlasTextures(bucket: Bucket, localSlot: number): void {
+    const list = bucket.localAtlasTextures[localSlot];
+    if (list === undefined) return;
+    for (const bound of list) packAtlasTextureFields(bucket, localSlot, bound.set, bound.binding);
+  }
+
+  /**
+   * Write one atlas placement into a draw's header: into the fields of the
+   * texture binding `binding` of the effect, or (undefined) of every
+   * texture binding.
+   */
   function packAtlasTextureFields(
     bucket: Bucket, localSlot: number,
     textures: HeapTextureSet & { kind: "atlas" },
+    binding?: string,
   ): void {
     const f32 = bucket.drawHeaderStaging;
     const u32 = new Uint32Array(f32.buffer, f32.byteOffset, f32.length);
@@ -3839,6 +3877,7 @@ export function buildHeapScene(
       samplerStateBits(textures.sampler);
     for (const f of bucket.layout.drawHeaderFields) {
       if (f.kind !== "texture-ref") continue;
+      if (binding !== undefined && f.textureBindingName !== binding) continue;
       const off = baseBytes + f.byteOffset;
       const offU32 = off / 4;
       const offF32 = off / 4;
@@ -3969,7 +4008,8 @@ export function buildHeapScene(
   const plannable = (spec: HeapDrawSpec): boolean =>
     enableDrawPlans && spec.shape !== undefined && spec.modeRules === undefined && spec.geometry === undefined
     && spec.instanceAttributes === undefined
-    && !(spec.textures?.kind === "atlas" && spec.textures.page.soloId !== undefined);
+    && !(spec.textures?.kind === "atlas" && spec.textures.page.soloId !== undefined)
+    && !(spec.textureSets !== undefined && spec.textureSets.some((b) => b.set.page.soloId !== undefined));
   const planFor = (spec: HeapDrawSpec): DrawPlan | undefined => {
     if (!plannable(spec)) return undefined;
     const plan = drawPlans.get(spec.shape!);
@@ -4599,101 +4639,71 @@ export function buildHeapScene(
     bucket.localLayoutIds[localSlot] = layoutId;
 
     packBucketHeader(bucket, localSlot, perDrawRefs, layoutId);
-    if (bucket.isAtlasBucket && spec.textures !== undefined && spec.textures.kind === "atlas") {
-      packAtlasTextureFields(bucket, localSlot, spec.textures);
-      // Pair this addDraw with one atlas refcount bump. The spec's
-      // release closure (stored below, fired in removeDraw) decrements
-      // exactly once per add/remove cycle; without this incRef the
-      // refcount underflows when the same cached spec is re-introduced
-      // across multiple aset add/remove cycles (e.g., a tile flipping
-      // in and out of the heap-eligible subset).
-      //
-      // Falls back to a full re-acquire if the entry was already
-      // evicted (incRef returns false): in that case the spec's stored
-      // (pageId, origin, size) are stale and the new acquire's values
-      // overwrite them before packAtlasTextureFields is re-called.
-      if (atlasPool !== undefined) {
-        const ok = atlasPool.incRef(spec.textures.poolRef, spec.textures.sourceAval as aval<ITexture> | undefined);
-        if (!ok) {
-          // Entry was evicted while the cached spec was idle in heap-
-          // remove state. Acquire a fresh sub-rect, redirect the spec
-          // (and the per-aval cell behind its release closure) to the
-          // new ref, and re-emit the drawHeader fields.
-          // Pass the captured `host` as `source` so the pool's
-          // `finalize` re-runs `upload()` for the fresh sub-rect. Without
-          // this, AtlasPool.acquire allocates the rect and skips the
-          // upload (the `source.host !== undefined` branch in finalize),
-          // so the drawHeader points at uninitialized atlas pixels —
-          // exactly the "black rectangle holes" symptom on tiles that
-          // cycled out and back in across a long-enough gap to be
-          // evicted.
-          const reW = spec.textures.size.x;
-          const reH = spec.textures.size.y;
-          const host = spec.textures.host;
-          const gpuTexture = spec.textures.gpuTexture;
-          const acq = atlasPool.acquire(
-            spec.textures.page.format,
-            spec.textures.sourceAval as aval<ITexture>,
-            reW, reH,
-            {
-              wantsMips: spec.textures.numMips > 1,
-              // GPU-resident source (cube grid) re-uploads via
-              // copyTextureToTexture; else the host source; else no upload.
-              ...(gpuTexture !== undefined
-                ? { source: { width: reW, height: reH, gpuTexture } }
-                : host !== undefined
-                  ? { source: { width: reW, height: reH, host } }
-                  : {}),
-            },
-          );
-          // ATLAS FULL (acq === null). Every page is packed with textures still
-          // in use, so this one cannot be re-placed right now. Keep the spec's
-          // existing sub-rect and retry on a later cycle, once a released tile
-          // has freed space: the draw shows a stale texture for a frame or two
-          // instead of the correct one. Previously `acquire` THREW here, the
-          // exception escaped into the render loop's frame callback, and the
-          // whole viewer stopped rendering permanently — taking the tile cut
-          // with it, since the worker's camera is driven from `OnRendered`.
+    // Every atlas texture of the draw: its placement into the header fields
+    // of its binding, one atlas reference counted for it, and (a texture
+    // that can change) the draw registered with its aval.
+    const boundTextures: HeapBoundTexture[] | undefined = !bucket.isAtlasBucket ? undefined
+      : spec.textureSets !== undefined ? spec.textureSets.map((b) => ({ binding: b.binding, set: b.set }))
+        : spec.textures !== undefined && spec.textures.kind === "atlas" ? [{ binding: undefined, set: spec.textures }]
+          : undefined;
+    if (boundTextures !== undefined) {
+      const arrIdx: (number | undefined)[] = [];
+      for (let k = 0; k < boundTextures.length; k++) {
+        const bound = boundTextures[k]!, ts = bound.set;
+        packAtlasTextureFields(bucket, localSlot, ts, bound.binding);
+        // Pair this addDraw with one atlas refcount bump. The set's
+        // release closure (fired in removeDraw) decrements exactly once
+        // per add/remove cycle; without this incRef the refcount
+        // underflows when the same cached spec is re-introduced across
+        // several aset add/remove cycles.
+        //
+        // Falls back to a full re-acquire if the entry was evicted while
+        // the cached spec sat idle (incRef returns false): the set's
+        // stored placement is stale then. The captured `host` /
+        // `gpuTexture` goes along as `source` so the pool uploads the
+        // pixels into the fresh sub-rect (without it the header would
+        // point at uninitialised atlas memory: black holes on things
+        // that cycled out and back in).
+        if (atlasPool !== undefined && !atlasPool.incRef(ts.poolRef, ts.sourceAval as aval<ITexture> | undefined)) {
+          const reW = ts.size.x, reH = ts.size.y;
+          const acq = atlasPool.acquire(ts.page.format, ts.sourceAval as aval<ITexture>, reW, reH, {
+            wantsMips: ts.numMips > 1,
+            ...(ts.gpuTexture !== undefined
+              ? { source: { width: reW, height: reH, gpuTexture: ts.gpuTexture } }
+              : ts.host !== undefined
+                ? { source: { width: reW, height: reH, host: ts.host } }
+                : {}),
+          });
+          // ATLAS FULL (acq === null): this one cannot be placed again right
+          // now. The set keeps its old sub-rect (stale pixels) and
+          // `replaceLostAtlasPlacements` tries again on later frames.
           if (acq !== null) {
-          (spec.textures as { pageId: number }).pageId = acq.pageId;
-          (spec.textures as { origin: V2f }).origin = acq.origin;
-          (spec.textures as { size: V2f }).size = acq.size;
-          (spec.textures as { numMips: number }).numMips = acq.numMips;
-          (spec.textures as { page: AtlasPage }).page = acq.page;
-          (spec.textures as { poolRef: number }).poolRef = acq.ref;
-          // The release closure captures a per-aval cell whose `ref`
-          // must track the LATEST acquired sub-rect; otherwise the
-          // closure releases a long-evicted ref (no-op leak).
-          if (spec.textures.repack !== undefined) {
-            // repack updates the per-aval cell to the new ref as a
-            // side effect of its own atlas-mark drain path. Re-using
-            // it here would free the entry we just acquired; instead
-            // mirror the same effect with a tiny helper attached to
-            // the spec at adapter time (`__retarget`).
-          }
-          const retarget = (spec.textures as unknown as { __retarget?: (ref: number) => void }).__retarget;
-          if (retarget !== undefined) retarget(acq.ref);
-          packAtlasTextureFields(bucket, localSlot, spec.textures);
+            retargetAtlasSet(ts, acq);
+            // (the release closure reads a per-aval cell that must name the LATEST ref)
+            const retarget = (ts as unknown as { __retarget?: (ref: number) => void }).__retarget;
+            if (retarget !== undefined) retarget(acq.ref);
+            packAtlasTextureFields(bucket, localSlot, ts, bound.binding);
+          } else {
+            atlasLostPending = true;
           }
         }
-      }
-      bucket.localAtlasReleases[localSlot] = spec.textures.release;
-      bucket.localAtlasTextures[localSlot] = spec.textures;
-      // Reactivity wire-up: subscribe to `sourceAval` (so sceneObj.inputChanged
-      // sees marks) and record the (bucket, slot) pair for the drain loop.
-      const sourceAval = spec.textures.sourceAval;
-      const repackFn = spec.textures.repack;
-      if (sourceAval !== undefined && repackFn !== undefined) {
-        // touch — registers sceneObj as an output of sourceAval.
-        sourceAval.getValue(outerTok);
-        let arr = atlasAvalRefs.get(sourceAval);
-        if (arr === undefined) {
-          arr = [];
-          atlasAvalRefs.set(sourceAval, arr);
+        // Reactivity: subscribe to the texture's aval (so sceneObj.inputChanged
+        // sees its marks) and record (bucket, slot, k) for the drain loop.
+        const sourceAval = ts.sourceAval;
+        const repackFn = ts.repack;
+        if (sourceAval !== undefined && repackFn !== undefined) {
+          sourceAval.getValue(outerTok);
+          let arr = atlasAvalRefs.get(sourceAval);
+          if (arr === undefined) { arr = []; atlasAvalRefs.set(sourceAval, arr); }
+          arrIdx[k] = arr.length;
+          arr.push({ bucket, localSlot, repack: repackFn, sampler: ts.sampler, k });
         }
-        bucket.localAtlasArrIdx[localSlot] = arr.length;
-        arr.push({ bucket, localSlot, repack: repackFn, sampler: spec.textures.sampler });
       }
+      bucket.localAtlasReleases[localSlot] = boundTextures.length === 1
+        ? boundTextures[0]!.set.release
+        : () => { for (const b of bucket.localAtlasTextures[localSlot] ?? boundTextures) b.set.release(); };
+      bucket.localAtlasTextures[localSlot] = boundTextures;
+      bucket.localAtlasArrIdx[localSlot] = arrIdx;
     }
     const byteOff = localSlot * bucket.layout.drawHeaderBytes;
     if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
@@ -5045,25 +5055,27 @@ export function buildHeapScene(
     // Drop atlas-aval ref (if any). When the last ref is dropped we
     // also remove the aval from the dirty set — a marking after the
     // last RO is gone is a no-op.
-    const atlasTex = bucket.localAtlasTextures[localSlot];
-    if (atlasTex !== undefined) {
-      const sourceAval = atlasTex.sourceAval;
-      const i = bucket.localAtlasArrIdx[localSlot];
-      if (sourceAval !== undefined && i !== undefined) {
+    const atlasList = bucket.localAtlasTextures[localSlot];
+    const atlasIdx = bucket.localAtlasArrIdx[localSlot];
+    if (atlasList !== undefined && atlasIdx !== undefined) {
+      for (let k = 0; k < atlasList.length; k++) {
+        const sourceAval = atlasList[k]!.set.sourceAval;
+        const i = atlasIdx[k];
+        if (sourceAval === undefined || i === undefined) continue;
         const arr = atlasAvalRefs.get(sourceAval);
-        if (arr !== undefined) {
-          // Swap-pop: O(1) regardless of array length.
-          const last = arr.length - 1;
-          if (i !== last) {
-            const moved = arr[last]!;
-            arr[i] = moved;
-            moved.bucket.localAtlasArrIdx[moved.localSlot] = i;
-          }
-          arr.pop();
-          if (arr.length === 0) {
-            atlasAvalRefs.delete(sourceAval);
-            atlasAvalDirty.delete(sourceAval);
-          }
+        if (arr === undefined) continue;
+        // Swap-pop: O(1) regardless of array length.
+        const last = arr.length - 1;
+        if (i !== last) {
+          const moved = arr[last]!;
+          arr[i] = moved;
+          const movedIdx = moved.bucket.localAtlasArrIdx[moved.localSlot];
+          if (movedIdx !== undefined) movedIdx[moved.k] = i;
+        }
+        arr.pop();
+        if (arr.length === 0) {
+          atlasAvalRefs.delete(sourceAval);
+          atlasAvalDirty.delete(sourceAval);
         }
       }
     }
@@ -5312,10 +5324,7 @@ export function buildHeapScene(
           bucket.localPosRefs[localSlot] = pr < 0 ? undefined : pr;
           bucket.localNorRefs[localSlot] = nr < 0 ? undefined : nr;
           packBucketHeader(bucket, localSlot, refs, bucket.localLayoutIds[localSlot] ?? 0);
-          if (bucket.isAtlasBucket) {
-            const ts = bucket.localAtlasTextures[localSlot];
-            if (ts !== undefined) packAtlasTextureFields(bucket, localSlot, ts);
-          }
+          if (bucket.isAtlasBucket) packAtlasTextures(bucket, localSlot);
           const byteOff = localSlot * bucket.layout.drawHeaderBytes;
           if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
           const end = byteOff + bucket.layout.drawHeaderBytes;
@@ -5576,10 +5585,7 @@ export function buildHeapScene(
               bucket.localPosRefs[localSlot] = pr < 0 ? undefined : pr;
               bucket.localNorRefs[localSlot] = nr < 0 ? undefined : nr;
               packBucketHeader(bucket, localSlot, refs, bucket.localLayoutIds[localSlot] ?? 0);
-              if (bucket.isAtlasBucket) {
-                const ts = bucket.localAtlasTextures[localSlot];
-                if (ts !== undefined) packAtlasTextureFields(bucket, localSlot, ts);
-              }
+              if (bucket.isAtlasBucket) packAtlasTextures(bucket, localSlot);
               const byteOff = localSlot * bucket.layout.drawHeaderBytes;
               if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
               const end = byteOff + bucket.layout.drawHeaderBytes;
@@ -5633,8 +5639,10 @@ export function buildHeapScene(
           // draw shows the previous pixels rather than the pass dying.
           if (acq === null) continue;
           for (const r of [...refs]) {
-            const cur = r.bucket.localAtlasTextures[r.localSlot];
-            if (cur !== undefined && soloIdOf(acq.page) !== soloIdOf(r.bucket.soloPage)) {
+            const bound = r.bucket.localAtlasTextures[r.localSlot]?.[r.k];
+            if (bound === undefined) continue;
+            const cur = bound.set;
+            if (soloIdOf(acq.page) !== soloIdOf(r.bucket.soloPage)) {
               // another page kind: the draw moves bucket (below)
               retargetAtlas(r.bucket, r.localSlot, cur, acq);
               continue;
@@ -5649,12 +5657,12 @@ export function buildHeapScene(
               sampler: r.sampler,
               page: acq.page,
               poolRef: acq.ref,
-              release: r.bucket.localAtlasTextures[r.localSlot]!.release,
+              release: cur.release,
               sourceAval: av,
               repack: r.repack,
             };
-            r.bucket.localAtlasTextures[r.localSlot] = newTextures;
-            packAtlasTextureFields(r.bucket, r.localSlot, newTextures);
+            bound.set = newTextures;
+            packAtlasTextureFields(r.bucket, r.localSlot, newTextures, bound.binding);
             const byteOff = r.localSlot * r.bucket.layout.drawHeaderBytes;
             if (byteOff < r.bucket.headerDirtyMin) r.bucket.headerDirtyMin = byteOff;
             const end = byteOff + r.bucket.layout.drawHeaderBytes;
@@ -5692,10 +5700,7 @@ export function buildHeapScene(
           const refs = bucket.localPerDrawRefs[localSlot];
           if (refs === undefined) continue;
           packBucketHeader(bucket, localSlot, refs, bucket.localLayoutIds[localSlot] ?? 0);
-          if (bucket.isAtlasBucket) {
-            const ts = bucket.localAtlasTextures[localSlot];
-            if (ts !== undefined) packAtlasTextureFields(bucket, localSlot, ts);
-          }
+          if (bucket.isAtlasBucket) packAtlasTextures(bucket, localSlot);
           const byteOff = localSlot * bucket.layout.drawHeaderBytes;
           if (byteOff < bucket.headerDirtyMin) bucket.headerDirtyMin = byteOff;
           const end = byteOff + bucket.layout.drawHeaderBytes;
@@ -5992,6 +5997,8 @@ export function buildHeapScene(
       totalEmitEstimate: number;
       recordCount: number;
       layout: BucketLayout;
+      /** The draw headers as last packed (one `layout.drawHeaderBytes` block per local slot). */
+      drawHeaderStaging: Float32Array;
     }[] {
       return buckets.map(b => ({
         indirectBuf: b.slots[0]!.indirectBuf,
@@ -6000,6 +6007,7 @@ export function buildHeapScene(
         totalEmitEstimate: b.slots[0]!.totalEmitEstimate,
         recordCount: b.slots[0]!.recordCount,
         layout: b.layout,
+        drawHeaderStaging: b.drawHeaderStaging,
       }));
     },
     /** How many draws were added by a draw plan (HeapDrawSpec.shape). */

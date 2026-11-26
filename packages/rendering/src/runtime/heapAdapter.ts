@@ -110,7 +110,7 @@ function compareFunctionOf(name: string): GPUCompareFunction {
 import type { RenderObject } from "../core/renderObject.js";
 import type { DrawCall } from "../core/drawCall.js";
 import { asAttributeProvider, asUniformProvider } from "../core/provider.js";
-import type { HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
+import type { HeapBoundTexture, HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
 import { isBufferView } from "./heapScene/pools.js";
 import { compileHeapEffect } from "./heapEffect.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
@@ -421,6 +421,8 @@ export interface DrawShape {
   storageArrays?: Map<string, aval<IBuffer>>;
   /** `null`: no texture. */
   textures?: HeapTextureSet | null;
+  /** (several textures: one set per texture binding of the effect) */
+  textureSets?: HeapBoundTexture[] | null;
 }
 
 export function renderObjectToHeapSpec(
@@ -558,6 +560,48 @@ interface SpecShare {
   specProto?: Record<string, unknown>;
 }
 const specShareCache = new WeakMap<object, SpecShare>();
+
+
+/**
+ * A texture's placement in the atlas, as the heap carries it: where it
+ * lies, how to release it, how to place it again when it changes or was
+ * evicted. Null when the atlas cannot take it (a kind or size it does not
+ * hold, or no room right now).
+ */
+function atlasSetFor(
+  pool: AtlasPool, texAval: aval<ITexture>, sampler: ISampler, token: AdaptiveToken,
+): (HeapTextureSet & { kind: "atlas" }) | null {
+  const texVal = texAval.getValue(token);
+  if (texVal === undefined || texVal.kind === "cube") return null;
+  const dims = describeTexture(texVal);
+  const format = dims === null ? null : AtlasPool.eligibleFormat(dims.format);
+  if (dims === null || format === null || !AtlasPool.eligibleSize(dims.width, dims.height)) return null;
+  const wantsMips = dims.mipLevelCount > 1;
+  const acq = pool.acquire(format, texAval, dims.width, dims.height, {
+    wantsMips,
+    ...(dims.host !== undefined ? { source: { width: dims.width, height: dims.height, host: dims.host } } : {}),
+  });
+  if (acq === null) return null;
+  // (one cell per aval, so every draw sharing it frees the LATEST sub-rect after a repack)
+  const cell = currentRefCellFor(texAval, acq.ref);
+  // the pool counted this acquire; the count is to follow the DRAWS (addDraw's incRef / the release below)
+  pool.release(acq.ref, texAval);
+  const set: HeapTextureSet & { kind: "atlas" } = {
+    kind: "atlas", format, pageId: acq.pageId, origin: acq.origin, size: acq.size, numMips: acq.numMips,
+    sampler, page: acq.page, poolRef: acq.ref,
+    release: () => pool.release(cell.ref, texAval),
+    sourceAval: texAval,
+    repack: (newTex: ITexture) => {
+      const next = pool.repack(texAval, newTex, { wantsMips });
+      if (next === null) return null;
+      cell.ref = next.ref;
+      return next;
+    },
+    ...(dims.host !== undefined ? { host: dims.host } : {}),
+  };
+  (set as unknown as { __retarget: (r: number) => void }).__retarget = (r: number) => { cell.ref = r; };
+  return set;
+}
 
 function buildFlatSpec(
   ro: RenderObject,
@@ -707,11 +751,52 @@ function buildFlatSpec(
   // `let` + nulled after use: the spec's long-lived closures share
   // this scope context — a leftover Set here is per-RO ballast.
   let textures: HeapTextureSet | undefined;
-  // The draws of a shape have the same texture and sampler avals, so they
-  // share one texture set (as they share its atlas entry): made for the
-  // first, reused while the atlas still holds the placement it names.
   const knownTextures = shape?.textures;
-  if (knownTextures !== undefined
+  let textureSets: HeapBoundTexture[] | undefined;
+  // SEVERAL textures (or samplers): every texture binding of the effect
+  // gets an atlas placement of its own. Which texture feeds which binding
+  // is decided by name, as the scene supplied them (`Name` or `Name_view`);
+  // a binding's sampler is the one declared at the same position.
+  let several = false;
+  {
+    let firstTex: unknown, firstSmp: unknown;
+    ro.textures.iter((_n, av) => { if (firstTex === undefined) firstTex = av; else if (av !== firstTex) several = true; });
+    ro.samplers.iter((_n, av) => { if (firstSmp === undefined) firstSmp = av; else if (av !== firstSmp) several = true; });
+  }
+  const knownSets = shape?.textureSets;
+  if (several && knownSets !== undefined && knownSets !== null && pool !== undefined && knownSets.every((b) => pool.isLive(b.set.poolRef))) {
+    textureSets = knownSets;
+    textures = knownSets[0]?.set;
+  } else if (several) {
+    if (pool === undefined) throw new Error("heapAdapter: several textures need an AtlasPool");
+    const sets: HeapBoundTexture[] = [];
+    let anySampler: aval<ISampler> | undefined;
+    ro.samplers.iter((_n, av) => { anySampler ??= av as aval<ISampler>; });
+    for (let i = 0; i < schema.textures.length; i++) {
+      const tb = schema.textures[i]!;
+      const base = tb.name.endsWith("_view") ? tb.name.slice(0, -5) : tb.name;
+      const texAval = (ro.textures.tryFind(tb.name) ?? ro.textures.tryFind(base) ?? ro.textures.tryFind(`${base}_view`)) as aval<ITexture> | undefined;
+      if (texAval === undefined) throw new Error(`heapAdapter: the effect samples "${tb.name}" but the render object has no such texture`);
+      const sb = schema.samplers[i] ?? schema.samplers[0];
+      let samplerVal: ISampler | undefined;
+      if (sb?.state !== undefined) {
+        samplerVal = ISampler.fromDescriptor(samplerDescriptorFromState(sb.state));
+      } else {
+        const sAval = ((sb !== undefined ? ro.samplers.tryFind(sb.name) : undefined) ?? ro.samplers.tryFind(base) ?? anySampler) as aval<ISampler> | undefined;
+        samplerVal = sAval?.getValue(token);
+      }
+      if (samplerVal === undefined) throw new Error(`heapAdapter: no sampler for texture "${tb.name}"`);
+      // (the same texture with the same sampler under two bindings is one placement)
+      const same = sets.find((b) => b.set.sourceAval === texAval && b.set.sampler === samplerVal);
+      const set = same !== undefined ? same.set : atlasSetFor(pool, texAval, samplerVal, token);
+      // (the atlas cannot take it right now: see the note at `acquire` below)
+      if (set === null) return null;
+      sets.push({ binding: tb.name, set });
+    }
+    textureSets = sets;
+    textures = sets[0]?.set;
+    if (shape !== undefined) shape.textureSets = sets;
+  } else if (knownTextures !== undefined
       && (knownTextures === null || knownTextures.kind !== "atlas" || pool === undefined || pool.isLive(knownTextures.poolRef))) {
     textures = knownTextures ?? undefined;
   } else {
@@ -952,6 +1037,7 @@ function buildFlatSpec(
     ...geom,
     ...(geometry !== undefined ? { geometry } : {}),
     ...(textures !== undefined ? { textures } : {}),
+    ...(textureSets !== undefined ? { textureSets } : {}),
     ...(ro.injectedStorage !== undefined && ro.injectedStorage.count > 0
       ? { storageBuffers: (() => { const m = new Map<string, aval<IBuffer>>(); ro.injectedStorage!.iter((n, av) => { m.set(n, av); }); return m; })() }
       : {}),
