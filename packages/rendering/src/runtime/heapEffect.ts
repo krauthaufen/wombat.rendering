@@ -211,6 +211,14 @@ function fboLayoutKey(layout: FragmentOutputLayout | undefined): string {
   return ":fbo[" + [...layout.locations.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([n, l]) => `${n}=${l}`).join("|") + "]";
 }
 
+// `compileHeapEffect` is asked for the same (effect, layout) once or more
+// per draw that is added. The answers are kept per effect object, by
+// layout object (a layout is immutable), and reused while the effect's
+// holes still have the values they were compiled with; that skips
+// building and hashing the content key.
+const NO_LAYOUT = {};
+const _lastCompiled = new WeakMap<Effect, { holes: string; byLayout: Map<object, CompiledHeapEffect> }>();
+
 function isCompiledHeapEffect(v: unknown): v is CompiledHeapEffect {
   return typeof v === "object" && v !== null
     && typeof (v as CompiledHeapEffect).rawVs === "string"
@@ -225,7 +233,23 @@ export function compileHeapEffect(effect: Effect, fragmentOutputLayout?: Fragmen
   // WGSL built from a previous hole value — and because this cache is also
   // persisted, the stale shader outlives the page. Pair the id with a
   // fingerprint of the current holes (empty for the hole-free hot path).
-  const contentKey = effect.id + effectHoleKey(effect) + fboLayoutKey(fragmentOutputLayout);
+  const holes = effectHoleKey(effect);
+  let last = _lastCompiled.get(effect);
+  if (last === undefined || last.holes !== holes) {
+    last = { holes, byLayout: new Map() };
+    _lastCompiled.set(effect, last);
+  }
+  const layoutKey = fragmentOutputLayout ?? NO_LAYOUT;
+  let result = last.byLayout.get(layoutKey);
+  if (result === undefined) {
+    result = compileHeapEffectByContent(effect, holes, fragmentOutputLayout);
+    if (last.byLayout.size < 8) last.byLayout.set(layoutKey, result);
+  }
+  return result;
+}
+
+function compileHeapEffectByContent(effect: Effect, holes: string, fragmentOutputLayout: FragmentOutputLayout | undefined): CompiledHeapEffect {
+  const contentKey = effect.id + holes + fboLayoutKey(fragmentOutputLayout);
   const mem = _compiledHeapEffectMemCache.get(contentKey);
   if (mem !== undefined) return mem;
   const lsKey = persistKey(persistVersionNow(), "che", contentKey);

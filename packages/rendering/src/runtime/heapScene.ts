@@ -3709,8 +3709,8 @@ export function buildHeapScene(
    * or create one on miss. The mode-flip hot path calls this when an
    * RO's tracker.modeKey lands on a slot that doesn't exist yet.
    */
-  function ensureSlot(bucket: Bucket, descriptor: PipelineStateDescriptor): BucketSlot {
-    const wanted = encodeModeKey(descriptor);
+  function ensureSlot(bucket: Bucket, descriptor: PipelineStateDescriptor, modeKey?: bigint): BucketSlot {
+    const wanted = modeKey ?? encodeModeKey(descriptor);
     for (const s of bucket.slots) {
       if (s.modeKey === wanted) return s;
     }
@@ -3881,6 +3881,40 @@ export function buildHeapScene(
   let __removeDrawCalls = 0;
   (sceneObj as unknown as { __addDrawCalls: () => number }).__addDrawCalls = () => __addDrawCalls;
   (sceneObj as unknown as { __removeDrawCalls: () => number }).__removeDrawCalls = () => __removeDrawCalls;
+  // A pipeline state none of whose values can change gives the same
+  // descriptor and mode key for every draw that uses it. Those are worked
+  // out once per state OBJECT and the tracker is shared by all its draws
+  // (a scene graph hands the same state object to everything below the
+  // node that set it). `null`: the state has a value that can change, so
+  // each draw keeps a tracker of its own, as before.
+  const staticStates = new WeakMap<PipelineState, ModeKeyTracker | null>();
+  const staticTrackerOf = (ps: PipelineState | undefined): ModeKeyTracker | undefined => {
+    if (ps === undefined) return undefined;
+    let t = staticStates.get(ps);
+    if (t === undefined) {
+      const made = new ModeKeyTracker(ps, sig, NOOP, { skipSubscribe: true });
+      let constant = true;
+      made.forEachLeaf((av) => { if (!av.isConstant) constant = false; });
+      t = constant ? made : null;
+      staticStates.set(ps, t);
+    }
+    return t ?? undefined;
+  };
+  const isSharedTracker = (t: ModeKeyTracker): boolean => t.ps !== undefined && staticStates.get(t.ps) === t;
+
+  // Per-draw ref arrays are views into shared slabs: a typed array of its
+  // own costs a separate backing store per draw (the allocation showed up
+  // as the single most expensive line of an add).
+  let refSlab = new Int32Array(1 << 15), refSlabUsed = 0;
+  const allocRefs = (n: number, fill: number): Int32Array => {
+    if (refSlabUsed + n > refSlab.length) { refSlab = new Int32Array(Math.max(1 << 15, n)); refSlabUsed = 0; }
+    const out = refSlab.subarray(refSlabUsed, refSlabUsed + n);
+    refSlabUsed += n;
+    out.fill(fill);
+    return out;
+  };
+  const NO_NAMES: ReadonlySet<string> = new Set<string>();
+  const NO_RULES: ReturnType<typeof collectRules> = [];
   function addDraw(spec: HeapDrawSpec): number {
     let id = -1;
     sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
@@ -3921,10 +3955,10 @@ export function buildHeapScene(
     // newly-seen effect's family on the fly (reactive rebuild) — supports a
     // scene mixing multiple effects added over time (tiles + markers + …).
     ensureFamilyForSpec(spec);
-    const perInstanceUniforms = new Set<string>();
-    const perInstanceAttributes = spec.instanceAttributes !== undefined
+    const perInstanceUniforms: ReadonlySet<string> = NO_NAMES;
+    const perInstanceAttributes: ReadonlySet<string> = spec.instanceAttributes !== undefined
       ? new Set(Object.keys(spec.instanceAttributes))
-      : new Set<string>();
+      : NO_NAMES;
 
     // If the spec has modeRules, pre-snapshot the rule-evaluated
     // descriptor so the bucket key + pipeline reflect post-rule
@@ -3984,13 +4018,23 @@ export function buildHeapScene(
     const addShared = (av: aval<unknown>, dataBytes: number): void => {
       if (!shared.some(e => e.av === av)) shared.push({ av, bytes: ALIGN16(ALLOC_HEADER_PAD_TO + dataBytes) });
     };
-    for (const f of layout.drawHeaderFields) {
+    // The derived rule of a field is asked for three times below (the
+    // estimate, the acquire, the registration): looked up once per field.
+    const headerFields = layout.drawHeaderFields;
+    const ruleMemo: (DerivedRule | undefined | null)[] = new Array(headerFields.length).fill(null);
+    const ruleOf = (fi: number, name: string): DerivedRule | undefined => {
+      let r = ruleMemo[fi];
+      if (r === null) { r = ruleForUniform(spec, name); ruleMemo[fi] = r; }
+      return r;
+    };
+    for (let fi = 0; fi < headerFields.length; fi++) {
+      const f = headerFields[fi]!;
       if (f.kind === "bounds-ref") {
         if (spec.bounds !== undefined) estBytes += ALIGN16(ALLOC_HEADER_PAD_TO + BOUNDS_BYTES);
         continue;
       }
       if (f.kind === "texture-ref" || f.name === "__layoutId" || INLINE_HEADER_UNIFORMS.has(f.name) || !effectFields.has(f.name)) continue;
-      if (ruleForUniform(spec, f.name) !== undefined) {
+      if (ruleOf(fi, f.name) !== undefined) {
         estBytes += ALIGN16(ALLOC_HEADER_PAD_TO + PACKER_MAT4.dataBytes); // §7 derived dummy mat4
         continue;
       }
@@ -4025,7 +4069,8 @@ export function buildHeapScene(
     let chunkIdx: number;
     {
       let preferred: number | undefined;
-      for (const [, val] of Object.entries(spec.inputs)) {
+      for (const key in spec.inputs) {
+        const val = spec.inputs[key];
         const av = (typeof val === "object" && val !== null && "getValue" in (val as object))
           ? (val as aval<unknown>) : undefined;
         if (av !== undefined) {
@@ -4100,8 +4145,10 @@ export function buildHeapScene(
     // bucket's `(effect, textureSet)` — each gets its own `ruleId`
     // baked into the master-pool record and the partition kernel's
     // dispatch switch picks the right body per record.
-    const collectedRules = spec.modeRules !== undefined ? collectRules(spec.modeRules) : [];
-    const roDescriptor = precomputedDescriptor ?? snapshotDescriptor(spec.pipelineState, sig);
+    const collectedRules = spec.modeRules !== undefined ? collectRules(spec.modeRules) : NO_RULES;
+    const sharedTracker = spec.modeRules === undefined ? staticTrackerOf(spec.pipelineState) : undefined;
+    const roDescriptor = precomputedDescriptor
+      ?? (sharedTracker !== undefined ? sharedTracker.descriptor : snapshotDescriptor(spec.pipelineState, sig));
     let roComboId = 0;
     if (collectedRules.length > 0) {
       roComboId = registerCombo(bucket, collectedRules, roDescriptor);
@@ -4122,7 +4169,8 @@ export function buildHeapScene(
     // accounting paths (slotToRecord, dirty bookkeeping) keep
     // working. The partition kernel overwrites both slots' draw
     // tables every frame from the master.
-    const roSlot       = bucket.gpuRouted ? bucket.slots[0]! : ensureSlot(bucket, roDescriptor);
+    const roSlot       = bucket.gpuRouted ? bucket.slots[0]!
+      : ensureSlot(bucket, roDescriptor, sharedTracker !== undefined && precomputedDescriptor === undefined ? sharedTracker.modeKey : undefined);
     const roSlotIdx    = bucket.slots.indexOf(roSlot);
 
     // Indices ride the same arena as attributes/uniforms (the VS storage-
@@ -4153,11 +4201,14 @@ export function buildHeapScene(
     const perDrawAvals: aval<unknown>[] = [];
     const perDrawAvalFieldIdx: number[] = [];
     let perDrawRawFieldIdx: number[] | undefined;
-    const perDrawRefs = new Int32Array(bucket.layout.drawHeaderFields.length).fill(-1);
-    const setRef = (name: string, ref: number): void => {
-      const i = bucket.fieldIdx.get(name);
-      if (i !== undefined) perDrawRefs[i] = ref;
-    };
+    // (the bucket's fields are the family's; should they ever differ, the
+    // rules looked up above were looked up for other positions)
+    const bucketFields = bucket.layout.drawHeaderFields;
+    if (bucketFields !== headerFields) {
+      ruleMemo.length = bucketFields.length;
+      ruleMemo.fill(null);
+    }
+    const perDrawRefs = allocRefs(bucketFields.length, -1);
     /** Column-backed uniforms: offset of this draw's value within the column (see `localRefDeltas`). */
     let refDeltas: Int32Array | undefined;
     /** What the header holds for a field: the allocation's ref plus the draw's offset into it. */
@@ -4169,7 +4220,8 @@ export function buildHeapScene(
     };
     {
       const tok = outerTok;
-      for (const f of bucket.layout.drawHeaderFields) {
+      for (let fi = 0; fi < bucketFields.length; fi++) {
+        const f = bucketFields[fi]!;
         // Atlas-variant texture bindings carry inline values rather than
         // pool refs; packAtlasTextureFields fills them after this loop.
         if (f.kind === "texture-ref") continue;
@@ -4183,9 +4235,9 @@ export function buildHeapScene(
               device, arena.attrs, bav, bucket.chunkIdx, bav.getValue(tok),
               BOUNDS_BYTES, 0, 1, packBounds,
             );
-            setRef(f.name, ref);
+            perDrawRefs[fi] = ref;
             perDrawAvals.push(bav);
-            perDrawAvalFieldIdx.push(bucket.fieldIdx.get(f.name)!);
+            perDrawAvalFieldIdx.push(fi);
             bucket.cullCount++;
           }
           continue;
@@ -4202,18 +4254,18 @@ export function buildHeapScene(
         if (INLINE_HEADER_UNIFORMS.has(f.name)) {
           const iv = f.name === "PickId" ? spec.pickId : undefined;
           if (iv !== undefined) {
-            setRef(f.name, iv >>> 0);
+            perDrawRefs[fi] = iv >>> 0;
             continue;
           }
           const provInline = spec.inputs[f.name];
           if (typeof provInline === "number") {
-            setRef(f.name, provInline >>> 0);
+            perDrawRefs[fi] = provInline >>> 0;
             continue;
           }
           if (provInline === undefined) {
             // No id at all (picking disabled but the effect still
             // reads the uniform): 0 = "no pick", a reserved id.
-            setRef(f.name, 0);
+            perDrawRefs[fi] = 0;
             continue;
           }
           // fall through: aval-provided → legacy pooled path
@@ -4222,7 +4274,7 @@ export function buildHeapScene(
         // pre-pass. We still allocate an arena slot here so the
         // drawHeader gets a valid ref written by packBucketHeader; §7
         // overwrites the arena data each frame the inputs are dirty.
-        if (ruleForUniform(spec, f.name) !== undefined) {
+        if (ruleOf(fi, f.name) !== undefined) {
           // Raw (aval-less) slot: §7's compute pre-pass overwrites the
           // data every dirty frame, so a keyed pool entry (placeholder
           // ConstantVal + Map per draw) bought nothing. The ref lives
@@ -4232,8 +4284,8 @@ export function buildHeapScene(
             arena.attrs, bucket.chunkIdx,
             PACKER_MAT4.dataBytes, PACKER_MAT4.typeId, 1,
           );
-          setRef(f.name, ref);
-          (perDrawRawFieldIdx ??= []).push(bucket.fieldIdx.get(f.name)!);
+          perDrawRefs[fi] = ref;
+          (perDrawRawFieldIdx ??= []).push(fi);
           continue;
         }
         // Heap-managed storage buffer: one arena allocation per distinct
@@ -4253,9 +4305,9 @@ export function buildHeapScene(
             device, arena.attrs, sav as aval<unknown>, bucket.chunkIdx, sval,
             sp.dataBytes, sp.typeId, sp.length, sp.pack, storagePlacement,
           );
-          setRef(f.name, ref);
+          perDrawRefs[fi] = ref;
           perDrawAvals.push(sav as aval<unknown>);
-          perDrawAvalFieldIdx.push(bucket.fieldIdx.get(f.name)!);
+          perDrawAvalFieldIdx.push(fi);
           continue;
         }
         // A cell of a uniform column (core/uniformColumn.ts): the WHOLE
@@ -4291,9 +4343,8 @@ export function buildHeapScene(
               device, arena.attrs, col.data as aval<unknown>, bucket.chunkIdx, data,
               cp.dataBytes, cp.typeId, cp.length, cp.pack, columnPlacement,
             );
-            const fi = bucket.fieldIdx.get(f.name)!;
             perDrawRefs[fi] = ref;
-            (refDeltas ??= new Int32Array(perDrawRefs.length))[fi] = delta;
+            (refDeltas ??= allocRefs(perDrawRefs.length, 0))[fi] = delta;
             perDrawAvals.push(col.data as aval<unknown>);
             perDrawAvalFieldIdx.push(fi);
             continue;
@@ -4384,9 +4435,9 @@ export function buildHeapScene(
           replanFn,
         );
         if (releasable !== undefined) releasable._v = null;   // staged — drop the CPU copy
-        setRef(f.name, ref);
+        perDrawRefs[fi] = ref;
         perDrawAvals.push(av);
-        perDrawAvalFieldIdx.push(bucket.fieldIdx.get(f.name)!);
+        perDrawAvalFieldIdx.push(fi);
       }
     }
 
@@ -4636,6 +4687,9 @@ export function buildHeapScene(
       }
       uniformAvals = m;
     }
+    // (a state that cannot change: the tracker all its draws share, nothing to subscribe)
+    if (sharedTracker !== undefined) drawIdToModeTracker[drawId] = sharedTracker;
+    else {
     const tracker = new ModeKeyTracker(
       spec.pipelineState, sig,
       // skipSubscribe means the tracker never invokes onDirty itself
@@ -4650,6 +4704,7 @@ export function buildHeapScene(
     );
     drawIdToModeTracker[drawId] = tracker;
     tracker.forEachLeaf((av) => subscribeModeLeaf(av, drawId));
+    }
 
     // ─── Derived-mode rule registration ────────────────────────────
     // Subscribe to each rule's `declared` aval so the bucket's
@@ -4675,10 +4730,11 @@ export function buildHeapScene(
     if (derivedScene !== undefined) {
       const ruleSubset = new Map<string, DerivedRule>();
       const outOffsetByName = new Map<string, number>();
-      for (const f of bucket.layout.drawHeaderFields) {
+      for (let fi = 0; fi < bucketFields.length; fi++) {
+        const f = bucketFields[fi]!;
         if (f.name === "__layoutId" || INLINE_HEADER_UNIFORMS.has(f.name)) continue;
         if (!effectFields.has(f.name)) continue;
-        const rule = ruleForUniform(spec, f.name);
+        const rule = ruleOf(fi, f.name);
         if (rule === undefined) continue;
         const ref = getRef(f.name);
         if (ref === undefined) continue;
@@ -4901,7 +4957,7 @@ export function buildHeapScene(
     drawIdToSpec[drawId]      = undefined;
     drawIdToStripKind[drawId] = undefined;
     const oldTracker = drawIdToModeTracker[drawId];
-    if (oldTracker !== undefined) {
+    if (oldTracker !== undefined && !isSharedTracker(oldTracker)) {
       oldTracker.forEachLeaf((av) => unsubscribeModeLeaf(av, drawId));
       oldTracker.dispose();
     }

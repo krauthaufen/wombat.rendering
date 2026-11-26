@@ -29,13 +29,28 @@ export function attributeNamesOf(ro: RenderObject): string[] {
  * fragment outputs) that `ro` lacks; empty when it has them all.
  */
 export function missingAttributes(ro: RenderObject, layout?: FragmentOutputLayout): string[] {
-  const read = compileHeapEffect(ro.effect, layout).schema.attributes;
-  if (read.length === 0) return [];
+  const compiled = compileHeapEffect(ro.effect, layout);
+  const read = compiled.schema.attributes;
+  if (read.length === 0) return NONE;
+  // Many draws share their attributes (the same mesh) and their shader:
+  // "this provider has all that shader reads" is remembered per pair, so
+  // only the first such draw looks at the names. (Only for draws without
+  // instance attributes, and only the good answer: a draw that lacks
+  // something is looked at in full every time.)
+  const shared = ro.instanceAttributes === undefined ? ro.vertexAttributes as object : undefined;
+  if (shared !== undefined && complete.get(shared)?.has(compiled) === true) return NONE;
   const has = new Set(attributeNamesOf(ro));
   const missing: string[] = [];
   for (const a of read) if (!has.has(a.name)) missing.push(a.name);
+  if (shared !== undefined && missing.length === 0) {
+    let known = complete.get(shared);
+    if (known === undefined) { known = new WeakSet(); complete.set(shared, known); }
+    known.add(compiled);
+  }
   return missing;
 }
+const NONE: string[] = [];
+const complete = new WeakMap<object, WeakSet<object>>();
 
 /** The message for a draw missing `missing`. */
 export function missingAttributesMessage(ro: RenderObject, missing: readonly string[]): string {

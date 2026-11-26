@@ -26,7 +26,11 @@ export interface RuleInput {
  * generated kernel arm consumes its arguments (e.g. the multiplication order of a
  * matmul chain). Throws if a name is used at two structurally-different types.
  */
-export function inputsOf(ir: Expr): RuleInput[] {
+export function inputsOf(ir: Expr): readonly RuleInput[] {
+  // Asked for every uniform of every draw that is added; a rule's IR is
+  // immutable, so the walk is done once per IR object.
+  const known = inputsOfCache.get(ir);
+  if (known !== undefined) return known;
   const out: RuleInput[] = [];
   const seen = new Set<string>(); // key = `${inverse ? "i" : "v"}:${name}`
   const typeByName = new Map<string, Type>();
@@ -54,8 +58,10 @@ export function inputsOf(ir: Expr): RuleInput[] {
     visitExprChildren(e, walk);
   };
   walk(ir);
+  inputsOfCache.set(ir, out);
   return out;
 }
+const inputsOfCache = new WeakMap<Expr, readonly RuleInput[]>();
 
 /**
  * Substitute every derived-uniform leaf in `ir` with its (recursively
