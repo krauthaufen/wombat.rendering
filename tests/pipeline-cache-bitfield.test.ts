@@ -133,9 +133,27 @@ describe("pipelineCache/bitfield", () => {
   test("rejects out-of-range attachments", () => {
     const tooMany: PipelineStateDescriptor = {
       ...DEFAULT_DESCRIPTOR,
-      attachments: Array(5).fill(DEFAULT_ATTACHMENT_BLEND),
+      attachments: Array(9).fill(DEFAULT_ATTACHMENT_BLEND),
     };
     expect(() => encodeModeKey(tooMany)).toThrow(/attachments exceeds/);
+  });
+
+  test("round-trips WebGPU's maximum of eight attachments (a G-buffer)", () => {
+    const additive = {
+      enabled: true, writeMask: 0x7,
+      color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+      alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
+    } as const;
+    const d: PipelineStateDescriptor = {
+      ...DEFAULT_DESCRIPTOR,
+      attachments: [...Array(7).fill(DEFAULT_ATTACHMENT_BLEND), additive],
+    };
+    const back = decodeModeKey(encodeModeKey(d));
+    expect(back.attachments.length).toBe(8);
+    expect(descriptorEquals(back, d)).toBe(true);
+    // the last slot is really encoded: changing only it changes the key
+    const other: PipelineStateDescriptor = { ...d, attachments: Array(8).fill(DEFAULT_ATTACHMENT_BLEND) };
+    expect(encodeModeKey(other)).not.toBe(encodeModeKey(d));
   });
 
   test("rejects stencil (v1 not supported)", () => {

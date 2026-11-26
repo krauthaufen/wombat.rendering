@@ -89,16 +89,18 @@ function indexOf<T>(arr: readonly T[], v: T, name: string): number {
 //   [22:19]  alpha dstFactor  (4 bits)
 //   [26:23]  writeMask        (4 bits, RGBA)
 //
-// At MAX_ATTACHMENTS=4: header 28 + 4×27 = 136 bits. Still a bigint and
+// At MAX_ATTACHMENTS=8: header 28 + 8×27 = 244 bits. Still a bigint and
 // still exact — bigints are arbitrary precision, so the width costs
 // nothing but the key's own size, and CPU map keys take it natively.
 //
 // Raised from 2 because a target may legitimately carry more than a
 // colour and a pick: a point cloud publishes each point's sub-pixel
 // centre as a third attachment, and the cap rejected every pipeline on
-// that target rather than the one feature that needed it.
+// that target rather than the one feature that needed it. Raised again
+// to 8, WebGPU's own limit (`maxColorAttachments`): a G-buffer with six
+// targets made every heap pipeline on it throw.
 
-export const MAX_ATTACHMENTS = 4;
+export const MAX_ATTACHMENTS = 8;
 
 const HEADER_BITS      = 28n;
 const ATTACHMENT_BITS  = 27n;
@@ -172,7 +174,7 @@ function decodeAttachment(slot: bigint): AttachmentBlend {
 export function encodeModeKey(d: PipelineStateDescriptor): bigint {
   if (d.attachments.length > MAX_ATTACHMENTS) {
     throw new Error(
-      `pipelineCache: ${d.attachments.length} attachments exceeds v1 cap of ${MAX_ATTACHMENTS}`,
+      `pipelineCache: ${d.attachments.length} attachments exceeds the cap of ${MAX_ATTACHMENTS}`,
     );
   }
   if (d.stencil !== undefined) {
