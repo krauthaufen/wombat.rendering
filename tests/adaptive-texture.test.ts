@@ -28,6 +28,31 @@ describe("prepareAdaptiveTexture", () => {
     expect(t.destroyed).toBe(true);
   });
 
+  it("an uploaded image with generateMips gets every level below the first filled", () => {
+    // (allocated but unfilled levels are black: anything sampled at a distance then reads black)
+    const gpu = new MockGPU();
+    const image = { width: 16, height: 8 } as unknown as ImageBitmap;
+    const r = prepareAdaptiveTexture(gpu.device, cval(ITexture.fromExternal(image, { generateMips: true })));
+    r.acquire();
+    const t = asMock(r.getValue(AdaptiveToken.top));
+    expect(t.descriptor.mipLevelCount).toBe(5);
+    expect(gpu.copyExternalCalls).toHaveLength(1);
+    // one pass per level 1..4, each drawing into that level from the one above
+    expect(gpu.renderPasses).toHaveLength(4);
+    for (const pass of gpu.renderPasses) { expect(pass.drawCalls).toHaveLength(1); expect(pass.ended).toBe(true); }
+    r.release();
+  });
+
+  it("an uploaded image without generateMips has one level and no passes", () => {
+    const gpu = new MockGPU();
+    const image = { width: 16, height: 8 } as unknown as ImageBitmap;
+    const r = prepareAdaptiveTexture(gpu.device, cval(ITexture.fromExternal(image)));
+    r.acquire();
+    expect(asMock(r.getValue(AdaptiveToken.top)).descriptor.mipLevelCount ?? 1).toBe(1);
+    expect(gpu.renderPasses).toHaveLength(0);
+    r.release();
+  });
+
   it("same-shape update reuses the texture", () => {
     const gpu = new MockGPU();
     const src = cval(ITexture.fromRaw({ data: new Uint8Array(16), width: 2, height: 2, format: "rgba8unorm" }));

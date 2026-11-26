@@ -146,3 +146,87 @@ export function generateMips(
   }
   pass.end();
 }
+
+
+// ─── Mip chain by rendering ────────────────────────────────────────────
+//
+// `fillMips(device, texture)` fills levels 1… of a texture from its level
+// 0, each level a linear downsample of the one above, drawn with a
+// fullscreen triangle. Unlike the compute path above it needs no storage
+// usage and works for every renderable, filterable format (sRGB included:
+// sampling decodes, writing encodes, so the average is taken in linear
+// light). It encodes and submits on its own, in queue order after
+// whatever was written to level 0 before the call.
+//
+// This is what an uploaded image with `generateMips` gets: allocating the
+// levels without filling them leaves them BLACK, and anything sampled at a
+// distance then reads black.
+
+const WGSL_MIP_BLIT = `
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    // (a destination texel covers two source texels each way: its centre sits on their corner)
+    let uv = pos.xy * 2.0 / vec2<f32>(textureDimensions(src));
+    return textureSampleLevel(src, smp, uv, 0.0);
+}
+`;
+
+interface MipBlitCache {
+  readonly module: GPUShaderModule;
+  readonly sampler: GPUSampler;
+  readonly layout: GPUBindGroupLayout;
+  readonly pipelineLayout: GPUPipelineLayout;
+  readonly pipelines: Map<GPUTextureFormat, GPURenderPipeline>;
+}
+const blitCaches = new WeakMap<GPUDevice, MipBlitCache>();
+
+export function fillMips(device: GPUDevice, texture: GPUTexture): void {
+  if (texture.mipLevelCount <= 1) return;
+  let cache = blitCaches.get(device);
+  if (cache === undefined) {
+    const layout = device.createBindGroupLayout({
+      label: "mipblit",
+      entries: [
+        { binding: 0, visibility: 0x2, texture: { sampleType: "float" } },
+        { binding: 1, visibility: 0x2, sampler: { type: "filtering" } },
+      ],
+    });
+    cache = {
+      module: device.createShaderModule({ code: WGSL_MIP_BLIT, label: "mipblit" }),
+      sampler: device.createSampler({ magFilter: "linear", minFilter: "linear" }),
+      layout, pipelineLayout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+      pipelines: new Map(),
+    };
+    blitCaches.set(device, cache);
+  }
+  let pipeline = cache.pipelines.get(texture.format);
+  if (pipeline === undefined) {
+    pipeline = device.createRenderPipeline({
+      label: `mipblit-${texture.format}`,
+      layout: cache.pipelineLayout,
+      vertex: { module: cache.module, entryPoint: "vs" },
+      fragment: { module: cache.module, entryPoint: "fs", targets: [{ format: texture.format }] },
+      primitive: { topology: "triangle-list" },
+    });
+    cache.pipelines.set(texture.format, pipeline);
+  }
+  const encoder = device.createCommandEncoder({ label: "mipblit" });
+  for (let level = 1; level < texture.mipLevelCount; level++) {
+    const from = texture.createView({ baseMipLevel: level - 1, mipLevelCount: 1, dimension: "2d", baseArrayLayer: 0, arrayLayerCount: 1 });
+    const to = texture.createView({ baseMipLevel: level, mipLevelCount: 1, dimension: "2d", baseArrayLayer: 0, arrayLayerCount: 1 });
+    const pass = encoder.beginRenderPass({ colorAttachments: [{ view: to, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: cache.layout,
+      entries: [{ binding: 0, resource: from }, { binding: 1, resource: cache.sampler }],
+    }));
+    pass.draw(3, 1, 0, 0);
+    pass.end();
+  }
+  device.queue.submit([encoder.finish()]);
+}

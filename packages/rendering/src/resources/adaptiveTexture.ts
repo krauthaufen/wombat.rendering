@@ -33,6 +33,7 @@ import {
   type aval,
 } from "@aardworx/wombat.adaptive";
 import { TextureUsage } from "./webgpuFlags.js";
+import { fillMips } from "./mipGen.js";
 
 export interface PrepareAdaptiveTextureOptions {
   /** Extra usage flags. `COPY_DST` and `TEXTURE_BINDING` are added automatically. */
@@ -73,7 +74,7 @@ function descFor(src: RawTextureSource | ExternalTextureSource): OwnedDesc {
   const s = src.source;
   let width = 0;
   let height = 0;
-  if (s instanceof ImageData) {
+  if (typeof ImageData !== "undefined" && s instanceof ImageData) {
     width = s.width; height = s.height;
   } else if ("naturalWidth" in s && typeof s.naturalWidth === "number") {
     // HTMLImageElement
@@ -270,7 +271,8 @@ function uploadExternal(device: GPUDevice, tex: GPUTexture, src: ExternalTexture
     { source: src.source as GPUImageCopyExternalImageSource },
     { texture: tex },
     { width: (src.source as { width: number }).width, height: (src.source as { height: number }).height, depthOrArrayLayers: 1 },
-  );
+  );  // `generateMips`: the levels below were allocated with the texture and are filled from this one
+  if (tex.mipLevelCount > 1) fillMips(device, tex);
 }
 
 export interface BlockInfo {

@@ -224,6 +224,12 @@ export class MockGPU {
           destroy() { t.destroyed = true; },
           createView() { return {} as GPUTextureView; },
         };
+        // (a real GPUTexture reports what it was created with)
+        const size = desc.size as { width?: number; height?: number } | number[];
+        Object.assign(t, {
+          width: Array.isArray(size) ? size[0] : size.width, height: Array.isArray(size) ? size[1] ?? 1 : size.height ?? 1,
+          format: desc.format, mipLevelCount: desc.mipLevelCount ?? 1,
+        });
         self.textures.push(t);
         return t as unknown as GPUTexture;
       },

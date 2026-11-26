@@ -46,6 +46,7 @@ export {
 
 export {
   generateMips,
+  fillMips,
   type GenerateMipsOptions,
 } from "./mipGen.js";
 
