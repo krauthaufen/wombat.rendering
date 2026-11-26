@@ -99,17 +99,20 @@ export interface RunFrameOptions {
    */
   readonly onAfterFrame?: () => void;
   /**
-   * Frame pacer. When provided, runFrame awaits this promise after
-   * each frame's eval and BEFORE invoking `onAfterFrame` / scheduling
-   * the next rAF. Caps the JS encode rate to whatever the pacer
-   * resolves at — typically `() => device.queue.onSubmittedWorkDone()`
-   * to keep the GPU queue at depth 1 instead of letting submit-
-   * returns-immediately balloon the queue under load.
+   * Frame pacer: a promise per frame that resolves when the frame is
+   * finished — typically `() => device.queue.onSubmittedWorkDone()`.
+   * It keeps the JS encode rate at what the GPU can do: without one, JS
+   * happily encodes 60 frames/s into a GPU that's actually running at
+   * 10 fps — the compositor then drops frames silently and the perceived
+   * rate has nothing to do with rAF rate. Always supply a pacer for
+   * continuous-redraw scenes.
    *
-   * Without a pacer, JS happily encodes 60 frames/s into a GPU that's
-   * actually running at 10 fps — the compositor then drops frames
-   * silently and the perceived rate has nothing to do with rAF rate.
-   * Always supply a pacer for continuous-redraw scenes.
+   * The loop lets TWO frames be in flight: after a frame's eval it waits
+   * for the pacer of the frame BEFORE it, then invokes `onAfterFrame` and
+   * schedules the next rAF. Waiting for the frame just submitted would
+   * serialise CPU and GPU, and it stalls in Firefox, which delivers
+   * `onSubmittedWorkDone` only with the page's next `queue.submit` (or on
+   * a 100 ms timer) — the very submit the loop would be holding back.
    */
   readonly pacer?: () => Promise<void>;
 }
@@ -142,6 +145,7 @@ export function runFrame(
   // queue up and the picture arrives in bursts.
   let inFlight = false;
   let markedInFlight = false;
+  let previousPacer: Promise<void> = Promise.resolve();
   let consecutiveErrors = 0;
   const MAX_CONSECUTIVE_ERRORS = 30;
   const UNCAPPED = isUncapped();
@@ -201,7 +205,7 @@ export function runFrame(
 
   const finalizeFrame = (): void => {
     if (stopped) return;
-    // pacer (GPU completion) has resolved by now — this frame is DONE
+    // the pacer the frame waited for has resolved by now (see `pacer`)
     if (UNCAPPED) bumpFrameCount();
     if (opts.onAfterFrame !== undefined) {
       transact(opts.onAfterFrame);
@@ -247,12 +251,15 @@ export function runFrame(
           if (!pending && !stopped) { pending = true; rafId = schedule(tick); }
         }
       };
-      opts.pacer().then(done, (e) => {
-        // A rejected pacer (GPU hiccup) must not brick the loop either — the
-        // frame is done as far as we're concerned; carry on.
-        console.error("runFrame: pacer rejected", e);
-        done();
-      });
+      // A rejected pacer (GPU hiccup) must not brick the loop either — the
+      // frame is done as far as we're concerned; carry on.
+      const mine = opts.pacer().then(undefined, (e) => { console.error("runFrame: pacer rejected", e); });
+      // The loop goes on once the frame BEFORE this one is finished, so at
+      // most two frames are in flight (see `pacer`). The uncapped benchmark
+      // loop waits for this very frame: its figures are per finished frame.
+      const wait = UNCAPPED ? mine : previousPacer;
+      previousPacer = mine;
+      void wait.then(done);
       // Nor must a pacer that never settles (a lost device): after a long
       // wait the frame counts as done.
       setTimeout(done, PACER_TIMEOUT_MS);
