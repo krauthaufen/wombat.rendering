@@ -30,7 +30,7 @@ const N = 240;
 const top = AdaptiveToken.top;
 
 /** One scene and everything a step may change; `shapes` is the only difference between two worlds. */
-function world(shapes: boolean) {
+function world(shapes: boolean, heapEnabled?: aval<boolean>) {
   const gpu = new MockGPU();
   const effect = makeHeapTestEffect();
   const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" }, depthStencil: { format: "depth24plus" } });
@@ -74,7 +74,7 @@ function world(shapes: boolean) {
   };
   const trees = Array.from({ length: N }, (_, i) => RenderTree.leaf(object(i)));
   const set = cset<RenderTree>();
-  const scene = compileHybridScene(gpu.device, sig, RenderTree.unorderedFromSet(set), { enableDrawShapes: shapes });
+  const scene = compileHybridScene(gpu.device, sig, RenderTree.unorderedFromSet(set), { enableDrawShapes: shapes, ...(heapEnabled !== undefined ? { heapEnabled } : {}) });
   const heap = scene.heapSceneForTest as unknown as {
     _debug: { stateForTest(): unknown; plannedAdds(): number; forceCompact(): number };
   };
@@ -130,5 +130,33 @@ describe("heap: draw plans", () => {
     const before = a.heap._debug.plannedAdds();
     both((w) => { for (let i = 0; i < N; i += 4) w.set.add(w.trees[i]!); });
     expect(a.heap._debug.plannedAdds()).toBeGreaterThan(before);
+  });
+
+  it("objects move between the heap and the legacy path with the toggle, also while coming and going", () => {
+    const on = cval(true);
+    const w = world(true, on);
+    const counts = (): [number, number] => {
+      w.scene.update(top);
+      return [w.scene.heapTotalDraws(), (w.scene as unknown as { __legacyCount(): number }).__legacyCount()];
+    };
+    transact(() => { for (let i = 0; i < 60; i++) w.set.add(w.trees[i]!); });
+    expect(counts()).toEqual([60, 0]);
+    transact(() => { on.value = false; });
+    expect(counts()).toEqual([0, 60]);
+    // while off: some leave, some arrive
+    transact(() => {
+      for (let i = 0; i < 20; i++) w.set.remove(w.trees[i]!);
+      for (let i = 60; i < 100; i++) w.set.add(w.trees[i]!);
+    });
+    expect(counts()).toEqual([0, 80]);
+    transact(() => { on.value = true; });
+    expect(counts()).toEqual([80, 0]);
+    // a toggle and a removal in the same transaction
+    transact(() => { on.value = false; for (let i = 20; i < 40; i++) w.set.remove(w.trees[i]!); });
+    expect(counts()).toEqual([0, 60]);
+    transact(() => { on.value = true; w.set.clear(); });
+    expect(counts()).toEqual([0, 0]);
+    transact(() => { for (let i = 0; i < 30; i++) w.set.add(w.trees[i]!); });
+    expect(counts()).toEqual([30, 0]);
   });
 });

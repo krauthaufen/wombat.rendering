@@ -619,6 +619,16 @@ interface Bucket {
 // Public API
 // ---------------------------------------------------------------------------
 
+/**
+ * Draws handed over as changes, without a set in between: every call
+ * gives what was added (`count > 0`) and removed since the last one,
+ * each spec at most once. `getChanges` must evaluate under `token`, so
+ * that a later change marks the scene.
+ */
+export interface HeapDrawFeed {
+  getChanges(token: AdaptiveToken): { iter(f: (op: { value: HeapDrawSpec; count: number }) => void): void };
+}
+
 export interface HeapDrawSpec {
   /**
    * The shader. Two draws with the same effect (matched by `effect.id`)
@@ -1174,7 +1184,7 @@ export function createHeapStorage(device: GPUDevice, opts: HeapStorageOptions = 
 export function buildHeapScene(
   device: GPUDevice,
   sig: import("../core/framebufferSignature.js").FramebufferSignature,
-  initialDraws: readonly HeapDrawSpec[] | aset<HeapDrawSpec>,
+  initialDraws: readonly HeapDrawSpec[] | aset<HeapDrawSpec> | HeapDrawFeed,
   opts: BuildHeapSceneOptions = {},
 ): HeapScene {
   const atlasPool = opts.atlasPool;
@@ -5105,7 +5115,7 @@ export function buildHeapScene(
   }
 
   // ─── Aset reader (pull-driven on each frame) ──────────────────────
-  let asetReader: IHashSetReader<HeapDrawSpec> | undefined;
+  let asetReader: HeapDrawFeed | undefined;
   const specToDrawId = new Map<HeapDrawSpec, number>();
   function drainAsetWith(tok: AdaptiveToken): void {
     if (asetReader === undefined) return;
@@ -5148,7 +5158,9 @@ export function buildHeapScene(
       for (const d of arr) addDrawImpl(d, tok);
     });
   } else {
-    asetReader = (initialDraws as aset<HeapDrawSpec>).getReader();
+    asetReader = typeof (initialDraws as { getReader?: unknown }).getReader === "function"
+      ? (initialDraws as aset<HeapDrawSpec>).getReader() as unknown as HeapDrawFeed
+      : initialDraws as HeapDrawFeed;
     sceneObj.evaluateAlways(AdaptiveToken.top, (tok) => {
       // First drain: snapshot all add-ops, build the family from their
       // effects up front, then run addDraw. Subsequent drains reuse the

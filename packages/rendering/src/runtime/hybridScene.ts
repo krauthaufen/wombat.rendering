@@ -28,7 +28,8 @@
 // their internal amortization.
 
 import {
-  ASet, AVal, AdaptiveToken, type aset, type aval, type AdaptiveToken as _T,
+  ASet, AVal, AbstractReader, AdaptiveObject, AdaptiveToken, HashSetDelta, SetOperation,
+  type IAdaptiveObject, type aset, type aval, type AdaptiveToken as _T,
 } from "@aardworx/wombat.adaptive";
 import type { CompiledEffect, Effect } from "../core/shader.js";
 import type { FramebufferSignature } from "../core/framebufferSignature.js";
@@ -39,7 +40,7 @@ import { flattenRenderTree } from "./flattenTree.js";
 import { materializeRow, type RenderRowSet } from "../core/index.js";
 import { isHeapEligible } from "./heapEligibility.js";
 import { renderObjectToHeapSpec } from "./heapAdapter.js";
-import { buildHeapScene, type HeapDrawSpec, type HeapScene } from "./heapScene.js";
+import { buildHeapScene, type HeapDrawFeed, type HeapDrawSpec, type HeapScene } from "./heapScene.js";
 import type { DrawShape } from "./heapAdapter.js";
 import type { FragmentOutputLayout } from "./heapEffect.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
@@ -385,29 +386,172 @@ export function compileHybridScene(
     return shape.storageName === storageName ? shape : undefined;
   };
 
-  const heapSpecAset = flat.chooseA((ro: RenderObject) => {
-    const shape = shapeFor(ro);
-    if (shape !== undefined && shape.fast) {
-      const spec = specOf(ro, shape);
-      return spec !== undefined ? AVal.constant(spec) : (CONST_UNDEF as aval<HeapDrawSpec | undefined>);
-    }
-    if (!drawable(ro)) return CONST_UNDEF as aval<HeapDrawSpec | undefined>;
-    const e = elig(ro);
-    if (e.isConstant) {
-      // Why force here: constant — immutable by definition.
-      const on = e.force(/* allow-force */);
-      // (drawable and eligible for good: so is every other object of its shape)
-      if (on && shape !== undefined) shape.fast = true;
-      return on
-        ? AVal.constant(specOf(ro, shape))
-        : (CONST_UNDEF as aval<HeapDrawSpec | undefined>);
-    }
-    return e.map((b) => (b ? specOf(ro) : undefined));
-  });
+  // ─── The partition: ONE pass over the scene's objects ────────────
+  // Every object goes to exactly one of the heap (as its draw spec), the
+  // legacy path (as a leaf) or neither (not drawable). The scene's set
+  // of objects is read ONCE; each object is placed as it arrives and
+  // its place is handed to the side that takes it. (This used to be two
+  // filter stages over the same set, one per side, each with a change
+  // set, a cache entry and a wrapper value per object.) An object whose
+  // eligibility can change is watched and moved when it does.
+  const leafCache = new WeakMap<RenderObject, RenderTree>();
+  const leafOf = (ro: RenderObject): RenderTree => {
+    let l = leafCache.get(ro);
+    if (l === undefined) { l = RenderTree.leaf(ro); leafCache.set(ro, l); }
+    return l;
+  };
+  const NEITHER = 0, HEAP = 1, LEGACY = 2;
+  type Place = typeof NEITHER | typeof HEAP | typeof LEGACY;
+  /** What a side is told: net changes since it last asked (an add and a remove cancel). */
+  interface Taker { readonly place: Place; put(value: unknown, count: number): void }
+  const netPut = (pending: Map<unknown, number>, value: unknown, count: number): void => {
+    const n = (pending.get(value) ?? 0) + count;
+    if (n === 0) pending.delete(value); else pending.set(value, n);
+  };
 
-  const allHeapSpecs = rowSpecSets.length === 0
-    ? heapSpecAset
-    : ASet.unionMany(ASet.ofArray([heapSpecAset, ...rowSpecSets]));
+  class Partition extends AdaptiveObject {
+    private readonly reader = flat.getReader();
+    private readonly placed = new Map<RenderObject, Place>();
+    /** Objects whose eligibility can change, by the value that decides it. */
+    private readonly watched = new Map<IAdaptiveObject, RenderObject | Set<RenderObject>>();
+    private dirty = new Set<IAdaptiveObject>();
+    private readonly takers: Taker[] = [];
+
+    /** A side joins: it is first told everything already in its place. */
+    attach(t: Taker): void {
+      for (const [ro, p] of this.placed) if (p === t.place) t.put(this.payload(ro, p), 1);
+      this.takers.push(t);
+    }
+
+    override inputChanged(_t: unknown, o: IAdaptiveObject): void {
+      if (this.watched.has(o)) this.dirty.add(o);
+    }
+
+    /** Bring the placement up to date; `token` is the asking side's (so a change marks it). */
+    sync(token: AdaptiveToken): void {
+      this.evaluateAlways(token, (tok) => {
+        if (!this.outOfDate) return;
+        this.reader.getChanges(tok).iter((op) => {
+          const ro = op.value;
+          if (op.count > 0) {
+            if (this.placed.has(ro)) return;
+            const p = this.place(ro, tok);
+            this.placed.set(ro, p);
+            if (p !== NEITHER) this.tell(ro, p, 1);
+          } else {
+            const p = this.placed.get(ro);
+            if (p === undefined) return;
+            this.placed.delete(ro);
+            this.unwatch(ro);
+            if (p !== NEITHER) this.tell(ro, p, -1);
+          }
+        });
+        if (this.dirty.size > 0) {
+          const dirty = this.dirty;
+          this.dirty = new Set();
+          for (const o of dirty) {
+            const ros = this.watched.get(o);
+            if (ros === undefined) continue;
+            // (read again: that is also what keeps this subscribed to it)
+            const on = (o as unknown as aval<boolean>).getValue(tok);
+            for (const ro of ros instanceof Set ? [...ros] : [ros]) {
+              const was = this.placed.get(ro);
+              if (was === undefined) continue;
+              const now: Place = on ? (specOf(ro) !== undefined ? HEAP : NEITHER) : LEGACY;
+              if (now === was) continue;
+              if (was !== NEITHER) this.tell(ro, was, -1);
+              this.placed.set(ro, now);
+              if (now !== NEITHER) this.tell(ro, now, 1);
+            }
+          }
+        }
+      });
+    }
+
+    private place(ro: RenderObject, tok: AdaptiveToken): Place {
+      const shape = shapeFor(ro);
+      if (shape !== undefined && shape.fast) return specOf(ro, shape) !== undefined ? HEAP : NEITHER;
+      if (!drawable(ro)) return NEITHER;
+      const e = elig(ro);
+      if (e.isConstant) {
+        // Why force here: constant — immutable by definition.
+        const on = e.force(/* allow-force */);
+        if (!on) return LEGACY;
+        // (drawable and eligible for good: so is every other object of its shape)
+        if (shape !== undefined) shape.fast = true;
+        return specOf(ro, shape) !== undefined ? HEAP : NEITHER;
+      }
+      const on = e.getValue(tok);
+      const o = e as unknown as IAdaptiveObject;
+      const ros = this.watched.get(o);
+      if (ros === undefined) this.watched.set(o, ro);
+      else if (ros instanceof Set) ros.add(ro);
+      else this.watched.set(o, new Set([ros, ro]));
+      if (!on) return LEGACY;
+      return specOf(ro) !== undefined ? HEAP : NEITHER;
+    }
+
+    private unwatch(ro: RenderObject): void {
+      if (this.watched.size === 0) return;
+      const o = elig(ro) as unknown as IAdaptiveObject;
+      const ros = this.watched.get(o);
+      if (ros === undefined) return;
+      if (ros instanceof Set) { ros.delete(ro); if (ros.size === 0) this.watched.delete(o); }
+      else if (ros === ro) this.watched.delete(o);
+    }
+
+    /** What a side gets for an object: its spec (heap) or its leaf (legacy). */
+    private payload(ro: RenderObject, p: Place): unknown {
+      return p === HEAP ? specCache.get(ro) : leafOf(ro);
+    }
+
+    private tell(ro: RenderObject, p: Place, count: number): void {
+      const value = this.payload(ro, p);
+      for (const t of this.takers) if (t.place === p) t.put(value, count);
+    }
+  }
+  const partition = new Partition();
+
+  /** A side as an ordinary set (the legacy tree; the heap when row sets join it). */
+  class SideReader<T> extends AbstractReader<HashSetDelta<T>> implements Taker {
+    private readonly pending = new Map<unknown, number>();
+    constructor(readonly place: Place) {
+      super(HashSetDelta.empty<T>());
+      partition.attach(this);
+    }
+    put(value: unknown, count: number): void { netPut(this.pending, value, count); }
+    override compute(tok: AdaptiveToken): HashSetDelta<T> {
+      partition.sync(tok);
+      if (this.pending.size === 0) return HashSetDelta.empty<T>();
+      const ops: SetOperation<T>[] = [];
+      for (const [v, c] of this.pending) ops.push(new SetOperation(v as T, c));
+      this.pending.clear();
+      return HashSetDelta.ofArray(ops);
+    }
+  }
+  /** The heap's side handed over directly: the changes as they are, no set in between. */
+  class HeapFeed extends AdaptiveObject implements Taker, HeapDrawFeed {
+    readonly place = HEAP;
+    private pending = new Map<unknown, number>();
+    constructor() { super(); partition.attach(this); }
+    put(value: unknown, count: number): void { netPut(this.pending, value, count); }
+    getChanges(token: AdaptiveToken): { iter(f: (op: { value: HeapDrawSpec; count: number }) => void): void } {
+      return this.evaluateAlways(token, (tok) => {
+        partition.sync(tok);
+        const taken = this.pending;
+        if (taken.size > 0) this.pending = new Map();
+        return {
+          iter(f: (op: { value: HeapDrawSpec; count: number }) => void): void {
+            for (const [value, count] of taken) f({ value: value as HeapDrawSpec, count });
+          },
+        };
+      });
+    }
+  }
+
+  const allHeapSpecs: aset<HeapDrawSpec> | HeapDrawFeed = rowSpecSets.length === 0
+    ? new HeapFeed()
+    : ASet.unionMany(ASet.ofArray([ASet.ofReader(() => new SideReader<HeapDrawSpec>(HEAP)), ...rowSpecSets]));
 
   const heapScene: HeapScene = buildHeapScene(device, signature, allHeapSpecs, {
     fragmentOutputLayout,
@@ -427,25 +571,7 @@ export function compileHybridScene(
   // and resource ref-counting all behave exactly as the master path.
   // ONE fused stage (ineligible → leaf); the leaf wrapper is memoized
   // so eligibility flips re-emit the identical tree object.
-  const leafCache = new WeakMap<RenderObject, RenderTree>();
-  const leafOf = (ro: RenderObject): RenderTree => {
-    let l = leafCache.get(ro);
-    if (l === undefined) { l = RenderTree.leaf(ro); leafCache.set(ro, l); }
-    return l;
-  };
-  const legacyFromFlat = flat.chooseA((ro: RenderObject) => {
-    // (an object of a shape known to be on the heap for good is not legacy)
-    if (shapeFor(ro)?.fast === true) return CONST_UNDEF as aval<RenderTree | undefined>;
-    if (!drawable(ro)) return CONST_UNDEF as aval<RenderTree | undefined>;
-    const e = elig(ro);
-    if (e.isConstant) {
-      // Why force here: constant — immutable by definition.
-      return e.force(/* allow-force */)
-        ? (CONST_UNDEF as aval<RenderTree | undefined>)
-        : AVal.constant(leafOf(ro));
-    }
-    return e.map((b) => (b ? undefined : leafOf(ro)));
-  });
+  const legacyFromFlat: aset<RenderTree> = ASet.ofReader(() => new SideReader<RenderTree>(LEGACY));
   // Row sets render legacy ONLY when the global heap toggle is off —
   // with the (default) constant-true toggle the bind collapses and
   // this contributes nothing.
