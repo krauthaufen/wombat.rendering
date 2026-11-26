@@ -194,13 +194,15 @@ function storageIsReadOnly(ro: RenderObject): boolean {
   return ok;
 }
 
-/** A host texture that fits the atlas's shared pages (not a cube, not one needing a page of its own). */
+/** A host texture the atlas's shared pages can hold, grown if need be (not a cube). */
 function isSharedPageTexture(t: ITexture): boolean {
   if (t.kind !== "host") return false;
   const src = t.source;
-  if (src.kind === "raw") return AtlasPool.eligibleSize(src.width, src.height);
+  // (up to what the pages can GROW to hold: see AtlasPool.growEdge)
+  const fits = (w: number, h: number, mips: boolean): boolean => AtlasPool.eligibleSize(w, h) || AtlasPool.soloSize(w, h, mips);
+  if (src.kind === "raw") return fits(src.width, src.height, (src.mipLevelCount ?? 1) > 1);
   const live = src.source as { width?: number; height?: number };
-  return AtlasPool.eligibleSize(src.width ?? live.width ?? 0, src.height ?? live.height ?? 0);
+  return fits(src.width ?? live.width ?? 0, src.height ?? live.height ?? 0, src.generateMips === true);
 }
 
 function textureAvals(ro: RenderObject): aval<ITexture>[] {

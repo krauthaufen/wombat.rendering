@@ -575,10 +575,12 @@ function atlasSetFor(
   if (texVal === undefined || texVal.kind === "cube") return null;
   const dims = describeTexture(texVal);
   const format = dims === null ? null : AtlasPool.eligibleFormat(dims.format);
-  if (dims === null || format === null || !AtlasPool.eligibleSize(dims.width, dims.height)) return null;
+  if (dims === null || format === null) return null;
   const wantsMips = dims.mipLevelCount > 1;
+  // (too large for a page? then the pages grow: a draw with several textures needs every one on the shared pages)
+  if (!AtlasPool.eligibleSize(dims.width, dims.height) && !AtlasPool.soloSize(dims.width, dims.height, wantsMips)) return null;
   const acq = pool.acquire(format, texAval, dims.width, dims.height, {
-    wantsMips,
+    wantsMips, shared: true,
     ...(dims.host !== undefined ? { source: { width: dims.width, height: dims.height, host: dims.host } } : {}),
   });
   if (acq === null) return null;

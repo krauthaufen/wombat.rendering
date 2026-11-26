@@ -40,7 +40,7 @@ import { renderObjectToHeapSpec } from "./heapAdapter.js";
 import { buildHeapScene, type HeapDrawFeed, type HeapDrawSpec, type HeapScene } from "./heapScene.js";
 import type { DrawShape } from "./heapAdapter.js";
 import type { FragmentOutputLayout } from "./heapEffect.js";
-import { ATLAS_PAGE_FORMATS, AtlasPool, atlasPageSizeNow } from "./textureAtlas/atlasPool.js";
+import { ATLAS_PAGE_FORMATS, AtlasPool } from "./textureAtlas/atlasPool.js";
 import { checkAttributes } from "./missingAttributes.js";
 
 void (null as AdaptiveToken | _T | null);
@@ -664,7 +664,7 @@ export function compileHybridScene(
     heapSceneForTest: heapScene,
     placement: placementCounts,
     atlas: () => ({
-      pageSize: atlasPageSizeNow(),
+      pageSize: atlasPool.pageEdgeNow,
       formats: Object.fromEntries(ATLAS_PAGE_FORMATS.map((f) => [f, { pages: atlasPool.pagesFor(f).length, cap: atlasPool.capFor(f) }])),
     }),
     update(token: AdaptiveToken): void {

@@ -328,6 +328,20 @@ export class TexturePacking<K> {
     return new TexturePacking<K>(this.size, this.allowRotate, free, newUsed);
   }
 
+  /**
+   * The same packing in a LARGER area: everything stays where it is, the
+   * strips gained to the right and below are free. (An atlas page that was
+   * given a longer edge.)
+   */
+  grown(size: V2i): TexturePacking<K> {
+    if (size.x < this.size.x || size.y < this.size.y) throw new Error("TexturePacking.grown: the area cannot shrink");
+    if (size.x === this.size.x && size.y === this.size.y) return this;
+    let free = this.free;
+    if (size.x > this.size.x) free = addFree(mkBox(this.size.x, 0, size.x - 1, size.y - 1), free);
+    if (size.y > this.size.y) free = addFree(mkBox(0, this.size.y, size.x - 1, size.y - 1), free);
+    return new TexturePacking<K>(size, this.allowRotate, free, this.used);
+  }
+
   /** Remove `id` (no-op if absent). */
   remove(id: K): TexturePacking<K> {
     const rect = this.used.get(id);

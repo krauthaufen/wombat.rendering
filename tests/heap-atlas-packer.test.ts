@@ -231,3 +231,29 @@ describe("TexturePacking properties", () => {
     );
   });
 });
+
+// A packing moved into a LARGER area (an atlas page given a longer edge):
+// what was placed stays where it was, and the area gained can be used.
+describe("TexturePacking.grown", () => {
+  it("keeps every rect and makes room for what did not fit before", async () => {
+    const { TexturePacking } = await import("../packages/rendering/src/runtime/textureAtlas/packer.js");
+    let p = TexturePacking.empty<number>(new V2i(64, 64), false);
+    for (let k = 0; k < 4; k++) p = p.tryAdd(k, new V2i(32, 32))!;
+    expect(p.tryAdd(9, new V2i(8, 8))).toBeNull();          // full
+    const before = new Map(p.used);
+    const g = p.grown(new V2i(128, 128));
+    expect(g.size.x).toBe(128);
+    for (const [k, r] of before) expect(g.used.get(k)).toEqual(r);
+    // three more quarters' worth fits now, none on top of another or of the old ones
+    let q = g;
+    for (let k = 10; k < 13; k++) { const next = q.tryAdd(k, new V2i(64, 64)); expect(next).not.toBeNull(); q = next!; }
+    const rects = [...q.used.values()];
+    for (let i = 0; i < rects.length; i++) for (let j = i + 1; j < rects.length; j++) {
+      const a = rects[i]!, b = rects[j]!;
+      const apart = a.max.x < b.min.x || b.max.x < a.min.x || a.max.y < b.min.y || b.max.y < a.min.y;
+      expect(apart).toBe(true);
+      expect(a.max.x).toBeLessThan(128); expect(a.max.y).toBeLessThan(128);
+    }
+    expect(() => p.grown(new V2i(32, 32))).toThrow();
+  });
+});

@@ -178,6 +178,36 @@ describe("several textures on one heap draw", () => {
     expect(code).not.toMatch(/texture(SampleLevel|Load)\((checker|detail)/);
   });
 
+  it("a texture too large for a page makes the pages grow; nothing already placed moves", () => {
+    const gpu = new MockGPU();
+    const small = { checker: texture(64, 64), detail: texture(32, 32), mask: texture(16, 16) };
+    // 2048² fits a 4096² page as it is; 4096² needs more than a page has
+    const large = { checker: texture(2048, 2048), detail: texture(4096, 4096), mask: texture(16, 16) };
+    const first = RenderTree.leaf(object(small, 0));
+    const set = cset<RenderTree>([first]);
+    const scene = compileHybridScene(gpu.device, sig(), RenderTree.unorderedFromSet(set), {});
+    scene.update(top);
+    expect(scene.atlas().pageSize).toBe(4096);
+    const before = placements(scene, 0);
+    const big = object(large, 1);
+    expect(isHeapEligible(big).getValue(top)).toBe(true);
+    transact(() => set.add(RenderTree.leaf(big)));
+    scene.update(top);
+    // both on the heap, in one bucket; the pages are twice as long now
+    expect(scene.placement()).toMatchObject({ heap: 2, legacy: 0, neither: 0 });
+    expect(scene.heapSceneForTest.stats.groups).toBe(1);
+    expect(scene.atlas().pageSize).toBe(8192);
+    expect(placements(scene, 0)).toEqual(before);
+    const p = placements(scene, 1);
+    expect(binding(p, "checker").size).toEqual([2048, 2048]);
+    expect(binding(p, "detail").size).toEqual([4096, 4096]);
+    // (and they do not overlap: the large one went into the area gained)
+    const a = binding(p, "checker"), b = binding(p, "detail");
+    const apart = a.pageRef !== b.pageRef || a.origin[0] + 2048 <= b.origin[0] || b.origin[0] + 4096 <= a.origin[0]
+      || a.origin[1] + 2048 <= b.origin[1] || b.origin[1] + 4096 <= a.origin[1];
+    expect(apart).toBe(true);
+  });
+
   it("removing the object gives every one of its atlas entries back", () => {
     const gpu = new MockGPU();
     const tree = RenderTree.leaf(object({ checker: texture(64, 64), detail: texture(32, 32), mask: texture(16, 16) }));

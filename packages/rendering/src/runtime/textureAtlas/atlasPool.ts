@@ -238,6 +238,14 @@ export interface AtlasAcquireOptions {
    * `floor(log2(max(w,h))) + 1` (full chain to 1×1).
    */
   readonly numMips?: number;
+  /**
+   * The texture must lie on the SHARED pages: a draw that samples several
+   * textures cannot use a page of its own for one of them (that page is
+   * bound in place of the whole array). If it is too large for the pages
+   * as they are, the pages are given a longer edge (see `growEdge`); until
+   * the device has confirmed that, `acquire` returns null.
+   */
+  readonly shared?: boolean;
 }
 
 /** Adds `d` to the refs `av` holds on `e` (see `AtlasEntry.aliasRefs`). */
@@ -353,6 +361,18 @@ export class AtlasPool {
   private readonly growthsByFormat = new Map<AtlasPageFormat, { texture: GPUTexture; layers: number; state: "pending" | "ok" | "failed"; firstRef: number }[]>();
   /** Per format, the layer count the device could not grow past (out of memory). */
   private readonly oomCapByFormat = new Map<AtlasPageFormat, number>();
+  /**
+   * Edge of this pool's pages, in texels. It starts at the configured page
+   * size and GROWS when a texture that has to lie on the shared pages
+   * needs more (`growEdge`): every page becomes that much larger, what is
+   * on it stays where it is. (Placements are in atlas pixels and the
+   * shader divides by the bound array's size, so nothing else moves.)
+   */
+  private pageEdge = atlasPageSizeNow();
+  /** The largest edge the device was willing to give (after a refusal). */
+  private edgeCap = Infinity;
+  private edgeGrowing = false;
+  get pageEdgeNow(): number { return this.pageEdge; }
   private readonly layersLostListeners = new Map<AtlasPageFormat, Set<(firstLostPage: number) => void>>();
   /**
    * Keyed by `aval<ITexture>` under the aval equality protocol: a
@@ -522,7 +542,7 @@ export class AtlasPool {
     if (scoped) this.device.pushErrorScope("out-of-memory");
     const texture = this.device.createTexture({
       label: `atlas/${format}[${next}]`,
-      size: { width: atlasPageSizeNow(), height: atlasPageSizeNow(), depthOrArrayLayers: next },
+      size: { width: this.pageEdge, height: this.pageEdge, depthOrArrayLayers: next },
       format,
       mipLevelCount: 1,
       usage:
@@ -540,7 +560,7 @@ export class AtlasPool {
       enc.copyTextureToTexture(
         { texture: store.texture },
         { texture },
-        { width: atlasPageSizeNow(), height: atlasPageSizeNow(), depthOrArrayLayers: store.layers },
+        { width: this.pageEdge, height: this.pageEdge, depthOrArrayLayers: store.layers },
       );
       this.device.queue.submit([enc.finish()]);
     }
@@ -620,7 +640,7 @@ export class AtlasPool {
       kind: "out-of-memory",
       recovered: true,
       message:
-        `texture atlas ${format}: the device could not allocate ${refusedLayers} layers of ${atlasPageSizeNow()}² (${message.split("\n")[0]}); ` +
+        `texture atlas ${format}: the device could not allocate ${refusedLayers} layers of ${this.pageEdge}² (${message.split("\n")[0]}); ` +
         `kept ${layers} layer(s), ${lostPages} page(s) and ${lostEntries} placement(s) lost and placed again where they fit; ` +
         `textures that do not fit take an ordinary binding.`,
     });
@@ -635,9 +655,102 @@ export class AtlasPool {
       format,
       // getter: growth reallocates the array; pages must never cache it
       get texture(): GPUTexture { return pool.storesByFormat.get(format)!.texture; },
-      packing: TexturePacking.empty<number>(new V2i(atlasPageSizeNow(), atlasPageSizeNow()), false),
+      packing: TexturePacking.empty<number>(new V2i(this.pageEdge, this.pageEdge), false),
       pageId,
     };
+  }
+
+  /**
+   * Give every page a longer edge, so that a `need`-texel rect fits one.
+   * True when the pages are that large NOW. On a real device the larger
+   * arrays are first allocated inside an out-of-memory scope and only
+   * swapped in once the device has confirmed them: this returns false
+   * then, and true on a later call. (The caller's object waits on the
+   * ordinary texture path meanwhile and is asked again.) A refusal caps
+   * the edge for good.
+   */
+  private growEdge(need: number): boolean {
+    const limit = (this.device as { limits?: { maxTextureDimension2D?: number } }).limits?.maxTextureDimension2D ?? SOLO_MAX_DIM;
+    let edge = this.pageEdge;
+    while (edge < need) edge *= 2;
+    if (edge > Math.min(SOLO_MAX_DIM, limit, this.edgeCap)) return false;
+    const scoped = typeof (this.device as { pushErrorScope?: unknown }).pushErrorScope === "function";
+    if (!scoped) {
+      // (mock devices: nothing to wait for)
+      this.swapEdge(edge, this.allocateEdge(edge));
+      return true;
+    }
+    if (!this.edgeGrowing) {
+      this.edgeGrowing = true;
+      void this.prepareEdge(edge).finally(() => { this.edgeGrowing = false; });
+    }
+    return false;
+  }
+
+  /** New arrays with `edge`-texel layers, one per format that has pages (as many layers as it has now). */
+  private allocateEdge(edge: number): Map<AtlasPageFormat, { texture: GPUTexture; layers: number }> {
+    const out = new Map<AtlasPageFormat, { texture: GPUTexture; layers: number }>();
+    for (const [format, store] of this.storesByFormat) {
+      out.set(format, {
+        layers: store.layers,
+        texture: this.device.createTexture({
+          label: `atlas/${format}[${store.layers}]@${edge}`,
+          size: { width: edge, height: edge, depthOrArrayLayers: store.layers },
+          format,
+          mipLevelCount: 1,
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
+        }),
+      });
+    }
+    return out;
+  }
+
+  private async prepareEdge(edge: number): Promise<void> {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      // (a layer growth still waiting for the device's word: let it settle first)
+      const unsettled = [...this.growthsByFormat.values()].some((chain) => chain.some((g) => g.state !== "ok"));
+      if (unsettled) { await this.device.queue.onSubmittedWorkDone(); continue; }
+      this.device.pushErrorScope("out-of-memory");
+      const fresh = this.allocateEdge(edge);
+      const error = await this.device.popErrorScope();
+      const destroy = (): void => { for (const f of fresh.values()) f.texture.destroy(); };
+      if (error !== null) {
+        destroy();
+        this.edgeCap = this.pageEdge;
+        console.warn(`texture atlas: the device could not allocate pages of ${edge}² (${error.message}); large textures stay on the ordinary texture path.`);
+        return;
+      }
+      // (pages were added while the device was thinking: allocate again, with as many layers as there are now)
+      const stale = [...this.storesByFormat].some(([format, store]) => fresh.get(format)?.layers !== store.layers) || fresh.size !== this.storesByFormat.size;
+      if (stale) { destroy(); continue; }
+      this.swapEdge(edge, fresh);
+      return;
+    }
+  }
+
+  /** Put the larger arrays in the old ones' place: their layers copied across, every page's free area extended. */
+  private swapEdge(edge: number, fresh: Map<AtlasPageFormat, { texture: GPUTexture; layers: number }>): void {
+    // (an open upload batch may hold copies into the old arrays: they go first)
+    this.flushUploadBatch();
+    const old: GPUTexture[] = [];
+    const enc = this.device.createCommandEncoder({ label: "atlas/grow-edge" });
+    for (const [format, next] of fresh) {
+      const store = this.storesByFormat.get(format);
+      if (store === undefined) { next.texture.destroy(); continue; }
+      enc.copyTextureToTexture({ texture: store.texture }, { texture: next.texture },
+        { width: this.pageEdge, height: this.pageEdge, depthOrArrayLayers: store.layers });
+      old.push(store.texture);
+      this.storesByFormat.set(format, next);
+      this.growthsByFormat.delete(format);
+      for (const page of this.pagesByFormat.get(format) ?? []) page.packing = page.packing.grown(new V2i(edge, edge));
+    }
+    this.device.queue.submit([enc.finish()]);
+    this.pageEdge = edge;
+    const done = (this.device.queue as { onSubmittedWorkDone?: () => Promise<void> }).onSubmittedWorkDone;
+    if (typeof done === "function") void done.call(this.device.queue).then(() => { for (const t of old) t.destroy(); });
+    else for (const t of old) t.destroy();
+    // the arrays are other objects now: whoever binds them binds anew
+    for (const [format, listeners] of this.pageAddedListeners) { if (fresh.has(format)) for (const cb of listeners) cb(0); }
   }
 
   /** The format family's current array texture (undefined before the
@@ -796,8 +909,9 @@ export class AtlasPool {
                              defaultMipCount(width, height)))
       : 1;
 
-    // Too large for the shared pages: a page of its own.
-    if (!AtlasPool.eligibleSize(width, height)) {
+    // Too large for the shared pages: a page of its own, unless it has to
+    // share (then the pages grow to hold it, below).
+    if (!AtlasPool.eligibleSize(width, height) && opts.shared !== true) {
       return this.acquireSolo(format, sourceAval, width, height, numMips, opts.source, valueKey);
     }
 
@@ -826,6 +940,7 @@ export class AtlasPool {
       reservedH = Math.max(reservedH, stackedH);
     }
     const size = new V2i(reservedW, reservedH);
+    if (Math.max(reservedW, reservedH) > this.pageEdge && !this.growEdge(Math.max(reservedW, reservedH))) return null;
 
     const pages = this.pagesByFormat.get(format)!;
 
@@ -879,7 +994,7 @@ export class AtlasPool {
       if (!this.fullWarned.has(format)) {
         this.fullWarned.add(format);
         console.warn(
-          `atlas: FULL for ${format} — ${pages.length} pages × ${atlasPageSizeNow()}² all in use ` +
+          `atlas: FULL for ${format} — ${pages.length} pages × ${this.pageEdge}² all in use ` +
           `(${this.entriesByRef.size} live entries, ${this.lru.size} evictable). ` +
           `New textures are deferred until space frees.`,
         );
@@ -891,7 +1006,7 @@ export class AtlasPool {
     const placed = page.packing.tryAdd(this.nextRef, size);
     if (placed === null) {
       throw new Error(
-        `AtlasPool: ${reservedW}×${reservedH} doesn't fit a fresh ${atlasPageSizeNow()}² page`,
+        `AtlasPool: ${reservedW}×${reservedH} doesn't fit a fresh ${this.pageEdge}² page`,
       );
     }
     page.packing = placed;
