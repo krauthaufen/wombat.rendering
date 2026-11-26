@@ -1246,6 +1246,14 @@ export class AtlasPool {
     h: number,
     numMips: number,
   ): boolean {
+    // An ImageData is pixels in memory: taken as such. Only some browsers
+    // accept one as the source of a GPU image copy (Chrome does; Safari and
+    // Firefox throw), and none can draw one onto a canvas, which is what
+    // the fallback below would try. Either failure used to escape into the
+    // frame callback and stop the picture for good.
+    if (host.kind === "external" && typeof ImageData !== "undefined" && host.source instanceof ImageData) {
+      host = { kind: "raw", data: host.source.data, width: host.source.width, height: host.source.height, format: host.format ?? "rgba8unorm" };
+    }
     // CLOSED-SOURCE GUARD. Memory-lean callers close ImageBitmaps once
     // the pixels are in the atlas; if this entry was later evicted and
     // re-acquired, the upload source is gone (a closed ImageBitmap

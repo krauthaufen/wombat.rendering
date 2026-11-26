@@ -267,6 +267,14 @@ function uploadRaw(device: GPUDevice, tex: GPUTexture, src: RawTextureSource): v
 }
 
 function uploadExternal(device: GPUDevice, tex: GPUTexture, src: ExternalTextureSource): void {
+  // (an ImageData is pixels in memory; only some browsers take one as the source of an image copy)
+  if (typeof ImageData !== "undefined" && src.source instanceof ImageData) {
+    const image = src.source;
+    device.queue.writeTexture({ texture: tex }, image.data, { bytesPerRow: image.width * 4, rowsPerImage: image.height },
+      { width: image.width, height: image.height, depthOrArrayLayers: 1 });
+    if (tex.mipLevelCount > 1) fillMips(device, tex);
+    return;
+  }
   device.queue.copyExternalImageToTexture(
     { source: src.source as GPUImageCopyExternalImageSource },
     { texture: tex },
