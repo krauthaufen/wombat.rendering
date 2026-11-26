@@ -27,10 +27,7 @@
 // pipeline + bind-group switches at the boundary; both batches retain
 // their internal amortization.
 
-import {
-  ASet, AVal, AbstractReader, AdaptiveObject, AdaptiveToken, HashSetDelta, SetOperation,
-  type IAdaptiveObject, type aset, type aval, type AdaptiveToken as _T,
-} from "@aardworx/wombat.adaptive";
+import { ASet, AVal, AbstractReader, AdaptiveObject, AdaptiveToken, HashSetDelta, SetOperation, type IAdaptiveObject, type aset, type aval, type AdaptiveToken as _T, transact, markOutdated } from "@aardworx/wombat.adaptive";
 import type { CompiledEffect, Effect } from "../core/shader.js";
 import type { FramebufferSignature } from "../core/framebufferSignature.js";
 import { RenderTree } from "../core/renderTree.js";
@@ -43,7 +40,7 @@ import { renderObjectToHeapSpec } from "./heapAdapter.js";
 import { buildHeapScene, type HeapDrawFeed, type HeapDrawSpec, type HeapScene } from "./heapScene.js";
 import type { DrawShape } from "./heapAdapter.js";
 import type { FragmentOutputLayout } from "./heapEffect.js";
-import { AtlasPool } from "./textureAtlas/atlasPool.js";
+import { ATLAS_PAGE_FORMATS, AtlasPool, atlasPageSizeNow } from "./textureAtlas/atlasPool.js";
 import { checkAttributes } from "./missingAttributes.js";
 
 void (null as AdaptiveToken | _T | null);
@@ -113,6 +110,14 @@ export interface CompileHybridSceneOptions {
 export interface HybridScene {
   /** The heap half (for tests). */
   readonly heapSceneForTest: HeapScene;
+  /**
+   * Where the scene's objects are drawn: on the heap, on the legacy path
+   * (`waiting`: of those, the heap-eligible ones the texture atlas had no
+   * room for yet), or by neither (not drawable).
+   */
+  placement(): { heap: number; legacy: number; waiting: number; neither: number };
+  /** The texture atlas of this scene: its page edge, and per format how many pages there are and may be. */
+  atlas(): { pageSize: number; formats: Record<string, { pages: number; cap: number }> };
   /**
    * Run both backends' CPU-side update phases. Idempotent within a
    * frame. Call before opening the render pass.
@@ -418,6 +423,10 @@ export function compileHybridScene(
     private readonly watched = new Map<IAdaptiveObject, RenderObject | Set<RenderObject>>();
     private dirty = new Set<IAdaptiveObject>();
     private readonly takers: Taker[] = [];
+    /** Heap-eligible objects the atlas had no room for: on the legacy path until it has. */
+    private readonly waiting = new Set<RenderObject>();
+    private retryAt = 0;
+    private retryNow = false;
 
     /** A side joins: it is first told everything already in its place. */
     attach(t: Taker): void {
@@ -431,8 +440,26 @@ export function compileHybridScene(
 
     /** Bring the placement up to date; `token` is the asking side's (so a change marks it). */
     sync(token: AdaptiveToken): void {
+      // (asking again moves objects between the sides, so it has to happen in an
+      // evaluation both sides take part in: this one is marked for the next frame)
+      if (this.waiting.size > 0 && !this.retryNow && performance.now() >= this.retryAt) {
+        this.retryNow = true;
+        queueMicrotask(() => transact(() => markOutdated(this)));
+      }
       this.evaluateAlways(token, (tok) => {
         if (!this.outOfDate) return;
+        if (this.retryNow) {
+          this.retryNow = false;
+          this.retryAt = performance.now() + 1000;
+          for (const ro of [...this.waiting]) {
+            if (this.placed.get(ro) !== LEGACY) { this.waiting.delete(ro); continue; }
+            if (specOf(ro) === undefined) continue;
+            this.waiting.delete(ro);
+            this.tell(ro, LEGACY, -1);
+            this.placed.set(ro, HEAP);
+            this.tell(ro, HEAP, 1);
+          }
+        }
         this.reader.getChanges(tok).iter((op) => {
           const ro = op.value;
           if (op.count > 0) {
@@ -444,6 +471,7 @@ export function compileHybridScene(
             const p = this.placed.get(ro);
             if (p === undefined) return;
             this.placed.delete(ro);
+            this.waiting.delete(ro);
             this.unwatch(ro);
             if (p !== NEITHER) this.tell(ro, p, -1);
           }
@@ -459,7 +487,7 @@ export function compileHybridScene(
             for (const ro of ros instanceof Set ? [...ros] : [ros]) {
               const was = this.placed.get(ro);
               if (was === undefined) continue;
-              const now: Place = on ? (specOf(ro) !== undefined ? HEAP : NEITHER) : LEGACY;
+              const now: Place = on ? this.heapOrWait(ro) : LEGACY;
               if (now === was) continue;
               if (was !== NEITHER) this.tell(ro, was, -1);
               this.placed.set(ro, now);
@@ -470,9 +498,21 @@ export function compileHybridScene(
       });
     }
 
+    /**
+     * The heap, or (its textures do not fit the atlas right now) the legacy
+     * path for the time being. Such an object used to be drawn by NEITHER
+     * path: it simply vanished, and stayed gone. Now it is drawn the
+     * ordinary way and asked again about once a second.
+     */
+    private heapOrWait(ro: RenderObject, shape?: DrawShape): Place {
+      if (specOf(ro, shape) !== undefined) { this.waiting.delete(ro); return HEAP; }
+      this.waiting.add(ro);
+      return LEGACY;
+    }
+
     private place(ro: RenderObject, tok: AdaptiveToken): Place {
       const shape = shapeFor(ro);
-      if (shape !== undefined && shape.fast) return specOf(ro, shape) !== undefined ? HEAP : NEITHER;
+      if (shape !== undefined && shape.fast) return this.heapOrWait(ro, shape);
       if (!drawable(ro)) return NEITHER;
       const e = elig(ro);
       if (e.isConstant) {
@@ -481,7 +521,7 @@ export function compileHybridScene(
         if (!on) return LEGACY;
         // (drawable and eligible for good: so is every other object of its shape)
         if (shape !== undefined) shape.fast = true;
-        return specOf(ro, shape) !== undefined ? HEAP : NEITHER;
+        return this.heapOrWait(ro, shape);
       }
       const on = e.getValue(tok);
       const o = e as unknown as IAdaptiveObject;
@@ -490,7 +530,7 @@ export function compileHybridScene(
       else if (ros instanceof Set) ros.add(ro);
       else this.watched.set(o, new Set([ros, ro]));
       if (!on) return LEGACY;
-      return specOf(ro) !== undefined ? HEAP : NEITHER;
+      return this.heapOrWait(ro);
     }
 
     private unwatch(ro: RenderObject): void {
@@ -500,6 +540,12 @@ export function compileHybridScene(
       if (ros === undefined) return;
       if (ros instanceof Set) { ros.delete(ro); if (ros.size === 0) this.watched.delete(o); }
       else if (ros === ro) this.watched.delete(o);
+    }
+
+    counts(): { heap: number; legacy: number; waiting: number; neither: number } {
+      let heap = 0, legacy = 0, neither = 0;
+      for (const p of this.placed.values()) { if (p === HEAP) heap++; else if (p === LEGACY) legacy++; else neither++; }
+      return { heap, legacy, waiting: this.waiting.size, neither };
     }
 
     /** What a side gets for an object: its spec (heap) or its leaf (legacy). */
@@ -513,6 +559,8 @@ export function compileHybridScene(
     }
   }
   const partition = new Partition();
+  /** How many objects are where (for diagnostics): on the heap, on the legacy path, and of those waiting for the atlas. */
+  const placementCounts = (): { heap: number; legacy: number; waiting: number; neither: number } => partition.counts();
 
   /** A side as an ordinary set (the legacy tree; the heap when row sets join it). */
   class SideReader<T> extends AbstractReader<HashSetDelta<T>> implements Taker {
@@ -614,6 +662,11 @@ export function compileHybridScene(
   return {
     /** (tests: the heap half) */
     heapSceneForTest: heapScene,
+    placement: placementCounts,
+    atlas: () => ({
+      pageSize: atlasPageSizeNow(),
+      formats: Object.fromEntries(ATLAS_PAGE_FORMATS.map((f) => [f, { pages: atlasPool.pagesFor(f).length, cap: atlasPool.capFor(f) }])),
+    }),
     update(token: AdaptiveToken): void {
       // Batch all of this frame's atlas uploads (tile ingest during
       // heapScene.update → pool.acquire) into ONE queue submission —
