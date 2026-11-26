@@ -111,6 +111,7 @@ import type { RenderObject } from "../core/renderObject.js";
 import type { DrawCall } from "../core/drawCall.js";
 import { asAttributeProvider, asUniformProvider } from "../core/provider.js";
 import type { HeapBoundTexture, HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
+import { textureFormatOf, textureInFormat } from "../core/textureFormats.js";
 import { isBufferView } from "./heapScene/pools.js";
 import { compileHeapEffect } from "./heapEffect.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
@@ -777,8 +778,10 @@ function buildFlatSpec(
     for (let i = 0; i < schema.textures.length; i++) {
       const tb = schema.textures[i]!;
       const base = tb.name.endsWith("_view") ? tb.name.slice(0, -5) : tb.name;
-      const texAval = (ro.textures.tryFind(tb.name) ?? ro.textures.tryFind(base) ?? ro.textures.tryFind(`${base}_view`)) as aval<ITexture> | undefined;
-      if (texAval === undefined) throw new Error(`heapAdapter: the effect samples "${tb.name}" but the render object has no such texture`);
+      const supplied = (ro.textures.tryFind(tb.name) ?? ro.textures.tryFind(base) ?? ro.textures.tryFind(`${base}_view`)) as aval<ITexture> | undefined;
+      if (supplied === undefined) throw new Error(`heapAdapter: the effect samples "${tb.name}" but the render object has no such texture`);
+      // (in the format the effect declares for this texture, if it does: that decides the atlas pages it goes to)
+      const texAval = textureInFormat(supplied, textureFormatOf(ro.effect, tb.name));
       const sb = schema.samplers[i] ?? schema.samplers[0];
       let samplerVal: ISampler | undefined;
       if (sb?.state !== undefined) {
@@ -824,7 +827,8 @@ function buildFlatSpec(
     ro.samplers.iter((_n, av) => { distinctSamplerAvals!.add(av as aval<ISampler>); });
   }
   if (distinctTexAvals.size === 1 && distinctSamplerAvals.size === 1) {
-    const texAval = [...distinctTexAvals][0]!;
+    // (in the format the effect declares for its texture, if it does)
+    const texAval = textureInFormat([...distinctTexAvals][0]!, schema.textures.length > 0 ? textureFormatOf(ro.effect, schema.textures[0]!.name) : undefined);
     const samplerAval = [...distinctSamplerAvals][0]!;
     const texVal = texAval.getValue(token);
     const samplerVal = samplerAval.getValue(token);

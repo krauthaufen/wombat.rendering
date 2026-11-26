@@ -146,3 +146,5 @@ export {
 export {
   RenderContext,
 } from "./renderContext.js";
+
+export { withTextureFormats, textureFormatOf, textureInFormat } from "./textureFormats.js";

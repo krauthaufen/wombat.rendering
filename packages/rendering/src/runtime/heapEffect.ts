@@ -136,7 +136,7 @@ export interface FragmentOutputLayout {
 // reads are rewritten into arena loads (storage-ref drawHeader fields).
 // h18: every drawHeader carries a `__bounds` ref (frustum culling), which
 // can widen the header stride baked into the shaders.
-export const HEAP_PERSIST_VERSION_BASE = "h19";
+export const HEAP_PERSIST_VERSION_BASE = "h20";
 export const HEAP_PERSIST_VERSION = HEAP_PERSIST_VERSION_BASE; // legacy export (see persistVersionNow)
 /** The wombat.shader version compiling the cached WGSL: a compiler change
  *  (fusion, linking, emit) re-keys the cache instead of serving WGSL the old
@@ -1057,9 +1057,9 @@ export function generateAtlasSwitch(): string {
   return [
     `  let _nLayers = select(textureNumLayers(atlasLinear), textureNumLayers(atlasSrgb), format == 1u);`,
     `  if (pageRef < _nLayers) {`,
-    `    let lin = textureSampleLevel(atlasLinear, atlasSampler, atlasUv, min(pageRef, textureNumLayers(atlasLinear) - 1u), 0.0);`,
-    `    let sr  = textureSampleLevel(atlasSrgb,   atlasSampler, atlasUv, min(pageRef, textureNumLayers(atlasSrgb) - 1u), 0.0);`,
-    `    return select(lin, sr, format == 1u);`,
+    // (an explicit level may be sampled inside a branch: ONE lookup, in the array the placement names)
+    `    if (format == 1u) { return textureSampleLevel(atlasSrgb, atlasSampler, atlasUv, pageRef, 0.0); }`,
+    `    return textureSampleLevel(atlasLinear, atlasSampler, atlasUv, pageRef, 0.0);`,
     `  }`,
   ].join("\n");
 }

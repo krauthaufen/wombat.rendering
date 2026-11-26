@@ -10,6 +10,7 @@ import {
   BufferView, ElementType, ISampler, ITexture, PipelineState, RenderTree, asAttributeProvider, asUniformProvider,
   type DrawCall, type RenderObject,
 } from "@aardworx/wombat.rendering/core";
+import { withTextureFormats } from "../packages/rendering/src/core/textureFormats.js";
 import { createFramebufferSignature } from "@aardworx/wombat.rendering/resources";
 import { compileHybridScene } from "../packages/rendering/src/runtime/hybridScene.js";
 import { isHeapEligible } from "../packages/rendering/src/runtime/heapEligibility.js";
@@ -206,6 +207,28 @@ describe("several textures on one heap draw", () => {
     const apart = a.pageRef !== b.pageRef || a.origin[0] + 2048 <= b.origin[0] || b.origin[0] + 4096 <= a.origin[0]
       || a.origin[1] + 2048 <= b.origin[1] || b.origin[1] + 4096 <= a.origin[1];
     expect(apart).toBe(true);
+  });
+
+  it("an effect declares the format it expects a texture in; the atlas keeps it on that format's pages", () => {
+    const gpu = new MockGPU();
+    // one image, handed over without a colour space, under two effects that read it differently
+    const image = texture(64, 64), other = texture(32, 32), third = texture(16, 16);
+    const asColour = withTextureFormats(makeHeapTestEffectThreeTextures(), { checker: "rgba8unorm-srgb" });
+    const asNumbers = makeHeapTestEffectThreeTextures();
+    const a = { ...object({ checker: image, detail: other, mask: third }, 0), effect: asColour };
+    const b = { ...object({ checker: image, detail: other, mask: third }, 1), effect: asNumbers };
+    const scene = compileHybridScene(gpu.device, sig(), RenderTree.unordered(RenderTree.leaf(a), RenderTree.leaf(b)), {});
+    scene.update(top);
+    expect(scene.placement()).toMatchObject({ heap: 2, legacy: 0 });
+    // (the two effects are the same shader, so their draws share a bucket; the reading is per draw)
+    const formatBits = (name: string): number[] => [0, 1].map((draw) => binding(placements(scene, draw), name).formatBits & 1).sort();
+    // the colour reading lies on the sRGB pages, the plain one on the linear pages
+    expect(formatBits("checker")).toEqual([0, 1]);
+    // the textures nobody declared anything for are where their own format says, shared by both
+    expect(formatBits("detail")).toEqual([0, 0]);
+    expect(binding(placements(scene, 0), "detail")).toEqual(binding(placements(scene, 1), "detail"));
+    expect(scene.atlas().formats["rgba8unorm-srgb"]!.pages).toBe(1);
+    expect(scene.atlas().formats["rgba8unorm"]!.pages).toBe(1);
   });
 
   it("removing the object gives every one of its atlas entries back", () => {

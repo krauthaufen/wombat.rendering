@@ -24,6 +24,7 @@ import { type IUniformProvider,
   type ProgramInterface,
   type RenderObject,
 } from "../core/index.js";
+import { textureFormatOf, textureInFormat } from "../core/textureFormats.js";
 import {
   type AdaptiveToken,
   type aval,
@@ -828,8 +829,10 @@ export function prepareRenderObject(
   }
 
   for (const t of iface.textures) {
-    const av = obj.textures.tryFind(t.name);
-    if (av === undefined) throw new Error(`prepareRenderObject: missing texture "${t.name}"`);
+    const supplied = obj.textures.tryFind(t.name);
+    if (supplied === undefined) throw new Error(`prepareRenderObject: missing texture "${t.name}"`);
+    // (kept in the format the effect declares for this texture, if it does: core/textureFormats)
+    const av = textureInFormat(supplied, textureFormatOf(obj.effect, t.name));
     const res = prepareAdaptiveTexture(device, av, {
       ...(opts.label !== undefined ? { label: `${opts.label}.${t.name}` } : {}),
     });
