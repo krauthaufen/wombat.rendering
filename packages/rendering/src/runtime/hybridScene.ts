@@ -40,6 +40,7 @@ import { materializeRow, type RenderRowSet } from "../core/index.js";
 import { isHeapEligible } from "./heapEligibility.js";
 import { renderObjectToHeapSpec } from "./heapAdapter.js";
 import { buildHeapScene, type HeapDrawSpec, type HeapScene } from "./heapScene.js";
+import type { DrawShape } from "./heapAdapter.js";
 import type { FragmentOutputLayout } from "./heapEffect.js";
 import { AtlasPool } from "./textureAtlas/atlasPool.js";
 import { checkAttributes } from "./missingAttributes.js";
@@ -96,6 +97,12 @@ export interface CompileHybridSceneOptions {
   readonly maxChunkBytes?: number;
   /** Pre-size heap arena chunks (bytes) — pass-through to `BuildHeapSceneOptions.initialArenaBytes`. */
   readonly initialArenaBytes?: number;
+  /**
+   * Recognise objects made of the same objects apart from their uniforms
+   * (`DrawShape`) and bring them in by a shared plan. Default true;
+   * `false` translates and adds every object in full (for comparison).
+   */
+  readonly enableDrawShapes?: boolean;
   /** Heap arena compaction toggle — pass-through to `BuildHeapSceneOptions.enableCompaction`. */
   readonly enableCompaction?: boolean;
   /** Compaction waste floor (bytes) — pass-through to `BuildHeapSceneOptions.compactionWasteFloorBytes`. */
@@ -103,6 +110,8 @@ export interface CompileHybridSceneOptions {
 }
 
 export interface HybridScene {
+  /** The heap half (for tests). */
+  readonly heapSceneForTest: HeapScene;
   /**
    * Run both backends' CPU-side update phases. Idempotent within a
    * frame. Call before opening the render pass.
@@ -279,11 +288,12 @@ export function compileHybridScene(
   // usually have freed atlas space). It costs a missing tile for a frame or two;
   // the alternative was an exception in the frame callback, which killed the
   // render loop outright.
-  const specOf = (ro: RenderObject): HeapDrawSpec | undefined => {
+  const specOf = (ro: RenderObject, shape?: DrawShape): HeapDrawSpec | undefined => {
     let spec = specCache.get(ro);
     if (spec === undefined) {
       const built = renderObjectToHeapSpec(ro, AdaptiveToken.top, atlasPool, {
         enableDerivedUniforms: opts.enableDerivedUniforms !== false,
+        ...(shape !== undefined ? { shape } : {}),
       });
       if (built === null) return undefined;
       spec = built;
@@ -319,13 +329,77 @@ export function compileHybridScene(
   // `constant(undefined)`, so ChooseAReader's aval-keyed refcount map
   // holds a single entry for the whole eligible population.
   const CONST_UNDEF = AVal.constant(undefined);
+
+  // ─── Draw shapes ─────────────────────────────────────────────────
+  // Objects that are made of the same OBJECTS apart from their uniforms
+  // (see `DrawShape`) are recognised by walking a trie of those objects'
+  // identities. The first object of a shape is checked and translated in
+  // full; the others take the verdict (drawable, heap-eligible for good)
+  // and the shared parts of the spec from the shape, and the heap scene
+  // adds them by the shape's draw plan. Nothing is assumed about objects
+  // that share nothing: they find no shape and go the full way.
+  const shapesOn = opts.enableDrawShapes !== false;
+  const NONE = {};
+  const shapeRoot = new WeakMap<object, unknown>();
+  const next = (level: WeakMap<object, unknown>, key: object): WeakMap<object, unknown> => {
+    let n = level.get(key) as WeakMap<object, unknown> | undefined;
+    if (n === undefined) { n = new WeakMap(); level.set(key, n); }
+    return n;
+  };
+  /** The one aval of a texture / sampler map (`NONE` for an empty map, `undefined` for several). */
+  const single = (m: { count: number; iter(f: (k: string, v: object) => void): void }): object | undefined => {
+    if (m.count === 0) return NONE;
+    let one: object | undefined, several = false;
+    m.iter((_k, v) => { if (one === undefined) one = v; else if (one !== v) several = true; });
+    return several ? undefined : one;
+  };
+  const shapeOfRo = new WeakMap<RenderObject, DrawShape | null>();
+  const shapeFor = (ro: RenderObject): DrawShape | undefined => {
+    let s = shapeOfRo.get(ro);
+    if (s === undefined) { s = findShape(ro) ?? null; shapeOfRo.set(ro, s); }
+    return s ?? undefined;
+  };
+  const findShape = (ro: RenderObject): DrawShape | undefined => {
+    if (!shapesOn || ro.instanceAttributes !== undefined || ro.modeRules !== undefined) return undefined;
+    if (ro.injectedStorage !== undefined && ro.injectedStorage.count > 0) return undefined;
+    if (!ro.drawCall.isConstant || (ro.drawCall as { __sgHeapSafeDraw?: unknown }).__sgHeapSafeDraw !== undefined) return undefined;
+    if (Object.getPrototypeOf(ro) !== Object.prototype) return undefined;   // (a row over a template)
+    let storage: object = NONE, storageName = "";
+    if (ro.storageBuffers !== undefined && ro.storageBuffers.count > 0) {
+      if (ro.storageBuffers.count > 1) return undefined;
+      ro.storageBuffers.iter((n, av) => { storage = av; storageName = n; });
+    }
+    const tex = single(ro.textures as never), samp = single(ro.samplers as never);
+    if (tex === undefined || samp === undefined) return undefined;
+    let level = next(shapeRoot, ro.effect);
+    level = next(level, ro.vertexAttributes);
+    level = next(level, ro.indices ?? NONE);
+    level = next(level, ro.drawCall);
+    level = next(level, ro.pipelineState ?? NONE);
+    level = next(level, storage);
+    level = next(level, tex);
+    level = next(level, samp);
+    const key = ro.bounds ?? NONE;
+    let shape = level.get(key) as DrawShape | undefined;
+    if (shape === undefined) { shape = { fast: false, storageName }; level.set(key, shape); }
+    return shape.storageName === storageName ? shape : undefined;
+  };
+
   const heapSpecAset = flat.chooseA((ro: RenderObject) => {
+    const shape = shapeFor(ro);
+    if (shape !== undefined && shape.fast) {
+      const spec = specOf(ro, shape);
+      return spec !== undefined ? AVal.constant(spec) : (CONST_UNDEF as aval<HeapDrawSpec | undefined>);
+    }
     if (!drawable(ro)) return CONST_UNDEF as aval<HeapDrawSpec | undefined>;
     const e = elig(ro);
     if (e.isConstant) {
       // Why force here: constant — immutable by definition.
-      return e.force(/* allow-force */)
-        ? AVal.constant(specOf(ro))
+      const on = e.force(/* allow-force */);
+      // (drawable and eligible for good: so is every other object of its shape)
+      if (on && shape !== undefined) shape.fast = true;
+      return on
+        ? AVal.constant(specOf(ro, shape))
         : (CONST_UNDEF as aval<HeapDrawSpec | undefined>);
     }
     return e.map((b) => (b ? specOf(ro) : undefined));
@@ -360,6 +434,8 @@ export function compileHybridScene(
     return l;
   };
   const legacyFromFlat = flat.chooseA((ro: RenderObject) => {
+    // (an object of a shape known to be on the heap for good is not legacy)
+    if (shapeFor(ro)?.fast === true) return CONST_UNDEF as aval<RenderTree | undefined>;
     if (!drawable(ro)) return CONST_UNDEF as aval<RenderTree | undefined>;
     const e = elig(ro);
     if (e.isConstant) {
@@ -408,6 +484,8 @@ export function compileHybridScene(
   dbgArr.push(dbgEntry);
 
   return {
+    /** (tests: the heap half) */
+    heapSceneForTest: heapScene,
     update(token: AdaptiveToken): void {
       // Batch all of this frame's atlas uploads (tile ingest during
       // heapScene.update → pool.acquire) into ONE queue submission —

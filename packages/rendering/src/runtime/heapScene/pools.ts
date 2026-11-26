@@ -76,7 +76,7 @@ export interface PoolPlacement {
   readonly pack: PoolPack;
 }
 
-interface PoolEntry {
+export interface PoolEntry {
   readonly chunkIdx: number;
   /** Byte offset within the chunk's GPUBuffer. Mutated by
    *  `UniformPool.remapRefs` when a waste-triggered arena compaction
@@ -317,6 +317,15 @@ export class UniformPool {
     this.deleteEntry(av, chunkIdx);
   }
 
+  /** Test aid: number of entries and the sum of their use counts. */
+  debugUses(): { entries: number; uses: number } {
+    let entries = 0, uses = 0;
+    for (const v of this.byAval.values()) {
+      for (const e of v instanceof Map ? v.values() : [v]) { entries++; uses += e.refcount; }
+    }
+    return { entries, uses };
+  }
+
   /** Re-seat every entry's `ref` in `chunkIdx` after a waste-triggered
    *  arena compaction relocated allocations. `remap` maps OLD→NEW byte
    *  offset. Entries whose ref didn't move are left as-is. O(entries). */
@@ -517,6 +526,31 @@ export class IndexPool {
     return { chunkIdx: r.chunkIdx, firstIndex, count: arr.length };
   }
 
+  /** Test aid: number of bindings and the sum of their use counts. */
+  debugUses(): { entries: number; uses: number } {
+    let entries = 0, uses = 0;
+    for (const v of this.byAval.values()) {
+      for (const b of v instanceof Map ? v.values() : [v]) { entries++; uses += b.perAvalCount; }
+    }
+    return { entries, uses };
+  }
+
+  /** The binding of `av` in `chunkIdx`, to be handed to `retain` later. */
+  bindingOf(av: aval<Uint32Array>, chunkIdx: number): IndexBinding | undefined {
+    return this.getBinding(av, chunkIdx);
+  }
+  /**
+   * One more use of a binding `bindingOf` returned — what `acquire` does
+   * for an aval that is already bound, without looking it up. Undefined
+   * when the binding has been released since.
+   */
+  retain(bound: IndexBinding): { chunkIdx: number; firstIndex: number; count: number } | undefined {
+    if (bound.perAvalCount <= 0) return undefined;
+    bound.perAvalCount++;
+    bound.entry.totalRefcount++;
+    return { chunkIdx: bound.entry.chunkIdx, firstIndex: bound.entry.firstIndex, count: bound.entry.count };
+  }
+
   /** The allocation's byte header offset (`ref`) of `av`'s entry in `chunkIdx`,
    *  or undefined if not allocated there. The heap compaction pass looks the
    *  region up in the arena remap by this ref to compute the draw's new
@@ -557,7 +591,7 @@ export class IndexPool {
   }
 }
 
-interface IndexBinding {
+export interface IndexBinding {
   entry: IndexPoolEntry;
   perAvalCount: number;
 }

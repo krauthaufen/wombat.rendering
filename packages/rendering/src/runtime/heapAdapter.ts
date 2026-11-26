@@ -108,6 +108,7 @@ function compareFunctionOf(name: string): GPUCompareFunction {
   }
 }
 import type { RenderObject } from "../core/renderObject.js";
+import type { DrawCall } from "../core/drawCall.js";
 import { asAttributeProvider, asUniformProvider } from "../core/provider.js";
 import type { HeapDrawSpec, HeapTextureSet } from "./heapScene.js";
 import { isBufferView } from "./heapScene/pools.js";
@@ -394,11 +395,39 @@ function describeTexture(t: ITexture): TextureDescriptor | null {
  * through the heap path's pool/repack machinery via the returned
  * spec's avals — this function does not subscribe to anything.
  */
+/**
+ * What many render objects have in common, found by object identity (see
+ * `compileHybridScene`): the same effect, vertex attributes, indices,
+ * draw call, pipeline state, storage buffer, texture, sampler and bounds
+ * OBJECTS — everything but their uniforms. Such objects need not be told
+ * apart by the user: a scene graph hands the same objects to every leaf
+ * below the node that set them, and a mesh drawn many times is the same
+ * attribute set each time.
+ *
+ * A shape remembers what was worked out for the first object that had
+ * it, here (the parts of the draw spec that follow from the shared
+ * objects) and in the heap scene, which keeps a draw plan per shape
+ * (`HeapDrawSpec.shape`).
+ */
+export interface DrawShape {
+  /** Drawable and heap-eligible for good: checked once, true for every object of the shape. */
+  fast: boolean;
+  /** Name of the one storage buffer the shape's objects supply ("" for none). */
+  readonly storageName: string;
+  attrs?: [string, unknown][];
+  drawCall?: DrawCall;
+  /** `null`: not indexed. */
+  indices?: aval<Uint32Array> | null;
+  storageArrays?: Map<string, aval<IBuffer>>;
+  /** `null`: no texture. */
+  textures?: HeapTextureSet | null;
+}
+
 export function renderObjectToHeapSpec(
   ro: RenderObject,
   token: AdaptiveToken,
   pool?: AtlasPool,
-  opts?: { readonly enableDerivedUniforms?: boolean },
+  opts?: { readonly enableDerivedUniforms?: boolean; readonly shape?: DrawShape },
   // Returns null when the RO cannot be placed on the heap RIGHT NOW — today
   // that means the texture atlas is full (every page packed with textures still
   // in use). The caller drops the draw for this cycle rather than rendering it;
@@ -534,8 +563,11 @@ function buildFlatSpec(
   ro: RenderObject,
   token: AdaptiveToken,
   pool?: AtlasPool,
-  opts?: { readonly enableDerivedUniforms?: boolean },
+  opts?: { readonly enableDerivedUniforms?: boolean; readonly shape?: DrawShape },
 ): HeapDrawSpec | null {
+  // What follows from the objects a shape's draws share is worked out for
+  // the first of them and taken from the shape after that.
+  const shape = opts?.shape;
   // 1. Inputs map: vertex attributes (BufferView) + uniforms, pulled
   //    SHADER-DRIVEN from the providers. We compile `ro.effect` (cached
   //    per Effect by the module-level compile cache) to discover the
@@ -556,9 +588,18 @@ function buildFlatSpec(
   // loose uniforms and drops names shadowed by an attribute.
   const schema = compileHeapEffect(ro.effect).schema;
   const inputs: { [name: string]: aval<unknown> | unknown } = {};
-  for (const a of schema.attributes) {
-    const bv = vAttr.tryGet(a.name);
-    if (bv !== undefined) inputs[a.name] = isBufferView(bv) ? tightenBufferView(bv) : bv;
+  if (shape?.attrs !== undefined) {
+    for (const e of shape.attrs) inputs[e[0]] = e[1];
+  } else {
+    const found: [string, unknown][] = [];
+    for (const a of schema.attributes) {
+      const bv = vAttr.tryGet(a.name);
+      if (bv !== undefined) {
+        inputs[a.name] = isBufferView(bv) ? tightenBufferView(bv) : bv;
+        found.push([a.name, inputs[a.name]]);
+      }
+    }
+    if (shape !== undefined) shape.attrs = found;
   }
   const pullUniform = (name: string): void => {
     if (Object.prototype.hasOwnProperty.call(inputs, name)) return;
@@ -639,7 +680,8 @@ function buildFlatSpec(
   //    Slice offsets fold in here: firstIndex → record indexStart,
   //    indexCount → record slice length, baseVertex → baked into the
   //    transcoded index values (so it needs no record field).
-  const dc = ro.drawCall.getValue(token);
+  const dc = shape?.drawCall ?? ro.drawCall.getValue(token);
+  if (shape !== undefined) shape.drawCall = dc;
   const baseVertex = dc.kind === "indexed" ? dc.baseVertex : 0;
 
   // 2. Indices: BufferView → aval<Uint32Array>. Map the underlying
@@ -648,12 +690,14 @@ function buildFlatSpec(
   //    Non-indexed ROs (no `ro.indices`) carry no index aval — the spec
   //    then sets `vertexCount` and the megacall decodes the vertex directly.
   const indices: aval<Uint32Array> | undefined =
-    ro.indices !== undefined
+    shape?.indices !== undefined ? (shape.indices ?? undefined)
+    : ro.indices !== undefined
       ? indicesAvalFor(
           ro.indices.buffer, ro.indices.elementType.indexFormat ?? "uint32", baseVertex,
           stripKindOfSpec(ro) !== undefined,
         )
       : undefined;
+  if (shape !== undefined) shape.indices = indices ?? null;
 
   // 3. Texture/sampler: single-pair v1. The Sg compile layer binds
   //    each texture aval under both `name` and `${name}_view` so the
@@ -662,6 +706,15 @@ function buildFlatSpec(
   //    Dedupe by identity before applying the single-pair rule.
   // `let` + nulled after use: the spec's long-lived closures share
   // this scope context — a leftover Set here is per-RO ballast.
+  let textures: HeapTextureSet | undefined;
+  // The draws of a shape have the same texture and sampler avals, so they
+  // share one texture set (as they share its atlas entry): made for the
+  // first, reused while the atlas still holds the placement it names.
+  const knownTextures = shape?.textures;
+  if (knownTextures !== undefined
+      && (knownTextures === null || knownTextures.kind !== "atlas" || pool === undefined || pool.isLive(knownTextures.poolRef))) {
+    textures = knownTextures ?? undefined;
+  } else {
   let distinctTexAvals: Set<aval<ITexture>> | undefined = new Set<aval<ITexture>>();
   ro.textures.iter((_n, av) => { distinctTexAvals!.add(av as aval<ITexture>); });
   let distinctSamplerAvals: Set<aval<ISampler>> | undefined = new Set<aval<ISampler>>();
@@ -683,7 +736,6 @@ function buildFlatSpec(
   } else {
     ro.samplers.iter((_n, av) => { distinctSamplerAvals!.add(av as aval<ISampler>); });
   }
-  let textures: HeapTextureSet | undefined;
   if (distinctTexAvals.size === 1 && distinctSamplerAvals.size === 1) {
     const texAval = [...distinctTexAvals][0]!;
     const samplerAval = [...distinctSamplerAvals][0]!;
@@ -847,6 +899,8 @@ function buildFlatSpec(
   // Drop the dedup scratch — see the `let` note above.
   distinctTexAvals = undefined;
   distinctSamplerAvals = undefined;
+  if (shape !== undefined) shape.textures = textures ?? null;
+  }
 
   // 4. DrawCall geometry. Classifier validates fields are heap-
   //    compatible (instanceCount≥1, firstInstance=0, non-indexed firstVertex=0).
@@ -902,8 +956,14 @@ function buildFlatSpec(
       ? { storageBuffers: (() => { const m = new Map<string, aval<IBuffer>>(); ro.injectedStorage!.iter((n, av) => { m.set(n, av); }); return m; })() }
       : {}),
     ...(ro.storageBuffers !== undefined && ro.storageBuffers.count > 0
-      ? { storageArrays: (() => { const m = new Map<string, aval<IBuffer>>(); ro.storageBuffers!.iter((n, av) => { m.set(n, av); }); return m; })() }
+      ? { storageArrays: shape?.storageArrays ?? (() => {
+          const m = new Map<string, aval<IBuffer>>();
+          ro.storageBuffers!.iter((n, av) => { m.set(n, av); });
+          if (shape !== undefined) shape.storageArrays = m;
+          return m;
+        })() }
       : {}),
+    ...(shape !== undefined ? { shape } : {}),
     ...(ro.bounds !== undefined ? { bounds: ro.bounds } : {}),
     ...(ro.modeRules !== undefined ? { modeRules: ro.modeRules } : {}),
     ...(ro.modelChain !== undefined ? { modelChain: ro.modelChain } : {}),

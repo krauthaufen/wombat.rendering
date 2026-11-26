@@ -626,6 +626,18 @@ export interface HeapDrawSpec {
    */
   readonly effect: Effect;
   /**
+   * Set by a producer that knows several specs to be the same apart from
+   * their uniforms: specs carrying the same `shape` object have the same
+   * effect, pipeline state, indices (and slice), vertex / instance count,
+   * texture source and sampler, storage arrays, bounds and attribute
+   * inputs (the same objects), and none of them has instance attributes,
+   * a changing geometry, mode rules or bucket-level storage buffers. The
+   * scene then adds all but the first by a plan made for the shape
+   * (bucket, slot, and the pool entries of the shared inputs). Omitted:
+   * every draw is resolved in full.
+   */
+  readonly shape?: object;
+  /**
    * Optional picking id (u32 < 2^24), written INLINE into the
    * drawHeader's `PickId` field (see `INLINE_HEADER_UNIFORMS`) — no
    * pool entry, no per-draw aval.
@@ -1043,6 +1055,8 @@ export interface BuildHeapSceneOptions {
    * distribution. Pass `false` to disable.
    */
   readonly enableCompaction?: boolean;
+  /** Add draws that share a `shape` by the shape's plan (default true; false resolves every draw in full). */
+  readonly enableDrawPlans?: boolean;
   /**
    * Override the fragmentation-waste floor (bytes) below which compaction is
    * skipped. Default `COMPACTION_WASTE_FLOOR_BYTES` (4 MiB). Tests pass a
@@ -1763,6 +1777,7 @@ export function buildHeapScene(
   // else in this file should run when it is. On by default — pass
   // `enableDerivedUniforms: false` to opt out.
   const enableCompaction = opts.enableCompaction !== false;
+  const enableDrawPlans = opts.enableDrawPlans !== false;
   const releaseConstantAttributes = opts.releaseConstantAttributes === true;
   const compactionWasteFloor = opts.compactionWasteFloorBytes ?? COMPACTION_WASTE_FLOOR_BYTES;
   const enableDerivedUniforms = opts.enableDerivedUniforms !== false;
@@ -3913,6 +3928,56 @@ export function buildHeapScene(
     out.fill(fill);
     return out;
   };
+  // ─── Draw plans ──────────────────────────────────────────────────
+  // For specs that share a `shape` (see HeapDrawSpec.shape): where the
+  // first of them went and the pool entries of what they share. A plan
+  // owns nothing — every draw still counts its own uses of each entry —
+  // and is checked each time it is used: an entry that was freed since
+  // has a zero count, a ref that moved (compaction, a resized payload) is
+  // read from the entry, and a plan that no longer fits is replaced by
+  // the next draw that goes the full way.
+  type PoolEntryRef = NonNullable<ReturnType<UniformPool["entry"]>>;
+  interface DrawPlan {
+    readonly bucket: Bucket;
+    readonly slot: BucketSlot;
+    readonly chunkIdx: number;
+    readonly index: ReturnType<IndexPool["bindingOf"]>;
+    /** Per header field: the entry of an input every draw of the shape shares (attributes,
+     *  storage, bounds), or MAY share (a uniform: taken when the draw supplies the same aval). */
+    readonly entries: (PoolEntryRef | undefined)[];
+    readonly avals: (aval<unknown> | undefined)[];
+    /** Fields whose entry every draw of the shape needs alive (the non-uniform ones). */
+    readonly needed: number[];
+    /** Uniform fields: what a draw may still have to allocate for itself. */
+    readonly uniformFields: number[];
+    readonly ownBytes: number;
+  }
+  const drawPlans = new WeakMap<object, DrawPlan>();
+  let __plannedAdds = 0;
+  (sceneObj as unknown as { __plannedAdds: () => number }).__plannedAdds = () => __plannedAdds;
+  /** Whether a spec may be planned at all (also: a texture on a page of its own picks its bucket by that page). */
+  const plannable = (spec: HeapDrawSpec): boolean =>
+    enableDrawPlans && spec.shape !== undefined && spec.modeRules === undefined && spec.geometry === undefined
+    && spec.instanceAttributes === undefined
+    && !(spec.textures?.kind === "atlas" && spec.textures.page.soloId !== undefined);
+  const planFor = (spec: HeapDrawSpec): DrawPlan | undefined => {
+    if (!plannable(spec)) return undefined;
+    const plan = drawPlans.get(spec.shape!);
+    if (plan === undefined) return undefined;
+    const bucket = plan.bucket;
+    if (bucketByKey.get(bucket.label) !== bucket || bucket.gpuRouted) return undefined;
+    for (const fi of plan.needed) if (plan.entries[fi]!.refcount <= 0) return undefined;
+    if (plan.index !== undefined && plan.index.perAvalCount <= 0) return undefined;
+    // what the draw allocates itself must fit on the plan's page ...
+    if (arena.attrs.bumpHeadroom(plan.chunkIdx) < plan.ownBytes) return undefined;
+    // ... and a column it reads must already be there (a column is large)
+    const fields = bucket.layout.drawHeaderFields;
+    for (const fi of plan.uniformFields) {
+      const v = spec.inputs[fields[fi]!.name];
+      if (isUniformColumnCell(v) && !pool.has(v.column.data as aval<unknown>, plan.chunkIdx)) return undefined;
+    }
+    return plan;
+  };
   const NO_NAMES: ReadonlySet<string> = new Set<string>();
   const NO_RULES: ReturnType<typeof collectRules> = [];
   function addDraw(spec: HeapDrawSpec): number {
@@ -4010,6 +4075,10 @@ export function buildHeapScene(
       );
     }
 
+    // A plan of the draw's shape answers everything up to the uniforms.
+    const plan = icAval === undefined ? planFor(spec) : undefined;
+    if (plan !== undefined) __plannedAdds++;
+
     let estBytes = indexArr !== undefined ? ALIGN16(ALLOC_HEADER_PAD_TO + indexArr.byteLength) : 0;
     // Large allocations many draws share (a uniform column, a storage
     // array): they cost a page nothing when it already holds them, so
@@ -4027,7 +4096,7 @@ export function buildHeapScene(
       if (r === null) { r = ruleForUniform(spec, name); ruleMemo[fi] = r; }
       return r;
     };
-    for (let fi = 0; fi < headerFields.length; fi++) {
+    for (let fi = 0; plan === undefined && fi < headerFields.length; fi++) {
       const f = headerFields[fi]!;
       if (f.kind === "bounds-ref") {
         if (spec.bounds !== undefined) estBytes += ALIGN16(ALLOC_HEADER_PAD_TO + BOUNDS_BYTES);
@@ -4067,7 +4136,8 @@ export function buildHeapScene(
     }
 
     let chunkIdx: number;
-    {
+    if (plan !== undefined) chunkIdx = plan.chunkIdx;
+    else {
       let preferred: number | undefined;
       for (const key in spec.inputs) {
         const val = spec.inputs[key];
@@ -4116,7 +4186,8 @@ export function buildHeapScene(
         atlasPool.release(acq.ref);
       }
     }
-    const bucket = findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, chunkIdx, precomputedDescriptor);
+    const bucket = plan !== undefined ? plan.bucket
+      : findOrCreateBucket(spec.effect, spec.textures, spec.pipelineState, chunkIdx, precomputedDescriptor);
     // User storage buffers (layout.storageBindings): bucket-level, set once.
     if (bucket.layout.storageBindings.length > 0 && bucket.storageBuffers === undefined) {
       if (spec.storageBuffers === undefined) {
@@ -4170,6 +4241,7 @@ export function buildHeapScene(
     // working. The partition kernel overwrites both slots' draw
     // tables every frame from the master.
     const roSlot       = bucket.gpuRouted ? bucket.slots[0]!
+      : plan !== undefined ? plan.slot
       : ensureSlot(bucket, roDescriptor, sharedTracker !== undefined && precomputedDescriptor === undefined ? sharedTracker.modeKey : undefined);
     const roSlotIdx    = bucket.slots.indexOf(roSlot);
 
@@ -4182,7 +4254,8 @@ export function buildHeapScene(
     // `indexArr` were read above for the group estimate; the group landed
     // wholly on `bucket.chunkIdx`, so this allocation can't spill.
     const idxAlloc = hasIndices
-      ? indexPool.acquire(device, arena.attrs, indicesAval!, bucket.chunkIdx, indexArr!)
+      ? (plan?.index !== undefined ? indexPool.retain(plan.index) : undefined)
+        ?? indexPool.acquire(device, arena.attrs, indicesAval!, bucket.chunkIdx, indexArr!)
       : undefined;
     // Emit count per instance + the firstIndex field written to the record.
     // Slice: emit only [firstIndex, firstIndex+indexCount) of the (shared,
@@ -4218,10 +4291,32 @@ export function buildHeapScene(
       const r = perDrawRefs[i]!;
       return r < 0 ? undefined : r + (refDeltas !== undefined ? refDeltas[i]! : 0);
     };
+    // The first draw of a shape that goes the full way leaves a plan for
+    // the others: the entries of what it acquired, noted as it goes.
+    const capture = plan === undefined && plannable(spec) && sharedTracker !== undefined
+      && !bucket.gpuRouted && icAval === undefined
+      ? { entries: new Array<PoolEntryRef | undefined>(bucketFields.length).fill(undefined),
+          avals: new Array<aval<unknown> | undefined>(bucketFields.length).fill(undefined), ok: true }
+      : undefined;
     {
       const tok = outerTok;
       for (let fi = 0; fi < bucketFields.length; fi++) {
         const f = bucketFields[fi]!;
+        // By the plan: an input the draw shares with its shape (for a
+        // uniform: when it supplies the very aval the plan saw) is the
+        // entry the plan knows, counted once more.
+        if (plan !== undefined) {
+          const pe = plan.entries[fi];
+          if (pe !== undefined && pe.refcount > 0 && (f.kind !== "uniform-ref" || spec.inputs[f.name] === plan.avals[fi])) {
+            pe.refcount++;
+            perDrawRefs[fi] = pe.ref;
+            perDrawAvals.push(plan.avals[fi]!);
+            perDrawAvalFieldIdx.push(fi);
+            if (f.kind === "bounds-ref") bucket.cullCount++;
+            ruleMemo[fi] = undefined;
+            continue;
+          }
+        }
         // Atlas-variant texture bindings carry inline values rather than
         // pool refs; packAtlasTextureFields fills them after this loop.
         if (f.kind === "texture-ref") continue;
@@ -4235,6 +4330,7 @@ export function buildHeapScene(
               device, arena.attrs, bav, bucket.chunkIdx, bav.getValue(tok),
               BOUNDS_BYTES, 0, 1, packBounds,
             );
+            if (capture !== undefined) { capture.entries[fi] = pool.entry(bav, bucket.chunkIdx); capture.avals[fi] = bav; }
             perDrawRefs[fi] = ref;
             perDrawAvals.push(bav);
             perDrawAvalFieldIdx.push(fi);
@@ -4305,6 +4401,7 @@ export function buildHeapScene(
             device, arena.attrs, sav as aval<unknown>, bucket.chunkIdx, sval,
             sp.dataBytes, sp.typeId, sp.length, sp.pack, storagePlacement,
           );
+          if (capture !== undefined) { capture.entries[fi] = pool.entry(sav as aval<unknown>, bucket.chunkIdx); capture.avals[fi] = sav as aval<unknown>; }
           perDrawRefs[fi] = ref;
           perDrawAvals.push(sav as aval<unknown>);
           perDrawAvalFieldIdx.push(fi);
@@ -4435,9 +4532,44 @@ export function buildHeapScene(
           replanFn,
         );
         if (releasable !== undefined) releasable._v = null;   // staged — drop the CPU copy
+        if (capture !== undefined) {
+          if (releasable === undefined && !isPerInstanceUniformField && !isPerInstanceAttrField && !STANDARD_DERIVED_RULES.has(f.name)) {
+            capture.entries[fi] = pool.entry(av, bucket.chunkIdx); capture.avals[fi] = av;
+          } else if (f.kind !== "uniform-ref") {
+            capture.ok = false;   // an attribute the plan could not vouch for
+          }
+        }
         perDrawRefs[fi] = ref;
         perDrawAvals.push(av);
         perDrawAvalFieldIdx.push(fi);
+      }
+    }
+
+    if (capture !== undefined && capture.ok) {
+      const needed: number[] = [], uniformFields: number[] = [];
+      let ownBytes = 0, ok = true;
+      for (let fi = 0; fi < bucketFields.length && ok; fi++) {
+        const f = bucketFields[fi]!;
+        if (f.kind === "uniform-ref") {
+          if (f.name === "__layoutId" || !effectFields.has(f.name)) continue;
+          uniformFields.push(fi);
+          // (a derived uniform's slot is a matrix; anything else has the size of its type)
+          let bytes = PACKER_MAT4.dataBytes;
+          if (!INLINE_HEADER_UNIFORMS.has(f.name)) {
+            try { bytes = Math.max(bytes, packerForWgslType(f.uniformWgslType ?? "").dataBytes); }
+            catch { ok = false; }
+          }
+          ownBytes += ALIGN16(ALLOC_HEADER_PAD_TO + bytes);
+        } else if (capture.entries[fi] !== undefined) {
+          needed.push(fi);
+        }
+      }
+      if (ok) {
+        drawPlans.set(spec.shape!, {
+          bucket, slot: roSlot, chunkIdx: bucket.chunkIdx,
+          index: hasIndices ? indexPool.bindingOf(indicesAval!, bucket.chunkIdx) : undefined,
+          entries: capture.entries, avals: capture.avals, needed, uniformFields, ownBytes,
+        });
       }
     }
 
@@ -5857,6 +5989,31 @@ export function buildHeapScene(
         recordCount: b.slots[0]!.recordCount,
         layout: b.layout,
       }));
+    },
+    /** How many draws were added by a draw plan (HeapDrawSpec.shape). */
+    plannedAdds(): number { return __plannedAdds; },
+    /**
+     * The CPU side of everything a draw's placement decides, as plain
+     * data: per bucket (by label) the header words of its live slots and
+     * each slot's draw records, plus the pools' use counts. Two scenes fed
+     * the same draws in the same order must agree on it.
+     */
+    stateForTest(): unknown {
+      const out = buckets.map((b) => {
+        const words = b.layout.drawHeaderBytes / 4;
+        const u32 = new Uint32Array(b.drawHeaderStaging.buffer, b.drawHeaderStaging.byteOffset, b.drawHeaderStaging.length);
+        const headers: Record<number, number[]> = {};
+        for (const ls of [...b.drawSlots].sort((x, y) => x - y)) headers[ls] = Array.from(u32.subarray(ls * words, (ls + 1) * words));
+        return {
+          label: b.label, cullCount: b.cullCount, headers,
+          slots: b.slots.map((sl) => ({
+            records: sl.recordCount,
+            table: Array.from(sl.drawTableShadow!.subarray(0, sl.recordCount * RECORD_U32)),
+            emit: sl.totalEmitEstimate,
+          })),
+        };
+      }).sort((x, y) => x.label < y.label ? -1 : x.label > y.label ? 1 : 0);
+      return { buckets: out, uniformUses: pool.debugUses(), indexUses: indexPool.debugUses(), draws: stats.totalDraws };
     },
     /** §7 debug: bucket drawHeap GPU buffers. */
     drawHeapBufsForTest(): readonly GPUBuffer[] {
