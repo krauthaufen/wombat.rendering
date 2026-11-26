@@ -347,12 +347,16 @@ export function compileHybridScene(
     if (n === undefined) { n = new WeakMap(); level.set(key, n); }
     return n;
   };
-  /** The one aval of a texture / sampler map (`NONE` for an empty map, `undefined` for several). */
-  const single = (m: { count: number; iter(f: (k: string, v: object) => void): void }): object | undefined => {
-    if (m.count === 0) return NONE;
-    let one: object | undefined, several = false;
-    m.iter((_k, v) => { if (one === undefined) one = v; else if (one !== v) several = true; });
-    return several ? undefined : one;
+  /**
+   * Down the trie by every aval of a texture / sampler map, in the map's
+   * order (the same names with the same avals walk the same way), closed
+   * by a marker so that one map's avals are never taken for the start of
+   * the next. Any number of textures: an effect may sample as many as it
+   * likes.
+   */
+  const walk = (level: WeakMap<object, unknown>, m: { iter(f: (k: string, v: object) => void): void }): WeakMap<object, unknown> => {
+    m.iter((_k, v) => { level = next(level, v); });
+    return next(level, NONE);
   };
   const shapeOfRo = new WeakMap<RenderObject, DrawShape | null>();
   const shapeFor = (ro: RenderObject): DrawShape | undefined => {
@@ -370,16 +374,14 @@ export function compileHybridScene(
       if (ro.storageBuffers.count > 1) return undefined;
       ro.storageBuffers.iter((n, av) => { storage = av; storageName = n; });
     }
-    const tex = single(ro.textures as never), samp = single(ro.samplers as never);
-    if (tex === undefined || samp === undefined) return undefined;
     let level = next(shapeRoot, ro.effect);
     level = next(level, ro.vertexAttributes);
     level = next(level, ro.indices ?? NONE);
     level = next(level, ro.drawCall);
     level = next(level, ro.pipelineState ?? NONE);
     level = next(level, storage);
-    level = next(level, tex);
-    level = next(level, samp);
+    level = walk(level, ro.textures as never);
+    level = walk(level, ro.samplers as never);
     const key = ro.bounds ?? NONE;
     let shape = level.get(key) as DrawShape | undefined;
     if (shape === undefined) { shape = { fast: false, storageName }; level.set(key, shape); }

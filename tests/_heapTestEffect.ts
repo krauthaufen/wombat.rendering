@@ -8,9 +8,9 @@
 // the module.
 
 import { effect, vertex, fragment, type Effect } from "@aardworx/wombat.shader";
-import { type Sampler2D, type SamplerCube, type Storage, type i32, texture, textureSize } from "@aardworx/wombat.shader/types";
+import { type Sampler2D, type SamplerCube, type Storage, type i32, texelFetch, texture, textureLod, textureSize } from "@aardworx/wombat.shader/types";
 import { uniform } from "@aardworx/wombat.shader/uniforms";
-import { V3f, V4f } from "@aardworx/wombat.base";
+import { V2i, V3f, V4f } from "@aardworx/wombat.base";
 
 // `ModelTrafo`, `ViewProjTrafo`, `LightLocation` are in the default
 // `UniformScope`; we augment only for the test-specific `Color`.
@@ -87,6 +87,16 @@ const threeTexturesFS = fragment((v: { color: V4f }) => {
 });
 export function makeHeapTestEffectThreeTextures(): Effect {
   return effect(baseVS, threeTexturesFS);
+}
+
+// The other ways of reading a texture: an explicit level, and a single texel.
+const explicitReadsFS = fragment((v: { color: V4f }) => {
+  const a = textureLod(checker, v.color.xy, 2.0);
+  const b = texelFetch(detail, new V2i(3, 4), 1);
+  return { outColor: a.add(b) };
+});
+export function makeHeapTestEffectExplicitReads(): Effect {
+  return effect(baseVS, explicitReadsFS);
 }
 
 export function makeHeapTestEffectTextured(): Effect {

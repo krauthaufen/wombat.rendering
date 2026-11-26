@@ -136,7 +136,7 @@ export interface FragmentOutputLayout {
 // reads are rewritten into arena loads (storage-ref drawHeader fields).
 // h18: every drawHeader carries a `__bounds` ref (frustum culling), which
 // can widen the header stride baked into the shaders.
-export const HEAP_PERSIST_VERSION_BASE = "h18";
+export const HEAP_PERSIST_VERSION_BASE = "h19";
 export const HEAP_PERSIST_VERSION = HEAP_PERSIST_VERSION_BASE; // legacy export (see persistVersionNow)
 /** The wombat.shader version compiling the cached WGSL: a compiler change
  *  (fusion, linking, emit) re-keys the cache instead of serving WGSL the old
@@ -946,10 +946,12 @@ ${generateAtlasSwitch()}
   return vec4<f32>(0.0);
 }
 
-fn atlasSample(
+// One texture lookup at an explicit level of detail: the two nearest
+// stored mips, blended. Every way of sampling an atlas texture ends here.
+fn atlasSampleLod(
   pageRef: u32, formatBits: u32,
   origin_px: vec2<f32>, size_px: vec2<f32>,
-  uv: vec2<f32>,
+  uv: vec2<f32>, lodIn: f32,
 ) -> vec4<f32> {
   let format  = formatBits & 0x1u;
   let numMips = (formatBits >> 1u) & 0x7u;
@@ -959,15 +961,8 @@ fn atlasSample(
   // filters in software, so the mag bit drives a single texel-snap flag for
   // both axes — enough to distinguish MinMagMipPoint from MinMagMipLinear.
   let filterNearest = u32(((formatBits >> 8u) & 0x3u) == 0u);
-  // LOD on pre-wrap UV. dpdx/dpdy on the wrapped value spikes at the
-  // fract/mirror seam (discontinuity → bogus huge derivative → tiny
-  // mip selected → blurred band). Multiply by size_px to get
-  // texels-per-screen-pixel.
-  let dx = dpdx(uv) * size_px;
-  let dy = dpdy(uv) * size_px;
-  let rho = max(length(dx), length(dy));
   let maxLod = f32(max(numMips, 1u) - 1u);
-  let lod = clamp(log2(max(rho, 1e-6)), 0.0, maxLod);
+  let lod = clamp(lodIn, 0.0, maxLod);
   let lo = u32(floor(lod));
   let hi = min(lo + 1u, max(numMips, 1u) - 1u);
   let t  = lod - f32(lo);
@@ -975,6 +970,63 @@ fn atlasSample(
   if (numMips <= 1u) { return a; }
   let b = atlasSampleAtMip(pageRef, format, origin_px, size_px, hi, uv, addrU, addrV, filterNearest);
   return mix(a, b, t);
+}
+
+// textureSample: the level from the screen-space derivatives of the uv.
+fn atlasSample(
+  pageRef: u32, formatBits: u32,
+  origin_px: vec2<f32>, size_px: vec2<f32>,
+  uv: vec2<f32>,
+) -> vec4<f32> {
+  // LOD on pre-wrap UV. dpdx/dpdy on the wrapped value spikes at the
+  // fract/mirror seam (discontinuity → bogus huge derivative → tiny
+  // mip selected → blurred band). Multiply by size_px to get
+  // texels-per-screen-pixel.
+  let dx = dpdx(uv) * size_px;
+  let dy = dpdy(uv) * size_px;
+  let rho = max(length(dx), length(dy));
+  return atlasSampleLod(pageRef, formatBits, origin_px, size_px, uv, log2(max(rho, 1e-6)));
+}
+
+// textureSampleBias: as textureSample, the level shifted.
+fn atlasSampleBias(
+  pageRef: u32, formatBits: u32,
+  origin_px: vec2<f32>, size_px: vec2<f32>,
+  uv: vec2<f32>, bias: f32,
+) -> vec4<f32> {
+  let rho = max(length(dpdx(uv) * size_px), length(dpdy(uv) * size_px));
+  return atlasSampleLod(pageRef, formatBits, origin_px, size_px, uv, log2(max(rho, 1e-6)) + bias);
+}
+
+// textureSampleLevel: the level given.
+fn atlasSampleLevel(
+  pageRef: u32, formatBits: u32,
+  origin_px: vec2<f32>, size_px: vec2<f32>,
+  uv: vec2<f32>, level: f32,
+) -> vec4<f32> {
+  return atlasSampleLod(pageRef, formatBits, origin_px, size_px, uv, level);
+}
+
+// textureSampleGrad: the level from the derivatives given.
+fn atlasSampleGrad(
+  pageRef: u32, formatBits: u32,
+  origin_px: vec2<f32>, size_px: vec2<f32>,
+  uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>,
+) -> vec4<f32> {
+  let rho = max(length(ddx * size_px), length(ddy * size_px));
+  return atlasSampleLod(pageRef, formatBits, origin_px, size_px, uv, log2(max(rho, 1e-6)));
+}
+
+// textureLoad: one texel of one stored level, by its integer coordinates.
+fn atlasLoad(
+  pageRef: u32, formatBits: u32,
+  origin_px: vec2<f32>, size_px: vec2<f32>,
+  coords: vec2<i32>, level: i32,
+) -> vec4<f32> {
+  let numMips = (formatBits >> 1u) & 0x7u;
+  let k = u32(clamp(level, 0, i32(max(numMips, 1u)) - 1));
+  let uv = (vec2<f32>(coords) + vec2<f32>(0.5)) / atlasMipSizePx(size_px, k);
+  return atlasSampleAtMip(pageRef, formatBits & 0x1u, origin_px, size_px, k, uv, 0u, 0u, 1u);
 }
 `;
 }

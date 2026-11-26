@@ -534,9 +534,9 @@ function rewriteFsAtlasTexturesDirect(
         headerU32At(formatBitsOff),
         newVec([headerF32At(originOff),     headerF32At(originOff + 1)],     Tvec2),
         newVec([headerF32At(sizeOff),       headerF32At(sizeOff + 1)],       Tvec2),
-        hit.uv,
+        hit.uv, ...hit.rest,
       ];
-      return { kind: "CallIntrinsic", op: ATLAS_SAMPLE_INTRINSIC, args, type: Tvec4 };
+      return { kind: "CallIntrinsic", op: hit.op, args, type: Tvec4 };
     }),
   }));
 }
@@ -766,9 +766,24 @@ const ATLAS_SAMPLE_INTRINSIC: IntrinsicRef = {
   emit: { glsl: "atlasSample", wgsl: "atlasSample" },
 };
 
-function isAtlasSampleCall(e: Expr, atlasNames: ReadonlySet<string>): { name: string; uv: Expr } | null {
+/**
+ * Every way a shader reads a texture, and the atlas function that stands
+ * in for it (same arguments after the texture; the texture itself becomes
+ * its placement from the draw header).
+ */
+const ATLAS_READS: Readonly<Record<string, IntrinsicRef>> = Object.fromEntries(([
+  ["textureSample", "atlasSample"],
+  ["textureSampleBias", "atlasSampleBias"],
+  ["textureSampleLevel", "atlasSampleLevel"],
+  ["textureSampleGrad", "atlasSampleGrad"],
+  ["textureLoad", "atlasLoad"],
+] as const).map(([from, to]) => [from, to === "atlasSample" ? ATLAS_SAMPLE_INTRINSIC
+  : { name: to, returnTypeOf: () => Tvec4, pure: true, emit: { glsl: to, wgsl: to } } as IntrinsicRef]));
+
+function isAtlasSampleCall(e: Expr, atlasNames: ReadonlySet<string>): { name: string; uv: Expr; op: IntrinsicRef; rest: readonly Expr[] } | null {
   if (e.kind !== "CallIntrinsic") return null;
-  if (e.op.emit.wgsl !== "textureSample") return null;
+  const op = ATLAS_READS[e.op.emit.wgsl];
+  if (op === undefined) return null;
   if (e.args.length < 2) return null;
   const tex = e.args[0]!;
   // Pre-legaliseTypes the sampler arg is a Var or ReadInput referencing
@@ -789,7 +804,7 @@ function isAtlasSampleCall(e: Expr, atlasNames: ReadonlySet<string>): { name: st
   // texture(sampler, uv) parses as a 2-arg call (no separate sampler/
   // texture pair until splitWgslSamplers runs). The uv is args[1].
   const uv = e.args[1]!;
-  return { name: matched, uv };
+  return { name: matched, uv, op, rest: e.args.slice(2) };
 }
 
 /** `textureSize(<atlas-routed sampler>)` — the sibling of `isAtlasSampleCall`.
@@ -900,9 +915,9 @@ function rewriteFsAtlasTextures(m: Module, layout: BucketLayout): Module {
         readScope("Input", v.formatBits, Tu32),
         readScope("Input", v.origin,     Tvec2),
         readScope("Input", v.size,       Tvec2),
-        hit.uv,
+        hit.uv, ...hit.rest,
       ];
-      return { kind: "CallIntrinsic", op: ATLAS_SAMPLE_INTRINSIC, args, type: Tvec4 };
+      return { kind: "CallIntrinsic", op: hit.op, args, type: Tvec4 };
     }),
   }));
   return out;
@@ -1671,9 +1686,9 @@ function rewriteFsAtlasTexturesViaCarrier(m: Module, layout: BucketLayout): Modu
         readScope("Input", v.formatBits, Tu32),
         readScope("Input", v.origin,     Tvec2),
         readScope("Input", v.size,       Tvec2),
-        hit.uv,
+        hit.uv, ...hit.rest,
       ];
-      return { kind: "CallIntrinsic", op: ATLAS_SAMPLE_INTRINSIC, args, type: Tvec4 };
+      return { kind: "CallIntrinsic", op: hit.op, args, type: Tvec4 };
     }),
   }));
   return out;

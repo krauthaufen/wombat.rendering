@@ -14,7 +14,7 @@ import { createFramebufferSignature } from "@aardworx/wombat.rendering/resources
 import { compileHybridScene } from "../packages/rendering/src/runtime/hybridScene.js";
 import { isHeapEligible } from "../packages/rendering/src/runtime/heapEligibility.js";
 import { MockGPU } from "./_mockGpu.js";
-import { makeHeapTestEffectThreeTextures } from "./_heapTestEffect.js";
+import { makeHeapTestEffectExplicitReads, makeHeapTestEffectThreeTextures } from "./_heapTestEffect.js";
 
 const g = globalThis as Record<string, unknown>;
 g.GPUTextureUsage ??= { COPY_SRC: 0x01, COPY_DST: 0x02, TEXTURE_BINDING: 0x04, STORAGE_BINDING: 0x08, RENDER_ATTACHMENT: 0x10 };
@@ -135,6 +135,47 @@ describe("several textures on one heap draw", () => {
     expect(binding(after, "mask").size).toEqual([48, 24]);
     expect(binding(after, "checker")).toEqual(binding(before, "checker"));
     expect(binding(after, "detail")).toEqual(binding(before, "detail"));
+  });
+
+  it("objects made of the same things are added by a draw plan, with the same result as the full way", () => {
+    const build = (shapes: boolean) => {
+      const gpu = new MockGPU();
+      // (textures that cannot change: only then is an object heap-eligible for good, which a plan needs)
+      const fixed = (w: number, h: number): aval<ITexture> => AVal.constant(ITexture.fromRaw({ data: new Uint8Array(w * h * 4), width: w, height: h, format: "rgba8unorm" }));
+      const tex = { checker: fixed(64, 64), detail: fixed(32, 32), mask: fixed(16, 16) };
+      // one object as the template: the others share everything but their colour
+      const base = object(tex);
+      const set = cset<RenderTree>(Array.from({ length: 24 }, (_, i) => RenderTree.leaf({
+        ...base,
+        uniforms: asUniformProvider(HashMap.empty<string, aval<unknown>>()
+          .add("ModelTrafo", AVal.constant(Trafo3d.identity) as aval<unknown>)
+          .add("ViewProjTrafo", AVal.constant(Trafo3d.identity) as aval<unknown>)
+          .add("LightLocation", AVal.constant(new V3f(0, 0, 1)) as aval<unknown>)
+          .add("Color", AVal.constant(new V4f(i / 24, 0, 0, 1)) as aval<unknown>)),
+      })));
+      const scene = compileHybridScene(gpu.device, sig(), RenderTree.unorderedFromSet(set), { enableDrawShapes: shapes });
+      scene.update(top);
+      const heap = scene.heapSceneForTest as unknown as { _debug: { stateForTest(): unknown; plannedAdds(): number } };
+      return { state: heap._debug.stateForTest(), planned: heap._debug.plannedAdds(), draws: scene.heapSceneForTest.stats.totalDraws };
+    };
+    const withShapes = build(true), without = build(false);
+    expect(withShapes.draws).toBe(24);
+    expect(withShapes.planned).toBeGreaterThanOrEqual(22);
+    expect(without.planned).toBe(0);
+    expect(withShapes.state).toEqual(without.state);
+  });
+
+  it("explicit-level reads and texel fetches are atlas lookups too", () => {
+    const gpu = new MockGPU();
+    const ro = { ...object({ checker: texture(64, 64), detail: texture(32, 32), mask: texture(16, 16) }), effect: makeHeapTestEffectExplicitReads() };
+    const scene = compileHybridScene(gpu.device, sig(), RenderTree.leaf(ro), {});
+    scene.update(top);
+    expect(scene.heapSceneForTest.stats.totalDraws).toBe(1);
+    const code = gpu.shaderModules.map((m) => m.code).join("\n");
+    // (the helpers are declared in every heap shader; what matters is that they are CALLED and nothing reads a texture directly)
+    expect(code).toMatch(/=\s*atlasSampleLevel\(|\(atlasSampleLevel\(|\batlasSampleLevel\(headersU32/);
+    expect(code).toMatch(/atlasLoad\(headersU32/);
+    expect(code).not.toMatch(/texture(SampleLevel|Load)\((checker|detail)/);
   });
 
   it("removing the object gives every one of its atlas entries back", () => {
