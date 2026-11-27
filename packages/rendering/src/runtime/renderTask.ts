@@ -244,7 +244,9 @@ class RenderTask implements IRenderTask {
     token: AdaptiveToken,
     clearValues?: ClearValues,
   ): void {
-    const scene = this.sceneFor(cmd, cmd.tree);
+    // A linear command draws through the framebuffer's sRGB views, where it has them.
+    if (cmd.linear === true && framebuffer.linear !== undefined) framebuffer = framebuffer.linear;
+    const scene = this.sceneFor(cmd, cmd.tree, framebuffer.signature);
     scene.update(token);
     if (!scene.hasDraws() && clearValues === undefined) return;
     // Compute prep (drawTable prefix-sum) must happen outside any
@@ -259,10 +261,11 @@ class RenderTask implements IRenderTask {
   private sceneFor(
     cmd: Extract<Command, { kind: "Render" }>,
     tree: RenderTree,
+    drawn: FramebufferSignature,
   ): HybridScene {
     let s = this._scenes.get(cmd);
     if (s === undefined) {
-      s = compileHybridScene(this.ctx.device, this.signature, tree, {
+      s = compileHybridScene(this.ctx.device, cmd.linear === true ? drawn : this.signature, tree, {
         compileEffect: this.ctx.compileEffect,
         ...(this.ctx.heapEnabled !== undefined ? { heapEnabled: this.ctx.heapEnabled } : {}),
         ...(this.ctx.enableFamilyMerge === true ? { enableFamilyMerge: true } : {}),

@@ -97,6 +97,7 @@ export function attachCanvas(
       size: { width: w, height: h, depthOrArrayLayers: 1 },
       format,
       sampleCount,
+      viewFormats: srgbOf(format) !== undefined ? [srgbOf(format)!] : [],
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
       label: "canvas.color.msaa",
     });
@@ -205,6 +206,7 @@ function configure(
 ): void {
   ctx.configure({
     device, format, alphaMode,
+    viewFormats: srgbOf(format) !== undefined ? [srgbOf(format)!] : [],
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
   });
 }
@@ -257,18 +259,41 @@ function makeFramebuffer(
   // swap-chain — multisample textures are not sampleable in the
   // normal sense).
   const colorTextures = HashMap.empty<string, GPUTexture>().add(colorName, swap);
+  const depth = depthTexture !== undefined
+    ? { depthStencil: depthTexture.createView(), depthStencilTexture: depthTexture }
+    : {};
+  // The same textures through their sRGB views: for commands that blend in linear light.
+  const srgb = srgbOf(signature.colors.tryFind(colorName)!);
+  let linear: IFramebuffer | undefined;
+  if (srgb !== undefined) {
+    const swapLinear = swap.createView({ format: srgb });
+    const passLinear = msaa ? (msaaColor ?? swap).createView({ format: srgb }) : swapLinear;
+    linear = {
+      signature: { ...signature, colors: signature.colors.add(colorName, srgb) },
+      colors: HashMap.empty<string, GPUTextureView>().add(colorName, passLinear),
+      colorTextures,
+      ...(msaa ? { resolveColors: HashMap.empty<string, GPUTextureView>().add(colorName, swapLinear) } : {}),
+      width: size.width,
+      height: size.height,
+      ...depth,
+    };
+  }
   const fb: IFramebuffer = {
     signature,
     colors,
     colorTextures,
     ...(resolveColors !== undefined ? { resolveColors } : {}),
+    ...(linear !== undefined ? { linear } : {}),
     width: size.width,
     height: size.height,
-    ...(depthTexture !== undefined
-      ? { depthStencil: depthTexture.createView(), depthStencilTexture: depthTexture }
-      : {}),
+    ...depth,
   };
   return fb;
+}
+
+/** The sRGB format with a format's layout, for a view that encodes on write. */
+export function srgbOf(format: GPUTextureFormat): GPUTextureFormat | undefined {
+  return format === "bgra8unorm" ? "bgra8unorm-srgb" : format === "rgba8unorm" ? "rgba8unorm-srgb" : undefined;
 }
 
 function depthAttachmentSig(format: GPUTextureFormat) {

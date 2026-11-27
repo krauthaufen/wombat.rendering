@@ -44,7 +44,12 @@ export type CopySpec = BufferCopy | TextureCopy;
  * `Copy` and `Custom` are framebuffer-agnostic and unchanged.
  */
 export type Command =
-  | { readonly kind: "Render"; readonly tree: RenderTree }
+  | {
+      readonly kind: "Render"; readonly tree: RenderTree;
+      /** Draws into the framebuffer's `linear` variant (sRGB views: linear
+       *  colour out, blended in linear light), where it has one. */
+      readonly linear?: boolean;
+    }
   | { readonly kind: "Clear"; readonly values: ClearValues }
   | { readonly kind: "Copy"; readonly copy: CopySpec }
   | { readonly kind: "Custom"; readonly encode: (cmd: GPUCommandEncoder) => void };
