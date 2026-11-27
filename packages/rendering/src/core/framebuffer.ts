@@ -32,6 +32,13 @@ export interface IFramebuffer {
    */
   readonly resolveColors?: HashMap<string, GPUTextureView>;
   readonly depthStencilTexture?: GPUTexture;
+  /**
+   * The same targets through sRGB views of their colour textures, where
+   * those have one: what a shader writes there is linear colour, blended
+   * in linear light and stored sRGB-encoded. Its signature carries the
+   * views' formats. A `Render` command marked `linear` draws into it.
+   */
+  readonly linear?: IFramebuffer;
   readonly width: number;
   readonly height: number;
 }

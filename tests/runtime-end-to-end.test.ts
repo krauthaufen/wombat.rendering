@@ -112,6 +112,42 @@ describe("Runtime.compile(alist<Command>)", () => {
     fbo.release();
   });
 
+  it("a linear Render command draws through the framebuffer's linear variant, with pipelines of its formats", () => {
+    const gpu = new MockGPU();
+    const runtime = new Runtime({ device: gpu.device, heapEnabled: cval(false) });
+    const sig = createFramebufferSignature({ colors: { outColor: "rgba8unorm" } });
+    const fbo = allocateFramebuffer(gpu.device, sig, cval({ width: 4, height: 4 }));
+    fbo.acquire();
+    const plain = fbo.getValue(AdaptiveToken.top);
+    const linearView = { __view: "srgb" } as unknown as GPUTextureView;
+    const fb = {
+      ...plain,
+      linear: {
+        ...plain,
+        signature: { ...sig, colors: sig.colors.add("outColor", "rgba8unorm-srgb" as GPUTextureFormat) },
+        colors: plain.colors.add("outColor", linearView),
+      },
+    };
+    const cmds = AList.ofArray<Command>([
+      { kind: "Render", tree: RenderTree.leaf(obj()) },
+      { kind: "Render", tree: RenderTree.leaf(obj()), linear: true },
+    ]);
+    const task = runtime.compile(sig, cmds);
+    task.run(fb, AdaptiveToken.top);
+    expect(gpu.renderPasses).toHaveLength(2);
+    const view = (i: number) => (gpu.renderPasses[i]!.desc.colorAttachments as GPURenderPassColorAttachment[])[0]!.view;
+    expect(view(0)).toBe(plain.colors.tryFind("outColor"));
+    expect(view(1)).toBe(linearView);
+    const formats = gpu.pipelines.map((p) => [...(p.fragment!.targets as GPUColorTargetState[])][0]!.format);
+    expect(formats).toEqual(["rgba8unorm", "rgba8unorm-srgb"]);
+    // Without a linear variant the command draws as any other.
+    gpu.renderPasses.length = 0;
+    task.run(plain, AdaptiveToken.top);
+    expect(view(1)).toBe(plain.colors.tryFind("outColor"));
+    task.dispose();
+    fbo.release();
+  });
+
   it("Ordered tree of two leaves batches into one render pass", () => {
     const gpu = new MockGPU();
     const runtime = new Runtime({ device: gpu.device, heapEnabled: cval(false) });
