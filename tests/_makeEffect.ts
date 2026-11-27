@@ -21,7 +21,7 @@ import type { Module, Type, ValueDef } from "@aardworx/wombat.shader/ir";
 export function makeEffect(
   source: string,
   entries: readonly EntryRequest[],
-  opts: { file?: string; extraValues?: readonly ValueDef[] } = {},
+  opts: { file?: string; extraValues?: readonly ValueDef[]; helpers?: readonly string[] } = {},
 ): Effect {
   const externalTypes = new Map<string, Type>();
   for (const v of opts.extraValues ?? []) {
@@ -33,6 +33,7 @@ export function makeEffect(
   const parseInput: Parameters<typeof parseShader>[0] = {
     source, entries, externalTypes,
     ...(opts.file !== undefined ? { file: opts.file } : {}),
+    ...(opts.helpers !== undefined ? { helpers: opts.helpers } : {}),
   };
   const parsed = parseShader(parseInput);
   const merged: Module = opts.extraValues && opts.extraValues.length > 0

@@ -36,7 +36,7 @@ import {
   type BucketLayout,
   type DrawHeaderField,
 } from "./heapEffect.js";
-import type { IntrinsicRef } from "@aardworx/wombat.shader/ir";
+import type { IntrinsicRef, FunctionSignature, Parameter } from "@aardworx/wombat.shader/ir";
 
 // ─── IR builders ────────────────────────────────────────────────────
 
@@ -438,9 +438,8 @@ function rewriteFsUniformsDirect(
   instIdExpr: Expr = { kind: "Var", var: { name: "instId", type: Tu32, mutable: false } } as Expr,
 ): Module {
   const used = new Set<string>();
-  for (const v of m.values) {
-    if (v.kind !== "Entry" || v.entry.stage !== "fragment") continue;
-    for (const sn of readInputs(v.entry.body).values()) {
+  for (const body of fragmentSideBodies(m)) {
+    for (const sn of readInputs(body).values()) {
       if (sn.scope === "Uniform") used.add(sn.name);
     }
   }
@@ -479,9 +478,8 @@ function rewriteFsAtlasTexturesDirect(
 ): Module {
   if (layout.atlasTextureBindings.size === 0) return m;
   const used = new Set<string>();
-  for (const v of m.values) {
-    if (v.kind !== "Entry" || v.entry.stage !== "fragment") continue;
-    visitStmtExprs(v.entry.body, e => {
+  for (const body of fragmentSideBodies(m)) {
+    visitStmtExprs(body, e => {
       const hit = isAtlasSampleCall(e, layout.atlasTextureBindings);
       if (hit !== null) used.add(hit.name);
       const sz = isAtlasSizeCall(e, layout.atlasTextureBindings);
@@ -567,12 +565,11 @@ function rewriteFsHeapDirectStandalone(m: Module, layout: BucketLayout): Module 
   // What does the FS actually touch?
   const usedUniforms = new Set<string>();
   const usedAtlas = new Set<string>();
-  for (const v of m.values) {
-    if (v.kind !== "Entry" || v.entry.stage !== "fragment") continue;
-    for (const sn of readInputs(v.entry.body).values()) {
+  for (const body of fragmentSideBodies(m)) {
+    for (const sn of readInputs(body).values()) {
       if (sn.scope === "Uniform") usedUniforms.add(sn.name);
     }
-    visitStmtExprs(v.entry.body, e => {
+    visitStmtExprs(body, e => {
       const hit = isAtlasSampleCall(e, layout.atlasTextureBindings);
       if (hit !== null) usedAtlas.add(hit.name);
       const sz = isAtlasSizeCall(e, layout.atlasTextureBindings);
@@ -1026,6 +1023,89 @@ fn cubeProjectZup(d: vec3<f32>) -> vec2<f32> {
 `;
 
 /** Visit every Expr inside a Stmt tree, read-only. */
+/**
+ * The bodies a fragment-side scan has to read: the fragment entries and
+ * every helper function. A helper belongs to no stage, and what only a
+ * helper reads (a uniform, an atlas texture) is read per fragment all the
+ * same.
+ */
+function* fragmentSideBodies(m: Module): Generator<Stmt> {
+  for (const v of m.values) {
+    if (v.kind === "Function") yield v.body;
+    else if (v.kind === "Entry" && v.entry.stage === "fragment") yield v.entry.body;
+  }
+}
+
+/**
+ * Hands the per-draw carriers to the helper functions that read them.
+ *
+ * The heap rewrites turn a read of per-draw data (a uniform, an atlas
+ * header, a heap-managed storage buffer) into arena loads keyed by the
+ * draw index, which an entry point reads from its stage input. A helper
+ * function has no stage input: `in._h_drawIdx` in its body does not
+ * parse, and one module that does not parse invalidates the pipeline and
+ * with it the frame's whole command buffer. So every function that reads
+ * a carrier, or calls one that does, takes it as a parameter, and each
+ * caller passes its own on: an entry its stage input, a function its
+ * parameter.
+ */
+function threadCarriersIntoFunctions(m: Module, carriers: readonly string[]): Module {
+  const functions = new Map<string, Extract<ValueDef, { kind: "Function" }>>();
+  for (const v of m.values) if (v.kind === "Function") functions.set(v.signature.name, v);
+  if (functions.size === 0) return m;
+
+  // What each function reads itself, and whom it calls.
+  const needs = new Map<string, Set<string>>();
+  const calls = new Map<string, Set<string>>();
+  for (const [name, f] of functions) {
+    const read = new Set<string>(), called = new Set<string>();
+    visitStmtExprs(f.body, e => {
+      if (e.kind === "ReadInput" && e.scope === "Input" && carriers.includes(e.name)) read.add(e.name);
+      else if (e.kind === "Call" && functions.has(e.fn.signature.name)) called.add(e.fn.signature.name);
+    });
+    needs.set(name, read);
+    calls.set(name, called);
+  }
+  // A caller needs what its callees need.
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [name, called] of calls) {
+      const mine = needs.get(name)!;
+      for (const callee of called) for (const c of needs.get(callee)!) if (!mine.has(c)) { mine.add(c); changed = true; }
+    }
+  }
+  if (![...needs.values()].some(n => n.size > 0)) return m;
+
+  // In the carriers' own order, so every call site agrees with the signature.
+  const neededBy = (name: string): string[] => carriers.filter(c => needs.get(name)!.has(c));
+  const signatureOf = (name: string): FunctionSignature => {
+    const s = functions.get(name)!.signature;
+    return { ...s, parameters: [...s.parameters, ...neededBy(name).map((c): Parameter => ({ name: c, type: Tu32, modifier: "in" }))] };
+  };
+  const paramOf = (carrier: string): Expr => ({ kind: "Var", var: { name: carrier, type: Tu32, mutable: false }, type: Tu32 } as Expr);
+  const rewrite = (body: Stmt, inFunction: boolean): Stmt => mapStmt(body, {
+    expr: top => mapExpr(top, e => {
+      if (inFunction && e.kind === "ReadInput" && e.scope === "Input" && carriers.includes(e.name)) return paramOf(e.name);
+      // (a call the walk has already been at carries its carriers: leave it)
+      if (e.kind === "Call" && functions.has(e.fn.signature.name) && needs.get(e.fn.signature.name)!.size > 0
+          && e.args.length === functions.get(e.fn.signature.name)!.signature.parameters.length) {
+        const name = e.fn.signature.name;
+        const passed = neededBy(name).map(c => inFunction ? paramOf(c) : readScope("Input", c, Tu32));
+        return { ...e, fn: { ...e.fn, signature: signatureOf(name) }, args: [...e.args, ...passed] };
+      }
+      return e;
+    }),
+  });
+  return {
+    ...m,
+    values: m.values.map((v): ValueDef => {
+      if (v.kind === "Function") return { ...v, signature: signatureOf(v.signature.name), body: rewrite(v.body, true) };
+      if (v.kind === "Entry") return { ...v, entry: { ...v.entry, body: rewrite(v.entry.body, false) } };
+      return v;
+    }),
+  };
+}
+
 function visitStmtExprs(s: Stmt, fn: (e: Expr) => void): void {
   mapStmt(s, {
     expr: e => mapExpr(e, sub => { fn(sub); return sub; }),
@@ -1159,6 +1239,7 @@ export function compileHeapEffectIR(
     // 16-location inter-stage cap and silently invalidated whole pipelines.)
     combined = rewriteFsHeapDirectStandalone(combined, layout);
   }
+  if (mode !== "family-member") combined = threadCarriersIntoFunctions(combined, ["_h_drawIdx", "_iidx"]);
   // Add heap storage buffers as bindings.
   combined = { ...combined, values: [...heapStorageBufferDecls(), ...combined.values] };
 
@@ -1270,9 +1351,8 @@ function rewriteFsHeapDirectViaCarrier(m: Module, layout: BucketLayout): Module 
     if (f.kind === "uniform-ref") uniformFields.set(f.name, f);
   }
   const used = new Set<string>();
-  for (const v of out.values) {
-    if (v.kind !== "Entry" || v.entry.stage !== "fragment") continue;
-    for (const sn of readInputs(v.entry.body).values()) {
+  for (const body of fragmentSideBodies(out)) {
+    for (const sn of readInputs(body).values()) {
       if (sn.scope === "Input" && uniformFields.has(sn.name)) used.add(sn.name);
     }
   }
@@ -1449,6 +1529,7 @@ function compileHeapEffectIRViaDecoder(
   combined = rewriteFsCubeTextures(combined, layout);
 
   combined = rewriteFsHeapDirectViaCarrier(combined, layout);
+  combined = threadCarriersIntoFunctions(combined, [HEAP_FS_DRAWIDX, HEAP_FS_INSTID]);
 
   // 6b. USER storage buffers (the OIT node pool & co): pin each to the
   // slot the bucket's BGL committed to. `keep: true` makes the emitter

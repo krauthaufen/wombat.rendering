@@ -45,4 +45,25 @@ describe("heap-managed storage buffers: struct elements", () => {
     expect(ir.fs).toMatch(/let dim: f32 = heapF32\[.*\+ 28u\)/);
     expect(ir.fs.match(/Lamp\(/g)!.length).toBe(1);
   });
+
+  it("a function the fragment stage calls reads per-draw data through the draw index it is handed", () => {
+    const effect = makeLampEffect(true);
+    const fol = { locations: new Map([["outColor", 0]]) };
+    const fam = buildShaderFamily([effect], fol, undefined, {
+      perEffectPerInstance: new Map([[effect, { attributes: new Set<string>(), storage: new Set(["Lamps"]) }]]),
+    });
+    const ir = compileHeapEffectIR(effect, fam.drawHeaderUnion, { target: "wgsl", fragmentOutputLayout: fol }, "standalone");
+    const helper = /fn lampStrength\(([^)]*)\)[^{]*\{([\s\S]*?)\n\}/.exec(ir.fs);
+    expect(helper).not.toBeNull();
+    // `in` is the entry point's parameter: a function of its own cannot name it (the module would not parse)
+    expect(helper![2]).not.toMatch(/\bin\./);
+    // it takes the draw index as a parameter and loads through it
+    expect(helper![1]).toMatch(/_h_drawIdx: u32/);
+    expect(helper![2]).toMatch(/headersU32\[/);
+    // and the entry point hands it its own
+    expect(ir.fs).toContain("lampStrength(idx, in._h_drawIdx)");
+    expect(ir.fs).toContain("lampStrength(0i, in._h_drawIdx)");
+    // the uniform only the function reads comes from the arena too
+    expect(helper![2]).toMatch(/heapV4f\[/);
+  });
 });

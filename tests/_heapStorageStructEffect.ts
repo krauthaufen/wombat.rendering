@@ -16,12 +16,24 @@ export const Lamp: Type = {
   fields: [{ name: "Position", type: Tvec3f }, { name: "Strength", type: Tf32 }, { name: "Tint", type: Tvec4f }],
 } as Type;
 
-export function makeLampEffect(): Effect {
-  const source = `
+/** `helper`: the storage and a uniform are read in a function the fragment stage calls, not in its own body. */
+export function makeLampEffect(helper = false): Effect {
+  const source = (helper ? `
+    function lampStrength(i: i32): f32 {
+      if (i < 0) { return 0.0; }
+      let sum = 0.0;
+      for (let k = 0; k < 2; k++) { sum = sum + Lamps[i + k].Strength * uColor.y; }
+      return sum;
+    }
+    function fsMain(input: { color: V4f }): { outColor: V4f } {
+      const idx = input.color.x as i32;
+      return { outColor: new V4f(lampStrength(idx), lampStrength(0), 0.0, 1.0) };
+    }
+  ` : "") + `
     function vsMain(input: { Positions: V4f }): { gl_Position: V4f; color: V4f } {
       return { gl_Position: uViewProjTrafo.mul(input.Positions), color: uColor };
     }
-    function fsMain(input: { color: V4f }): { outColor: V4f } {
+    ` + (helper ? "" : `function fsMain(input: { color: V4f }): { outColor: V4f } {
       const idx = input.color.x as i32;
       const lamp = Lamps[idx];
       const dim = Lamps[0].Strength;
@@ -31,7 +43,7 @@ export function makeLampEffect(): Effect {
         lamp.Tint.z * lamp.Strength + lamp.Position.z + dim,
         1.0) };
     }
-  `;
+  `);
   const extraValues: ValueDef[] = [
     { kind: "Uniform", binding: { group: 0, slot: 99 }, name: "U", uniforms: [
       { name: "uViewProjTrafo", type: Tmat4 }, { name: "uColor", type: Tvec4f },
@@ -53,5 +65,5 @@ export function makeLampEffect(): Effect {
       inputs: [{ name: "color", type: Tvec4f, semantic: "Color", decorations: [{ kind: "Location", value: 0 }] }],
       outputs: [{ name: "outColor", type: Tvec4f, semantic: "Color", decorations: [{ kind: "Location", value: 0 }] }],
     },
-  ], { extraValues });
+  ], { extraValues, ...(helper ? { helpers: ["lampStrength"] } : {}) });
 }
