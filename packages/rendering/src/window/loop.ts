@@ -60,20 +60,24 @@ function bumpFrameCount(): void {
 
 // setTimeout(0) is useless for an uncapped loop: Chrome clamps nested
 // timers to a 4 ms minimum after depth 5. MessageChannel.postMessage
-// is the unthrottled macrotask primitive.
+// is the unthrottled macrotask primitive. The channel is made on first
+// use: a port with a handler keeps Node alive, so one made at module load
+// kept any Node script that imports this module from exiting.
 const immediateCbs = new Map<number, () => void>();
 let immediateNext = 1;
-const immediateChannel: MessageChannel | null =
-  typeof MessageChannel !== "undefined" ? new MessageChannel() : null;
-if (immediateChannel !== null) {
-  immediateChannel.port1.onmessage = (e: MessageEvent): void => {
-    const id = e.data as number;
-    const cb = immediateCbs.get(id);
-    immediateCbs.delete(id);
-    cb?.();
-  };
-}
+let immediateChannel: MessageChannel | null | undefined;
 function setImmediate2(cb: () => void): number {
+  if (immediateChannel === undefined) {
+    immediateChannel = typeof MessageChannel !== "undefined" ? new MessageChannel() : null;
+    if (immediateChannel !== null) {
+      immediateChannel.port1.onmessage = (e: MessageEvent): void => {
+        const id = e.data as number;
+        const cb = immediateCbs.get(id);
+        immediateCbs.delete(id);
+        cb?.();
+      };
+    }
+  }
   if (immediateChannel === null) return setTimeout(cb, 0) as unknown as number;
   const id = immediateNext++;
   immediateCbs.set(id, cb);
